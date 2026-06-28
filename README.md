@@ -34,7 +34,10 @@ CLAUDE.md                     # the Lead's operating manual (loaded every sessio
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget
 agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staffing-plan
 agent-firm/templates/*        # run-ledger artifact templates
-bin/                          # new-run, ledger-log, validate-verdict, ledger-hook
+agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
+agent-firm/evals/*            # golden-task evals that guard firm changes
+bin/                          # new-run, ledger-log, validate-verdict, new-worktree, integrate,
+                              #   qa-checkout, traceability-check, propose-system-change, run-evals
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
 .claude-plugin/               # plugin + marketplace scaffold (Phase 4 packaging)
 docs/PHASE0.md                # what's built now and the roadmap
@@ -42,7 +45,7 @@ docs/PHASE0.md                # what's built now and the roadmap
 
 ## Roadmap (see the plan)
 - **Phase 0 (done):** core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff.
-- **Phase 1:** workflow scripts for parallel build/review/test, traceability, integration branch, retro + System-Change-PR flow.
+- **Phase 1 (done):** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
 - **Phase 2:** Recruiter + hireable specialist **bench** (incl. a `heightslabs`-scoped crypto-crime specialist) with job specs, budgets, and evals.
 - **Phase 3:** Codex/GPT read-only QA judge via `codex exec --output-schema`.
 - **Phase 4:** multi-profile secrets/auth (`op` + direnv, `CLAUDE_CONFIG_DIR` + `CODEX_HOME`), plugin packaging, second-machine bootstrap.

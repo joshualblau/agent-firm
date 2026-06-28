@@ -6,7 +6,7 @@ FROM node:20-bookworm-slim@sha256:6e2c6e0e1a7e0e9b0e3f4f5a6b7c8d9e0f1a2b3c4d5e6f
 # Minimal toolchain the firm needs (git, jq, python for schema validation, ca-certs).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git jq python3 python3-pip ca-certificates curl \
- && pip3 install --no-cache-dir --break-system-packages jsonschema \
+ && pip3 install --no-cache-dir --break-system-packages jsonschema pyyaml \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — agents operate without host privileges.

@@ -1,0 +1,12 @@
+# Traceability matrix — every acceptance criterion mapped to code, tests, and evidence.
+# Produced during Review/QA; bin/traceability-check enforces it against 08-qa-verdict.json.
+task_slug:
+matrix:
+  - id: AC-001
+    implementation_files: []     # e.g. [src/greet.js]
+    tests: []                    # e.g. [test/greet.test.js::adds two numbers]
+    manual_verification: ""     # if verification was manual, describe it
+    evidence: ""                # path under 09-test-evidence/ or a note
+    status: uncovered            # covered | partial | uncovered
+# Rule: an `uncovered` criterion fails the traceability gate UNLESS it carries an explicit
+# justification (e.g. waived at the Requirements gate, or out of scope).

@@ -1,0 +1,13 @@
+name: greet-fast-path
+description: The firm can take a tiny feature through the fast-path lifecycle to an APPROVE verdict, with evidence, without auto-finishing.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/greet.js
+  - file_exists: test/greet.test.js
+  - test_passes: node --test
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - traceability_passes: true
+  - no_default_branch_merge: true
+  - final_gate_pending: true

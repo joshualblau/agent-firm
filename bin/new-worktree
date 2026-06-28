@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# new-worktree <role> <work-order-id>
+# Creates an isolated git worktree for one implementer work-order, per worktree_policy:
+#  - base = local HEAD (in-progress feature), NOT origin/HEAD
+#  - branch/dir named <run_id>-<role>-<work_order>
+#  - allocates a deterministic port + db name so parallel units don't collide
+#  - copies ONLY .env.example; never real secrets/auth caches
+# Run from the work-project root with an active run (bin/new-run first).
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # resolve sibling scripts by location
+
+role="${1:-}"; wo="${2:-}"
+if [[ -z "$role" || -z "$wo" ]]; then echo "usage: new-worktree <role> <work-order-id>" >&2; exit 2; fi
+role="$(printf '%s' "$role" | tr -cd 'a-zA-Z0-9-')"
+wo="$(printf '%s' "$wo" | tr -cd 'a-zA-Z0-9-')"
+
+run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+if [[ -z "$run_dir" ]]; then echo "no active run — run bin/new-run first" >&2; exit 1; fi
+run_id="$(basename "$run_dir")"
+
+branch="wt/${run_id}-${role}-${wo}"
+wt_dir=".agent-firm/worktrees/${run_id}-${role}-${wo}"
+mkdir -p .agent-firm/worktrees
+
+git worktree add -b "$branch" "$wt_dir" HEAD >/dev/null
+
+# Make sure the firm's per-worktree scratch file is NEVER staged/committed — otherwise two
+# worktrees each commit their own .agent-firm-worktree.env at the same path and integration
+# hits a false conflict. The shared exclude covers every linked worktree.
+excl="$(git rev-parse --git-common-dir)/info/exclude"
+for pat in '.agent-firm-worktree.env' '.agent-firm/'; do
+  grep -qxF "$pat" "$excl" 2>/dev/null || printf '%s\n' "$pat" >> "$excl"
+done
+
+# Deterministic, collision-free per-worktree resources.
+h="$(printf '%s' "${run_id}-${role}-${wo}" | cksum | awk '{print $1}')"
+port=$(( 20000 + (h % 20000) ))
+db="firm_$(printf '%s' "${run_id}_${role}_${wo}" | tr -cd 'a-zA-Z0-9_')"
+
+# Copy only safe scaffolding — NEVER real .env / secrets / auth caches.
+[[ -f .env.example ]] && cp .env.example "$wt_dir/.env.example" 2>/dev/null || true
+cat > "$wt_dir/.agent-firm-worktree.env" <<EOF
+WORKTREE_ROLE=$role
+WORKTREE_WORKORDER=$wo
+WORKTREE_BRANCH=$branch
+WORKTREE_PORT=$port
+WORKTREE_DB=$db
+EOF
+
+[[ -x "$SELF/ledger-log" ]] && "$SELF/ledger-log" worktree_created role="$role" work_order="$wo" branch="$branch" port="$port" || true
+
+echo "worktree: $wt_dir"
+echo "branch:   $branch"
+echo "port:     $port"
+echo "db:       $db"

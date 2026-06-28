@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# run-evals [eval-name]
+# Phase 1: validate eval STRUCTURE and list the golden-task suite.
+# Phase 5: drive the firm against each fixture and check assertions (needs the autonomous-run
+# permission posture to be settled). For now this is the structural guard.
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVALS="$(cd "$SELF/.." && pwd)/agent-firm/evals"
+
+want="${1:-}"
+rc=0; n=0
+for d in "$EVALS"/*/; do
+  [[ -d "$d" ]] || continue
+  name="$(basename "$d")"
+  [[ "$name" == "README.md" ]] && continue
+  [[ -n "$want" && "$want" != "$name" ]] && continue
+  n=$((n+1))
+  ok=1
+  [[ -f "$d/task.md" ]]        || { echo "  MISSING task.md"; ok=0; }
+  [[ -f "$d/assertions.yaml" ]] || { echo "  MISSING assertions.yaml"; ok=0; }
+  [[ -d "$d/fixture" ]]        || { echo "  MISSING fixture/"; ok=0; }
+  if [[ $ok -eq 1 ]]; then
+    a_count="$(grep -cE '^\s*-\s' "$d/assertions.yaml" || true)"
+    echo "ok   $name  ($a_count assertions)"
+  else
+    echo "BAD  $name"; rc=1
+  fi
+done
+[[ $n -eq 0 ]] && { echo "no evals found in $EVALS"; exit 0; }
+echo "---"
+echo "$n eval(s) structurally valid. Full execution lands in Phase 5 (see agent-firm/evals/README.md)."
+exit $rc

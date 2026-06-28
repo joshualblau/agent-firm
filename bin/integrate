@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# integrate [integration-branch]
+# Creates/uses an integration branch and merges this run's implementer worktree branches into it.
+# On conflict, aborts that merge and reports it for the Integrator agent to resolve by hand —
+# never silently drops a change. Merging to the DEFAULT branch is a human gate (not done here).
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # resolve sibling scripts by location
+
+run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+run_id="$(basename "${run_dir:-none}")"
+intb="${1:-integration/${run_id}}"
+
+# Create the integration branch from current HEAD if it doesn't exist.
+if git show-ref --verify --quiet "refs/heads/${intb}"; then
+  git switch "$intb" >/dev/null 2>&1
+else
+  git switch -c "$intb" >/dev/null 2>&1
+fi
+
+# bash 3.2 compatible (macOS): no `mapfile`.
+# strip leading markers: '*' (current), '+' (checked out in a linked worktree), and spaces
+branches="$(git branch --list "wt/${run_id}-*" | sed 's/^[*+ ]*//')"
+if [[ -z "$branches" ]]; then echo "no worktree branches for ${run_id}; nothing to integrate"; exit 0; fi
+
+conflicts=0; merged=0
+while IFS= read -r b; do
+  [[ -z "$b" ]] && continue
+  printf 'merging %-50s ... ' "$b"
+  if git merge --no-edit "$b" >/dev/null 2>&1; then
+    echo "ok"; merged=$((merged+1))
+  else
+    echo "CONFLICT (left for Integrator to resolve)"; git merge --abort 2>/dev/null || true; conflicts=$((conflicts+1))
+  fi
+done <<< "$branches"
+
+echo "integration branch: $intb"
+echo "merged: $merged   conflicts: $conflicts"
+[[ -x "$SELF/ledger-log" ]] && "$SELF/ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
+echo "NEXT: reconcile lockfiles/migrations/ports/fixtures, run the COMBINED suite, write integration-summary.md."
+[[ $conflicts -eq 0 ]]

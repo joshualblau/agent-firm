@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# propose-system-change <slug>
+# Scaffolds a System Change PR (a reviewed change to the FIRM itself) from the template into
+# system-changes/<ts>-<slug>.md. Run from the firm repo (or a checkout of it).
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIRM_ROOT="$(cd "$SELF/.." && pwd)"
+
+slug="${1:-}"
+if [[ -z "$slug" ]]; then echo "usage: propose-system-change <slug>" >&2; exit 2; fi
+slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p system-changes
+out="system-changes/${ts}-${slug}.md"
+cp "$FIRM_ROOT/agent-firm/templates/system-change-pr.md" "$out"
+echo "$out"
+echo "Next: fill it in, get human approval, then make the firm-config edits ON THIS PR and add a golden eval." >&2

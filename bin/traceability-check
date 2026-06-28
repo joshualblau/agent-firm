@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# traceability-check [run_dir]
+# Cross-references acceptance criteria (01-acceptance-criteria.yaml) against the QA verdict's
+# acceptance_criteria_coverage (08-qa-verdict.json). Fails if any criterion is uncovered without
+# a justification. Defaults to the active run (.agent-firm/CURRENT_RUN).
+set -euo pipefail
+
+run_dir="${1:-}"
+if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent-firm/CURRENT_RUN)"; fi
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
+
+python3 - "$run_dir" <<'PY'
+import json, re, sys, os
+run = sys.argv[1]
+ac_path = os.path.join(run, "01-acceptance-criteria.yaml")
+v_path  = os.path.join(run, "08-qa-verdict.json")
+if not os.path.exists(ac_path): print(f"MISSING {ac_path}"); sys.exit(2)
+if not os.path.exists(v_path):  print(f"MISSING {v_path}");  sys.exit(2)
+
+# Acceptance-criteria ids: prefer yaml, fall back to a regex that handles BOTH block style
+# (`- id: AC-001`) and flow style (`- {id: AC-001, ...}`).
+ac_ids = []
+text = open(ac_path).read()
+try:
+    import yaml
+    doc = yaml.safe_load(text) or {}
+    ac_ids = [c.get("id") for c in (doc.get("criteria") or []) if isinstance(c, dict) and c.get("id")]
+except Exception:
+    ac_ids = re.findall(r'(?:^|[\s\-{,])id:\s*["\']?([A-Za-z0-9_-]+)', text, re.M)
+ac_ids = [a for a in ac_ids if a]
+
+# Fail-closed: if the file declares criteria but we couldn't extract any ids, we cannot verify
+# coverage — do NOT pass vacuously (matches the firm's "BLOCK on uncertainty" stance).
+if not ac_ids and re.search(r'^\s*criteria\s*:', text, re.M):
+    print("TRACEABILITY: CANNOT VERIFY — 'criteria:' present but no ids parsed (install pyyaml or fix the file format)")
+    sys.exit(1)
+
+verdict = json.load(open(v_path))
+cov = { c.get("id"): c for c in verdict.get("acceptance_criteria_coverage", []) }
+
+problems = []
+for ac in ac_ids:
+    c = cov.get(ac)
+    if c is None:
+        problems.append(f"{ac}: NOT in verdict coverage")
+    elif c.get("covered") == "no" and not (c.get("evidence") or "").strip():
+        problems.append(f"{ac}: covered=no with no justification")
+
+print(f"acceptance criteria: {len(ac_ids)}  covered entries: {len(cov)}")
+if problems:
+    print("TRACEABILITY: FAIL")
+    for p in problems: print("  -", p)
+    sys.exit(1)
+print("TRACEABILITY: PASS — every criterion is covered or justified.")
+PY
