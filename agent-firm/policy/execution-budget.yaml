@@ -1,0 +1,31 @@
+# Bounded execution — quality is prioritized over cost, but every run is capped.
+# A breach is a STOP condition AND a process defect surfaced in the retrospective.
+# The Lead sets the track at intake; caps below are defaults the Lead may tighten (never silently loosen).
+
+defaults:
+  fast_path:
+    max_specialists_concurrent: 1
+    max_subagents_total: 4
+    max_turns_per_agent: 25
+    max_wall_clock_minutes: 20
+    max_files_changed: 15
+    max_test_repair_loops: 2        # implementer stops + reports after this many repair attempts
+    max_review_panel_size: 1
+
+  full_track:
+    max_specialists_concurrent: 3
+    max_subagents_total: 12
+    max_turns_per_agent: 60
+    max_wall_clock_minutes: 120
+    max_files_changed: 80
+    max_test_repair_loops: 3
+    max_review_panel_size: 4
+
+stop_conditions:
+  - any cap above is reached -> stop the offending agent, log budget_or_usage_limit, escalate to Lead
+  - the same test fails after max_test_repair_loops -> stop, report failure, do NOT weaken the test
+  - a plan/usage rate-limit is hit (Claude or Codex) -> pause, surface to human, suggest API-key fallback
+  - net new files changed exceed max_files_changed -> stop and re-scope with the human
+
+# Note: "cost is not the constraint" (max subscriptions) but unbounded loops, rate-limit throttling,
+# and human review-load ARE. Caps protect those, not the bill.

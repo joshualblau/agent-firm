@@ -1,0 +1,40 @@
+# Action scopes — what agents may do without a human gate.
+# "Read-only / investigation only" means: NO irreversible external/on-chain actions.
+# Local code edits inside a worktree are expected and allowed.
+# Enforced by .claude/settings.json (allow/ask/deny) AND the OS sandbox; this file is the
+# human-readable contract that the settings implement. Gate on REVERSIBILITY, not confidence.
+
+local_repository:
+  read: allowed
+  write: within_worktree          # edits only inside the run's git worktree
+  commit: ask                     # ask before committing
+  merge_to_main: human_gate       # never merge to the default branch without sign-off
+  push: human_gate
+
+local_runtime:
+  install_dependencies: ask_or_allowlisted   # lockfile installs ok; arbitrary global installs ask
+  run_tests: allowed_in_sandbox
+  run_build: allowed_in_sandbox
+  network_egress: allowlisted     # default-deny; allow registries + model/provider + git host
+  delete_files: ask               # never rm -rf outside the worktree; deletes ask
+
+external_systems:
+  read: case_by_case              # read-only API/MCP reads ok when scoped (e.g. heightslabs)
+  write: denied_by_default
+  pr_or_issue_creation: human_gate
+  send_message_or_email: human_gate
+  irreversible_actions: human_gate
+
+production:
+  read: ask
+  write: denied_by_default
+  deploy: human_gate
+  migrations: human_gate
+
+financial_or_onchain:
+  any_value_transfer: prohibited           # never move money / sign / send funds — ask the human
+  signing: prohibited
+  reporting_or_disclosure: human_gate
+
+# Reference: gate-matrix.md (when a human gate fires + required evidence),
+# never-rules.yaml (hard prohibitions), execution-budget.yaml (caps).

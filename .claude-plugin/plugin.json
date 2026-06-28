@@ -1,0 +1,9 @@
+{
+  "name": "agent-firm",
+  "version": "0.1.0",
+  "description": "A reusable AI engineering firm: a hierarchical lead + core role subagents, a run-ledger source of truth, evidence gates, bounded execution, and (later phases) a hireable specialist bench and a Codex/GPT QA judge.",
+  "author": { "name": "Heights Labs" },
+  "license": "UNLICENSED",
+  "keywords": ["agents", "orchestration", "qa", "lifecycle", "claude-code"],
+  "//": "Phase 0 scaffold. Claude Code auto-discovers .claude/agents, .claude/skills, and .claude/settings.json. .mcp.json and bench/ are added in later phases."
+}

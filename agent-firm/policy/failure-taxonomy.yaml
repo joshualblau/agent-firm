@@ -1,0 +1,18 @@
+# Failure taxonomy — when blocked, classify the failure so retrospectives are actionable.
+# Every BLOCK / stop event in run.jsonl should carry one of these `failure_type` values.
+
+failure_taxonomy:
+  ambiguous_requirement:        # spec under-specified; needs a human/product decision
+  architecture_decision_needed: # a non-obvious design fork requiring sign-off
+  implementation_bug:           # code is wrong; fixable by an implementer
+  test_failure:                 # a real, reproducible test failure
+  flaky_test:                   # nondeterministic failure; quarantine + note, don't "fix" by weakening
+  environment_failure:          # toolchain/container/network broke, not the code
+  missing_secret_or_access:     # needs a credential/permission the agent doesn't (and shouldn't) have
+  permission_denied:            # blocked by the action-scope/permission policy (often correct)
+  external_service_unavailable: # upstream API/MCP down or rate-limited
+  budget_or_usage_limit:        # hit a turn/wall-clock/spend/plan cap — a PROCESS defect to review
+  safety_policy_block:          # a never-rule or injection attempt stopped the action
+
+# Each failure recorded with: failure_type, where (stage/agent), what was attempted,
+# the evidence, and a proposed next action (retry / escalate / redesign / abandon).

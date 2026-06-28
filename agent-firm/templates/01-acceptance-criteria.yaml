@@ -1,0 +1,10 @@
+# 01 · Acceptance criteria  (validates against agent-firm/schemas/acceptance-criteria.schema.json)
+task_slug:
+track: full_track            # fast_path | full_track
+criteria:
+  - id: AC-001
+    type: functional         # functional|non_functional|compatibility|security_privacy|observability|performance|accessibility|data_migration|rollback
+    statement: ""            # testable given/when/then or clear assertion
+    verification: automated_test   # automated_test | manual_check | review_only
+explicitly_out_of_scope: []
+test_evidence_required: [unit]     # which test types must show evidence

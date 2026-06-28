@@ -1,0 +1,12 @@
+{
+  "name": "heights-labs-marketplace",
+  "owner": { "name": "Heights Labs" },
+  "//": "Phase 4 scaffold. Host this repo and `claude plugin marketplace add <repo>` to install the firm on any machine with one command.",
+  "plugins": [
+    {
+      "name": "agent-firm",
+      "source": "./",
+      "description": "Reusable AI engineering firm (core roles, ledger, gates, sandbox, QA)."
+    }
+  ]
+}

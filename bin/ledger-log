@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ledger-log <event> [key=value ...]
+# Appends one JSON event line to the current run's run.jsonl (ts added automatically).
+# Resolves the run dir from ./.agent-firm/CURRENT_RUN. Best-effort: never fails the caller.
+set -uo pipefail
+
+event="${1:-event}"; shift || true
+
+run_dir=""
+[[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+  exit 0   # no active run; logging is best-effort
+fi
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Build a JSON object from key=value pairs using jq if available; else a minimal manual encode.
+if command -v jq >/dev/null 2>&1; then
+  args=(--arg ts "$ts" --arg event "$event")
+  filter='{ts:$ts, event:$event}'
+  i=0
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    args+=(--arg "k$i" "$k" --arg "v$i" "$v")
+    filter="$filter + {(\$k$i): \$v$i}"
+    i=$((i+1))
+  done
+  jq -cn "${args[@]}" "$filter" >> "$run_dir/run.jsonl" 2>/dev/null || \
+    printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
+else
+  printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
+fi
+exit 0

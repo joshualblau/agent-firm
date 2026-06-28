@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm/schemas/acceptance-criteria.schema.json",
+  "title": "Acceptance criteria",
+  "description": "Structured contract produced by Intake. QA checks coverage against this. Lightweight for fast-path tasks, full for substantial work.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_slug", "track", "criteria", "explicitly_out_of_scope", "test_evidence_required"],
+  "properties": {
+    "task_slug": { "type": "string" },
+    "track": { "type": "string", "enum": ["fast_path", "full_track"] },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "statement", "verification"],
+        "properties": {
+          "id": { "type": "string", "description": "e.g. AC-001" },
+          "type": { "type": "string", "enum": ["functional", "non_functional", "compatibility", "security_privacy", "observability", "performance", "accessibility", "data_migration", "rollback"] },
+          "statement": { "type": "string", "description": "testable 'given/when/then' or clear assertion" },
+          "verification": { "type": "string", "enum": ["automated_test", "manual_check", "review_only"] }
+        }
+      }
+    },
+    "explicitly_out_of_scope": { "type": "array", "items": { "type": "string" } },
+    "test_evidence_required": { "type": "array", "items": { "type": "string" }, "description": "which test types must show evidence, e.g. ['unit','integration']" }
+  }
+}

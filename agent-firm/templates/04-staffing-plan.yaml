@@ -1,0 +1,7 @@
+# 04 · Staffing plan  (Phase 2+; validates against schemas/staffing-plan.schema.json)
+task_slug:
+track: full_track
+core_roles_active: [intake-analyst, architect, implementer, reviewer, qa-tester, packager]
+specialists: []        # each entry is a job-spec (schemas/job-spec.schema.json)
+staffing_budget:
+  max_specialists_concurrent: 1

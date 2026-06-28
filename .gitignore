@@ -1,0 +1,21 @@
+# Never commit secrets or machine-local auth/state. Portable config travels; secrets do not.
+.env
+.env.*
+!.env.example
+*.local.*
+.envrc                 # machine-local; commit .envrc.example instead
+.direnv/
+
+# Auth caches / credential stores (treat as secrets)
+**/auth.json
+.claude-*/             # per-account Claude config dirs
+.codex-*/              # per-account Codex config dirs
+
+# Per-run ledgers live in the WORK project, not in the firm repo; ignore if generated here
+.agent-firm/runs/
+
+# OS / editor noise
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc

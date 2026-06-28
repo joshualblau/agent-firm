@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm/schemas/job-spec.schema.json",
+  "title": "Specialist job spec",
+  "description": "Required before the Recruiter spawns any specialist (Phase 2). Prevents role-theater and bounds blast radius.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role_name", "task", "why_core_staff_cant", "expected_deliverable",
+    "required_tools", "denied_tools", "mcp_servers", "model",
+    "max_turns", "max_wall_clock_minutes", "success_criteria", "retirement_condition", "mode"
+  ],
+  "properties": {
+    "role_name": { "type": "string", "description": "kebab-case, e.g. crypto-crime-investigator" },
+    "task": { "type": "string" },
+    "why_core_staff_cant": { "type": "string", "description": "justification — why an existing core role cannot do this" },
+    "expected_deliverable": { "type": "string", "description": "must be independently reviewable" },
+    "required_tools": { "type": "array", "items": { "type": "string" } },
+    "denied_tools": { "type": "array", "items": { "type": "string" } },
+    "mcp_servers": { "type": "array", "items": { "type": "string" }, "description": "least-privilege, e.g. ['heightslabs (read-only)']" },
+    "model": { "type": "string", "enum": ["opus", "sonnet", "haiku", "codex"] },
+    "max_turns": { "type": "integer", "minimum": 1 },
+    "max_wall_clock_minutes": { "type": "integer", "minimum": 1 },
+    "success_criteria": { "type": "string" },
+    "retirement_condition": { "type": "string", "description": "when this ephemeral hire is dismissed" },
+    "mode": { "type": "string", "enum": ["ephemeral", "durable_candidate"] },
+    "domain_guardrails": { "type": "array", "items": { "type": "string" }, "description": "for sensitive domains (e.g. forensics): legal/ethical boundary, provenance, PII minimization, no irreversible action" }
+  }
+}

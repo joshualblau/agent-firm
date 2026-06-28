@@ -1,0 +1,25 @@
+{
+  "name": "agent-firm-sandbox",
+  "build": { "dockerfile": "Dockerfile" },
+
+  "//": "Mount ONLY the project. Do not mount host home, ~/.ssh, cloud creds, or auth caches.",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "remoteUser": "firm",
+  "containerUser": "firm",
+
+  "//runArgs": "no-new-privileges hardens; cap-drop + the egress firewall are tightened in Phase 5.",
+  "runArgs": [
+    "--security-opt=no-new-privileges:true",
+    "--cap-drop=ALL"
+  ],
+
+  "//egress": "Phase 5: run .devcontainer/egress-firewall.sh as a postStartCommand (needs NET_ADMIN) to default-deny outbound traffic except an allowlist (npm/PyPI registries, model+provider endpoints, your git host). Default-deny egress is the main lever that bounds prompt-injection blast radius.",
+
+  "postCreateCommand": "bash .devcontainer/verify.sh",
+
+  "remoteEnv": {
+    "AGENT_FIRM_SANDBOX": "1"
+  }
+}

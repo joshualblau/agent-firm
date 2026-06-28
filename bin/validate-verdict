@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# validate-verdict <path-to-qa-verdict.json>
+# Validates a QA verdict against qa-verdict.schema.json.
+# Uses python `jsonschema` if installed; otherwise a structural fallback (valid JSON +
+# required top-level keys + verdict in {APPROVE,BLOCK}). Exit 0 = valid, non-zero = invalid.
+set -euo pipefail
+
+verdict="${1:-}"
+if [[ -z "$verdict" ]]; then echo "usage: validate-verdict <qa-verdict.json>" >&2; exit 2; fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCHEMA="$(cd "$SCRIPT_DIR/.." && pwd)/agent-firm/schemas/qa-verdict.schema.json"
+
+python3 - "$verdict" "$SCHEMA" <<'PY'
+import json, sys
+vpath, spath = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(vpath))
+except Exception as e:
+    print(f"INVALID: not valid JSON: {e}"); sys.exit(1)
+try:
+    import jsonschema
+    schema = json.load(open(spath))
+    jsonschema.validate(data, schema)
+    print("VALID (jsonschema): verdict =", data.get("verdict")); sys.exit(0)
+except ImportError:
+    required = ["verdict","commit_sha","environment","commands_run","unit","integration",
+                "e2e","visual","acceptance_criteria_coverage","untested_risks","blockers",
+                "warnings","artifacts","summary"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        print("INVALID (structural): missing keys:", ", ".join(missing)); sys.exit(1)
+    if data.get("verdict") not in ("APPROVE","BLOCK"):
+        print("INVALID (structural): verdict must be APPROVE or BLOCK"); sys.exit(1)
+    print("VALID (structural fallback — install `jsonschema` for full validation): verdict =", data["verdict"]); sys.exit(0)
+except Exception as e:
+    print("INVALID (jsonschema):", e); sys.exit(1)
+PY

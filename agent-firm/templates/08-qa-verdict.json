@@ -1,0 +1,16 @@
+{
+  "verdict": "BLOCK",
+  "commit_sha": "",
+  "environment": "",
+  "commands_run": [],
+  "unit": { "status": "not_applicable", "evidence": "" },
+  "integration": { "status": "not_applicable", "evidence": "" },
+  "e2e": { "status": "not_applicable", "evidence": "" },
+  "visual": { "status": "not_applicable", "evidence": "" },
+  "acceptance_criteria_coverage": [],
+  "untested_risks": [],
+  "blockers": ["verdict not yet produced"],
+  "warnings": [],
+  "artifacts": [],
+  "summary": "Template placeholder — QA has not run yet. Default is BLOCK until evidence exists."
+}

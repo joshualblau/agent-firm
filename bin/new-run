@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# new-run <slug> [track]
+# Scaffolds a run-ledger directory under ./.agent-firm/runs/<ts>-<slug>/, seeds it from the
+# firm templates, opens run.jsonl with a run_started event, and points .agent-firm/CURRENT_RUN at it.
+# Run from the ROOT of the work project (the git repo you are operating on).
+set -euo pipefail
+
+slug="${1:-}"
+track="${2:-full_track}"
+if [[ -z "$slug" ]]; then
+  echo "usage: new-run <slug> [fast_path|full_track]" >&2; exit 2
+fi
+slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+
+# Resolve the firm root (where templates live) from this script's location.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIRM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEMPLATES="$FIRM_ROOT/agent-firm/templates"
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="${ts}-${slug}"
+run_dir=".agent-firm/runs/${run_id}"
+mkdir -p "$run_dir/05-work-orders" "$run_dir/09-test-evidence"
+
+# Seed from templates (copy whatever exists; don't fail if a template is missing).
+if [[ -d "$TEMPLATES" ]]; then
+  for t in "$TEMPLATES"/*; do
+    [[ -e "$t" ]] || continue
+    cp -n "$t" "$run_dir/$(basename "$t")"
+  done
+fi
+
+# Open the append-only event log.
+repo="$(basename "$(pwd)")"
+base_sha="$(git rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
+printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" >> "$run_dir/run.jsonl"
+
+# Point CURRENT_RUN at this run so ledger-log knows where to append.
+mkdir -p .agent-firm
+printf '%s\n' "$run_dir" > .agent-firm/CURRENT_RUN
+
+echo "$run_dir"

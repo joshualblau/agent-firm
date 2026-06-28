@@ -1,0 +1,17 @@
+# Definition of Done — a deliverable is only "done" when ALL applicable items hold.
+# "applicable" is judged against the task track (fast-path waives the N/A items explicitly).
+
+definition_of_done:
+  - acceptance criteria satisfied, or explicitly waived with a recorded reason
+  - implementation summary written (06-implementation-summary.md)
+  - tests added for new behavior, or the omission is justified in writing
+  - unit tests pass
+  - integration / e2e tests pass where applicable
+  - visual checks pass or are marked not_applicable with a reason
+  - QA verdict is APPROVE and validates against qa-verdict.schema.json
+  - no unexplained snapshot/baseline changes
+  - secret scan run with no findings (or findings triaged + justified)
+  - changelog / docs updated if the change is user-facing
+  - rollback / migration notes included if relevant
+  - run.jsonl and the run-ledger are complete
+  - final human approval recorded in 10-handoff.md

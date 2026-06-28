@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm/schemas/staffing-plan.schema.json",
+  "title": "Staffing plan",
+  "description": "Produced by the Recruiter (Phase 2). Records the team composition for a run: which core roles are active and which specialists are hired, each via a job spec.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_slug", "track", "core_roles_active", "specialists", "staffing_budget"],
+  "properties": {
+    "task_slug": { "type": "string" },
+    "track": { "type": "string", "enum": ["fast_path", "full_track"] },
+    "core_roles_active": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["intake-analyst", "architect", "implementer", "integrator", "reviewer", "qa-tester", "packager"] }
+    },
+    "specialists": {
+      "type": "array",
+      "items": { "$ref": "https://agent-firm/schemas/job-spec.schema.json" }
+    },
+    "staffing_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_specialists_concurrent"],
+      "properties": {
+        "max_specialists_concurrent": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

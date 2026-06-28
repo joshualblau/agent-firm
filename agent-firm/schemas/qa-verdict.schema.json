@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm/schemas/qa-verdict.schema.json",
+  "title": "QA verdict",
+  "description": "Schema-validated output of the QA/Test pod. Compatible with Codex `codex exec --output-schema`. QA is read-only against source; this is the only thing it emits. Emit BLOCK on uncertainty, never APPROVE.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict", "commit_sha", "environment", "commands_run",
+    "unit", "integration", "e2e", "visual",
+    "acceptance_criteria_coverage", "untested_risks", "blockers", "warnings", "artifacts", "summary"
+  ],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["APPROVE", "BLOCK"] },
+    "commit_sha": { "type": "string", "description": "SHA of the clean integration checkout QA ran against" },
+    "environment": { "type": "string", "description": "e.g. 'devcontainer node20 / pinned playwright image'" },
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "exit_code", "duration_s", "artifact"],
+        "properties": {
+          "cmd": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "duration_s": { "type": "number" },
+          "artifact": { "type": "string", "description": "path to captured output under 09-test-evidence/" }
+        }
+      }
+    },
+    "unit":        { "$ref": "#/$defs/stageResult" },
+    "integration": { "$ref": "#/$defs/stageResult" },
+    "e2e":         { "$ref": "#/$defs/stageResult" },
+    "visual":      { "$ref": "#/$defs/stageResult" },
+    "acceptance_criteria_coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "covered", "evidence"],
+        "properties": {
+          "id": { "type": "string", "description": "acceptance criterion id, e.g. AC-001" },
+          "covered": { "type": "string", "enum": ["yes", "no", "partial"] },
+          "evidence": { "type": "string", "description": "test name(s) / artifact path, or why not covered" }
+        }
+      }
+    },
+    "untested_risks": { "type": "array", "items": { "type": "string" }, "description": "what was NOT tested and why it matters" },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "paths to logs, screenshots, reports" },
+    "summary": { "type": "string", "description": "2-4 sentence human-readable verdict rationale" }
+  },
+  "$defs": {
+    "stageResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "evidence"],
+      "properties": {
+        "status": { "type": "string", "enum": ["pass", "fail", "not_applicable"] },
+        "evidence": { "type": "string", "description": "artifact path or reason for not_applicable" }
+      }
+    }
+  }
+}
