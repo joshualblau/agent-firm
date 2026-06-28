@@ -24,7 +24,7 @@ Per project, once: `firm-install` (grants the firm's permission policy). Then `c
 ## Update flow (propagate a generalizable improvement)
 1. Land the change in `~/agent-firm` (ideally via `firm-propose-system-change` → review → commit).
 2. Bump `version` in `.claude-plugin/plugin.json` (e.g. 0.2.0 → 0.2.1).
-3. `claude plugin marketplace update heights-labs && claude plugin update agent-firm` (restart to apply).
+3. `claude plugin marketplace update heights-labs && claude plugin update agent-firm@heights-labs` (restart to apply).
 
 Every project that updates picks up the change. Project-specific tweaks stay in that project's
 `.claude/` and never propagate. A change can't reach other projects without a deliberate version bump.
@@ -42,6 +42,7 @@ in-flight engagement can't be blindsided by a firm change until you choose to bu
 - `claude plugin validate .` passes.
 - Install loads all components: **Agents (7)**, the `start` command, the PreToolUse ledger hook.
 - `firm-install` merges 57 permission rules idempotently.
+- Update flow verified: version bump 0.2.0 → 0.2.1 propagated via `marketplace update` + `plugin update agent-firm@heights-labs`.
 - Tested under an isolated `CLAUDE_CONFIG_DIR` so the global config wasn't touched during development.
 
 ## Not yet (rest of Phase 4)

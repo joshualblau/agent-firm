@@ -34,7 +34,7 @@ gates (with a well-formed approval payload), and gates on schema-valid QA eviden
 (`firm-validate-verdict` + `firm-traceability-check`) before the final sign-off.
 
 To update everywhere after a change: bump `version` in `.claude-plugin/plugin.json`, then
-`claude plugin marketplace update heights-labs && claude plugin update agent-firm`.
+`claude plugin marketplace update heights-labs && claude plugin update agent-firm@heights-labs` (restart to apply).
 
 **Fallback: copy mode** (no plugin). Copy the pieces into the project, mapping agents into `.claude/`:
 ```bash
