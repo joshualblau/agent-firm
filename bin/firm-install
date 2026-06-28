@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# firm-install [--user]
+# Installs the firm's PERMISSION rules into a settings.json. A Claude Code plugin cannot ship a
+# `permissions` block, so when the firm is used as a plugin you run this once per project (or once
+# at user scope) to grant the firm's allow/ask/deny policy.
+#   firm-install            -> merges into ./.claude/settings.json (project scope, default)
+#   firm-install --user     -> merges into ~/.claude/settings.json (all projects)
+# Idempotent: unions rules, never duplicates. Does NOT touch hooks (the plugin provides those).
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+SRC="$ROOT/.claude/settings.json"   # canonical permission set lives here
+
+scope=project
+[[ "${1:-}" == "--user" ]] && scope=user
+if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
+
+python3 - "$SRC" "$target" <<'PY'
+import json, os, sys
+src, target = sys.argv[1], sys.argv[2]
+src_perms = json.load(open(src)).get("permissions", {})
+os.makedirs(os.path.dirname(target), exist_ok=True)
+tgt = json.load(open(target)) if os.path.exists(target) else {}
+perms = tgt.setdefault("permissions", {})
+added = 0
+for k in ("allow", "ask", "deny"):
+    cur = perms.setdefault(k, [])
+    for rule in src_perms.get(k, []):
+        if rule not in cur:
+            cur.append(rule); added += 1
+json.dump(tgt, open(target, "w"), indent=2)
+print(f"firm-install: merged firm permissions into {target} (+{added} rules)")
+PY

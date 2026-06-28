@@ -4,7 +4,7 @@ Goal: a working, bounded, evidence-producing firm with the core roles — **befo
 (Phase 2) or the GPT teammate (Phase 3), so blast radius is small while the lifecycle is proven.
 
 ## What's built
-- **Core roles** (`.claude/agents/`): intake-analyst, architect, implementer, integrator, reviewer,
+- **Core roles** (`agents/`): intake-analyst, architect, implementer, integrator, reviewer,
   qa-tester, packager — each with scoped tools, a model, a mandate, a durable-artifact contract, and
   role-specific never-rules. The **Lead** is the main session, driven by `CLAUDE.md`.
 - **Run ledger** (`firm-new-run`, `firm-ledger-log`, `ledger-hook`): per-run directory with numbered

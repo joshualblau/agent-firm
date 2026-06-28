@@ -16,31 +16,52 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 - **Source of truth:** a per-run **ledger** on disk (`.agent-firm/runs/<ts>-<slug>/`), not chat context.
 
 ## Use it on a work project
-1. Make the firm config available in the project — either copy `.claude/`, `CLAUDE.md`, `bin/`, and
-   `agent-firm/` into the repo, or (Phase 4) install the packaged plugin.
-2. Open the project in the hardened dev container (`.devcontainer/`).
-3. Start `claude`. The Lead reads `CLAUDE.md` and runs the lifecycle:
-   - `firm-new-run <slug> <fast_path|full_track>` opens a run ledger.
-   - Each stage is delegated to its subagent (`.claude/agents/`), producing its artifact.
-   - You're paused only at the gates in `agent-firm/policy/gate-matrix.md`, with a well-formed
-     approval payload each time.
-   - `firm-validate-verdict 08-qa-verdict.json` gates on schema-valid QA evidence before the final gate.
+**Recommended: install as a versioned plugin (shared across all projects, one source of truth).**
+```bash
+claude plugin marketplace add ~/agent-firm        # register this repo as a local marketplace
+claude plugin install agent-firm@heights-labs     # installs at user scope (all projects)
+```
+Then, in any work project (one-time, since a plugin can't ship permissions):
+```bash
+firm-install                                       # merge the firm's allow/ask/deny into .claude/settings.json
+```
+Now start an engagement in that project:
+```bash
+claude                                             # then run:  /agent-firm:start <your goal>
+```
+The Lead opens a run ledger (`firm-new-run`), delegates each stage to its subagent, pauses only at the
+gates (with a well-formed approval payload), and gates on schema-valid QA evidence
+(`firm-validate-verdict` + `firm-traceability-check`) before the final sign-off.
+
+To update everywhere after a change: bump `version` in `.claude-plugin/plugin.json`, then
+`claude plugin marketplace update heights-labs && claude plugin update agent-firm`.
+
+**Fallback: copy mode** (no plugin). Copy the pieces into the project, mapping agents into `.claude/`:
+```bash
+mkdir -p <repo>/.claude && cp -R ~/agent-firm/agents <repo>/.claude/agents
+cp -R ~/agent-firm/.claude/settings.json ~/agent-firm/bin ~/agent-firm/agent-firm ~/agent-firm/CLAUDE.md <repo>/
+# add the firm's bin/ to PATH, or call tools as <repo>/bin/firm-*
+```
 
 ## Layout
 ```
-CLAUDE.md                     # the Lead's operating manual (loaded every session)
-.claude/agents/*.md           # core roles: intake, architect, implementer, integrator, reviewer, qa, packager
-.claude/settings.json         # permissions (action scopes) + the ledger logging hook
+.claude-plugin/plugin.json    # plugin manifest (name, version) — drives the versioned install
+.claude-plugin/marketplace.json # local marketplace entry (this repo hosts the plugin)
+agents/*.md                   # core roles: intake, architect, implementer, integrator, reviewer, qa, packager
+commands/start.md             # /agent-firm:start — activates the firm and begins an engagement
+hooks/hooks.json              # run-ledger logging hook (plugin mode)
+bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
+                              #   firm-integrate, firm-qa-checkout, firm-traceability-check, firm-policy,
+                              #   firm-propose-system-change, firm-run-evals, firm-install
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget
 agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staffing-plan
 agent-firm/templates/*        # run-ledger artifact templates
 agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
 agent-firm/evals/*            # golden-task evals that guard firm changes
-bin/                          # new-run, ledger-log, validate-verdict, new-worktree, integrate,
-                              #   qa-checkout, traceability-check, propose-system-change, run-evals
+.claude/settings.json         # permission rules (copy-mode + the source firm-install merges)
+CLAUDE.md                     # operating manual (copy-mode reference; plugin uses /agent-firm:start)
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
-.claude-plugin/               # plugin + marketplace scaffold (Phase 4 packaging)
-docs/PHASE0.md                # what's built now and the roadmap
+docs/PHASE*.md                # what's built per phase + the roadmap
 ```
 
 ## Roadmap (see the plan)
