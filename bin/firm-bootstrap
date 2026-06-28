@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# firm-bootstrap [--with-permissions]
+# One-command device setup: register this repo as a local marketplace and install the agent-firm
+# plugin (user scope = all projects). Idempotent. Portable: it locates the firm repo from its own
+# path, so it works wherever you cloned/copied the repo.
+#   firm-bootstrap                     # register marketplace + install/update the plugin
+#   firm-bootstrap --with-permissions  # also run firm-install in the CURRENT directory (project scope)
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+
+echo "agent-firm bootstrap"
+echo "  repo: $ROOT"
+command -v claude >/dev/null 2>&1 || { echo "ERROR: the 'claude' CLI is not on PATH. Install Claude Code first." >&2; exit 1; }
+
+# 1. Local marketplace (idempotent)
+if claude plugin marketplace list 2>/dev/null | grep -q 'heights-labs'; then
+  echo "  ✔ marketplace 'heights-labs' already registered (updating)"
+  claude plugin marketplace update heights-labs >/dev/null 2>&1 || true
+else
+  claude plugin marketplace add "$ROOT"
+fi
+
+# 2. Plugin (install or update)
+if claude plugin list 2>/dev/null | grep -q 'agent-firm@heights-labs'; then
+  echo "  ✔ plugin already installed — updating to latest"
+  claude plugin update agent-firm@heights-labs || true
+else
+  claude plugin install agent-firm@heights-labs
+fi
+
+# 3. Optional: permissions into the current project
+if [[ "${1:-}" == "--with-permissions" ]]; then
+  echo "  installing firm permissions into: $(pwd)/.claude/settings.json"
+  "$SELF/firm-install"
+fi
+
+cat <<'EOF'
+
+Done. Next steps:
+  cd <your project> && firm-install     # grant the firm's permission policy (once per project)
+  claude                                # then, inside the session:  /agent-firm:start <your goal>
+
+Note: restart any already-running claude session so it loads/refreshes the plugin.
+EOF

@@ -16,6 +16,11 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 - **Source of truth:** a per-run **ledger** on disk (`.agent-firm/runs/<ts>-<slug>/`), not chat context.
 
 ## Use it on a work project
+
+> **Setup, including on a new device, is recorded in [docs/INSTALL.md](docs/INSTALL.md).** Quickest path
+> on a machine that has this repo: `~/agent-firm/bin/firm-bootstrap` (registers the marketplace +
+> installs the plugin), then `firm-install` per project, then `/agent-firm:start <goal>`.
+
 **Recommended: install as a versioned plugin (shared across all projects, one source of truth).**
 ```bash
 claude plugin marketplace add ~/agent-firm        # register this repo as a local marketplace
