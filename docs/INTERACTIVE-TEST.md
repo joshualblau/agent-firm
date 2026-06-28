@@ -8,6 +8,9 @@ the steps at the bottom if `/tmp` was cleared). Run the firm for real and watch 
 cd /tmp/firm-live
 claude
 ```
+(All your MCP servers connect cleanly now. If you ever hit unrelated MCP startup noise,
+`claude --strict-mcp-config` runs the firm with no MCP servers, which is fine at Phase 0/1.)
+
 Then paste this kickoff message:
 
 > Operate the firm (read CLAUDE.md). Run a **fast_path** engagement: add a `greet(name)` function in
