@@ -15,9 +15,9 @@ Then paste this kickoff message:
 
 > Operate the firm (read CLAUDE.md). Run a **fast_path** engagement: add a `greet(name)` function in
 > `src/greet.js` that returns `"Hello, <name>!"`, with a unit test in `test/greet.test.js` using
-> node:test. Open a run ledger with `bin/new-run`, delegate coding to the `implementer` subagent and
+> node:test. Open a run ledger with `firm-new-run`, delegate coding to the `implementer` subagent and
 > testing to the `qa-tester` subagent, have qa-tester produce a schema-valid `08-qa-verdict.json`
-> validated by `bin/validate-verdict`, then stop at the final gate for my approval.
+> validated by `firm-validate-verdict`, then stop at the final gate for my approval.
 
 ## What to watch for (this is the test)
 1. **Ledger opens** — a dir appears under `.agent-firm/runs/<ts>-greet/`, and `run.jsonl` starts logging.
@@ -27,7 +27,7 @@ Then paste this kickoff message:
    and captures evidence under `09-test-evidence/`.
 4. **Permission gates engage** — anything in the `ask` list (e.g. `git commit`) prompts you; `git push`
    / `sudo` are denied. Reads and the test runner run without prompts.
-5. **Schema-valid verdict** — `08-qa-verdict.json` is produced and `bin/validate-verdict` passes.
+5. **Schema-valid verdict** — `08-qa-verdict.json` is produced and `firm-validate-verdict` passes.
 6. **No auto-finish** — the Lead pauses at the **final gate** with a well-formed approval payload
    (decision, context, options, recommendation, default, risk, blocking) and waits for your sign-off.
 

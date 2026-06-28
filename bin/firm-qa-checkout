@@ -19,6 +19,6 @@ mkdir -p "$(dirname "$qa_dir")"
 git worktree add --force "$qa_dir" "$branch" >/dev/null
 
 sha="$(git -C "$qa_dir" rev-parse --short HEAD)"
-[[ -x "$SELF/ledger-log" ]] && "$SELF/ledger-log" qa_checkout dir="$qa_dir" branch="$branch" sha="$sha" || true
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_checkout dir="$qa_dir" branch="$branch" sha="$sha" || true
 echo "clean QA checkout: $qa_dir  (at ${branch} @ ${sha})"
 echo "QA: cd into it, install from the lockfile, run the exact CI command, capture evidence. Do NOT edit source."

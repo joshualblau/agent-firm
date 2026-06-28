@@ -11,15 +11,15 @@ improves itself under review.
   - `integrate [branch]` — merges this run's worktree branches into an integration branch; conflicts are
     reported for the Integrator to resolve, never silently dropped.
   - `qa-checkout [branch]` — a fresh clean checkout at the integration HEAD so QA runs from known-clean state.
-- **Traceability gate**: `bin/traceability-check` cross-references `01-acceptance-criteria.yaml` against
+- **Traceability gate**: `firm-traceability-check` cross-references `01-acceptance-criteria.yaml` against
   the verdict's `acceptance_criteria_coverage` and fails if any criterion is uncovered without justification.
   Template: `agent-firm/templates/traceability.yaml`.
 - **Fan-out workflow**: `agent-firm/workflows/build-review-test.js` — a Workflow-tool script that runs
   Build (parallel implementers in worktrees) → Integrate → Review panel → QA, keeping orchestration out
   of the Lead's context.
-- **Continuous improvement loop**: `bin/propose-system-change <slug>` scaffolds a reviewed change to the
+- **Continuous improvement loop**: `firm-propose-system-change <slug>` scaffolds a reviewed change to the
   firm itself (template `agent-firm/templates/system-change-pr.md`), guarded by **golden evals** under
-  `agent-firm/evals/` (validate with `bin/run-evals`; full execution is Phase 5).
+  `agent-firm/evals/` (validate with `firm-run-evals`; full execution is Phase 5).
 
 ## Verified (smoke tests)
 - Parallel worktrees with independent changes integrate cleanly; same-line edits conflict and are

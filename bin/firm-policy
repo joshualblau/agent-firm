@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# firm-policy [name|list]
+# Prints a bundled policy or schema file regardless of the current working directory (resolves the
+# firm root from this script's own location). Lets agents read policy in plugin mode, where the
+# work-project cwd has no agent-firm/ dir. Examples:
+#   firm-policy gate-matrix         firm-policy never-rules        firm-policy qa-verdict.schema
+#   firm-policy list
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+POL="$ROOT/agent-firm/policy"; SCH="$ROOT/agent-firm/schemas"
+
+name="${1:-list}"
+if [[ "$name" == "list" ]]; then
+  echo "policies ($POL):"; ls "$POL" 2>/dev/null | sed 's/^/  /'
+  echo "schemas  ($SCH):"; ls "$SCH" 2>/dev/null | sed 's/^/  /'
+  exit 0
+fi
+for d in "$POL" "$SCH"; do
+  for ext in "" .md .yaml .yml .json .schema.json; do
+    f="$d/$name$ext"
+    [[ -f "$f" ]] && { cat "$f"; exit 0; }
+  done
+done
+echo "firm-policy: no policy/schema named '$name' (try: firm-policy list)" >&2
+exit 1

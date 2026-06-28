@@ -12,7 +12,7 @@
 //
 // Notes:
 //  - Stages map to the firm's own subagents (agentType). Build runs implementers in parallel, each in
-//    its own git worktree via bin/new-worktree. Integration, clean-checkout QA, and verdict validation
+//    its own git worktree via firm-new-worktree. Integration, clean-checkout QA, and verdict validation
 //    are done by agents running the firm's bin/ scripts (workflow scripts cannot run shell directly).
 //  - fast_path collapses to a single reviewer and skips the integrator when there is one work order.
 
@@ -74,7 +74,7 @@ phase('Build')
 log(`Building ${workOrders.length} work-order(s) in parallel worktrees...`)
 const built = await parallel(workOrders.map(wo => () =>
   agent(
-    `You are an Implementer in the firm. Run \`bin/new-worktree implementer ${wo.id}\` from the project root, ` +
+    `You are an Implementer in the firm. Run \`firm-new-worktree implementer ${wo.id}\` from the project root, ` +
     `then implement this work-order INSIDE that worktree directory and self-correct to green:\n\n${wo.brief}\n\n` +
     `Add tests for new behavior. Run the project's test command. Stop after the firm's max_test_repair_loops ` +
     `and report test_result:"red" rather than thrashing. Return your structured summary; do NOT commit to or ` +
@@ -92,7 +92,7 @@ const needIntegrator = built.length > 1 || track === 'full_track'
 if (needIntegrator) {
   phase('Integrate')
   integration = await agent(
-    `You are the Integrator. Run \`bin/integrate\` to merge this run's worktree branches into the integration ` +
+    `You are the Integrator. Run \`firm-integrate\` to merge this run's worktree branches into the integration ` +
     `branch. Resolve any reported conflicts by hand (never drop a change), reconcile lockfiles/migrations/ports/` +
     `fixtures, run the COMBINED test suite, and write integration-summary.md into ${runDir}. ` +
     `Return a short status: branch name, conflicts resolved, combined-suite result.`,
@@ -119,11 +119,11 @@ const blockers = reviews.flatMap(r => (r.findings || []).filter(f => f.severity 
 // ---------- Test: independent QA from a clean checkout, schema-valid verdict ----------
 phase('Test')
 const qa = await agent(
-  `You are the QA / Test pod. Run \`bin/qa-checkout\` to get a clean checkout at the integration branch HEAD. ` +
+  `You are the QA / Test pod. Run \`firm-qa-checkout\` to get a clean checkout at the integration branch HEAD. ` +
   `Install from the lockfile and run the exact CI command: \`${ciCommand}\`. Capture each command's output under ` +
   `${runDir}/09-test-evidence/. Check acceptance-criteria coverage against ${runDir}/01-acceptance-criteria.yaml. ` +
   `Write ${runDir}/08-qa-verdict.json conforming to agent-firm/schemas/qa-verdict.schema.json, then validate it ` +
-  `with \`bin/validate-verdict\` and run \`bin/traceability-check\`. You are READ-ONLY against source. ` +
+  `with \`firm-validate-verdict\` and run \`firm-traceability-check\`. You are READ-ONLY against source. ` +
   `Emit BLOCK on any uncertainty. Return the verdict (APPROVE/BLOCK), the top blockers, and the untested risks.`,
   { label: 'qa', phase: 'Test', agentType: 'qa-tester' }
 )

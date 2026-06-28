@@ -23,9 +23,9 @@ execution-budget) and `agent-firm/schemas/` (acceptance-criteria, job-spec, qa-v
    prompt cruft.
 
 ## Start every engagement
-1. Run `bin/new-run <slug> <track>` from the project root. It scaffolds `.agent-firm/runs/<ts>-<slug>/`
+1. Run `firm-new-run <slug> <track>` from the project root. It scaffolds `.agent-firm/runs/<ts>-<slug>/`
    (the ledger), opens `run.jsonl`, and sets `.agent-firm/CURRENT_RUN`.
-2. Log milestones with `bin/ledger-log <event> key=value ...` (run start/stop, agent spawns, gate
+2. Log milestones with `firm-ledger-log <event> key=value ...` (run start/stop, agent spawns, gate
    decisions, commands, verdicts). Best-effort; never let logging block work.
 
 ## The lifecycle (delegate each stage to its subagent)
@@ -46,10 +46,10 @@ execution-budget) and `agent-firm/schemas/` (acceptance-criteria, job-spec, qa-v
 **Fast-path** collapses Plan/Integrate/Panel into lightweight checks (single reviewer, slim verdict).
 **Full-track** runs every stage with a reviewer panel and the Integrator.
 
-**Stage tooling** (Phase 1): Build uses `bin/new-worktree <role> <wo>` (one isolated worktree per
-work-order, per the worktree policy). Integrate uses `bin/integrate` (merge worktree branches into an
-integration branch; conflicts are surfaced, never dropped). Test uses `bin/qa-checkout` (a clean
-checkout at the integration HEAD) then `bin/validate-verdict` + `bin/traceability-check`.
+**Stage tooling** (Phase 1): Build uses `firm-new-worktree <role> <wo>` (one isolated worktree per
+work-order, per the worktree policy). Integrate uses `firm-integrate` (merge worktree branches into an
+integration branch; conflicts are surfaced, never dropped). Test uses `firm-qa-checkout` (a clean
+checkout at the integration HEAD) then `firm-validate-verdict` + `firm-traceability-check`.
 
 ## Gates and asking the human
 - Pause only at the gates in `policy/gate-matrix.md`. Gate on **reversibility and impact**, never on
@@ -63,9 +63,9 @@ checkout at the integration HEAD) then `bin/validate-verdict` + `bin/traceabilit
 
 ## Self-testing before approval (non-negotiable)
 - Implementers self-correct to green, bounded by `max_test_repair_loops`, then stop and report.
-- `qa-tester` independently re-runs the pyramid from a **clean checkout** (`bin/qa-checkout`) and emits
-  a **schema-valid** APPROVE/BLOCK (`bin/validate-verdict`). QA is **read-only against source**.
-- Gate on **acceptance coverage**: `bin/traceability-check` must pass (every criterion covered or
+- `qa-tester` independently re-runs the pyramid from a **clean checkout** (`firm-qa-checkout`) and emits
+  a **schema-valid** APPROVE/BLOCK (`firm-validate-verdict`). QA is **read-only against source**.
+- Gate on **acceptance coverage**: `firm-traceability-check` must pass (every criterion covered or
   justified) before the final gate. Reject malformed verdicts.
 - The team never self-approves and never auto-merges.
 
@@ -83,10 +83,10 @@ checkout at the integration HEAD) then `bin/validate-verdict` + `bin/traceabilit
 - Partition parallel work so units are independent; same-file/sequential work stays single-stream.
 
 ## Close every engagement
-Write `11-retrospective.md`. Propose **zero or more System Change PRs** with `bin/propose-system-change
+Write `11-retrospective.md`. Propose **zero or more System Change PRs** with `firm-propose-system-change
 <slug>` — changes to the firm itself (`.claude/`, `bench/`, `skills/`, workflows), **separate from the
 deliverable** — for the human to approve and version. Accepted changes are guarded by golden evals
-(`bin/run-evals`) so a later change can't silently regress them.
+(`firm-run-evals`) so a later change can't silently regress them.
 
 ## Phase status
 Phase 0 + Phase 1 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;

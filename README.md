@@ -20,11 +20,11 @@ every gate carries evidence, every run is bounded, and the firm improves only th
    `agent-firm/` into the repo, or (Phase 4) install the packaged plugin.
 2. Open the project in the hardened dev container (`.devcontainer/`).
 3. Start `claude`. The Lead reads `CLAUDE.md` and runs the lifecycle:
-   - `bin/new-run <slug> <fast_path|full_track>` opens a run ledger.
+   - `firm-new-run <slug> <fast_path|full_track>` opens a run ledger.
    - Each stage is delegated to its subagent (`.claude/agents/`), producing its artifact.
    - You're paused only at the gates in `agent-firm/policy/gate-matrix.md`, with a well-formed
      approval payload each time.
-   - `bin/validate-verdict 08-qa-verdict.json` gates on schema-valid QA evidence before the final gate.
+   - `firm-validate-verdict 08-qa-verdict.json` gates on schema-valid QA evidence before the final gate.
 
 ## Layout
 ```

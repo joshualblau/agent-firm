@@ -7,12 +7,12 @@ Goal: a working, bounded, evidence-producing firm with the core roles — **befo
 - **Core roles** (`.claude/agents/`): intake-analyst, architect, implementer, integrator, reviewer,
   qa-tester, packager — each with scoped tools, a model, a mandate, a durable-artifact contract, and
   role-specific never-rules. The **Lead** is the main session, driven by `CLAUDE.md`.
-- **Run ledger** (`bin/new-run`, `bin/ledger-log`, `ledger-hook`): per-run directory with numbered
+- **Run ledger** (`firm-new-run`, `firm-ledger-log`, `ledger-hook`): per-run directory with numbered
   artifacts + an append-only `run.jsonl`. This is the source of truth.
 - **Policies** (`agent-firm/policy/`): layered action-scopes, the gate matrix + approval-payload format,
   never-rules, definition-of-done, failure-taxonomy, and execution-budget caps.
 - **Schemas** (`agent-firm/schemas/`): acceptance-criteria, job-spec, qa-verdict (Codex-ready),
-  staffing-plan — with `bin/validate-verdict` enforcing the QA verdict.
+  staffing-plan — with `firm-validate-verdict` enforcing the QA verdict.
 - **Permissions** (`.claude/settings.json`): allow/ask/deny implementing the action scopes, plus the
   PreToolUse logging hook.
 - **Sandbox** (`.devcontainer/`): project-only mount, non-root, pinned base; egress firewall stubbed
@@ -21,9 +21,9 @@ Goal: a working, bounded, evidence-producing firm with the core roles — **befo
 ## How to run the lifecycle (manually, today)
 From a work project that has the firm config:
 ```bash
-bin/new-run my-feature full_track          # opens the ledger
+firm-new-run my-feature full_track          # opens the ledger
 claude                                      # Lead runs intake → … → package, delegating to subagents
-bin/validate-verdict .agent-firm/runs/<run>/08-qa-verdict.json
+firm-validate-verdict .agent-firm/runs/<run>/08-qa-verdict.json
 ```
 The Lead pauses only at the gates and presents a well-formed approval payload; nothing merges/ships
 without your final sign-off.

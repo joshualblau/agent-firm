@@ -47,7 +47,7 @@ WORKTREE_PORT=$port
 WORKTREE_DB=$db
 EOF
 
-[[ -x "$SELF/ledger-log" ]] && "$SELF/ledger-log" worktree_created role="$role" work_order="$wo" branch="$branch" port="$port" || true
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" worktree_created role="$role" work_order="$wo" branch="$branch" port="$port" || true
 
 echo "worktree: $wt_dir"
 echo "branch:   $branch"

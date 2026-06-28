@@ -35,6 +35,6 @@ done <<< "$branches"
 
 echo "integration branch: $intb"
 echo "merged: $merged   conflicts: $conflicts"
-[[ -x "$SELF/ledger-log" ]] && "$SELF/ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
 echo "NEXT: reconcile lockfiles/migrations/ports/fixtures, run the COMBINED suite, write integration-summary.md."
 [[ $conflicts -eq 0 ]]
