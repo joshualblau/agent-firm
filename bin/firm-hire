@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# firm-hire <role-name>
+# Scaffolds a specialist job-spec skeleton into the current run for the Recruiter to fill in.
+# The spec conforms to agent-firm/schemas/job-spec.schema.json. Run from the project root with an
+# active run (firm-new-run first).
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+role="${1:-}"
+if [[ -z "$role" ]]; then echo "usage: firm-hire <role-name>" >&2; exit 2; fi
+role="$(printf '%s' "$role" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+
+run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no active run — run firm-new-run first" >&2; exit 1; fi
+
+mkdir -p "$run_dir/hires"
+out="$run_dir/hires/${role}.job.yaml"
+if [[ -e "$out" ]]; then echo "$out"; echo "(already exists)" >&2; exit 0; fi
+
+cat > "$out" <<EOF
+# job spec — validates against agent-firm/schemas/job-spec.schema.json
+role_name: $role
+task: ""                       # the concrete deliverable for this engagement
+why_core_staff_cant: ""        # REQUIRED justification (prevents role-theater)
+expected_deliverable: ""       # must be independently reviewable
+required_tools: []             # least-privilege
+denied_tools: []
+mcp_servers: []                # least-privilege; read-only where possible
+model: sonnet                  # opus | sonnet | haiku | codex
+max_turns: 25
+max_wall_clock_minutes: 30
+success_criteria: ""
+retirement_condition: "end of engagement"
+mode: ephemeral                # ephemeral | durable_candidate
+domain_guardrails: []          # sensitive domains: legal/ethical boundary, provenance, PII, no irreversible action
+EOF
+
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" hire_scaffolded role="$role" file="$out" || true
+echo "$out"
+echo "Fill it in, then record it in $run_dir/04-staffing-plan.yaml. Ephemeral hires are dispatched via the 'specialist' agent and retired at end." >&2

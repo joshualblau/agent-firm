@@ -1,0 +1,41 @@
+# The bench — the firm's DURABLE, reusable specialists.
+#
+# Design principle: this starts EMPTY of domain experts, on purpose. The firm is general-purpose and
+# works on many different things, so it does NOT carry permanent domain specialists (finance, crypto,
+# medical, legal, a specific framework guru, etc.). Instead it HIRES expertise per engagement:
+#   - The Recruiter mints an EPHEMERAL specialist from a job spec, the Lead dispatches the generic
+#     `specialist` agent with that spec, and it is RETIRED when done.
+#   - A specialist earns a durable spot here only after proving broadly reusable: used successfully
+#     >=3 times OR explicitly approved by the human — and only if it generalizes across projects,
+#     not because one project happened to need it.
+#
+# So expect this list to stay short. Growth comes from retrospectives (System Change PRs), reviewed
+# one at a time, each guarded by a golden eval.
+
+specialists: []      # durable, promoted specialists live here (job-spec shaped). Empty by design.
+
+governance:
+  promotion:
+    criteria: "used successfully >=3 times OR human-approved AND genuinely cross-project"
+    requires: [job_spec_review, tool_and_mcp_scope_review, one_golden_eval]
+    owner: lead
+  retirement:
+    ephemeral: "dismissed when the job spec's retirement_condition is met (end of engagement)"
+    durable: "deprecate with a reason + replacement; keep the eval until removed"
+  scoping:
+    default: least_privilege
+    hard_scope: "if tool/MCP scope must be enforced (not just requested), persist a durable agent with explicit tools/mcpServers rather than an ephemeral dispatch"
+
+# --- Illustrative shape only (NOT an active member). This shows what a durable entry looks like;
+# --- it is NOT loaded and NOT a permanent hire. Delete or ignore.
+example_entry:
+  role_name: <kebab-case>
+  what_it_does: <one line>
+  when_to_hire: <the signal that this expertise is needed>
+  model: opus|sonnet|codex
+  required_tools: []
+  mcp_servers: []            # least-privilege, e.g. a read-only domain MCP
+  denied_tools: []
+  domain_guardrails: []      # for sensitive domains
+  promoted_on: <date/reason>
+  eval: agent-firm/evals/<name>/

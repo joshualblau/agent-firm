@@ -30,7 +30,8 @@ The firm's tools are on your PATH (`firm-*`). Read any full policy with `firm-po
 |---|---|---|---|
 | Intake | `intake-analyst` | `00-intake.md`, `01-acceptance-criteria.yaml` | 🟢 Requirements |
 | Plan | `architect` (full_track) | `02-architecture-options.md` | 🔵 crit · 🟢 Architecture (if non-obvious) |
-| Build | `implementer` ×N (`firm-new-worktree`) | `05-work-orders/*`, `06-implementation-summary.md` | — |
+| Staff | `recruiter` (hires per need) | `04-staffing-plan.yaml` | — |
+| Build | `implementer` ×N (`firm-new-worktree`) + hired specialists | `05-work-orders/*`, `06-implementation-summary.md` | — |
 | Integrate | `integrator` (if parallel; `firm-integrate`) | `integration-summary.md` | — |
 | Review | `reviewer` ×N | `07-review-findings.yaml` | 🔵 (🟢 if risky) |
 | Test | `qa-tester` (`firm-qa-checkout`) | `08-qa-verdict.json`, `09-test-evidence/` | — |
@@ -45,6 +46,19 @@ reviewer panel and the Integrator. For heavy parallel fan-out, invoke the Workfl
 - Pause only at the gates in `firm-policy gate-matrix`. Gate on **reversibility and impact**, never on confidence. Reversible, in-worktree work runs autonomously.
 - Ask **once, well-formed**: `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`. Never ask without options, a recommendation, and a safe default. Subagents cannot ask — **you** own every human question.
 - The **final gate is mandatory**: present handoff + QA verdict + known risks; nothing is done, merged, deployed, or published without explicit sign-off.
+
+## Staffing — hire expertise per engagement (not permanent domain experts)
+The firm is general-purpose, so it does not carry standing domain experts. For any capability the core
+roles lack, the `recruiter` staffs it for THIS engagement:
+- **Core-first:** only hire when no core role fits.
+- **Mint an ephemeral specialist:** `firm-hire <role>` scaffolds a job spec (mandate, least-privilege
+  tools/MCP, budget, retirement); dispatch the generic `specialist` subagent with that spec; retire it
+  at engagement end.
+- **Hard tool/MCP scoping:** persist a durable agent (via `/agents`) with explicit tools/`mcpServers`
+  instead of an ephemeral dispatch when the scope must be enforced, not just requested.
+- **Keep the bench general:** `bench/registry.yaml` stays near-empty of domain experts; promote a
+  specialist to durable ONLY after ≥3 successful uses or human approval, and only if it is genuinely
+  reusable across projects. A one-off need never becomes a permanent hire.
 
 ## Self-testing before approval (non-negotiable)
 - Implementers self-correct to green, bounded by `max_test_repair_loops`, then stop and report.

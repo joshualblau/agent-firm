@@ -35,7 +35,7 @@ execution-budget) and `agent-firm/schemas/` (acceptance-criteria, job-spec, qa-v
 |---|---|---|---|
 | Intake | `intake-analyst` | `00-intake.md`, `01-acceptance-criteria.yaml` | 🟢 Requirements |
 | Plan | `architect` (full_track) | `02-architecture-options.md` | 🔵 design crit · 🟢 Architecture (if non-obvious) |
-| Staff | (Phase 2) `recruiter` | `04-staffing-plan.yaml` | — |
+| Staff | `recruiter` (hires per need) | `04-staffing-plan.yaml` | — |
 | Build | `implementer` ×N | `05-work-orders/*`, `06-implementation-summary.md` | — |
 | Integrate | `integrator` (only if parallel) | `integration-summary.md` | — |
 | Review | `reviewer` ×N | `07-review-findings.yaml` | 🔵 (🟢 if risky change) |
@@ -89,9 +89,10 @@ deliverable** — for the human to approve and version. Accepted changes are gua
 (`firm-run-evals`) so a later change can't silently regress them.
 
 ## Phase status
-Phase 0 + Phase 1 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
-worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, and the
-retrospective → System-Change-PR + golden-eval loop.
-Not yet wired: the `recruiter`/bench (Phase 2), the Codex GPT QA judge (Phase 3), multi-profile
-secrets/portability (Phase 4), egress firewall + visual regression + full eval execution (Phase 5).
-See `docs/PHASE1.md` and the plan for the roadmap.
+Phase 0–2 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
+worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, the
+retrospective → System-Change-PR + golden-eval loop; and the `recruiter` + generic `specialist` +
+`firm-hire` staffing mechanism (hire per engagement; bench stays general). Distributed as a versioned
+plugin (Phase 4 part 1).
+Not yet wired: the Codex GPT QA judge (Phase 3), multi-profile secrets (rest of Phase 4), egress
+firewall + visual regression + full eval execution (Phase 5). See `docs/` and the plan.
