@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# firm-gpt-qa [run_dir]
+# The firm's INDEPENDENT, cross-provider QA judge: runs GPT via the Codex CLI on your ChatGPT
+# subscription (NO API key) and emits a schema-valid verdict at <run_dir>/08-qa-verdict.gpt.json.
+# It hunts for implementation blind spots a same-provider judge might share.
+#
+# Prereqs (see docs/PHASE3.md): `codex` installed + `codex login` on your ChatGPT plan. If codex is
+# absent, this exits 3 and the qa-tester degrades to Claude-only QA (logged), never silently passing.
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+SCHEMA="$ROOT/agent-firm/schemas/qa-verdict.schema.json"
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "firm-gpt-qa: 'codex' not found. Install the Codex CLI and run 'codex login' on your ChatGPT plan (docs/PHASE3.md). Skipping the GPT judge." >&2
+  exit 3
+fi
+
+run_dir="${1:-}"
+[[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "firm-gpt-qa: no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
+mkdir -p "$run_dir/09-test-evidence"
+
+out="$run_dir/08-qa-verdict.gpt.json"
+log="$run_dir/09-test-evidence/gpt-qa.log"
+
+read -r -d '' PROMPT <<EOF
+You are an INDEPENDENT QA judge from a DIFFERENT model provider than the implementer. Hunt for
+implementation blind spots and certify with evidence, not opinion.
+- Run the project's test command(s); read the diff and the evidence under ${run_dir}/09-test-evidence/.
+- Check every acceptance criterion in ${run_dir}/01-acceptance-criteria.yaml has proving evidence.
+- State what was NOT tested. You are READ-ONLY against source: never edit code or tests.
+- Emit BLOCK on any uncertainty; APPROVE only with passing evidence for every required test type.
+Return ONLY the verdict conforming to the provided JSON schema.
+EOF
+
+echo "firm-gpt-qa: running the Codex judge on your ChatGPT subscription..." >&2
+if codex exec --skip-git-repo-check --output-schema "$SCHEMA" -o "$out" "$PROMPT" >>"$log" 2>&1; then
+  # validate the structured verdict Codex produced
+  "$SELF/firm-validate-verdict" "$out"
+  [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" gpt_qa file="$out" || true
+  echo "$out"
+else
+  echo "firm-gpt-qa: codex exec failed — see $log" >&2
+  exit 1
+fi

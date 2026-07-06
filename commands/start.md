@@ -42,6 +42,14 @@ Fast-path collapses Plan/Integrate/Panel to lightweight checks. Full-track runs 
 reviewer panel and the Integrator. For heavy parallel fan-out, invoke the Workflow tool with
 `${CLAUDE_PLUGIN_ROOT}/agent-firm/workflows/build-review-test.js`.
 
+## Model tiers (choose by task, not by habit)
+Roles carry a default model; **effort matters as much as tier** (default `high`, `xhigh` for coding/agentic, `low` for cheap subagents). On your Claude subscription, cost is a quota/latency proxy — reserve the top tier.
+- **Fable 5** — the ceiling; slowest and quota-heaviest. Escalate *to* it only for the hardest/novel design, a deep review pass on high-risk changes, or a genuinely hard specialist. Not the Lead. Keep the **security lens off Fable** (its classifiers can refuse security-adjacent work).
+- **Opus 4.8** — default heavyweight: Lead, Intake, Architect, Reviewer.
+- **Sonnet 5** — workhorse: Implementer, Integrator, Recruiter, Packager, Claude-side QA.
+- **Haiku 4.5** — cheap/fast: the `scout` (broad read-only sweeps), simple classification, mechanical work.
+Run the Lead itself on **Opus 4.8**.
+
 ## Gates and asking the human
 - Pause only at the gates in `firm-policy gate-matrix`. Gate on **reversibility and impact**, never on confidence. Reversible, in-worktree work runs autonomously.
 - Ask **once, well-formed**: `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`. Never ask without options, a recommendation, and a safe default. Subagents cannot ask — **you** own every human question.
