@@ -20,6 +20,9 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 > **Setup, including on a new device, is recorded in [docs/INSTALL.md](docs/INSTALL.md).** Quickest path
 > on a machine that has this repo: `~/agent-firm/bin/firm-bootstrap` (registers the marketplace +
 > installs the plugin), then `firm-install` per project, then `/agent-firm:start <goal>`.
+>
+> **Wiring accounts/secrets/hardening** (1Password, per-project profiles, egress firewall, visual
+> baselines, phone approvals, eval calibration) is a one-time runbook in [docs/WIRING.md](docs/WIRING.md).
 
 **Recommended: install as a versioned plugin (shared across all projects, one source of truth).**
 ```bash

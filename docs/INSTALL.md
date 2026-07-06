@@ -13,8 +13,8 @@ Then, per project (once):
 cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
-**Optional — per-project subscription profile + secrets** (see [PHASE4.md](PHASE4.md) part 2 for the
-one-time account setup with `op`, `direnv`, and `claude setup-token`):
+**Optional — per-project subscription profile + secrets** (full step-by-step in [WIRING.md](WIRING.md);
+see [PHASE4.md](PHASE4.md) part 2 for the rationale + the macOS Keychain caveat):
 ```bash
 cp ~/agent-firm/.envrc.example .envrc    # set FIRM_PROFILE (which account this repo uses)
 cp ~/agent-firm/.env.op.example .env.op  # edit the op:// references (commit this — references only)
