@@ -35,12 +35,17 @@ Return ONLY the verdict conforming to the provided JSON schema.
 EOF
 
 echo "firm-gpt-qa: running the Codex judge on your ChatGPT subscription..." >&2
-if codex exec --skip-git-repo-check --output-schema "$SCHEMA" -o "$out" "$PROMPT" >>"$log" 2>&1; then
+# NOTE: close stdin (</dev/null) — otherwise `codex exec` blocks reading "additional input from stdin".
+# Hard wall-clock cap via a perl alarm (macOS has no `timeout`); alarm survives exec and terminates codex.
+timeout_secs="${FIRM_GPT_QA_TIMEOUT:-300}"
+if perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" \
+     codex exec --skip-git-repo-check --output-schema "$SCHEMA" -o "$out" "$PROMPT" </dev/null >>"$log" 2>&1; then
   # validate the structured verdict Codex produced
   "$SELF/firm-validate-verdict" "$out"
   [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" gpt_qa file="$out" || true
   echo "$out"
 else
-  echo "firm-gpt-qa: codex exec failed — see $log" >&2
+  rc=$?
+  echo "firm-gpt-qa: codex exec failed or timed out after ${timeout_secs}s (rc=$rc) — see $log" >&2
   exit 1
 fi

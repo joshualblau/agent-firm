@@ -30,13 +30,27 @@ as **skipped** (logged to `run.jsonl`) and proceeds Claude-only. "Skipped" is ne
 
 ## Verify (once Codex is set up)
 ```bash
-codex exec "say hi"                                  # confirm subscription auth, no API key set
+codex login status                                   # confirm you're on your ChatGPT plan (no API key)
+codex exec --skip-git-repo-check "say hi"            # smoke-test (the flag firm-gpt-qa already uses)
 firm-gpt-qa .agent-firm/runs/<run>                   # produces + validates 08-qa-verdict.gpt.json
 ```
 Watch for: the GPT judge runs the test command, writes `08-qa-verdict.gpt.json`, `firm-validate-verdict`
 passes it, and a `gpt_qa` event lands in `run.jsonl`.
 
+## Gotchas learned (validated empirically)
+- **`codex exec` reads stdin.** With a prompt arg *and* an open stdin it blocks on "Reading additional
+  input from stdin". `firm-gpt-qa` closes stdin (`</dev/null`) — don't remove that.
+- **Trusted-directory guard.** `codex exec` refuses to run outside a directory it trusts; the wrapper
+  passes `--skip-git-repo-check` so it runs anywhere.
+- **Wall-clock cap.** `firm-gpt-qa` caps the judge at `FIRM_GPT_QA_TIMEOUT` seconds (default 300) via a
+  perl alarm (macOS has no `timeout`), so a slow/hung judge can't run away.
+- **Run QA in the pinned dev container.** codex's login shell may default to a different toolchain
+  (in testing it used Node 14, so `npm test` → `node --test` failed and the judge correctly BLOCKed).
+  Running QA inside `.devcontainer/` gives the same pinned toolchain CI uses.
+- **Read-only sandbox is fine for QA.** codex ran read-only yet could still execute the test command;
+  no write sandbox needed (QA is read-only against source anyway).
+- **Verdict fidelity confirmed:** `codex exec --output-schema` produced a schema-valid, well-reasoned
+  verdict that `firm-validate-verdict` accepted.
+
 ## Not yet
-- Codex tool-calling fidelity through `--output-schema` should be validated empirically on your first
-  real run before depending on it (structured-output quirks vary by provider).
 - Multi-profile `CODEX_HOME` switching is the rest of Phase 4.
