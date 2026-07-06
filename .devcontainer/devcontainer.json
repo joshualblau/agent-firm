@@ -9,15 +9,18 @@
   "remoteUser": "firm",
   "containerUser": "firm",
 
-  "//runArgs": "no-new-privileges hardens; cap-drop + the egress firewall are tightened in Phase 5.",
+  "//runArgs": "no-new-privileges hardens. cap-drop=ALL, then additively add ONLY the two caps the egress firewall needs (cap-add wins over cap-drop=ALL in Docker). Uncomment the two cap-add lines + the postStartCommand below to ENABLE the firewall (opt-in — it elevates the container's networking privileges).",
   "runArgs": [
     "--security-opt=no-new-privileges:true",
     "--cap-drop=ALL"
+    // , "--cap-add=NET_ADMIN"   // iptables/ipset — uncomment to enable the egress firewall
+    // , "--cap-add=NET_RAW"     // ICMP + curl connectivity probes
   ],
 
-  "//egress": "Phase 5: run .devcontainer/egress-firewall.sh as a postStartCommand (needs NET_ADMIN) to default-deny outbound traffic except an allowlist (npm/PyPI registries, model+provider endpoints, your git host). Default-deny egress is the main lever that bounds prompt-injection blast radius.",
+  "//egress": "Phase 5 (opt-in): the egress firewall default-denies outbound traffic except an allowlist (npm/PyPI registries, api.anthropic.com, your git host; OpenAI/Codex needs a CDN mitigation — see .devcontainer/egress-allowlist.conf + docs/PHASE5.md). It fails SAFE (refuses to boot open). To enable: uncomment the two --cap-add lines above AND the postStartCommand below. Default-deny egress is the main lever that bounds prompt-injection blast radius.",
 
   "postCreateCommand": "bash .devcontainer/verify.sh",
+  "//postStartCommand": "sudo /workspace/.devcontainer/egress-firewall.sh",
 
   "remoteEnv": {
     "AGENT_FIRM_SANDBOX": "1"

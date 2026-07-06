@@ -1,0 +1,8 @@
+/* Injected via playwright.config stylePath before every screenshot to kill nondeterminism. */
+*, *::before, *::after {
+  animation: none !important;
+  transition: none !important;
+  caret-color: transparent !important;
+}
+/* Hide known-live regions by class as a backstop to per-test masks. */
+.live-clock, .carousel, .spinner { visibility: hidden !important; }

@@ -89,13 +89,16 @@ deliverable** — for the human to approve and version. Accepted changes are gua
 (`firm-run-evals`) so a later change can't silently regress them.
 
 ## Phase status
-Phase 0–4 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
+Phase 0–5 done. Core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
 worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, the
 retrospective → System-Change-PR + golden-eval loop; the `recruiter` + generic `specialist` +
-`firm-hire` staffing mechanism (hire per engagement; bench stays general); the independent Codex/GPT QA
-judge (`firm-gpt-qa`, two-voice QA — both must APPROVE); and portability — a versioned plugin plus
-per-project subscription profiles + `op`/direnv secrets guarded by a fail-closed `firm-doctor`
-(run it before an engagement; `CLAUDE_CODE_OAUTH_TOKEN` switches the Claude account on macOS,
-`CODEX_HOME` switches ChatGPT; keep `*_API_KEY` unset on subscription projects). See `docs/PHASE4.md`.
-Not yet wired: egress firewall, visual-regression suite, Slack/phone approvals, full golden-eval
-execution (Phase 5). See `docs/` and the plan.
+`firm-hire` staffing mechanism; the independent Codex/GPT QA judge (`firm-gpt-qa`, two-voice — both must
+APPROVE); portability — a versioned plugin + per-project subscription profiles + `op`/direnv secrets
+guarded by a fail-closed `firm-doctor`; and hardening (Phase 5): an opt-in default-deny **egress
+firewall**, a **visual-regression** suite (`firm-visual-check`, wired into the QA `visual` verdict —
+project-gated, read-only, baselines never auto-updated), provider-agnostic **remote approval
+notifications** (`firm-notify` — notify-only phone alerts via the `Notification` hook), and **full
+golden-eval execution** (`firm-run-evals` drives the firm headlessly under a bounded, never-bypass
+posture + `firm-check-assertions`). Hard rules that persist: QA never updates visual baselines; evals
+never use `--dangerously-skip-permissions`; keep the security lens off Fable. See `docs/PHASE5.md`.
+Optional/deferred: adversarial Agent-Teams panels and durable runners (documented seams, not shipped).

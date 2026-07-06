@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# firm-visual-check [project-dir]
+# ASSERT-ONLY visual regression: runs Playwright screenshot tests against COMMITTED baselines.
+# It NEVER writes/updates baselines (--update-snapshots=none). QA is read-only against source; baseline
+# updates are a separate, human-reviewed act (firm-visual-baseline).
+#
+# Exit codes (qa-tester branches on these to fill the verdict `visual` field):
+#   0  PASS            — screenshots match committed baselines
+#   3  not_applicable  — no playwright config / no spec files (project has no visual suite)
+#   other              — a visual diff / regression (or a run error) -> BLOCK
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+proj="${1:-.}"
+
+# Project-gated: only meaningful if the project actually has a Playwright config + specs.
+if [ ! -f "$proj/playwright.config.ts" ] && [ ! -f "$proj/playwright.config.js" ] && [ ! -f "$proj/playwright.config.mjs" ]; then
+  echo "firm-visual-check: no playwright config in $proj — visual not_applicable"; exit 3
+fi
+# Any *.spec.* under the project (tests/ or elsewhere)?
+if ! find "$proj" -type f \( -name '*.spec.ts' -o -name '*.spec.js' -o -name '*.spec.mjs' \) \
+        -not -path '*/node_modules/*' 2>/dev/null | grep -q .; then
+  echo "firm-visual-check: no spec files — visual not_applicable"; exit 3
+fi
+
+echo "firm-visual-check: asserting screenshots against committed baselines (no auto-update)..."
+# --update-snapshots=none forces assertion: a missing OR changed baseline FAILS (never silently written).
+( cd "$proj" && npx playwright test --update-snapshots=none )
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "firm-visual-check: PASS"
+else
+  echo "firm-visual-check: FAIL (rc=$rc) — see playwright-report/ and test-results/*-diff.png"
+fi
+exit "$rc"

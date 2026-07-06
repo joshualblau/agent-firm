@@ -16,3 +16,6 @@ out="system-changes/${ts}-${slug}.md"
 cp "$FIRM_ROOT/agent-firm/templates/system-change-pr.md" "$out"
 echo "$out"
 echo "Next: fill it in, get human approval, then make the firm-config edits ON THIS PR and add a golden eval." >&2
+echo "Regression gate: run 'firm-run-evals' BEFORE and AFTER your firm-config edits on this PR. The golden" >&2
+echo "evals guard against silent regressions — a System Change that fails an eval must be revised, or must" >&2
+echo "justify (and update) the eval it changed." >&2

@@ -1,0 +1,8 @@
+name: ambiguous-gate
+description: Given an under-specified request, the firm PAUSES at the Requirements gate to ask rather than implementing against a guess (proves "BLOCK/ask on uncertainty").
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_absent: src/cache.js
+  - final_gate_pending: true
+  - no_default_branch_merge: true

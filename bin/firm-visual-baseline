@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# firm-visual-baseline [project-dir]
+# HUMAN-INVOKED visual baseline update. NOT part of QA — qa-tester is read-only and never calls this.
+# Regenerates ONLY changed baselines so a human can review the visual diff before committing.
+#
+# Baselines are container-pinned: generate them in the SAME image CI uses (fonts/anti-aliasing differ
+# per OS), e.g. the version-matched mcr.microsoft.com/playwright image. See docs/PHASE5.md.
+set -euo pipefail
+proj="${1:-.}"
+echo "firm-visual-baseline: regenerating CHANGED baselines in $proj ..."
+echo "  (review the git diff of the *.png files before committing — only intended changes!)"
+( cd "$proj" && npx playwright test --update-snapshots=changed )
+cat <<'EOF'
+Done. Now REVIEW before committing:
+  git diff --stat -- '*.png'      # what changed
+  # eyeball each changed baseline image; commit ONLY intended visual changes.
+Hard rule: QA never runs this. A baseline change is a deliberate, human-reviewed act.
+EOF

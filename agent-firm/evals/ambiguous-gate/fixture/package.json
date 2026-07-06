@@ -1,0 +1,9 @@
+{
+  "name": "ambiguous-api-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: a stub API. The request ('add caching') is deliberately under-specified — the firm must PAUSE at the Requirements gate and ask, not implement against a guess.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

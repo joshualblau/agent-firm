@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# firm-notify — Notification-hook side-channel that pushes "Claude needs your attention" to your phone.
+#
+# NOTIFY-ONLY by construction: it never approves anything. The human still approves IN-SESSION; the push
+# is just an alert that a gate is waiting. (True approve-from-phone needs a public callback server =
+# out of scope — see docs/PHASE5.md.) Provider-agnostic: pick an adapter via FIRM_NOTIFY_ADAPTER.
+#
+# Reads the hook JSON on stdin, resolves the adapter secret from an op:// reference (or a plain env
+# fallback), and posts. FAILS OPEN: any missing config / error is a silent no-op (exit 0) — a broken
+# notifier must NEVER wedge the in-session approval flow. Secrets are op:// refs, never inline.
+#
+# Dry-run:  echo '{"message":"test","title":"agent-firm"}' | FIRM_NOTIFY_ADAPTER=ntfy FIRM_NTFY_TOPIC=xyz firm-notify
+set -uo pipefail
+
+INPUT="$(cat 2>/dev/null || true)"
+jqr() { printf '%s' "$INPUT" | jq -r "$1" 2>/dev/null; }
+MSG="$(jqr '.message // "Claude needs your attention"')"; [ -z "$MSG" ] && MSG="Claude needs your attention"
+TITLE="$(jqr '.title // "agent-firm"')"; [ -z "$TITLE" ] && TITLE="agent-firm"
+CWD="$(jqr '.cwd // empty')"
+BODY="$MSG"
+[ -n "$CWD" ] && BODY="$MSG  (project: $(basename "$CWD"))"
+[ -n "${CLAUDE_CODE_BRIDGE_SESSION_ID:-}" ] && BODY="$BODY  [session ${CLAUDE_CODE_BRIDGE_SESSION_ID}]"
+
+adapter="${FIRM_NOTIFY_ADAPTER:-none}"   # slack | pushover | telegram | ntfy | none
+
+# secret <op-ref-env> <value-env>: prefer `op read <ref>` (op:// reference) if op is present, else the
+# plain value env var. Both are optional — returns empty if neither is set.
+secret() {
+  local ref="${1:-}" val_env="${2:-}"
+  if [ -n "$ref" ] && command -v op >/dev/null 2>&1; then
+    local r; r="$(op read "$ref" 2>/dev/null || true)"; [ -n "$r" ] && { printf '%s' "$r"; return 0; }
+  fi
+  printf '%s' "${!val_env:-}"
+}
+
+case "$adapter" in
+  slack)
+    url="$(secret "${FIRM_SLACK_WEBHOOK_REF:-}" FIRM_SLACK_WEBHOOK_URL)"
+    [ -z "$url" ] && exit 0
+    curl -s -m 10 -X POST -H 'Content-type: application/json' \
+      --data "$(jq -nc --arg t "[$TITLE] $BODY" '{text:$t}')" "$url" >/dev/null 2>&1 || true ;;
+  pushover)
+    tok="$(secret "${FIRM_PUSHOVER_TOKEN_REF:-}" FIRM_PUSHOVER_TOKEN)"
+    usr="$(secret "${FIRM_PUSHOVER_USER_REF:-}"  FIRM_PUSHOVER_USER)"
+    { [ -z "$tok" ] || [ -z "$usr" ]; } && exit 0
+    curl -s -m 10 https://api.pushover.net/1/messages.json \
+      -F "token=$tok" -F "user=$usr" -F "title=$TITLE" -F "message=$BODY" >/dev/null 2>&1 || true ;;
+  telegram)
+    tok="$(secret "${FIRM_TELEGRAM_TOKEN_REF:-}" FIRM_TELEGRAM_TOKEN)"
+    chat="$(secret "${FIRM_TELEGRAM_CHAT_REF:-}" FIRM_TELEGRAM_CHAT)"
+    { [ -z "$tok" ] || [ -z "$chat" ]; } && exit 0
+    curl -s -m 10 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "text=[$TITLE] $BODY" >/dev/null 2>&1 || true ;;
+  ntfy)
+    topic="$(secret "${FIRM_NTFY_TOPIC_REF:-}" FIRM_NTFY_TOPIC)"
+    [ -z "$topic" ] && exit 0
+    server="${FIRM_NTFY_SERVER:-https://ntfy.sh}"
+    curl -s -m 10 -H "Title: $TITLE" -H "Priority: high" -d "$BODY" "${server%/}/${topic}" >/dev/null 2>&1 || true ;;
+  none|*) : ;;   # unconfigured / unknown adapter: silent no-op — never break the session
+esac
+exit 0   # ALWAYS succeed — a notifier must never block or fail the approval flow.

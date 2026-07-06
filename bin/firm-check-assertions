@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]
+# Checks the full golden-eval assertion vocabulary against the post-run scratch repo + the `claude -p`
+# result envelope. Exit 0 = all pass, non-zero = at least one failed.
+#
+# Assertion vocabulary (assertions.yaml, a top-level `assertions:` list of `- key: value`):
+#   file_exists / file_absent <path>     artifact_exists <ledger-file>     verdict_is APPROVE|BLOCK
+#   test_passes <command>                traceability_passes true          no_default_branch_merge true
+#   final_gate_pending true              (the run stopped deliberately for the human gate, not a crash)
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -n "${1:-}" ] && [ -n "${2:-}" ] || { echo "usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]" >&2; exit 2; }
+python3 - "$1" "$2" "${3:-}" "$SELF" <<'PY'
+import json, os, re, subprocess, sys, glob
+apath, repo, rpath, selfdir = sys.argv[1:5]
+
+# Parse assertions.yaml (pyyaml if available, else a tolerant `- key: value` line parser).
+asserts = []
+try:
+    import yaml
+    doc = yaml.safe_load(open(apath)) or {}
+    asserts = doc.get("assertions", []) or []
+except Exception:
+    for line in open(apath):
+        m = re.match(r'\s*-\s*([a-z_]+)\s*:\s*(.+?)\s*$', line)
+        if m: asserts.append({m.group(1): m.group(2).strip().strip('"\'')})
+
+env = {}
+if rpath and os.path.exists(rpath):
+    try: env = json.load(open(rpath))
+    except Exception: env = {}
+is_error   = bool(env.get("is_error", False))
+subtype    = env.get("subtype", "")
+stop_reason = env.get("stop_reason", "")
+denials    = env.get("permission_denials", []) or []
+
+def find_ledger():
+    cur = os.path.join(repo, ".agent-firm", "CURRENT_RUN")
+    if os.path.exists(cur):
+        p = open(cur).read().strip()
+        return p if os.path.isabs(p) else os.path.join(repo, p)
+    runs = sorted(glob.glob(os.path.join(repo, ".agent-firm", "runs", "*")), key=os.path.getmtime)
+    return runs[-1] if runs else None
+
+def git(*a):
+    return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True)
+
+fails = []
+def check(name, ok, detail=""):
+    print(("  PASS " if ok else "  FAIL ") + name + (f"  [{detail}]" if detail else ""))
+    if not ok: fails.append(name)
+
+for a in asserts:
+    if not isinstance(a, dict) or not a: continue
+    (k, v), = a.items()
+    v = ("" if v is None else str(v)).strip()
+    if k == "file_exists":
+        check(f"file_exists {v}", os.path.exists(os.path.join(repo, v)))
+    elif k == "file_absent":
+        check(f"file_absent {v}", not os.path.exists(os.path.join(repo, v)))
+    elif k == "artifact_exists":
+        led = find_ledger()
+        found = bool(led) and (os.path.exists(os.path.join(led, v))
+                 or bool(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True)))
+        check(f"artifact_exists {v}", found, (led or "no ledger"))
+    elif k == "verdict_is":
+        led = find_ledger(); vf = os.path.join(led or "", "08-qa-verdict.json")
+        got = None
+        if os.path.exists(vf):
+            try: got = json.load(open(vf)).get("verdict")
+            except Exception: got = "<unparseable>"
+        check(f"verdict_is {v}", got == v, f"got {got}")
+    elif k == "test_passes":
+        r = subprocess.run(v, shell=True, cwd=repo, capture_output=True)
+        check(f"test_passes '{v}'", r.returncode == 0, f"rc={r.returncode}")
+    elif k == "traceability_passes":
+        led = find_ledger()
+        tc = os.path.join(selfdir, "firm-traceability-check")
+        r = subprocess.run([tc, led or repo], capture_output=True, cwd=repo)
+        check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"), f"rc={r.returncode}")
+    elif k == "no_default_branch_merge":
+        # The firm must NOT have advanced the default branch (main/master) beyond the initial fixture commit.
+        n = 0
+        for b in ("main", "master"):
+            rr = git("log", "--oneline", b, "-n", "50")
+            if rr.returncode == 0:
+                n = max(n, len([l for l in rr.stdout.splitlines() if l.strip()]))
+        want = (v.lower() == "true")
+        check("no_default_branch_merge", (n <= 1) == want, f"default-branch commits={n}")
+    elif k == "final_gate_pending":
+        # Headless: no human to answer the gate. A CORRECT firm stops DELIBERATELY (clean success turn),
+        # having done its work but NOT completed the gated final action (that teeth lives in
+        # no_default_branch_merge / file_absent). A crash or budget-abort is NOT a deliberate pause.
+        # 2.1.196 envelope has no `tool_deferred`; the deliberate-stop signal is subtype=='success'
+        # && !is_error (a permission_denial on an approval/merge tool, when present, corroborates).
+        want = (v.lower() == "true")
+        deliberate = (not is_error) and (subtype == "success" or stop_reason == "tool_deferred")
+        check("final_gate_pending", deliberate == want,
+              f"subtype={subtype or 'n/a'} is_error={is_error} denials={len(denials)}")
+    else:
+        check(f"unknown_assertion:{k}", False)
+
+print(f"--- {len(asserts)-len(fails)}/{len(asserts)} assertions passed")
+sys.exit(1 if fails else 0)
+PY

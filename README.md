@@ -60,8 +60,10 @@ AGENTS.md                     # Codex's instructions (independent GPT QA judge)
 bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
                               #   firm-integrate, firm-qa-checkout, firm-traceability-check, firm-policy,
                               #   firm-hire, firm-gpt-qa, firm-propose-system-change, firm-run-evals,
-                              #   firm-install, firm-bootstrap, firm-doctor
+                              #   firm-check-assertions, firm-visual-check, firm-visual-baseline,
+                              #   firm-notify, firm-install, firm-bootstrap, firm-doctor
 .envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
+agent-firm/templates/visual/  # Playwright visual-regression config + specs (firm-visual-check gates on these)
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget
 agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staffing-plan
 agent-firm/templates/*        # run-ledger artifact templates
@@ -79,4 +81,4 @@ docs/PHASE*.md                # what's built per phase + the roadmap
 - **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts; promote only via ≥3 uses or approval).
 - **Phase 3 (done):** independent Codex/GPT QA judge via `codex exec --output-schema` on the ChatGPT subscription (`firm-gpt-qa`, two-voice QA); needs `codex login` (see docs/PHASE3.md).
 - **Phase 4 (done):** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
-- **Phase 5:** egress firewall, visual-regression suite, Slack/phone approvals, golden evals, optional durable runners.
+- **Phase 5 (done):** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).

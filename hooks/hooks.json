@@ -7,6 +7,14 @@
           { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/firm-ledger-hook\"" }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/firm-notify\"", "timeout": 15 }
+        ]
+      }
     ]
   }
 }

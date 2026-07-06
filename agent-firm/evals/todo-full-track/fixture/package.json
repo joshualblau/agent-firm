@@ -1,0 +1,9 @@
+{
+  "name": "todo-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: full-track. The firm must add a TODO module + tests and go through the full lifecycle to an APPROVE verdict, stopping at the final gate.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

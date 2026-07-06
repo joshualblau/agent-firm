@@ -1,0 +1,15 @@
+name: todo-full-track
+description: The firm can take a small feature through the FULL track (Requirements + Architecture gates, reviewer panel, QA) to an APPROVE verdict with evidence, stopping at the final gate without merging.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/todo.js
+  - file_exists: test/todo.test.js
+  - test_passes: node --test
+  - artifact_exists: 01-acceptance-criteria.yaml
+  - artifact_exists: 07-review-findings.yaml
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - traceability_passes: true
+  - no_default_branch_merge: true
+  - final_gate_pending: true

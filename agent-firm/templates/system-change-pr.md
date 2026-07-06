@@ -29,6 +29,8 @@ reviewed for generalizability, approved by the human, versioned, and guarded by 
      regress it. Name the eval added/updated under agent-firm/evals/. -->
 - Eval: `agent-firm/evals/<name>/`
 - What it asserts:
+- [ ] Golden evals pass (`firm-run-evals`) — attach the run output. If an eval changed, explain why the
+      new behavior is correct (not just newly-passing).
 
 ## Human decision
 - [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:

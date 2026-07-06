@@ -1,32 +1,99 @@
 #!/usr/bin/env bash
-# run-evals [eval-name]
-# Phase 1: validate eval STRUCTURE and list the golden-task suite.
-# Phase 5: drive the firm against each fixture and check assertions (needs the autonomous-run
-# permission posture to be settled). For now this is the structural guard.
-set -euo pipefail
+# firm-run-evals [--structural] [eval-name]
+# Golden evals: DRIVE the firm headlessly against each fixture under a BOUNDED permission posture, then
+# check assertions.yaml. `--structural` keeps the Phase-1 structure-only check (no model run).
+#
+# NEVER uses --dangerously-skip-permissions / bypassPermissions: the eval must exercise the firm's own
+# guardrails, and the `final_gate_pending` assertion relies on the firm stopping deliberately (not
+# barreling through the final gate). The bounded posture = --permission-mode default + a scoped
+# --allowedTools + --disallowedTools, so anything not allow-listed cannot proceed in headless mode.
+#
+# Requires: the agent-firm plugin installed (firm-bootstrap) so the firm's subagents + bin/firm-* tools
+# are available, and `claude` logged in. Run mode does NOT run in CI without a Claude login.
+set -uo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EVALS="$(cd "$SELF/.." && pwd)/agent-firm/evals"
+ROOT="$(cd "$SELF/.." && pwd)"
+EVALS="$ROOT/agent-firm/evals"
+MANUAL="$ROOT/CLAUDE.md"                 # firm operating manual — injected as an appended system prompt
+SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
 
+mode=run
+[ "${1:-}" = "--structural" ] && { mode=structural; shift; }
 want="${1:-}"
+
+structural_check() { # $1 = eval dir -> 0 ok, 1 bad
+  local d="$1" ok=1
+  [ -f "$d/task.md" ]         || { echo "  MISSING task.md"; ok=0; }
+  [ -f "$d/assertions.yaml" ] || { echo "  MISSING assertions.yaml"; ok=0; }
+  [ -d "$d/fixture" ]         || { echo "  MISSING fixture/"; ok=0; }
+  [ "$ok" -eq 1 ]
+}
+
+# A hook-free copy of the firm settings: the real settings.json registers a PreToolUse hook pointing at
+# the project's bin/firm-ledger-hook, which doesn't exist in an eval scratch repo (it would fail every
+# Bash call). Strip "hooks" so the eval loads only the allow/ask/deny posture.
+make_eval_settings() { # $1 = dest file
+  python3 - "$SETTINGS" "$1" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = json.load(open(src)); d.pop("hooks", None)
+json.dump(d, open(dst, "w"), indent=2)
+PY
+}
+
+run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
+  local d="$1" name="$2"
+  command -v claude >/dev/null 2>&1 || { echo "SKIP $name: 'claude' not found"; return 4; }
+
+  local scratch; scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-${name}.XXXXXX")"
+  cp -R "$d/fixture/." "$scratch/" 2>/dev/null || true
+  ( cd "$scratch" && git init -q && git add -A \
+      && git -c user.email=eval@firm -c user.name=eval commit -qm fixture ) || { echo "SKIP $name: git init failed"; return 4; }
+  local out="$scratch/.eval-out"; mkdir -p "$out"
+  make_eval_settings "$out/settings.json"
+
+  echo "==> $name: driving the firm headlessly (bounded posture) in $scratch"
+  # AskUserQuestion / merge / push are deliberately NOT allow-listed, so the firm cannot autonomously
+  # pass the final human gate in -p mode — that's how final_gate_pending is provable.
+  ( cd "$scratch" && claude -p "$(cat "$d/task.md")" \
+      --append-system-prompt "$(cat "$MANUAL")" \
+      --settings "$out/settings.json" \
+      --permission-mode default \
+      --allowedTools "Read,Edit,Write,Grep,Glob,Bash(firm-new-run:*),Bash(firm-ledger-log:*),Bash(firm-validate-verdict:*),Bash(firm-traceability-check:*),Bash(firm-qa-checkout:*),Bash(firm-integrate:*),Bash(firm-new-worktree:*),Bash(firm-gpt-qa:*),Bash(git add:*),Bash(git commit:*),Bash(git worktree:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(node --test),Bash(node --test:*),Bash(npm test:*),Bash(npm run test:*),Bash(pytest:*)" \
+      --disallowedTools "Bash(git push:*),Bash(git merge:*)" \
+      --max-budget-usd "${FIRM_EVAL_BUDGET_USD:-5.00}" \
+      --output-format json ) > "$out/result.json" 2>"$out/stderr.log" \
+      || echo "  (claude exited non-zero — see $out/stderr.log)" >&2
+
+  # Show the run envelope summary for observability.
+  python3 - "$out/result.json" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+print("    envelope:", {k:d.get(k) for k in ("subtype","is_error","num_turns","stop_reason","total_cost_usd")})
+print("    permission_denials:", len(d.get("permission_denials") or []))
+PY
+
+  "$SELF/firm-check-assertions" "$d/assertions.yaml" "$scratch" "$out/result.json"
+  local rc=$?
+  echo "    (scratch: $scratch — inspect .eval-out/ and .agent-firm/ on failure)"
+  return $rc
+}
+
 rc=0; n=0
 for d in "$EVALS"/*/; do
-  [[ -d "$d" ]] || continue
-  name="$(basename "$d")"
-  [[ "$name" == "README.md" ]] && continue
-  [[ -n "$want" && "$want" != "$name" ]] && continue
+  [ -d "$d" ] || continue
+  name="$(basename "$d")"; [ "$name" = "README.md" ] && continue
+  [ -n "$want" ] && [ "$want" != "$name" ] && continue
   n=$((n+1))
-  ok=1
-  [[ -f "$d/task.md" ]]        || { echo "  MISSING task.md"; ok=0; }
-  [[ -f "$d/assertions.yaml" ]] || { echo "  MISSING assertions.yaml"; ok=0; }
-  [[ -d "$d/fixture" ]]        || { echo "  MISSING fixture/"; ok=0; }
-  if [[ $ok -eq 1 ]]; then
-    a_count="$(grep -cE '^\s*-\s' "$d/assertions.yaml" || true)"
-    echo "ok   $name  ($a_count assertions)"
-  else
-    echo "BAD  $name"; rc=1
+  if ! structural_check "$d"; then echo "BAD  $name (structure)"; rc=1; continue; fi
+  if [ "$mode" = "structural" ]; then
+    a="$(grep -cE '^[[:space:]]*-[[:space:]]' "$d/assertions.yaml" 2>/dev/null || echo 0)"
+    echo "ok   $name ($a assertions)"; continue
   fi
+  if run_one "$d" "$name"; then echo "PASS $name"; else echo "FAIL $name"; rc=1; fi
 done
-[[ $n -eq 0 ]] && { echo "no evals found in $EVALS"; exit 0; }
+[ "$n" -eq 0 ] && { echo "no evals in $EVALS"; exit 0; }
 echo "---"
-echo "$n eval(s) structurally valid. Full execution lands in Phase 5 (see agent-firm/evals/README.md)."
-exit $rc
+[ "$rc" -eq 0 ] && echo "all evals passed" || echo "some evals FAILED"
+exit "$rc"
