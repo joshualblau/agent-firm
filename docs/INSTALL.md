@@ -30,18 +30,16 @@ claude plugin install agent-firm@heights-labs         # user scope = all project
 ## On a NEW device (first get the repo there)
 The plugin is served from this repo, so the repo must exist on the new machine first.
 
-1. **Get the repo onto the device** — one of:
-   - `git clone <your-remote> ~/agent-firm` (needs a git remote — not set up yet; see below), or
-   - copy `~/agent-firm` over (rsync/scp/USB), or
-   - (later) `chezmoi`-managed dotfiles, the rest of Phase 4.
+1. **Clone the repo** (private — you'll need `gh auth login` or a GitHub credential on the new device first):
+   ```bash
+   git clone https://github.com/joshualblau/agent-firm.git ~/agent-firm
+   ```
+   (Or copy `~/agent-firm` over via rsync/scp; or, later, chezmoi-managed dotfiles.)
 2. **Run the bootstrap:**
    ```bash
    ~/agent-firm/bin/firm-bootstrap
    ```
 3. Per project: `firm-install`, then `claude` → `/agent-firm:start`.
-
-> No git remote is configured yet, so cross-device sync needs one. Ask me to "set up a remote for the
-> firm" and I'll wire it up (you'll push), after which step 1 is just `git clone`.
 
 ## Update to a newer firm version (propagate an improvement)
 After the canonical repo changes and its `version` is bumped:
