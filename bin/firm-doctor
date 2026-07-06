@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# firm-doctor [--probe]
+# Fail-closed profile / secrets / subscription doctor for the agent-firm.
+#
+# It answers one question with evidence: "is this project safely wired to my SUBSCRIPTION
+# accounts, with no metered-API leak, isolated per-profile config, and working op+direnv secret
+# plumbing?" The HEADLINE check is fail-closed: if a metered-API key is exported in a subscription
+# project it ABORTS (exit 1), because such a key silently outranks your subscription and bills per token.
+#
+# Checks (see docs/PHASE4.md part 2):
+#   1. BILLING GUARD (fail-closed): no ANTHROPIC_/OPENAI_/CODEX_API_KEY leaking into a subscription project
+#   2. op (1Password CLI) present, >= 2.18.0, authenticated non-interactively (service-account)
+#   3. direnv present, shell hook installed, current .envrc allowed
+#   4. git hygiene: .env.op holds op:// REFERENCES only; secrets/auth are gitignored, none tracked
+#   5. op:// references in .env.op actually resolve  (with --probe, or when op is authed)
+#   6. Claude profile: CLAUDE_CONFIG_DIR isolated + CLAUDE_CODE_OAUTH_TOKEN present (macOS account switch)
+#   7. Codex profile: CODEX_HOME isolated + has its own auth.json (switches the ChatGPT account)
+#   8. codex present (the Phase-3 GPT QA judge), chezmoi bootstrap sanity (informational)
+#
+# Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
+#   --probe   also run live account probes (op run resolve, codex login status) — needs network.
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PROBE=0
+case "${1:-}" in
+  --probe) PROBE=1 ;;
+  -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  '') : ;;
+  *) echo "firm-doctor: unknown arg '$1' (use --probe or --help)" >&2; exit 2 ;;
+esac
+
+# ---- output helpers ------------------------------------------------------
+FAILS=0; WARNS=0; PASSES=0
+r=""; g=""; y=""; rd=""; dim=""
+if [ -t 1 ]; then r=$'\033[0m'; g=$'\033[32m'; y=$'\033[33m'; rd=$'\033[31m'; dim=$'\033[2m'; fi
+pass(){ PASSES=$((PASSES+1)); printf '  %sPASS%s %s\n' "$g" "$r" "$1"; }
+warn(){ WARNS=$((WARNS+1));  printf '  %sWARN%s %s\n' "$y" "$r" "$1"; }
+fail(){ FAILS=$((FAILS+1));  printf '  %sFAIL%s %s\n' "$rd" "$r" "$1"; }
+info(){ printf '  %s·%s %s%s\n' "$dim" "$r" "$dim" "$1$r"; }
+section(){ printf '\n%s%s%s\n' "$dim" "$1" "$r"; }
+
+# perl-alarm wall-clock cap (macOS has no `timeout`); falls back to no cap if perl is absent.
+run_capped(){ secs="$1"; shift; if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift @ARGV; exec @ARGV' "$secs" "$@"; else "$@"; fi; }
+# numeric "A >= B" for dotted versions (2.18.0 style), awk-based (portable, no sort -V).
+ver_ge(){ awk -v a="$1" -v b="$2" 'BEGIN{na=split(a,A,"."); nb=split(b,B,"."); n=(na>nb)?na:nb; for(i=1;i<=n;i++){x=A[i]+0;y=B[i]+0; if(x>y){print "y";exit} if(x<y){print "n";exit}} print "y"}' | grep -q y; }
+
+printf '%sagent-firm doctor%s  (%s)\n' "$dim" "$r" "$(pwd)"
+
+# ==========================================================================
+# 0. Subscription-context detection (drives fail-closed severity below)
+# ==========================================================================
+SUB=0
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && SUB=1
+[ -n "${FIRM_PROFILE:-}" ] && SUB=1
+[ -n "${CODEX_HOME:-}" ] && [ "${CODEX_HOME:-}" != "$HOME/.codex" ] && SUB=1
+[ -f .env.op ] && SUB=1
+
+# ==========================================================================
+# 1. BILLING GUARD — the fail-closed headline
+# ==========================================================================
+section "1. Billing guard (metered-API leak)"
+leaked=""
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY; do
+  [ -n "${!v:-}" ] && leaked="$leaked $v"
+done
+if [ -n "$leaked" ]; then
+  if [ "$SUB" = 1 ]; then
+    fail "metered-API key(s) exported in a SUBSCRIPTION project:$leaked"
+    info  "these OUTRANK your subscription auth and silently bill per token. The .envrc unsets them; run 'unset$leaked' in this shell."
+  else
+    warn "API key(s) set:$leaked — metered/API mode (no subscription context detected). Fine only if that's intended."
+  fi
+else
+  pass "no metered-API key leak (ANTHROPIC_/OPENAI_/CODEX_API_KEY all unset)"
+fi
+if [ -n "${OP_CONNECT_HOST:-}${OP_CONNECT_TOKEN:-}" ]; then
+  warn "OP_CONNECT_HOST/OP_CONNECT_TOKEN set — these override OP_SERVICE_ACCOUNT_TOKEN; unset them for portable service-account auth."
+fi
+
+# ==========================================================================
+# 2. 1Password CLI (op)
+# ==========================================================================
+section "2. 1Password CLI (op)"
+if command -v op >/dev/null 2>&1; then
+  opv="$(op --version 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  if [ -n "$opv" ] && ver_ge "$opv" "2.18.0"; then
+    pass "op $opv (>= 2.18.0, supports service-account tokens)"
+  else
+    warn "op ${opv:-unknown} is older than 2.18.0 — service-account tokens need 2.18.0+; upgrade with 'brew upgrade 1password-cli'."
+  fi
+  if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+    if run_capped 15 op whoami >/dev/null 2>&1; then
+      pass "op authenticated non-interactively (service account)"
+    else
+      if [ -f .env.op ]; then fail "OP_SERVICE_ACCOUNT_TOKEN set but 'op whoami' failed — this project's .env.op secrets won't resolve."
+      else warn "OP_SERVICE_ACCOUNT_TOKEN set but 'op whoami' failed (bad/expired token or no network)."; fi
+    fi
+  else
+    if [ -f .env.op ]; then warn "OP_SERVICE_ACCOUNT_TOKEN not set — .env.op op:// references can't resolve headlessly. Export it (from a shared vault; hand-carried on new machines)."
+    else info "OP_SERVICE_ACCOUNT_TOKEN not set (no .env.op in this project, so not required here)."; fi
+  fi
+else
+  if [ "$SUB" = 1 ]; then warn "op not found but this looks like a subscription project — install the 1Password CLI to resolve op:// secrets ('brew install 1password-cli')."
+  else info "op not found (no secrets plumbing needed here)."; fi
+fi
+
+# ==========================================================================
+# 3. direnv
+# ==========================================================================
+section "3. direnv"
+if command -v direnv >/dev/null 2>&1; then
+  pass "direnv present"
+  hookfound=0
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    [ -f "$rc" ] && grep -q 'direnv hook' "$rc" 2>/dev/null && hookfound=1
+  done
+  if [ "$hookfound" = 1 ]; then pass "direnv shell hook installed"; else warn "direnv shell hook not found in ~/.zshrc — add: eval \"\$(direnv hook zsh)\""; fi
+  if [ -f .envrc ]; then
+    st="$(direnv status 2>/dev/null)"
+    case "$st" in
+      *"Found RC allowed true"*|*"Found RC allowed 0"*) pass ".envrc is allowed (loaded on cd)" ;;
+      *) warn ".envrc present but not allowed — run 'direnv allow' in this directory (approval is per-machine by design)." ;;
+    esac
+  else
+    if [ -f .envrc.example ]; then info "no .envrc yet — 'cp .envrc.example .envrc', set FIRM_PROFILE, then 'direnv allow'."; else info "no .envrc in this directory."; fi
+  fi
+else
+  if [ "$SUB" = 1 ]; then warn "direnv not found — install it so .envrc auto-loads on cd ('brew install direnv')."
+  else info "direnv not found (not required outside a firm profile)."; fi
+fi
+
+# ==========================================================================
+# 4. git hygiene — refs-only .env.op, secrets gitignored, none tracked
+# ==========================================================================
+section "4. git hygiene"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # 4a. .env.op must carry ONLY op:// references (no plaintext values)
+  if [ -f .env.op ]; then
+    bad=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|\#*) continue ;; esac
+      l="${line#export }"
+      case "$l" in *=*) : ;; *) continue ;; esac
+      val="${l#*=}"; val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+      case "$val" in
+        op://*) : ;;
+        '$('*|'`'*) : ;;                       # a command substitution that resolves at load-time is acceptable
+        *) bad="$bad ${l%%=*}" ;;              # a literal value = plaintext secret
+      esac
+    done < .env.op
+    if [ -n "$bad" ]; then fail ".env.op contains non-op:// value(s) for:$bad — .env.op must hold op:// REFERENCES only, never secret values."
+    else pass ".env.op holds op:// references only (no plaintext secrets)"; fi
+  else
+    info "no .env.op in this project (nothing to scan)."
+  fi
+  # 4b. secret/auth paths must be gitignored
+  notign=""
+  for p in .envrc .env .env.op.local .direnv/x .claude-work/x .codex-work/x sub/auth.json; do
+    git check-ignore -q "$p" 2>/dev/null || notign="$notign $p"
+  done
+  if [ -n "$notign" ]; then fail "these secret/auth paths are NOT gitignored:$notign — add them to .gitignore before committing."
+  else pass "secret/auth paths (.envrc, .env*, .direnv, .claude-*/, .codex-*/, **/auth.json) are gitignored"; fi
+  # 4c. no obviously-secret file is tracked
+  tracked="$(git ls-files 2>/dev/null | grep -E '(^|/)(auth\.json|\.env|\.envrc)$' | grep -vE '(\.example|\.op)$' || true)"
+  if [ -n "$tracked" ]; then fail "secret file(s) are tracked in git: $(echo $tracked | tr '\n' ' ')— remove with 'git rm --cached'."
+  else pass "no secret/auth file is tracked in git"; fi
+  # 4d. .env.op itself SHOULD be committed (references only) when present
+  if [ -f .env.op ] && git check-ignore -q .env.op 2>/dev/null; then
+    warn ".env.op is gitignored — it holds only op:// references and is meant to be COMMITTED; add '!.env.op' to .gitignore."
+  fi
+else
+  info "not inside a git work tree — skipping tracked-file / gitignore checks."
+fi
+
+# ==========================================================================
+# 5. op:// references resolve (live; on --probe or when op is authed)
+# ==========================================================================
+if [ -f .env.op ] && command -v op >/dev/null 2>&1 && [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+  section "5. op:// reference resolution"
+  if run_capped 25 op run --no-masking --env-file=.env.op -- true >/dev/null 2>&1; then
+    pass "every op:// reference in .env.op resolves"
+  else
+    fail "one or more op:// references in .env.op do NOT resolve — wrong vault/item/field, a Private-vault ref a service account can't read, or a renamed item. Run 'op run --env-file=.env.op -- true' to see which."
+  fi
+fi
+
+# ==========================================================================
+# 6. Claude profile isolation + account switch
+# ==========================================================================
+section "6. Claude profile"
+DEF_CLAUDE="$HOME/.claude"
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  if [ -d "$CLAUDE_CONFIG_DIR" ]; then pass "CLAUDE_CONFIG_DIR isolates settings/agents/history/MCP: $CLAUDE_CONFIG_DIR"
+  else warn "CLAUDE_CONFIG_DIR set to $CLAUDE_CONFIG_DIR but that directory doesn't exist yet — log in once: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude  (then /login)."; fi
+  if [ -n "${FIRM_PROFILE:-}" ] && [ "$CLAUDE_CONFIG_DIR" = "$DEF_CLAUDE" ]; then
+    warn "FIRM_PROFILE=$FIRM_PROFILE but CLAUDE_CONFIG_DIR is the default ~/.claude — profile isolation isn't applied."
+  fi
+else
+  if [ "$SUB" = 1 ]; then warn "CLAUDE_CONFIG_DIR unset in a subscription project — set it via .envrc (CLAUDE_CONFIG_DIR=\$HOME/.claude-\$FIRM_PROFILE)."
+  else info "CLAUDE_CONFIG_DIR unset (using the default ~/.claude)."; fi
+fi
+info "macOS caveat: CLAUDE_CONFIG_DIR isolates SETTINGS but does NOT switch the subscription account (auth lives in the login Keychain)."
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  pass "CLAUDE_CODE_OAUTH_TOKEN present — overrides the shared Keychain so THIS account is used (real per-project switch)"
+else
+  if [ "$SUB" = 1 ]; then warn "CLAUDE_CODE_OAUTH_TOKEN not set — on macOS the account won't switch per project. Run 'claude setup-token' for this account, store it in op, and reference it from .env.op."
+  else info "CLAUDE_CODE_OAUTH_TOKEN not set."; fi
+fi
+if [ "$PROBE" = 1 ] && command -v claude >/dev/null 2>&1; then
+  info "probe: run 'claude' then /status to confirm auth is subscription-OAuth-token (not an API key)."
+fi
+
+# ==========================================================================
+# 7. Codex profile isolation (switches the ChatGPT account)
+# ==========================================================================
+section "7. Codex profile"
+DEF_CODEX="$HOME/.codex"
+if [ -n "${CODEX_HOME:-}" ]; then
+  if [ "$CODEX_HOME" = "$DEF_CODEX" ]; then info "CODEX_HOME is the default ~/.codex (single ChatGPT account)."
+  else pass "CODEX_HOME isolates the ChatGPT account: $CODEX_HOME"; fi
+  if [ -d "$CODEX_HOME" ]; then
+    if [ -f "$CODEX_HOME/auth.json" ]; then pass "$CODEX_HOME/auth.json present (a distinct logged-in ChatGPT account)"
+    else warn "$CODEX_HOME has no auth.json — log in once: CODEX_HOME=$CODEX_HOME codex login."; fi
+  else
+    warn "CODEX_HOME=$CODEX_HOME doesn't exist yet — create it by logging in: CODEX_HOME=$CODEX_HOME codex login."
+  fi
+  if [ "$PROBE" = 1 ] && command -v codex >/dev/null 2>&1; then
+    if run_capped 20 env CODEX_HOME="$CODEX_HOME" codex login status >/dev/null 2>&1; then pass "codex login status OK under $CODEX_HOME"
+    else warn "codex login status failed under $CODEX_HOME — not logged in on that profile (or no network)."; fi
+  fi
+else
+  if [ "$SUB" = 1 ]; then warn "CODEX_HOME unset in a subscription project — set it via .envrc (CODEX_HOME=\$HOME/.codex-\$FIRM_PROFILE) to select the ChatGPT account."
+  else info "CODEX_HOME unset (using the default ~/.codex)."; fi
+fi
+info "Codex config profiles (--profile) do NOT switch accounts — only CODEX_HOME does."
+
+# ==========================================================================
+# 8. Tooling sanity (GPT judge + bootstrap) — informational
+# ==========================================================================
+section "8. Tooling"
+if command -v codex >/dev/null 2>&1; then pass "codex present — the Phase-3 GPT QA judge (firm-gpt-qa) can run"
+else warn "codex not found — firm-gpt-qa degrades gracefully to Claude-only QA (never treated as a pass)."; fi
+if command -v chezmoi >/dev/null 2>&1; then
+  cfg="$HOME/.config/chezmoi/chezmoi.toml"
+  if [ -f "$cfg" ] && grep -q 'mode *= *"service"' "$cfg" 2>/dev/null; then pass "chezmoi present + [onepassword] mode=\"service\" (reproducible second-machine bootstrap)"
+  else info "chezmoi present; ~/.config/chezmoi/chezmoi.toml has no [onepassword] mode=\"service\" yet (see docs/PHASE4.md)."; fi
+else
+  info "chezmoi not installed (only needed for second-machine bootstrap)."
+fi
+
+# ==========================================================================
+# Summary
+# ==========================================================================
+printf '\n%s────────%s\n' "$dim" "$r"
+printf 'Summary: %s%d PASS%s · %s%d WARN%s · %s%d FAIL%s\n' "$g" "$PASSES" "$r" "$y" "$WARNS" "$r" "$rd" "$FAILS" "$r"
+if [ "$FAILS" -gt 0 ]; then
+  printf '%sFAIL — resolve the fail-closed issues above before running the firm on this project.%s\n' "$rd" "$r"
+  exit 1
+fi
+if [ "$WARNS" -gt 0 ]; then printf '%sOK with warnings — advisory items above are worth fixing.%s\n' "$y" "$r"; fi
+exit 0

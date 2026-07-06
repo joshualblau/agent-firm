@@ -60,7 +60,8 @@ AGENTS.md                     # Codex's instructions (independent GPT QA judge)
 bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
                               #   firm-integrate, firm-qa-checkout, firm-traceability-check, firm-policy,
                               #   firm-hire, firm-gpt-qa, firm-propose-system-change, firm-run-evals,
-                              #   firm-install, firm-bootstrap
+                              #   firm-install, firm-bootstrap, firm-doctor
+.envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget
 agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staffing-plan
 agent-firm/templates/*        # run-ledger artifact templates
@@ -77,5 +78,5 @@ docs/PHASE*.md                # what's built per phase + the roadmap
 - **Phase 1 (done):** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
 - **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts; promote only via ≥3 uses or approval).
 - **Phase 3 (done):** independent Codex/GPT QA judge via `codex exec --output-schema` on the ChatGPT subscription (`firm-gpt-qa`, two-voice QA); needs `codex login` (see docs/PHASE3.md).
-- **Phase 4:** versioned plugin distribution **(done)**; remaining: multi-profile secrets (`op` + direnv, `CLAUDE_CONFIG_DIR` + `CODEX_HOME`), second-machine bootstrap.
+- **Phase 4 (done):** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
 - **Phase 5:** egress firewall, visual-regression suite, Slack/phone approvals, golden evals, optional durable runners.

@@ -1,15 +1,32 @@
 # Never commit secrets or machine-local auth/state. Portable config travels; secrets do not.
+# NOTE: git only treats '#' as a comment at the START of a line. Keep comments on their own
+# lines — an inline '# ...' becomes part of the pattern and silently breaks the ignore.
+
+# Resolved env files + machine-local overrides
 .env
 .env.*
 !.env.example
+
+# op:// REFERENCE files are meant to be COMMITTED (references only, no values) — Pattern B.
+!.env.op
+!.env.op.example
+# ...but per-machine reference overrides are not:
+.env.op.local
+
 *.local.*
-.envrc                 # machine-local; commit .envrc.example instead
+
+# direnv: commit .envrc.example; never the machine-local .envrc / overrides
+.envrc
+!.envrc.example
+.envrc.private
 .direnv/
 
 # Auth caches / credential stores (treat as secrets)
 **/auth.json
-.claude-*/             # per-account Claude config dirs
-.codex-*/              # per-account Codex config dirs
+# per-account Claude config dirs
+.claude-*/
+# per-account Codex config dirs
+.codex-*/
 
 # Per-run ledgers live in the WORK project, not in the firm repo; ignore if generated here
 .agent-firm/runs/

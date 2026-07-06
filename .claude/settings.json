@@ -19,6 +19,7 @@
       "Bash(firm-run-evals:*)",
       "Bash(firm-propose-system-change:*)",
       "Bash(firm-gpt-qa:*)",
+      "Bash(firm-doctor:*)",
       "Bash(codex exec:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",

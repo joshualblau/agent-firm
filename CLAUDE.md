@@ -89,10 +89,13 @@ deliverable** — for the human to approve and version. Accepted changes are gua
 (`firm-run-evals`) so a later change can't silently regress them.
 
 ## Phase status
-Phase 0–2 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
+Phase 0–4 done: core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
 worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, the
-retrospective → System-Change-PR + golden-eval loop; and the `recruiter` + generic `specialist` +
-`firm-hire` staffing mechanism (hire per engagement; bench stays general). Distributed as a versioned
-plugin (Phase 4 part 1).
-Not yet wired: the Codex GPT QA judge (Phase 3), multi-profile secrets (rest of Phase 4), egress
-firewall + visual regression + full eval execution (Phase 5). See `docs/` and the plan.
+retrospective → System-Change-PR + golden-eval loop; the `recruiter` + generic `specialist` +
+`firm-hire` staffing mechanism (hire per engagement; bench stays general); the independent Codex/GPT QA
+judge (`firm-gpt-qa`, two-voice QA — both must APPROVE); and portability — a versioned plugin plus
+per-project subscription profiles + `op`/direnv secrets guarded by a fail-closed `firm-doctor`
+(run it before an engagement; `CLAUDE_CODE_OAUTH_TOKEN` switches the Claude account on macOS,
+`CODEX_HOME` switches ChatGPT; keep `*_API_KEY` unset on subscription projects). See `docs/PHASE4.md`.
+Not yet wired: egress firewall, visual-regression suite, Slack/phone approvals, full golden-eval
+execution (Phase 5). See `docs/` and the plan.

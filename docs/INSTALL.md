@@ -13,6 +13,14 @@ Then, per project (once):
 cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
+**Optional — per-project subscription profile + secrets** (see [PHASE4.md](PHASE4.md) part 2 for the
+one-time account setup with `op`, `direnv`, and `claude setup-token`):
+```bash
+cp ~/agent-firm/.envrc.example .envrc    # set FIRM_PROFILE (which account this repo uses)
+cp ~/agent-firm/.env.op.example .env.op  # edit the op:// references (commit this — references only)
+direnv allow                             # loads the profile + secrets on cd
+firm-doctor                              # fail-closed: no API-key leak, profiles isolated, op+direnv wired
+```
 Start an engagement:
 ```bash
 claude
@@ -40,6 +48,9 @@ The plugin is served from this repo, so the repo must exist on the new machine f
    ~/agent-firm/bin/firm-bootstrap
    ```
 3. Per project: `firm-install`, then `claude` → `/agent-firm:start`.
+
+For a full second-machine bootstrap that also carries your profiles/secrets (chezmoi for home glue +
+one hand-carried 1Password service-account token), see [PHASE4.md](PHASE4.md) part 2.
 
 ## Update to a newer firm version (propagate an improvement)
 After the canonical repo changes and its `version` is bumped:

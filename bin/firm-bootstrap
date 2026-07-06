@@ -39,6 +39,9 @@ cat <<'EOF'
 
 Done. Next steps:
   cd <your project> && firm-install     # grant the firm's permission policy (once per project)
+  # (optional) profile + secrets: cp ~/agent-firm/.envrc.example .envrc && cp ~/agent-firm/.env.op.example .env.op
+  #            edit FIRM_PROFILE + op:// refs, then:  direnv allow
+  firm-doctor                           # fail-closed check: no API-key leak, profiles isolated, op+direnv wired
   claude                                # then, inside the session:  /agent-firm:start <your goal>
 
 Note: restart any already-running claude session so it loads/refreshes the plugin.

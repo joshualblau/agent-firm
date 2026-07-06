@@ -1,0 +1,57 @@
+# .envrc.example — per-project profile + secrets loader for direnv.
+# Copy to .envrc, edit FIRM_PROFILE, then run:  direnv allow
+#
+# COMMITTED AS DOCUMENTATION. direnv loads only a file named `.envrc` (which is gitignored as
+# machine-local — see .gitignore); it never loads `.envrc.example`. This file holds ZERO secrets:
+# only op:// REFERENCES (in the companion .env.op) and a per-project profile name. Real secret
+# VALUES are resolved at cd-time by 1Password's `op` and never touch disk.
+#
+# ---------------------------------------------------------------------------
+# 0. Fail closed if the tools this project depends on are missing.
+# ---------------------------------------------------------------------------
+if ! has op;     then echo 'direnv: op (1Password CLI) not found — run firm-doctor' >&2; exit 1; fi
+if ! has direnv; then echo 'direnv: direnv not found' >&2; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# 1. Kill metered-API billing traps BEFORE anything else.
+#    An exported ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN outranks the Claude subscription token;
+#    OPENAI_API_KEY / CODEX_API_KEY outrank the ChatGPT subscription. On a SUBSCRIPTION project these
+#    must be unset or you silently pay per token. OP_CONNECT_* would shadow the op service-account token.
+# ---------------------------------------------------------------------------
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+unset OPENAI_API_KEY CODEX_API_KEY
+unset OP_CONNECT_HOST OP_CONNECT_TOKEN
+
+# ---------------------------------------------------------------------------
+# 2. Per-project PROFILE = which subscription account this repo uses.
+#    CLAUDE_CONFIG_DIR isolates Claude SETTINGS/agents/history/MCP on all OSes.
+#    CODEX_HOME isolates AND switches the ChatGPT account (its own auth.json).
+#    (On macOS, CLAUDE_CONFIG_DIR alone does NOT switch the Claude account — step 3 handles that.)
+# ---------------------------------------------------------------------------
+export FIRM_PROFILE="work"                                   # e.g. work | personal | client-acme
+export CLAUDE_CONFIG_DIR="$HOME/.claude-${FIRM_PROFILE}"
+export CODEX_HOME="$HOME/.codex-${FIRM_PROFILE}"
+
+# ---------------------------------------------------------------------------
+# 3. Secrets as op:// REFERENCES, resolved once on cd. Pattern B: a single `op run` resolves every
+#    reference in .env.op, and `direnv dump` captures the resulting env so subprocesses inherit it and
+#    nothing plaintext is written to disk. --no-masking is REQUIRED so values pass cleanly to dump.
+#    The Claude subscription token lives here (op://) because on macOS it must OUTRANK the login
+#    Keychain to make the per-project account switch real. See .env.op.example for the reference list.
+# ---------------------------------------------------------------------------
+direnv_load op run --no-masking --env-file=.env.op -- direnv dump
+
+# ---------------------------------------------------------------------------
+# 4. Optional per-machine overrides NOT in 1Password (gitignored).
+# ---------------------------------------------------------------------------
+source_env_if_exists .envrc.local
+
+# ---------------------------------------------------------------------------
+# 5. Fail loud if a required var never resolved (typo'd ref, wrong vault, missing token).
+# ---------------------------------------------------------------------------
+env_vars_required CLAUDE_CONFIG_DIR CODEX_HOME CLAUDE_CODE_OAUTH_TOKEN
+
+# ---------------------------------------------------------------------------
+# 6. Put the firm's tools on PATH for this project (bin/firm-*), if vendored here.
+# ---------------------------------------------------------------------------
+PATH_add bin
