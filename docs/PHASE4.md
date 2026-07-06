@@ -6,7 +6,7 @@ scope. Generalizable improvements flow in through System Change PRs, get a versi
 to every project on `claude plugin update`.
 
 ## How it's packaged
-- `.claude-plugin/marketplace.json` — makes this repo a local marketplace named `heights-labs`.
+- `.claude-plugin/marketplace.json` — makes this repo a local marketplace named `local`.
 - `.claude-plugin/plugin.json` — the `agent-firm` plugin manifest (carries the `version`).
 - **Auto-discovered components** (no manifest paths needed): `agents/` (the 7 roles), `commands/`
   (`/agent-firm:start`), `hooks/hooks.json` (the ledger hook), `bin/` (the `firm-*` tools join `$PATH`).
@@ -17,14 +17,14 @@ to every project on `claude plugin update`.
 ## Install (per machine)
 ```bash
 claude plugin marketplace add ~/agent-firm
-claude plugin install agent-firm@heights-labs        # user scope = all projects
+claude plugin install agent-firm@local        # user scope = all projects
 ```
 Per project, once: `firm-install` (grants the firm's permission policy). Then `claude` → `/agent-firm:start <goal>`.
 
 ## Update flow (propagate a generalizable improvement)
 1. Land the change in `~/agent-firm` (ideally via `firm-propose-system-change` → review → commit).
 2. Bump `version` in `.claude-plugin/plugin.json` (e.g. 0.2.0 → 0.2.1).
-3. `claude plugin marketplace update heights-labs && claude plugin update agent-firm@heights-labs` (restart to apply).
+3. `claude plugin marketplace update local && claude plugin update agent-firm@local` (restart to apply).
 
 Every project that updates picks up the change. Project-specific tweaks stay in that project's
 `.claude/` and never propagate. A change can't reach other projects without a deliberate version bump.
@@ -33,7 +33,7 @@ Every project that updates picks up the change. Project-specific tweaks stay in 
 Plugins install at user scope by default (one version everywhere). To pin a project to a specific
 version, install at project scope and commit it:
 ```bash
-claude plugin install agent-firm@heights-labs --scope project
+claude plugin install agent-firm@local --scope project
 ```
 This writes `extraKnownMarketplaces` + `enabledPlugins` into the repo's `.claude/settings.json`, so an
 in-flight engagement can't be blindsided by a firm change until you choose to bump it.
@@ -42,7 +42,7 @@ in-flight engagement can't be blindsided by a firm change until you choose to bu
 - `claude plugin validate .` passes.
 - Install loads all components: **Agents (7)**, the `start` command, the PreToolUse ledger hook.
 - `firm-install` merges 57 permission rules idempotently.
-- Update flow verified: version bump 0.2.0 → 0.2.1 propagated via `marketplace update` + `plugin update agent-firm@heights-labs`.
+- Update flow verified: version bump 0.2.0 → 0.2.1 propagated via `marketplace update` + `plugin update agent-firm@local`.
 - Tested under an isolated `CLAUDE_CONFIG_DIR` so the global config wasn't touched during development.
 
 ## Not yet (rest of Phase 4)

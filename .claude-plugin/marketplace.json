@@ -1,6 +1,6 @@
 {
-  "name": "heights-labs",
-  "owner": { "name": "Heights Labs" },
+  "name": "local",
+  "owner": { "name": "Josh Blau" },
   "metadata": {
     "description": "Local marketplace hosting the agent-firm plugin."
   },

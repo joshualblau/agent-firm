@@ -24,7 +24,7 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 **Recommended: install as a versioned plugin (shared across all projects, one source of truth).**
 ```bash
 claude plugin marketplace add ~/agent-firm        # register this repo as a local marketplace
-claude plugin install agent-firm@heights-labs     # installs at user scope (all projects)
+claude plugin install agent-firm@local     # installs at user scope (all projects)
 ```
 Then, in any work project (one-time, since a plugin can't ship permissions):
 ```bash
@@ -39,7 +39,7 @@ gates (with a well-formed approval payload), and gates on schema-valid QA eviden
 (`firm-validate-verdict` + `firm-traceability-check`) before the final sign-off.
 
 To update everywhere after a change: bump `version` in `.claude-plugin/plugin.json`, then
-`claude plugin marketplace update heights-labs && claude plugin update agent-firm@heights-labs` (restart to apply).
+`claude plugin marketplace update local && claude plugin update agent-firm@local` (restart to apply).
 
 **Fallback: copy mode** (no plugin). Copy the pieces into the project, mapping agents into `.claude/`:
 ```bash
@@ -72,7 +72,7 @@ docs/PHASE*.md                # what's built per phase + the roadmap
 ## Roadmap (see the plan)
 - **Phase 0 (done):** core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff.
 - **Phase 1 (done):** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
-- **Phase 2:** Recruiter + hireable specialist **bench** (incl. a `heightslabs`-scoped crypto-crime specialist) with job specs, budgets, and evals.
+- **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts; promote only via ≥3 uses or approval).
 - **Phase 3:** Codex/GPT read-only QA judge via `codex exec --output-schema`.
-- **Phase 4:** multi-profile secrets/auth (`op` + direnv, `CLAUDE_CONFIG_DIR` + `CODEX_HOME`), plugin packaging, second-machine bootstrap.
+- **Phase 4:** versioned plugin distribution **(done)**; remaining: multi-profile secrets (`op` + direnv, `CLAUDE_CONFIG_DIR` + `CODEX_HOME`), second-machine bootstrap.
 - **Phase 5:** egress firewall, visual-regression suite, Slack/phone approvals, golden evals, optional durable runners.

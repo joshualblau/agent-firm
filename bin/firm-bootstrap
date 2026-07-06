@@ -13,20 +13,20 @@ echo "agent-firm bootstrap"
 echo "  repo: $ROOT"
 command -v claude >/dev/null 2>&1 || { echo "ERROR: the 'claude' CLI is not on PATH. Install Claude Code first." >&2; exit 1; }
 
-# 1. Local marketplace (idempotent)
-if claude plugin marketplace list 2>/dev/null | grep -q 'heights-labs'; then
-  echo "  ✔ marketplace 'heights-labs' already registered (updating)"
-  claude plugin marketplace update heights-labs >/dev/null 2>&1 || true
+# 1. Local marketplace (idempotent — match by SOURCE PATH; the name 'local' is too generic to grep)
+if claude plugin marketplace list 2>/dev/null | grep -qF "$ROOT"; then
+  echo "  ✔ marketplace already registered (updating)"
+  claude plugin marketplace update local >/dev/null 2>&1 || true
 else
   claude plugin marketplace add "$ROOT"
 fi
 
 # 2. Plugin (install or update)
-if claude plugin list 2>/dev/null | grep -q 'agent-firm@heights-labs'; then
+if claude plugin list 2>/dev/null | grep -q 'agent-firm@local'; then
   echo "  ✔ plugin already installed — updating to latest"
-  claude plugin update agent-firm@heights-labs || true
+  claude plugin update agent-firm@local || true
 else
-  claude plugin install agent-firm@heights-labs
+  claude plugin install agent-firm@local
 fi
 
 # 3. Optional: permissions into the current project

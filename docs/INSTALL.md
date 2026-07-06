@@ -1,7 +1,7 @@
 # Install & bootstrap the firm (any device)
 
 The firm ships as a **versioned Claude Code plugin** (`agent-firm`) served from a **local marketplace**
-(`heights-labs`) that is this repo. Install it once per machine at user scope, and every project on that
+(`local`) that is this repo. Install it once per machine at user scope, and every project on that
 machine can use it.
 
 ## TL;DR (machine that already has this repo)
@@ -24,7 +24,7 @@ Restart any already-running `claude` session so it loads the plugin.
 ## Manual steps (what firm-bootstrap does)
 ```bash
 claude plugin marketplace add <path-to-this-repo>     # e.g. ~/agent-firm
-claude plugin install agent-firm@heights-labs         # user scope = all projects
+claude plugin install agent-firm@local         # user scope = all projects
 ```
 
 ## On a NEW device (first get the repo there)
@@ -45,8 +45,8 @@ The plugin is served from this repo, so the repo must exist on the new machine f
 After the canonical repo changes and its `version` is bumped:
 ```bash
 git -C ~/agent-firm pull                                    # if using a remote
-claude plugin marketplace update heights-labs
-claude plugin update agent-firm@heights-labs                # restart to apply
+claude plugin marketplace update local
+claude plugin update agent-firm@local                # restart to apply
 ```
 `firm-bootstrap` also updates in place if the plugin is already installed.
 
@@ -54,13 +54,13 @@ claude plugin update agent-firm@heights-labs                # restart to apply
 Default install is user scope (one version everywhere). To pin a project:
 ```bash
 cd <project>
-claude plugin install agent-firm@heights-labs --scope project   # writes enabledPlugins into .claude/settings.json (commit it)
+claude plugin install agent-firm@local --scope project   # writes enabledPlugins into .claude/settings.json (commit it)
 ```
 
 ## Verify / troubleshoot
 ```bash
-claude plugin list                       # should show agent-firm@heights-labs — ✔ enabled
-claude plugin details agent-firm@heights-labs    # Agents (7), the start command, the ledger hook
+claude plugin list                       # should show agent-firm@local — ✔ enabled
+claude plugin details agent-firm@local    # Agents (7), the start command, the ledger hook
 claude plugin validate ~/agent-firm      # manifest check
 ```
 - Components don't appear → restart the `claude` session (plugins load at session start).
@@ -69,6 +69,6 @@ claude plugin validate ~/agent-firm      # manifest check
 
 ## Uninstall
 ```bash
-claude plugin uninstall agent-firm@heights-labs
-claude plugin marketplace remove heights-labs
+claude plugin uninstall agent-firm@local
+claude plugin marketplace remove local
 ```
