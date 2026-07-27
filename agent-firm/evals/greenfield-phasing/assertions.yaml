@@ -1,0 +1,8 @@
+name: greenfield-phasing
+description: For a greenfield multi-module brief whose estimated scope exceeds one run's file cap, the Architect produces a run-phasing plan (>1 run, dependency-ordered) and the firm plans multiple bounded runs rather than attempting a single over-cap run — stopping at the Architecture gate.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - artifact_exists: 02-architecture-options.md
+  - final_gate_pending: true
+  - no_default_branch_merge: true

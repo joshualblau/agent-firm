@@ -1,0 +1,9 @@
+{
+  "name": "greenfield-widgets-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty greenfield product repo; the firm must produce a run-phasing plan (multi-run) at the Architecture gate rather than building all modules in one over-cap run.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

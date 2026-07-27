@@ -1,0 +1,9 @@
+{
+  "name": "least-privilege-grants-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: a relational DB with role separation whose grants.json starts in a least-privilege-VIOLATING state; the firm must correct it (request-path role loses write on protected tables; engagement-scoped tables get FORCE RLS + repo-only access) so the GRANT audit passes.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

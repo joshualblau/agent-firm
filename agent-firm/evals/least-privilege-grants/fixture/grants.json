@@ -1,0 +1,26 @@
+{
+  "_comment": "GRANT audit manifest. STARTS in a least-privilege-VIOLATING state on purpose: request_path has write on protected tables (audit_log, users) and the engagement-scoped table engagement_notes lacks FORCE RLS + is reachable directly by request_path. The firm must correct this so test/grants.test.js passes.",
+  "roles": {
+    "request_path": {
+      "_role": "the role the API/request path connects as",
+      "tables": {
+        "users":            ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "audit_log":        ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "engagement_notes": ["SELECT", "INSERT", "UPDATE", "DELETE"]
+      }
+    },
+    "repository": {
+      "_role": "the trusted repository role; the only role allowed to write engagement-scoped tables",
+      "tables": {
+        "users":            ["SELECT", "INSERT", "UPDATE"],
+        "audit_log":        ["SELECT", "INSERT"],
+        "engagement_notes": ["SELECT", "INSERT", "UPDATE", "DELETE"]
+      }
+    }
+  },
+  "tables": {
+    "users":            { "classification": "identity",             "force_rls": true,  "reachable_only_via_repository": true },
+    "audit_log":        { "classification": "config_append_only",   "force_rls": true,  "reachable_only_via_repository": true },
+    "engagement_notes": { "classification": "engagement_scoped",    "force_rls": false, "reachable_only_via_repository": false }
+  }
+}

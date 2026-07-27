@@ -15,3 +15,11 @@ definition_of_done:
   - rollback / migration notes included if relevant
   - run.jsonl and the run-ledger are complete
   - final human approval recorded in 10-handoff.md
+  # Applies only when the project has a relational DB with role separation:
+  - least-privilege DB grants — for any change adding DB tables/roles, the request-path role holds NO
+    write on catalog/config/append-only/PII/identity tables; every engagement-scoped table has FORCE
+    RLS + repository-only (repo-only) access; the implementer attaches a GRANT audit the reviewer verifies
+  # Applies to any change adding/altering tests:
+  - no-overclaim tests — a test's asserted property is ACTUALLY exercised: a multi-axis / "both X and Y"
+    test must vary EVERY axis it names; a title/describe may not claim a guarantee its body does not
+    drive; the reviewer checks test bodies against their titles

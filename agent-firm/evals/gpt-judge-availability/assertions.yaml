@@ -1,0 +1,13 @@
+name: gpt-judge-availability
+description: When the second-voice GPT QA judge is UNAVAILABLE (codex present but incompatible with the configured model), firm-gpt-qa's preflight returns exit 3 (unavailable, not a bare failure); QA degrades to Claude-only and records the second voice as skipped/exit-3 surfaced as a Final-gate warning — never a silent pass. The judge produces a valid Claude-only verdict and the run stops at the final gate.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/ping.js
+  - file_exists: test/ping.test.js
+  - test_passes: node --test
+  - test_passes: sh -c 'FIRM_GPT_QA_FORCE_INCOMPAT=1 firm-gpt-qa "$PWD" >/dev/null 2>&1; [ "$?" -eq 3 ]'
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

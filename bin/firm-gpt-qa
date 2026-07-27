@@ -5,7 +5,21 @@
 # It hunts for implementation blind spots a same-provider judge might share.
 #
 # Prereqs (see docs/PHASE3.md): `codex` installed + `codex login` on your ChatGPT plan. If codex is
-# absent, this exits 3 and the qa-tester degrades to Claude-only QA (logged), never silently passing.
+# absent OR present-but-incompatible with the configured model, this exits 3 (UNAVAILABLE) and the
+# qa-tester degrades to Claude-only QA (logged), never silently passing.
+#
+# Exit codes:
+#   0 = judge ran and produced a schema-valid verdict
+#   1 = judge RAN and BLOCKED / failed / timed out (a real judgement — surface it)
+#   2 = usage error (no run dir)
+#   3 = judge UNAVAILABLE (codex absent, or codex present but incompatible with the model) -> the
+#       qa-tester degrades to Claude-only QA and the Lead MUST surface this as a Final-gate warning.
+#       Never a silent pass.
+#
+# The model is env-configurable via FIRM_GPT_QA_MODEL (default below). A preflight detects a
+# version/model incompatibility (e.g. codex too old for the configured model -> HTTP 400 "requires a
+# newer Codex") and treats it as UNAVAILABLE (exit 3) with an actionable fix message, rather than
+# letting it look like a generic judge failure (exit 1).
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -14,9 +28,58 @@ ROOT="$(cd "$SELF/.." && pwd)"
 SCHEMA="$ROOT/agent-firm/schemas/qa-verdict.schema.json"
 
 if ! command -v codex >/dev/null 2>&1; then
-  echo "firm-gpt-qa: 'codex' not found. Install the Codex CLI and run 'codex login' on your ChatGPT plan (docs/PHASE3.md). Skipping the GPT judge." >&2
+  echo "firm-gpt-qa: 'codex' not found. Install the Codex CLI and run 'codex login' on your ChatGPT plan (docs/PHASE3.md). Skipping the GPT judge (UNAVAILABLE, exit 3)." >&2
   exit 3
 fi
+
+# The judge model, env-configurable. Default is the model the firm ships with; override to whatever
+# your installed codex supports (this is the human's environment action, NOT a network call we make).
+FIRM_GPT_QA_MODEL="${FIRM_GPT_QA_MODEL:-gpt-5.6-sol}"
+
+# Preflight: codex is PRESENT but may be incompatible with the configured model (the real failure mode:
+# an older codex + model gpt-5.6-sol -> HTTP 400 "requires a newer version of Codex"). Detect that here
+# and treat it as UNAVAILABLE (exit 3), NOT a bare judge failure (exit 1). We do a cheap, offline-ish
+# probe: if codex advertises supported models we check membership; otherwise we run a tiny exec and
+# scan for a version/compat error signature. Any incompat signature => exit 3 with an actionable fix.
+incompat_msg() {
+  cat >&2 <<EOF
+firm-gpt-qa: the installed Codex CLI ($(codex --version 2>/dev/null | head -n1 || echo 'unknown version')) is INCOMPATIBLE with the configured judge model '${FIRM_GPT_QA_MODEL}'.
+  Detail: ${1:-model/version mismatch}
+  Fix (human environment action, pick one):
+    - upgrade the Codex CLI to a version that supports '${FIRM_GPT_QA_MODEL}', OR
+    - set a compatible model:  export FIRM_GPT_QA_MODEL=<a-model-your-codex-supports>
+Skipping the GPT judge (UNAVAILABLE, exit 3) — the qa-tester degrades to Claude-only QA and the Lead MUST surface this at the Final gate. Never a silent pass.
+EOF
+}
+
+preflight_log="$(mktemp "${TMPDIR:-/tmp}/firm-gpt-qa-preflight.XXXXXX")"
+# Allow tests / callers to force the UNAVAILABLE path deterministically without a network round-trip.
+if [[ -n "${FIRM_GPT_QA_FORCE_INCOMPAT:-}" ]]; then
+  incompat_msg "forced via FIRM_GPT_QA_FORCE_INCOMPAT (simulated version/model mismatch)"
+  rm -f "$preflight_log"
+  exit 3
+fi
+# Try a fast list of supported models if the CLI offers one; membership check is authoritative.
+if codex --help 2>/dev/null | grep -qiE '\bmodels?\b.*list|list-models'; then
+  if codex models list >"$preflight_log" 2>&1 || codex models >"$preflight_log" 2>&1; then
+    if [[ -s "$preflight_log" ]] && ! grep -qiF "$FIRM_GPT_QA_MODEL" "$preflight_log"; then
+      incompat_msg "model '${FIRM_GPT_QA_MODEL}' not in codex's supported-model list"
+      rm -f "$preflight_log"; exit 3
+    fi
+  fi
+fi
+# Cheap exec probe: a trivial prompt with the configured model. A version/compat error (HTTP 400
+# "requires a newer version of Codex", "unsupported model", "unknown model", "upgrade") => UNAVAILABLE.
+if ! perl -e 'alarm shift @ARGV; exec @ARGV' "${FIRM_GPT_QA_PREFLIGHT_TIMEOUT:-30}" \
+      codex exec --skip-git-repo-check -m "$FIRM_GPT_QA_MODEL" "reply with: ok" </dev/null >"$preflight_log" 2>&1; then
+  if grep -qiE 'requires a newer version of codex|unsupported model|unknown model|not supported|please upgrade|HTTP 400' "$preflight_log"; then
+    incompat_msg "$(grep -iE 'requires a newer version of codex|unsupported model|unknown model|not supported|please upgrade|HTTP 400' "$preflight_log" | head -n1)"
+    rm -f "$preflight_log"; exit 3
+  fi
+  # A non-compat failure here (e.g. transient/login) is not fatal to preflight; the real judge run
+  # below is authoritative and will exit 1 if it genuinely fails.
+fi
+rm -f "$preflight_log"
 
 run_dir="${1:-}"
 [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
@@ -41,7 +104,7 @@ echo "firm-gpt-qa: running the Codex judge on your ChatGPT subscription..." >&2
 # Hard wall-clock cap via a perl alarm (macOS has no `timeout`); alarm survives exec and terminates codex.
 timeout_secs="${FIRM_GPT_QA_TIMEOUT:-300}"
 if perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" \
-     codex exec --skip-git-repo-check --output-schema "$SCHEMA" -o "$out" "$PROMPT" </dev/null >>"$log" 2>&1; then
+     codex exec --skip-git-repo-check -m "$FIRM_GPT_QA_MODEL" --output-schema "$SCHEMA" -o "$out" "$PROMPT" </dev/null >>"$log" 2>&1; then
   # validate the structured verdict Codex produced
   "$SELF/firm-validate-verdict" "$out"
   [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" gpt_qa file="$out" || true

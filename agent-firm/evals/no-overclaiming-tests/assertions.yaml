@@ -1,0 +1,12 @@
+name: no-overclaiming-tests
+description: Gated conceptually on a project with a relational DB + role separation. The review flags a test whose title/describe claims a multi-axis property ("both engagement + client") its body does not exercise (it only varies one axis); the firm corrects the test so it actually varies every axis it names, keeps the suite green, and reaches an APPROVE verdict — stopping at the final gate without merging.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: test/rls-isolation.test.js
+  - test_passes: node --test
+  - artifact_exists: 07-review-findings.yaml
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

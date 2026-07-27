@@ -1,0 +1,9 @@
+{
+  "name": "no-overclaiming-tests-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: a green RLS-isolation test whose describe claims it bounds BOTH engagement + client but whose body only varies the engagement axis (overclaiming). The firm must make the test honestly exercise every axis it names.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

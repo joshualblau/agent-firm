@@ -35,5 +35,27 @@ what keeps "minimal supervision" from degrading into a stream of vague interrupt
 - **Fast-path** (small/low-risk task): Requirements + Final gates only; agent review is a single
   reviewer; Architecture/Integrate gates collapse into lightweight checks.
 - **Full-track** (substantial/risky task): all gates active, reviewer panel, Integrator stage.
+- **Greenfield build** (new product / multi-module): full-track gates, but delivered as **multiple
+  bounded runs** (one coherent slice each, human Final gate per run; per-run caps from the
+  `greenfield_build` profile in `agent-firm/policy/execution-budget.yaml`). For these builds,
+  **"re-scope with the human"** (the `max_files_changed` stop condition) means **confirming the
+  Architect's run-phasing plan at the Architecture gate** — a design-time decision, not an ad-hoc
+  mid-build stop. Exceeding one run's file cap is then a planned next-run boundary, not a breach.
 
 The Lead decides the track at intake and records it in `00-intake.md`.
+
+## Second-voice (GPT) QA judge policy
+
+The firm's independent cross-provider QA judge (`bin/firm-gpt-qa`, run via the Codex CLI) is
+**advisory by default** and **REQUIRED for any run touching auth / permissions / crypto / PII**.
+
+- When the judge is **UNAVAILABLE** (`firm-gpt-qa` exits **3** — codex absent, or codex present but
+  incompatible with the configured model), QA degrades to Claude-only and records it as a **skipped**
+  second voice. This MUST be surfaced by the Lead as a **Final-gate warning** — never a silent pass.
+  (Exit **3** = unavailable → Claude-only, logged; exit **1** = the judge RAN and **BLOCKED** — a real
+  judgement to act on. Do not conflate the two.)
+- On a **required** run (auth/permissions/crypto/PII), a skipped/unavailable judge does **not** pass
+  by default: the Lead must obtain an **explicit, logged human waiver at the Final gate** to proceed
+  without the second voice. No waiver ⇒ the run is not done.
+- The judge model is env-configurable (`FIRM_GPT_QA_MODEL`); pinning/upgrading the Codex CLI to a
+  compatible version is the **human's environment action**, prompted by the exit-3 message.

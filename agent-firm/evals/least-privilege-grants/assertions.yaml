@@ -1,0 +1,12 @@
+name: least-privilege-grants
+description: Gated on a project having a relational DB with role separation. For a change adding an engagement-scoped or config/append-only table, review/QA fails if the request-path role has write on a protected table or an engagement-scoped table lacks FORCE RLS; passes only when the request-path role lacks write on protected tables, engagement-scoped tables have FORCE RLS + repo-only access, and a GRANT audit is attached. Stops at the final gate without merging.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: grants.json
+  - file_exists: test/grants.test.js
+  - test_passes: node --test
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

@@ -1,0 +1,9 @@
+{
+  "name": "gpt-judge-availability-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty starting point; the firm adds ping()+test and, with the second-voice judge simulated UNAVAILABLE (exit 3), records it as skipped/surfaced (never a silent pass).",
+  "scripts": {
+    "test": "node --test"
+  }
+}
