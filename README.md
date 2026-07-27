@@ -18,8 +18,9 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 ## Use it on a work project
 
 > **Setup, including on a new device, is recorded in [docs/INSTALL.md](docs/INSTALL.md).** Quickest path
-> on a machine that has this repo: `~/agent-firm/bin/firm-bootstrap` (registers the marketplace +
-> installs the plugin), then `firm-install` per project, then `/agent-firm:start <goal>`.
+> on a machine that has this repo: `~/agent-firm/bin/firm-bootstrap` (registers the marketplace,
+> installs the plugin, and links `firm-*` onto your shell PATH), then `firm-install` per project,
+> then `/agent-firm:start <goal>`.
 >
 > **Wiring accounts/secrets/hardening** (1Password, per-project profiles, egress firewall, visual
 > baselines, phone approvals, eval calibration) is a one-time runbook in [docs/WIRING.md](docs/WIRING.md).
@@ -28,7 +29,11 @@ every gate carries evidence, every run is bounded, and the firm improves only th
 ```bash
 claude plugin marketplace add ~/agent-firm        # register this repo as a local marketplace
 claude plugin install agent-firm@local     # installs at user scope (all projects)
+~/agent-firm/bin/firm-link                        # symlink firm-* into ~/.local/bin (SHELL PATH)
 ```
+`firm-link` is not optional: a plugin's `bin/` is on `$PATH` only *inside* a `claude` session, and
+`firm-install` below is run from your own terminal. `firm-bootstrap` does all three steps for you.
+
 Then, in any work project (one-time, since a plugin can't ship permissions):
 ```bash
 firm-install                                       # merge the firm's allow/ask/deny into .claude/settings.json
@@ -48,7 +53,7 @@ To update everywhere after a change: bump `version` in `.claude-plugin/plugin.js
 ```bash
 mkdir -p <repo>/.claude && cp -R ~/agent-firm/agents <repo>/.claude/agents
 cp -R ~/agent-firm/.claude/settings.json ~/agent-firm/bin ~/agent-firm/agent-firm ~/agent-firm/CLAUDE.md <repo>/
-# add the firm's bin/ to PATH, or call tools as <repo>/bin/firm-*
+<repo>/bin/firm-link --dir ~/.local/bin   # put firm-* on PATH, or call them as <repo>/bin/firm-*
 ```
 
 ## Layout
@@ -56,7 +61,8 @@ cp -R ~/agent-firm/.claude/settings.json ~/agent-firm/bin ~/agent-firm/agent-fir
 .claude-plugin/plugin.json    # plugin manifest (name, version) — drives the versioned install
 .claude-plugin/marketplace.json # local marketplace entry (this repo hosts the plugin)
 agents/*.md                   # roles: intake, architect, implementer, integrator, reviewer, qa, packager,
-                              #   recruiter, specialist, scout (Opus/Sonnet/Haiku by role; Fable escalation)
+                              #   recruiter, specialist, scout (Opus 5 for lead/intake/architect/build/
+                              #   integrate/review; Sonnet 5 workhorse; Haiku scout; Fable escalation)
 commands/start.md             # /agent-firm:start — activates the firm and begins an engagement
 hooks/hooks.json              # run-ledger logging hook (plugin mode)
 AGENTS.md                     # Codex's instructions (independent GPT QA judge)
@@ -64,7 +70,7 @@ bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-ver
                               #   firm-integrate, firm-qa-checkout, firm-traceability-check, firm-policy,
                               #   firm-hire, firm-gpt-qa, firm-propose-system-change, firm-run-evals,
                               #   firm-check-assertions, firm-visual-check, firm-visual-baseline,
-                              #   firm-notify, firm-install, firm-bootstrap, firm-doctor
+                              #   firm-notify, firm-install, firm-link, firm-bootstrap, firm-doctor
 .envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
 agent-firm/templates/visual/  # Playwright visual-regression config + specs (firm-visual-check gates on these)
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget

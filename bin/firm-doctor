@@ -20,7 +20,9 @@
 # Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
 #   --probe   also run live account probes (op run resolve, codex login status) — needs network.
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 
 PROBE=0
 case "${1:-}" in
@@ -239,6 +241,23 @@ info "Codex config profiles (--profile) do NOT switch accounts — only CODEX_HO
 # 8. Tooling sanity (GPT judge + bootstrap) — informational
 # ==========================================================================
 section "8. Tooling"
+# Shell PATH: a plugin's bin/ is on PATH only INSIDE a claude session, so firm-install & friends
+# must be linked out (firm-link) to be usable from a terminal.
+if command -v firm-install >/dev/null 2>&1; then
+  _fi="$(command -v firm-install)"
+  _resolved="$_fi"
+  while [ -L "$_resolved" ]; do
+    _d="$(cd -P "$(dirname "$_resolved")" && pwd)"; _resolved="$(readlink "$_resolved")"
+    case $_resolved in /*) ;; *) _resolved="$_d/$_resolved";; esac
+  done
+  if [ "$_resolved" = "$SELF/firm-install" ]; then
+    pass "firm-* on PATH at $_fi → this repo"
+  else
+    warn "firm-install on PATH resolves to $_resolved, not $SELF/firm-install — run 'firm-link' to repoint it at this repo."
+  fi
+else
+  warn "firm-* not on your shell PATH — run '$SELF/firm-link' (a plugin's bin/ is only on PATH inside a claude session)."
+fi
 if command -v codex >/dev/null 2>&1; then pass "codex present — the Phase-3 GPT QA judge (firm-gpt-qa) can run"
 else warn "codex not found — firm-gpt-qa degrades gracefully to Claude-only QA (never treated as a pass)."; fi
 if command -v chezmoi >/dev/null 2>&1; then

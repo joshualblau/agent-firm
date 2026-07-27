@@ -11,7 +11,9 @@
 # Requires: the agent-firm plugin installed (firm-bootstrap) so the firm's subagents + bin/firm-* tools
 # are available, and `claude` logged in. Run mode does NOT run in CI without a Claude login.
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 EVALS="$ROOT/agent-firm/evals"
 MANUAL="$ROOT/CLAUDE.md"                 # firm operating manual — injected as an appended system prompt

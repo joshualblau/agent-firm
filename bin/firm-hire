@@ -4,7 +4,9 @@
 # The spec conforms to agent-firm/schemas/job-spec.schema.json. Run from the project root with an
 # active run (firm-new-run first).
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 
 role="${1:-}"
 if [[ -z "$role" ]]; then echo "usage: firm-hire <role-name>" >&2; exit 2; fi

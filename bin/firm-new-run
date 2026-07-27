@@ -13,7 +13,9 @@ fi
 slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
 
 # Resolve the firm root (where templates live) from this script's location.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
 FIRM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATES="$FIRM_ROOT/agent-firm/templates"
 
@@ -25,7 +27,10 @@ mkdir -p "$run_dir/05-work-orders" "$run_dir/09-test-evidence"
 # Seed from templates (copy whatever exists; don't fail if a template is missing).
 if [[ -d "$TEMPLATES" ]]; then
   for t in "$TEMPLATES"/*; do
-    [[ -e "$t" ]] || continue
+    # Ledger artifacts are files. Skip directories (e.g. templates/visual/, which is a
+    # project scaffold for firm-visual-check, not a run artifact) — `cp -n` on a directory
+    # fails and, under `set -e`, aborted the whole run scaffold.
+    [[ -f "$t" ]] || continue
     cp -n "$t" "$run_dir/$(basename "$t")"
   done
 fi

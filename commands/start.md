@@ -44,11 +44,17 @@ reviewer panel and the Integrator. For heavy parallel fan-out, invoke the Workfl
 
 ## Model tiers (choose by task, not by habit)
 Roles carry a default model; **effort matters as much as tier** (default `high`, `xhigh` for coding/agentic, `low` for cheap subagents). On your Claude subscription, cost is a quota/latency proxy — reserve the top tier.
-- **Fable 5** — the ceiling; slowest and quota-heaviest. Escalate *to* it only for the hardest/novel design, a deep review pass on high-risk changes, or a genuinely hard specialist. Not the Lead. Keep the **security lens off Fable** (its classifiers can refuse security-adjacent work).
-- **Opus 4.8** — default heavyweight: Lead, Intake, Architect, Reviewer.
-- **Sonnet 5** — workhorse: Implementer, Integrator, Recruiter, Packager, Claude-side QA.
+- **Fable 5** — the ceiling; slowest and quota-heaviest. Escalate *to* it only for the hardest/novel design or a genuinely hard specialist. Not the Lead. Keep the **security lens off Fable** (its classifiers can refuse security-adjacent work).
+- **Opus 5** — default heavyweight: Lead, Intake, Architect, **Implementer**, **Integrator**, Reviewer. It is the strongest tier for agentic coding, long-horizon execution, and bug-finding (high precision *and* recall) — which is why Build and Integrate run here rather than on Sonnet.
+- **Sonnet 5** — workhorse: Recruiter, Packager, Claude-side QA, and hired specialists unless the job spec justifies more.
 - **Haiku 4.5** — cheap/fast: the `scout` (broad read-only sweeps), simple classification, mechanical work.
-Run the Lead itself on **Opus 4.8**.
+Run the Lead itself on **Opus 5**.
+
+**Quota discipline (the real cap).** With Build and Integrate on Opus 5, wide parallel implementer fan-out is the
+most likely way to hit a plan rate-limit. Respect `max_specialists_concurrent` from
+`firm-policy execution-budget`, prefer fewer/larger work-orders over many tiny ones, and dispatch `scout`
+(Haiku) for read-only reconnaissance so the Opus implementers stay focused on the diff. A rate-limit
+pause is a stop condition — surface it to the human rather than silently downgrading a role's tier.
 
 ## Gates and asking the human
 - Pause only at the gates in `firm-policy gate-matrix`. Gate on **reversibility and impact**, never on confidence. Reversible, in-worktree work runs autonomously.

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# firm-link [--uninstall] [--dir <bin-dir>]
+# Puts the firm's `firm-*` tools on your SHELL's PATH by symlinking them into a bin directory
+# (default: ~/.local/bin, override with --dir or $FIRM_BIN_DIR).
+#
+# Why this exists: a Claude Code plugin's bin/ joins PATH only INSIDE a claude session. The docs
+# tell you to run `firm-install` from your terminal in a project dir — that only works if the tools
+# are on your shell PATH too. This is the missing link (pun intended).
+#
+# The symlinks point at THIS repo, so `git pull` propagates instantly — no re-linking needed.
+# Every firm-* script resolves its own symlink, so they still find the repo root correctly.
+#
+# If the target dir is not on your PATH, an idempotent marked block is appended to your shell rc.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+
+BIN_DIR="${FIRM_BIN_DIR:-$HOME/.local/bin}"
+MODE=install
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall) MODE=uninstall; shift ;;
+    --dir) BIN_DIR="${2:?--dir needs a path}"; shift 2 ;;
+    -h|--help) sed -n '2,14p' "$__src"; exit 0 ;;
+    *) echo "firm-link: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+MARK_BEGIN='# >>> agent-firm >>>'
+MARK_END='# <<< agent-firm <<<'
+
+# --- uninstall -------------------------------------------------------------
+if [ "$MODE" = uninstall ]; then
+  removed=0
+  for link in "$BIN_DIR"/firm-*; do
+    [ -L "$link" ] || continue
+    target="$(readlink "$link")"
+    case "$target" in "$SELF"/*) rm -f "$link"; removed=$((removed+1)) ;; esac
+  done
+  echo "firm-link: removed $removed symlink(s) from $BIN_DIR"
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    grep -qF "$MARK_BEGIN" "$rc" || continue
+    tmp="$rc.firm-link.tmp"
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+      index($0,b){skip=1} !skip{print} index($0,e){skip=0}' "$rc" > "$tmp" && mv "$tmp" "$rc"
+    echo "firm-link: removed PATH block from $rc"
+  done
+  exit 0
+fi
+
+# --- install ---------------------------------------------------------------
+mkdir -p "$BIN_DIR" || { echo "firm-link: cannot create $BIN_DIR" >&2; exit 1; }
+
+linked=0 skipped=0 conflict=0
+for tool in "$SELF"/firm-*; do
+  [ -f "$tool" ] && [ -x "$tool" ] || continue
+  name="$(basename "$tool")"
+  dest="$BIN_DIR/$name"
+  if [ -L "$dest" ]; then
+    if [ "$(readlink "$dest")" = "$tool" ]; then skipped=$((skipped+1)); continue; fi
+    # Repoint stale links (repo moved, or an older agent-firm checkout).
+    ln -sfn "$tool" "$dest"; linked=$((linked+1)); continue
+  fi
+  if [ -e "$dest" ]; then
+    echo "  ! $name — a real file already exists at $dest; leaving it alone" >&2
+    conflict=$((conflict+1)); continue
+  fi
+  ln -s "$tool" "$dest"; linked=$((linked+1))
+done
+
+echo "firm-link: $linked linked, $skipped already current, $conflict conflict(s) in $BIN_DIR"
+echo "  source: $SELF"
+
+# --- ensure BIN_DIR is on PATH --------------------------------------------
+case ":$PATH:" in
+  *":$BIN_DIR:"*) echo "  ✔ $BIN_DIR is already on PATH"; exit 0 ;;
+esac
+
+# Pick the rc file for the user's login shell.
+case "$(basename "${SHELL:-/bin/zsh}")" in
+  zsh)  rc="$HOME/.zshrc" ;;
+  bash) if [ -f "$HOME/.bashrc" ]; then rc="$HOME/.bashrc"; else rc="$HOME/.bash_profile"; fi ;;
+  *)    rc="$HOME/.profile" ;;
+esac
+
+# Write the entry $HOME-relative when possible so the rc stays portable across machines.
+case "$BIN_DIR" in
+  "$HOME"/*) path_entry="\$HOME/${BIN_DIR#"$HOME"/}" ;;
+  *)         path_entry="$BIN_DIR" ;;
+esac
+
+if [ -f "$rc" ] && grep -qF "$MARK_BEGIN" "$rc"; then
+  echo "  ✔ PATH block already present in $rc (open a new shell to pick it up)"
+else
+  {
+    echo ""
+    echo "$MARK_BEGIN"
+    echo "export PATH=\"$path_entry:\$PATH\""
+    echo "$MARK_END"
+  } >> "$rc"
+  echo "  + added $BIN_DIR to PATH in $rc"
+fi
+echo "  → open a new shell (or: export PATH=\"$BIN_DIR:\$PATH\") to use firm-* now"

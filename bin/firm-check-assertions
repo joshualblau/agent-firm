@@ -8,7 +8,9 @@
 #   test_passes <command>                traceability_passes true          no_default_branch_merge true
 #   final_gate_pending true              (the run stopped deliberately for the human gate, not a crash)
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 [ -n "${1:-}" ] && [ -n "${2:-}" ] || { echo "usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]" >&2; exit 2; }
 python3 - "$1" "$2" "${3:-}" "$SELF" <<'PY'
 import json, os, re, subprocess, sys, glob

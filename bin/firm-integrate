@@ -4,7 +4,9 @@
 # On conflict, aborts that merge and reports it for the Integrator agent to resolve by hand —
 # never silently drops a change. Merging to the DEFAULT branch is a human gate (not done here).
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # resolve sibling scripts by location
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
 
 run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
 run_id="$(basename "${run_dir:-none}")"

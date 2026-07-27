@@ -2,7 +2,7 @@
 name: implementer
 description: Use to build a single work-order — write/edit code in an isolated git worktree and self-correct to green against the project's tests. Spawn one per independent work unit; they can run in parallel.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: sonnet
+model: opus
 effort: xhigh
 ---
 

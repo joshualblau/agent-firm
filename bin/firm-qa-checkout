@@ -3,7 +3,9 @@
 # Materializes a FRESH, clean checkout at the integration branch HEAD so QA runs from a known-clean
 # state (the firm rule: QA installs from lockfile and runs the same command CI uses, read-only).
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # resolve sibling scripts by location
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
 
 run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
 run_id="$(basename "${run_dir:-none}")"

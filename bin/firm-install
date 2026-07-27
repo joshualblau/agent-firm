@@ -7,7 +7,9 @@
 #   firm-install --user     -> merges into ~/.claude/settings.json (all projects)
 # Idempotent: unions rules, never duplicates. Does NOT touch hooks (the plugin provides those).
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 SRC="$ROOT/.claude/settings.json"   # canonical permission set lives here
 

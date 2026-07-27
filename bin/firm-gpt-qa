@@ -7,7 +7,9 @@
 # Prereqs (see docs/PHASE3.md): `codex` installed + `codex login` on your ChatGPT plan. If codex is
 # absent, this exits 3 and the qa-tester degrades to Claude-only QA (logged), never silently passing.
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 SCHEMA="$ROOT/agent-firm/schemas/qa-verdict.schema.json"
 

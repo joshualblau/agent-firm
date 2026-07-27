@@ -102,3 +102,10 @@ golden-eval execution** (`firm-run-evals` drives the firm headlessly under a bou
 posture + `firm-check-assertions`). Hard rules that persist: QA never updates visual baselines; evals
 never use `--dangerously-skip-permissions`; keep the security lens off Fable. See `docs/PHASE5.md`.
 Optional/deferred: adversarial Agent-Teams panels and durable runners (documented seams, not shipped).
+
+Since 0.7.0: `firm-link` closes the install hole (a plugin's `bin/` is on `$PATH` only *inside* a
+`claude` session, so the `firm-*` tools are symlinked into `~/.local/bin` for terminal use;
+`firm-bootstrap` does it, `firm-doctor` checks it) and every `firm-*` script now resolves its own
+symlink. Model tiering moved to **Opus 5** for Lead/Intake/Architect/**Implementer**/**Integrator**/
+Reviewer — Build and Integrate were promoted off Sonnet because Opus 5 leads on agentic coding and
+bug-finding. Watch `max_specialists_concurrent`: wide Opus fan-out is now the likeliest rate-limit.

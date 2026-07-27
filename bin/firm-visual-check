@@ -9,7 +9,9 @@
 #   3  not_applicable  — no playwright config / no spec files (project has no visual suite)
 #   other              — a visual diff / regression (or a run error) -> BLOCK
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 proj="${1:-.}"
 
 # Project-gated: only meaningful if the project actually has a Playwright config + specs.

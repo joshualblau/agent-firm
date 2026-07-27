@@ -7,7 +7,9 @@
 #  - copies ONLY .env.example; never real secrets/auth caches
 # Run from the work-project root with an active run (bin/new-run first).
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # resolve sibling scripts by location
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
 
 role="${1:-}"; wo="${2:-}"
 if [[ -z "$role" || -z "$wo" ]]; then echo "usage: new-worktree <role> <work-order-id>" >&2; exit 2; fi

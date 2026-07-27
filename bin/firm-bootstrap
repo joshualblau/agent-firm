@@ -6,7 +6,9 @@
 #   firm-bootstrap                     # register marketplace + install/update the plugin
 #   firm-bootstrap --with-permissions  # also run firm-install in the CURRENT directory (project scope)
 set -uo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 
 echo "agent-firm bootstrap"
@@ -29,7 +31,15 @@ else
   claude plugin install agent-firm@local
 fi
 
-# 3. Optional: permissions into the current project
+# 3. Shell PATH: the plugin's bin/ joins PATH only INSIDE a claude session, so symlink the
+#    firm-* tools into ~/.local/bin (or $FIRM_BIN_DIR) for use from your terminal.
+if [[ "${FIRM_SKIP_LINK:-0}" != "1" ]]; then
+  "$SELF/firm-link"
+else
+  echo "  (skipping shell PATH linking — FIRM_SKIP_LINK=1)"
+fi
+
+# 4. Optional: permissions into the current project
 if [[ "${1:-}" == "--with-permissions" ]]; then
   echo "  installing firm permissions into: $(pwd)/.claude/settings.json"
   "$SELF/firm-install"

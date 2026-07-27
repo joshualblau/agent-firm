@@ -6,7 +6,9 @@
 #   firm-policy gate-matrix         firm-policy never-rules        firm-policy qa-verdict.schema
 #   firm-policy list
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 POL="$ROOT/agent-firm/policy"; SCH="$ROOT/agent-firm/schemas"
 

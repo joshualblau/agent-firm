@@ -6,13 +6,26 @@ machine can use it.
 
 ## TL;DR (machine that already has this repo)
 ```bash
-~/agent-firm/bin/firm-bootstrap          # registers the marketplace + installs the plugin (idempotent)
+~/agent-firm/bin/firm-bootstrap          # marketplace + plugin + shell PATH links (idempotent)
 ```
 Then, per project (once):
 ```bash
 cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
+
+### How `firm-*` gets on your shell PATH
+A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,
+which you run from your own terminal, would otherwise be "command not found". `firm-bootstrap` fixes
+this by calling `firm-link`, which symlinks every `firm-*` tool into `~/.local/bin`:
+```bash
+firm-link                                # symlink firm-* into ~/.local/bin (or $FIRM_BIN_DIR)
+firm-link --dir /usr/local/bin           # ...somewhere else
+firm-link --uninstall                    # remove the symlinks (and the PATH block, if any)
+```
+The links point at **this repo**, so `git pull` propagates immediately — no re-linking. If the target
+directory isn't on your `PATH`, `firm-link` appends a marked block to your shell rc (`~/.zshrc` for
+zsh); open a new shell to pick it up. Set `FIRM_SKIP_LINK=1` to make `firm-bootstrap` skip this step.
 **Optional — per-project subscription profile + secrets** (full step-by-step in [WIRING.md](WIRING.md);
 see [PHASE4.md](PHASE4.md) part 2 for the rationale + the macOS Keychain caveat):
 ```bash
@@ -33,6 +46,7 @@ Restart any already-running `claude` session so it loads the plugin.
 ```bash
 claude plugin marketplace add <path-to-this-repo>     # e.g. ~/agent-firm
 claude plugin install agent-firm@local         # user scope = all projects
+~/agent-firm/bin/firm-link                     # firm-* onto your SHELL PATH (see above)
 ```
 
 ## On a NEW device (first get the repo there)
@@ -75,11 +89,17 @@ claude plugin details agent-firm@local    # Agents (7), the start command, the l
 claude plugin validate ~/agent-firm      # manifest check
 ```
 - Components don't appear → restart the `claude` session (plugins load at session start).
-- `firm-*` commands "not found" → the plugin's `bin/` joins PATH only while the plugin is enabled; confirm it's installed + the session was restarted.
+- `firm-*` "not found" **in your terminal** → run `firm-link` (the plugin's `bin/` is only on PATH
+  inside a `claude` session). Then open a new shell, or `export PATH="$HOME/.local/bin:$PATH"`.
+- `firm-*` "not found" **inside a claude session** → confirm the plugin is installed and the session
+  was restarted (`claude plugin list`).
+- A `firm-*` tool can't find its policies/templates → you have a stale hand-made symlink or copy from
+  before `firm-link`; re-run `firm-link` to repoint it at the repo.
 - Unrelated MCP startup errors → `claude --strict-mcp-config` runs with no MCP servers (the firm needs none).
 
 ## Uninstall
 ```bash
+~/agent-firm/bin/firm-link --uninstall    # remove the shell PATH symlinks + rc block
 claude plugin uninstall agent-firm@local
 claude plugin marketplace remove local
 ```

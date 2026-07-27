@@ -26,7 +26,9 @@ echo 'eval "$(direnv hook zsh)"' >> ~/.zshrc && source ~/.zshrc
 grep -E 'ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|ANTHROPIC_AUTH_TOKEN' ~/.zshrc ~/.zprofile 2>/dev/null
 # Remove any that are set. firm-doctor also fails closed on these.
 
-# Install the firm as a plugin (if not already):
+# Install the firm as a plugin (if not already). This also runs firm-link, which symlinks the
+# firm-* tools into ~/.local/bin — required for `firm-install` below, since a plugin's bin/ is on
+# PATH only INSIDE a claude session, not in your terminal. Open a new shell afterwards.
 ~/agent-firm/bin/firm-bootstrap
 ```
 

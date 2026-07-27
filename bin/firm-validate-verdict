@@ -8,7 +8,9 @@ set -euo pipefail
 verdict="${1:-}"
 if [[ -z "$verdict" ]]; then echo "usage: validate-verdict <qa-verdict.json>" >&2; exit 2; fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
 SCHEMA="$(cd "$SCRIPT_DIR/.." && pwd)/agent-firm/schemas/qa-verdict.schema.json"
 
 python3 - "$verdict" "$SCHEMA" <<'PY'
