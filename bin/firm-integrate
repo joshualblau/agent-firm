@@ -12,11 +12,40 @@ run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRE
 run_id="$(basename "${run_dir:-none}")"
 intb="${1:-integration/${run_id}}"
 
-# Create the integration branch from current HEAD if it doesn't exist.
+# The target must be an integration/* branch — a POSITIVE allowlist, on purpose. Denylisting
+# main/master/develop/release/* loses to the next protected name someone invents, and the only shape
+# integration is ever allowed to have is integration/<run_id>. There is deliberately no override
+# flag: an escape hatch is just the denylist again, wearing a different hat.
+case "$intb" in
+  integration/?*) : ;;
+  *)
+    echo "firm-integrate: refusing target '${intb}' — integration runs on integration/* branches only." >&2
+    echo "  Merging anywhere else (the default branch above all) is a HUMAN GATE, never this script's job." >&2
+    exit 2 ;;
+esac
+
+# Reach the integration branch, or STOP. This previously discarded git's exit code: a failed switch
+# (dirty tree, or the branch already checked out in a linked worktree — routine here) left HEAD on
+# whatever happened to be checked out, and the merges below landed THERE. With the Lead sitting on
+# `main` that is an autonomous merge to the default branch — never-rule #1 — and the permission layer
+# cannot see it, because Bash(firm-integrate:*) is allow-listed while Bash(git merge:*) is only `ask`.
 if git show-ref --verify --quiet "refs/heads/${intb}"; then
-  git switch "$intb" >/dev/null 2>&1
+  sw_err="$(git switch "$intb" 2>&1)"; sw_rc=$?
 else
-  git switch -c "$intb" >/dev/null 2>&1
+  sw_err="$(git switch -c "$intb" 2>&1)"; sw_rc=$?
+fi
+if [[ $sw_rc -ne 0 ]]; then
+  echo "firm-integrate: cannot reach '${intb}' (git rc=${sw_rc}) — NOTHING merged." >&2
+  echo "  ${sw_err}" >&2
+  echo "  Resolve it (commit/stash local changes, or release the branch from its other worktree) and re-run." >&2
+  exit 1
+fi
+
+# Belt and braces: prove we are standing on the target before a single merge runs.
+head_now="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+if [[ "$head_now" != "$intb" ]]; then
+  echo "firm-integrate: expected HEAD on '${intb}' but it is '${head_now}' — refusing to merge." >&2
+  exit 1
 fi
 
 # bash 3.2 compatible (macOS): no `mapfile`.
