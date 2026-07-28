@@ -48,9 +48,7 @@
       "Bash(pytest:*)",
       "Bash(python -m pytest:*)",
       "Bash(ruff:*)",
-      "Bash(ls:*)",
-      "Bash(cat:*)",
-      "Bash(jq:*)"
+      "Bash(ls:*)"
     ],
     "ask": [
       "Bash(git commit:*)",
@@ -77,7 +75,25 @@
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)",
       "Read(~/.codex/auth.json)",
-      "Read(~/.claude.json)"
+      "Read(~/.claude.json)",
+      "Bash(cat .env*)",
+      "Bash(cat ./.env*)",
+      "Bash(cat ~/.ssh/**)",
+      "Bash(cat ~/.aws/**)",
+      "Bash(cat ~/.codex/auth.json)",
+      "Bash(cat ~/.claude.json)",
+      "Bash(head .env*)",
+      "Bash(head ~/.ssh/**)",
+      "Bash(head ~/.aws/**)",
+      "Bash(tail .env*)",
+      "Bash(tail ~/.ssh/**)",
+      "Bash(tail ~/.aws/**)",
+      "Bash(less .env*)",
+      "Bash(less ~/.ssh/**)",
+      "Bash(less ~/.aws/**)",
+      "Bash(strings .env*)",
+      "Bash(strings ~/.ssh/**)",
+      "Bash(strings ~/.aws/**)"
     ]
   },
   "hooks": {

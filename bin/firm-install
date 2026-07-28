@@ -1,35 +1,80 @@
 #!/usr/bin/env bash
-# firm-install [--user]
+# firm-install [--user] [--migrate]
 # Installs the firm's PERMISSION rules into a settings.json. A Claude Code plugin cannot ship a
 # `permissions` block, so when the firm is used as a plugin you run this once per project (or once
 # at user scope) to grant the firm's allow/ask/deny policy.
 #   firm-install            -> merges into ./.claude/settings.json (project scope, default)
 #   firm-install --user     -> merges into ~/.claude/settings.json (all projects)
+#   firm-install --migrate  -> ALSO removes rules the firm has retired (policy/retired-permissions.json)
 # Idempotent: unions rules, never duplicates. Does NOT touch hooks (the plugin provides those).
+#
+# --migrate is the ONLY path in the firm that deletes a permission rule, and it deletes only rules
+# named in retired-permissions.json. Union-only installs cannot fix a rule that turned out to be
+# unsafe: every project installed from an older version keeps it forever. It prints the exact
+# before/after so the deletion is reviewable, never silent.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
-SRC="$ROOT/.claude/settings.json"   # canonical permission set lives here
+SRC="$ROOT/.claude/settings.json"                              # canonical permission set lives here
+RETIRED="$ROOT/agent-firm/policy/retired-permissions.json"     # rules the firm has withdrawn
 
 scope=project
-[[ "${1:-}" == "--user" ]] && scope=user
+migrate=0
+for arg in "$@"; do
+  case "$arg" in
+    --user)    scope=user ;;
+    --migrate) migrate=1 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "firm-install: unknown arg '$arg' (use --user and/or --migrate)" >&2; exit 2 ;;
+  esac
+done
 if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
 
-python3 - "$SRC" "$target" <<'PY'
+python3 - "$SRC" "$target" "$RETIRED" "$migrate" <<'PY'
 import json, os, sys
-src, target = sys.argv[1], sys.argv[2]
+src, target, retired_path, migrate = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
 src_perms = json.load(open(src)).get("permissions", {})
 os.makedirs(os.path.dirname(target), exist_ok=True)
 tgt = json.load(open(target)) if os.path.exists(target) else {}
 perms = tgt.setdefault("permissions", {})
+
+# Retired rules present in the target, regardless of which bucket they drifted into.
+retired = []
+if os.path.exists(retired_path):
+    retired = [r["rule"] for r in json.load(open(retired_path)).get("retired", [])]
+present = sorted({r for k in ("allow", "ask", "deny") for r in perms.get(k, []) if r in retired})
+
+removed = 0
+if migrate and present:
+    print("firm-install --migrate: removing retired rules")
+    for k in ("allow", "ask", "deny"):
+        before = perms.get(k, [])
+        after = [r for r in before if r not in retired]
+        for r in before:
+            if r in retired:
+                print(f"    - {k}: {r}")
+                removed += 1
+        if k in perms:
+            perms[k] = after
+
 added = 0
 for k in ("allow", "ask", "deny"):
     cur = perms.setdefault(k, [])
     for rule in src_perms.get(k, []):
         if rule not in cur:
             cur.append(rule); added += 1
+
 json.dump(tgt, open(target, "w"), indent=2)
-print(f"firm-install: merged firm permissions into {target} (+{added} rules)")
+print(f"firm-install: merged firm permissions into {target} (+{added} rules, -{removed} retired)")
+
+if present and not migrate:
+    print()
+    print("WARNING: this settings file still grants rules the firm has RETIRED as unsafe:")
+    for r in present:
+        print(f"    {r}")
+    print("  These were withdrawn because they read around the Read-tool deny rules.")
+    print(f"  Remove them with:  firm-install{' --user' if target.startswith(os.path.expanduser('~/.claude')) else ''} --migrate")
+    sys.exit(3)
 PY
