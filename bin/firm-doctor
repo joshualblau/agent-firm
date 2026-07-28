@@ -258,6 +258,46 @@ if command -v firm-install >/dev/null 2>&1; then
 else
   warn "firm-* not on your shell PATH — run '$SELF/firm-link' (a plugin's bin/ is only on PATH inside a claude session)."
 fi
+# Python prerequisites. jsonschema is GATE-CRITICAL: without it firm-validate-verdict exits 4
+# (DEGRADED) and a QA verdict cannot clear the Final gate. pyyaml only degrades parsers to regex.
+if python3 -c 'import jsonschema' >/dev/null 2>&1; then
+  pass "python jsonschema present — QA verdicts can be schema-validated"
+else
+  fail "python jsonschema MISSING — firm-validate-verdict exits 4 (DEGRADED) and no QA verdict can pass the Final gate"
+  info "fix: python3 -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)"
+fi
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+  pass "python pyyaml present — acceptance-criteria/assertion parsing is exact"
+else
+  warn "python pyyaml missing — traceability + eval assertion parsing falls back to regex; install with 'python3 -m pip install --user pyyaml'."
+fi
+
+# Retired permission rules. firm-install only unions rules, so a project installed before a rule was
+# withdrawn keeps it forever. This is a FAIL, not a warning: the retired rules read around the
+# Read-tool deny rules, and a warning would leave that open in every project that already has one.
+RETIRED_JSON="$SELF/../agent-firm/policy/retired-permissions.json"
+if [ -f "$RETIRED_JSON" ]; then
+  for _scope in project user; do
+    if [ "$_scope" = project ]; then _sfile=".claude/settings.json"; _sflag=""; else _sfile="$HOME/.claude/settings.json"; _sflag=" --user"; fi
+    [ -f "$_sfile" ] || continue
+    _found="$(python3 - "$RETIRED_JSON" "$_sfile" <<'PY' 2>/dev/null
+import json, sys
+retired = {r["rule"] for r in json.load(open(sys.argv[1])).get("retired", [])}
+try: perms = json.load(open(sys.argv[2])).get("permissions", {})
+except Exception: sys.exit(0)
+hits = sorted({r for k in ("allow","ask","deny") for r in perms.get(k, []) if r in retired})
+print(" ".join(hits))
+PY
+)"
+    if [ -n "$_found" ]; then
+      fail "$_scope settings still grant RETIRED permission rule(s): $_found"
+      info "these read around the Read-tool deny rules. Fix: firm-install$_sflag --migrate"
+    else
+      pass "$_scope settings carry no retired permission rules"
+    fi
+  done
+fi
+
 if command -v codex >/dev/null 2>&1; then pass "codex present — the Phase-3 GPT QA judge (firm-gpt-qa) can run"
 else warn "codex not found — firm-gpt-qa degrades gracefully to Claude-only QA (never treated as a pass)."; fi
 if command -v chezmoi >/dev/null 2>&1; then

@@ -105,8 +105,16 @@ echo "firm-gpt-qa: running the Codex judge on your ChatGPT subscription..." >&2
 timeout_secs="${FIRM_GPT_QA_TIMEOUT:-300}"
 if perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" \
      codex exec --skip-git-repo-check -m "$FIRM_GPT_QA_MODEL" --output-schema "$SCHEMA" -o "$out" "$PROMPT" </dev/null >>"$log" 2>&1; then
-  # validate the structured verdict Codex produced
-  "$SELF/firm-validate-verdict" "$out"
+  # Validate the structured verdict Codex produced. This rc was previously discarded — the script's
+  # last command was the `echo` below, so an invalid or unvalidatable second-voice verdict still
+  # exited 0 and read as a clean judge run. Fail closed instead.
+  "$SELF/firm-validate-verdict" "$out"; v_rc=$?
+  if [[ $v_rc -ne 0 ]]; then
+    echo "firm-gpt-qa: the judge's verdict did not validate (firm-validate-verdict rc=$v_rc) — treating as a BLOCK." >&2
+    [[ $v_rc -eq 4 ]] && echo "  rc=4 means DEGRADED: install jsonschema (firm-bootstrap --with-python-deps) and re-run." >&2
+    [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" gpt_qa_invalid file="$out" rc="$v_rc" || true
+    exit 1
+  fi
   [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" gpt_qa file="$out" || true
   echo "$out"
 else

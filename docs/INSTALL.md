@@ -4,15 +4,44 @@ The firm ships as a **versioned Claude Code plugin** (`agent-firm`) served from 
 (`local`) that is this repo. Install it once per machine at user scope, and every project on that
 machine can use it.
 
+## Prerequisites
+
+Beyond the `claude` CLI and `git`, the firm needs two Python packages:
+
+```bash
+python3 -m pip install --user jsonschema pyyaml
+```
+
+- **`jsonschema` is required.** Without it `firm-validate-verdict` cannot schema-check a QA verdict
+  and exits **4 (DEGRADED)**, which does not satisfy the Final gate — an unverifiable verdict is not
+  evidence. `firm-doctor` FAILs while it's missing.
+- **`pyyaml` is advisory.** Without it the acceptance-criteria and eval-assertion parsers fall back to
+  regex, which is looser.
+
+`firm-bootstrap` reports what's missing and prints this command; pass `--with-python-deps` to have it
+run the install for you. It never installs packages as a side effect — changing your machine should
+be something you asked for.
+
 ## TL;DR (machine that already has this repo)
 ```bash
 ~/agent-firm/bin/firm-bootstrap          # marketplace + plugin + shell PATH links (idempotent)
+~/agent-firm/bin/firm-bootstrap --with-python-deps   # ...and install the Python prerequisites
 ```
 Then, per project (once):
 ```bash
 cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
+
+**Upgrading a project installed before v0.7.0:** `firm-install` only ever *adds* rules, so a project
+set up earlier still grants rules the firm has since **retired** as unsafe (`Bash(cat:*)`,
+`Bash(jq:*)` — they read straight around the `Read(./.env)` / `Read(~/.ssh/**)` deny rules). Plain
+`firm-install` warns and exits 3; clear them with:
+```bash
+firm-install --migrate                   # removes retired rules, prints exactly what it deleted
+firm-install --user --migrate            # same, for user-scope settings
+```
+`firm-doctor` FAILs while a retired rule is present. See `agent-firm/policy/retired-permissions.json`.
 
 ### How `firm-*` gets on your shell PATH
 A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,

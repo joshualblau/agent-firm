@@ -1,15 +1,32 @@
 #!/usr/bin/env bash
-# firm-bootstrap [--with-permissions]
+# firm-bootstrap [--with-permissions] [--with-python-deps]
 # One-command device setup: register this repo as a local marketplace and install the agent-firm
 # plugin (user scope = all projects). Idempotent. Portable: it locates the firm repo from its own
 # path, so it works wherever you cloned/copied the repo.
 #   firm-bootstrap                     # register marketplace + install/update the plugin
 #   firm-bootstrap --with-permissions  # also run firm-install in the CURRENT directory (project scope)
+#   firm-bootstrap --with-python-deps  # also pip-install the required jsonschema + pyyaml
+#
+# Installing Python packages CHANGES YOUR MACHINE, so it never happens as a side effect of running
+# this script. Without the flag, bootstrap only reports what's missing and prints the exact command.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+
+# Flags are order-independent (this previously only inspected $1, so `--with-permissions` was
+# silently ignored whenever it wasn't the first argument).
+want_permissions=0
+want_python_deps=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-permissions) want_permissions=1 ;;
+    --with-python-deps) want_python_deps=1 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "firm-bootstrap: unknown arg '$arg'" >&2; exit 2 ;;
+  esac
+done
 
 echo "agent-firm bootstrap"
 echo "  repo: $ROOT"
@@ -39,8 +56,29 @@ else
   echo "  (skipping shell PATH linking — FIRM_SKIP_LINK=1)"
 fi
 
-# 4. Optional: permissions into the current project
-if [[ "${1:-}" == "--with-permissions" ]]; then
+# 4. Python prerequisites. `jsonschema` is gate-critical: without it firm-validate-verdict cannot
+#    schema-validate a QA verdict and exits 4 (DEGRADED), which does not satisfy the Final gate.
+#    `pyyaml` is advisory — the yaml parsers fall back to regex without it.
+PIP_CMD="python3 -m pip install --user jsonschema pyyaml"
+missing_py=""
+python3 -c 'import jsonschema' >/dev/null 2>&1 || missing_py="$missing_py jsonschema"
+python3 -c 'import yaml'       >/dev/null 2>&1 || missing_py="$missing_py pyyaml"
+
+if [[ -n "$missing_py" ]]; then
+  if [[ "$want_python_deps" == "1" ]]; then
+    echo "  installing Python prerequisites:$missing_py"
+    $PIP_CMD || echo "  WARNING: pip install failed — run it yourself: $PIP_CMD" >&2
+  else
+    echo "  ⚠ missing Python prerequisite(s):$missing_py"
+    echo "    jsonschema is REQUIRED (QA verdicts cannot be schema-validated without it)."
+    echo "    Install with:  $PIP_CMD     (or re-run: firm-bootstrap --with-python-deps)"
+  fi
+else
+  echo "  ✔ Python prerequisites present (jsonschema, pyyaml)"
+fi
+
+# 5. Optional: permissions into the current project
+if [[ "$want_permissions" == "1" ]]; then
   echo "  installing firm permissions into: $(pwd)/.claude/settings.json"
   "$SELF/firm-install"
 fi
