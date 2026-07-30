@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# firm-bench-record <role> <success|failure> [qa_verdict]
+# Appends ONE raw usage-event line for a specialist/role at retirement — the evidence a human
+# reviews before promoting anything to bench/registry.yaml. Never rewrites, never rotates.
+#
+# WHERE THIS LIVES, AND WHY (read before changing the path):
+#   $(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl
+# NOT a tracked file like bench/usage-log.jsonl. A tracked file is wrong twice over: it puts
+# append-only machine state into version control (merge conflicts on every parallel write), and —
+# the defect that actually matters — every LINKED WORKTREE gets its own separate working-tree copy
+# of a tracked file, so parallel implementers/specialists in different worktrees would append to
+# DIFFERENT files and take DIFFERENT locks. The mkdir lock below would coordinate nothing.
+# --git-common-dir is the same physical .git for every worktree of one repo, so this is the one path
+# every writer converges on regardless of which worktree it runs in — the identical mechanism
+# firm-new-worktree already relies on for the shared info/exclude entries, for the same reason.
+# Resolved via `cd -P` (this codebase's own symlink-canonicalization idiom, e.g. the __src-resolving
+# preamble in every bin/firm-* script) rather than a bare `git rev-parse --git-common-dir`, because
+# that command returns a path RELATIVE to cwd when run from the main worktree but ABSOLUTE when run
+# from a linked worktree — a bare capture would silently produce two different-looking paths for
+# writers in different worktrees. Verified directly before trusting it.
+#
+# Living inside .git/ also makes this inherently untracked (no .gitignore entry needed) and
+# inherently machine-local: it does not travel on clone and is lost if .git is discarded. That is the
+# correct tradeoff for raw events (evidence for a human promotion decision, not durable history) — the
+# durable record is bench/registry.yaml, which stays tracked and hand-edited. This log is also
+# PER-PROJECT (git-common-dir scopes to one repo), so "≥3 distinct projects" cannot be computed from
+# a single log; the `project` field exists so records stay attributable if a human aggregates across
+# projects at promotion time — itself already a human-reviewed act, not automated.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+
+role="${1:-}"; outcome="${2:-}"; qa_verdict="${3:-}"
+if [[ -z "$role" || -z "$outcome" ]]; then
+  echo "usage: firm-bench-record <role> <success|failure> [qa_verdict]" >&2
+  exit 2
+fi
+case "$outcome" in
+  success|failure) : ;;
+  *) echo "firm-bench-record: outcome must be 'success' or 'failure', got '$outcome'" >&2; exit 2 ;;
+esac
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "firm-bench-record: not inside a git work tree — nowhere to record this" >&2
+  exit 1
+fi
+common_dir="$(cd -P "$(git rev-parse --git-common-dir)" && pwd)"
+log_dir="$common_dir/agent-firm"
+log="$log_dir/bench-usage.jsonl"
+lock="$log_dir/.bench-usage.lock"   # a LOCKDIR, not a lockfile — mkdir is atomic on POSIX, no flock needed
+mkdir -p "$log_dir"
+
+run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
+run_id="$(basename "${run_dir:-unknown}")"
+project="$(basename "$(cd -P "$(git rev-parse --show-toplevel)" && pwd)")"
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Bounded-retry, stale-lock-tolerant lockdir acquire. mkdir is atomic: exactly one concurrent caller
+# succeeds. A lock older than the timeout is assumed abandoned (a killed writer) and reclaimed rather
+# than wedging every future call forever.
+stale_after="${FIRM_BENCH_LOCK_STALE_SECONDS:-30}"
+attempts=0
+max_attempts=100   # ~10s at the 0.1s sleep below; bounded so a genuinely stuck lock fails loudly
+while ! mkdir "$lock" 2>/dev/null; do
+  if [[ -d "$lock" ]]; then
+    lock_age=$(( $(date -u +%s) - $(date -u -r "$lock" +%s 2>/dev/null || echo 0) ))
+    if [[ $lock_age -gt $stale_after ]]; then
+      rmdir "$lock" 2>/dev/null || true   # reclaim; if another writer wins the re-race, loop retries
+      continue
+    fi
+  fi
+  attempts=$((attempts+1))
+  if [[ $attempts -ge $max_attempts ]]; then
+    echo "firm-bench-record: could not acquire lock at $lock after ${max_attempts} attempts — giving up" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+
+if command -v jq >/dev/null 2>&1; then
+  jq -cn --arg role "$role" --arg run_id "$run_id" --arg project "$project" \
+         --arg outcome "$outcome" --arg qa_verdict "$qa_verdict" --arg ts "$ts" \
+    '{role:$role, run_id:$run_id, project:$project, outcome:$outcome, qa_verdict:$qa_verdict, ts:$ts}' \
+    >> "$log"
+else
+  # jq-free fallback: these fields are all sanitized to a safe charset already (role/run_id/project
+  # derive from git-known names; outcome is one of two literals), but escape defensively anyway.
+  esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+  printf '{"role":"%s","run_id":"%s","project":"%s","outcome":"%s","qa_verdict":"%s","ts":"%s"}\n' \
+    "$(esc "$role")" "$(esc "$run_id")" "$(esc "$project")" "$(esc "$outcome")" "$(esc "$qa_verdict")" "$ts" >> "$log"
+fi
+
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" bench_record role="$role" outcome="$outcome" log="$log" || true
+echo "firm-bench-record: recorded ($role, $outcome) -> $log"
