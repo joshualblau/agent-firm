@@ -38,8 +38,49 @@ fi
 # Open the append-only event log.
 repo="$(basename "$(pwd)")"
 base_sha="$(git rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
-printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" >> "$run_dir/run.jsonl"
+
+# Resolve the DEFAULT branch (distinct from HEAD/base_sha above — a run can start on a feature branch)
+# and its SHA at run start. This lets firm-check-assertions PROVE the default branch hasn't moved by
+# comparing SHAs later, instead of the commit-count heuristic it used to use (which only "worked"
+# because eval fixtures happen to start with exactly one commit, and proves nothing in a real repo).
+# Every `if`/`||` below is deliberately structured so a resolution failure does NOT abort run creation
+# under `set -e` — `cmd && { ...; }` as a bare statement WOULD trigger -e on failure; `if cmd; then`
+# and a trailing `|| true` do not. Absence of a resolvable default branch (no git, or a brand-new repo
+# with zero commits) means no baseline is written below — callers must fail closed on that absence,
+# never assume "unchanged", the same way firm-doctor now fails closed on a settings.json it can't read.
+default_branch=""
+default_branch_start_sha=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ref="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$ref" ]]; then
+    default_branch="${ref#refs/remotes/origin/}"
+  else
+    for b in main master; do
+      if git show-ref --verify --quiet "refs/heads/$b"; then default_branch="$b"; break; fi
+    done
+  fi
+  if [[ -n "$default_branch" ]]; then
+    # `--verify --quiet`, not plain `git rev-parse <ref>`: on an unresolvable ref, plain rev-parse
+    # ECHOES THE LITERAL REF STRING TO STDOUT (not stderr) before failing — `2>/dev/null` alone lets
+    # that leak straight into this capture, and since `||` chains the fallback into the SAME command
+    # substitution, a missing refs/heads/<branch> produced "refs/heads/main\n<real sha from fallback>"
+    # as the value, corrupting run.jsonl/run-baseline.json's JSON. Caught by testing the exact case
+    # this exists for: origin/HEAD says one branch, but that branch has no LOCAL ref (e.g. a stale
+    # checkout after a remote rename) — --verify prints nothing on failure, only the SHA on success.
+    default_branch_start_sha="$(git rev-parse --verify --quiet "refs/heads/$default_branch" 2>/dev/null \
+      || git rev-parse --verify --quiet "refs/remotes/origin/$default_branch" 2>/dev/null || true)"
+  fi
+fi
+
+printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+
+# A separate file, not just the ledger line: firm-check-assertions can then do a plain file-exists
+# check for "is there a baseline at all" without parsing run.jsonl, and its absence is unambiguous.
+if [[ -n "$default_branch" && -n "$default_branch_start_sha" ]]; then
+  printf '{"default_branch":"%s","default_branch_start_sha":"%s"}\n' \
+    "$default_branch" "$default_branch_start_sha" > "$run_dir/run-baseline.json"
+fi
 
 # Point CURRENT_RUN at this run so ledger-log knows where to append.
 mkdir -p .agent-firm
