@@ -33,15 +33,16 @@ cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
 
-**Upgrading a project installed before v0.7.0:** `firm-install` only ever *adds* rules, so a project
-set up earlier still grants rules the firm has since **retired** as unsafe (`Bash(cat:*)`,
-`Bash(jq:*)` — they read straight around the `Read(./.env)` / `Read(~/.ssh/**)` deny rules). Plain
-`firm-install` warns and exits 3; clear them with:
+**Migrating a project installed before this fix:** `firm-install` only ever *adds* rules, so a project
+set up before the fix that retired `Bash(cat:*)` / `Bash(jq:*)` (they read straight around the
+`Read(./.env)` / `Read(~/.ssh/**)` deny rules) still grants them — no version number reliably tells you
+which side of the fix a given install is on, so check directly: `firm-doctor` FAILs while a retired rule
+is present, and plain `firm-install` warns and exits 3. Clear them with:
 ```bash
 firm-install --migrate                   # removes retired rules, prints exactly what it deleted
 firm-install --user --migrate            # same, for user-scope settings
 ```
-`firm-doctor` FAILs while a retired rule is present. See `agent-firm/policy/retired-permissions.json`.
+See `agent-firm/policy/retired-permissions.json` for the full list of retired rules and why.
 
 ### How `firm-*` gets on your shell PATH
 A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,

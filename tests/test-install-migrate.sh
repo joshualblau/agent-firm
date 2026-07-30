@@ -85,4 +85,34 @@ assert_ok "firm allow rules present"  has_rule "$S3" allow "Bash(firm-validate-v
 assert_ok "no blanket cat grant"      lacks_rule "$S3" allow "Bash(cat:*)"
 assert_ok "no blanket jq grant"       lacks_rule "$S3" allow "Bash(jq:*)"
 
+# ---------------------------------------------------------------------------
+t_case "the migrate suggestion names the RIGHT scope, even for a .claude*-prefixed project path"
+# firm-install used to guess scope via `target.startswith(os.path.expanduser('~/.claude'))` — a raw
+# string-prefix check that misfires for any project living under a path that textually starts with
+# "~/.claude" too, such as ~/.claude-work/<project>/ (a pattern this repo's own .gitignore already
+# anticipates: `.claude-*/`). A project-scope fix would be told to run --user, silently migrating the
+# WRONG file while the real grant stayed in place. It must use the scope firm-install already knows.
+base="$(mktemp -d)"; T_TMPDIRS="$T_TMPDIRS $base"
+weird_proj="$base/.claude-work/some-profile"
+mkdir -p "$weird_proj/.claude"
+printf '%s\n' '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }' > "$weird_proj/.claude/settings.json"
+
+install_scoped() { d="$1"; h="$2"; shift 2; ( cd "$d" && HOME="$h" "$BIN/firm-install" "$@" ); }
+
+assert_output "project-scope fix suggestion has NO --user" "Remove them with:  firm-install --migrate" \
+  install_scoped "$weird_proj" "$base"
+out="$(install_scoped "$weird_proj" "$base" 2>&1 || true)"
+case "$out" in
+  *"firm-install --user --migrate"*) _t_no "does not suggest --user for a project-scope fix" "got: $(_t_ctx "$out")" ;;
+  *) _t_ok "does not suggest --user for a project-scope fix" ;;
+esac
+
+t_case "the migrate suggestion still says --user for an actual --user install"
+user_home="$(mktemp -d)"; T_TMPDIRS="$T_TMPDIRS $user_home"
+mkdir -p "$user_home/.claude"
+printf '%s\n' '{ "permissions": { "allow": ["Bash(jq:*)"], "ask": [], "deny": [] } }' > "$user_home/.claude/settings.json"
+some_cwd="$(mk_repo)"
+assert_output "user-scope fix suggestion DOES say --user" "firm-install --user --migrate" \
+  install_scoped "$some_cwd" "$user_home" --user
+
 t_summary

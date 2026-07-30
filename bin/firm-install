@@ -32,9 +32,9 @@ for arg in "$@"; do
 done
 if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
 
-python3 - "$SRC" "$target" "$RETIRED" "$migrate" <<'PY'
+python3 - "$SRC" "$target" "$RETIRED" "$migrate" "$scope" <<'PY'
 import json, os, sys
-src, target, retired_path, migrate = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+src, target, retired_path, migrate, scope = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
 src_perms = json.load(open(src)).get("permissions", {})
 os.makedirs(os.path.dirname(target), exist_ok=True)
 tgt = json.load(open(target)) if os.path.exists(target) else {}
@@ -75,6 +75,12 @@ if present and not migrate:
     for r in present:
         print(f"    {r}")
     print("  These were withdrawn because they read around the Read-tool deny rules.")
-    print(f"  Remove them with:  firm-install{' --user' if target.startswith(os.path.expanduser('~/.claude')) else ''} --migrate")
+    # Use the scope firm-install already resolved from its OWN arguments, not a guess re-derived from
+    # the target path. A raw `target.startswith(os.path.expanduser('~/.claude'))` string-prefix check
+    # misfires for any PROJECT whose path happens to start with that string too — e.g. a project under
+    # ~/.claude-work/<project>/ (a directory-naming pattern this repo's own .gitignore anticipates:
+    # `.claude-*/`) — which would tell a project-scope user to run --user and silently migrate the
+    # wrong file, leaving the real grant in place while they believe it's fixed.
+    print(f"  Remove them with:  firm-install{' --user' if scope == 'user' else ''} --migrate")
     sys.exit(3)
 PY
