@@ -70,6 +70,12 @@ checkout at the integration HEAD) then `firm-validate-verdict` + `firm-traceabil
 - Implementers self-correct to green, bounded by `max_test_repair_loops`, then stop and report.
 - `qa-tester` independently re-runs the pyramid from a **clean checkout** (`firm-qa-checkout`) and emits
   a **schema-valid** APPROVE/BLOCK (`firm-validate-verdict`). QA is **read-only against source**.
+- **Immediately after QA returns, YOU (the Lead) run `firm-qa-clean-check`** against that same checkout
+  — never QA checking itself; self-certification is exactly what this step exists to avoid. It proves
+  QA left **no visible changes**, not that QA is read-only: it cannot catch a modify-then-revert inside
+  the checkout, and says nothing about writes outside it. A non-zero exit (dirty, or the checkout can't
+  even be inspected) is a BLOCK — see `docs/ENFORCEMENT.md` for the full claimed-invariant-vs-actual-
+  enforcement picture.
 - Gate on **acceptance coverage**: `firm-traceability-check` must pass (every criterion covered or
   justified) before the final gate. Reject malformed verdicts.
 - The team never self-approves and never auto-merges.
@@ -111,6 +117,7 @@ Optional/deferred: adversarial Agent-Teams panels and durable runners (documente
 Since 0.7.0: `firm-link` closes the install hole (a plugin's `bin/` is on `$PATH` only *inside* a
 `claude` session, so the `firm-*` tools are symlinked into `~/.local/bin` for terminal use;
 `firm-bootstrap` does it, `firm-doctor` checks it) and every `firm-*` script now resolves its own
-symlink. Model tiering moved to **Opus 5** for Lead/Intake/Architect/**Implementer**/**Integrator**/
-Reviewer — Build and Integrate were promoted off Sonnet because Opus 5 leads on agentic coding and
-bug-finding. Watch `max_specialists_concurrent`: wide Opus fan-out is now the likeliest rate-limit.
+symlink. Model tiering is `agent-firm/policy/model-tiers.yaml` (`firm-policy model-tiers`) —
+**Opus 5** for Lead/Intake/Architect/**Implementer**/**Integrator**/Reviewer, Build and Integrate
+promoted off Sonnet because Opus 5 leads on agentic coding and bug-finding. Watch
+`max_specialists_concurrent`: wide Opus fan-out is now the likeliest rate-limit.

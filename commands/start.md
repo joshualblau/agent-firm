@@ -69,15 +69,22 @@ roles lack, the `recruiter` staffs it for THIS engagement:
 - **Mint an ephemeral specialist:** `firm-hire <role>` scaffolds a job spec (mandate, least-privilege
   tools/MCP, budget, retirement); dispatch the generic `specialist` subagent with that spec; retire it
   at engagement end.
+- **At retirement, YOU (the Lead) run `firm-bench-record <role> success|failure [qa_verdict]`** — the
+  recruiter can't (it has no `Bash` tool). This is the raw usage evidence a human reviews before ever
+  promoting anything; it lives per-project at
+  `$(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl` (untracked, shared across every
+  worktree of this repo).
 - **Hard tool/MCP scoping:** persist a durable agent (via `/agents`) with explicit tools/`mcpServers`
   instead of an ephemeral dispatch when the scope must be enforced, not just requested.
 - **Keep the bench general:** `bench/registry.yaml` stays near-empty of domain experts; promote a
-  specialist to durable ONLY after ≥3 successful uses or human approval, and only if it is genuinely
-  reusable across projects. A one-off need never becomes a permanent hire.
+  specialist to durable ONLY after ≥3 successful uses **across ≥3 distinct projects**, each with a QA
+  **APPROVE**, and no eval regression attributable to it — or explicit human approval — and only if
+  it is genuinely reusable across projects. A one-off need never becomes a permanent hire.
 
 ## Self-testing before approval (non-negotiable)
 - Implementers self-correct to green, bounded by `max_test_repair_loops`, then stop and report.
 - `qa-tester` re-runs the pyramid from a clean checkout (`firm-qa-checkout`) and emits a schema-valid APPROVE/BLOCK (`firm-validate-verdict`); `firm-traceability-check` must pass. QA is read-only against source. The team never self-approves or auto-merges.
+- **Immediately after QA returns, run `firm-qa-clean-check` yourself (the Lead) against that same checkout — never QA checking itself.** It proves QA left no *visible* changes, not that QA is read-only (it can't catch modify-then-revert, or writes outside the checkout). A non-zero exit is a BLOCK.
 
 ## Hard rules (always; `firm-policy never-rules`)
 - No irreversible external/on-chain actions without a human gate; never move money/sign/send funds.
