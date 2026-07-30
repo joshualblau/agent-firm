@@ -8,9 +8,13 @@ definition_of_done:
   - unit tests pass
   - integration / e2e tests pass where applicable
   - visual checks pass or are marked not_applicable with a reason
-  - QA verdict is APPROVE and validates against qa-verdict.schema.json — `firm-validate-verdict` must
+  - >-
+    QA verdict is APPROVE and validates against qa-verdict.schema.json — `firm-validate-verdict` must
     exit 0. Exit 4 (DEGRADED — `jsonschema` absent, so the verdict was never schema-checked) does NOT
-    satisfy this item: install the prerequisite and re-validate. An unverifiable verdict is not evidence.
+    satisfy this item — install the prerequisite and re-validate. An unverifiable verdict is not evidence.
+  - QA checkout left no visible changes — the LEAD runs `firm-qa-clean-check` against the same checkout
+    QA used, immediately after QA returns (never QA checking itself). This proves absence of visible
+    changes, not read-only enforcement — see docs/ENFORCEMENT.md. A non-zero exit is a BLOCK.
   - no unexplained snapshot/baseline changes
   - secret scan run with no findings (or findings triaged + justified)
   - changelog / docs updated if the change is user-facing
@@ -22,6 +26,7 @@ definition_of_done:
     write on catalog/config/append-only/PII/identity tables; every engagement-scoped table has FORCE
     RLS + repository-only (repo-only) access; the implementer attaches a GRANT audit the reviewer verifies
   # Applies to any change adding/altering tests:
-  - no-overclaim tests — a test's asserted property is ACTUALLY exercised: a multi-axis / "both X and Y"
+  - >-
+    no-overclaim tests — a test's asserted property is ACTUALLY exercised (a multi-axis / "both X and Y"
     test must vary EVERY axis it names; a title/describe may not claim a guarantee its body does not
-    drive; the reviewer checks test bodies against their titles
+    drive); the reviewer checks test bodies against their titles
