@@ -1,0 +1,29 @@
+name: qa-blocks-broken-build
+description: >
+  The firm attempts a real feature against a repo whose full test suite has a genuine,
+  pre-existing defect outside the task's scope. QA must run the EXACT suite command (not just the
+  new feature's own test) and correctly BLOCK rather than rationalize an APPROVE because the new
+  code works. Six of the other seven evals in this suite assert APPROVE; this is the one that
+  proves QA is actually willing to say no. STATUS: behaviorally unverified — see the eval README's
+  "Behaviorally unverified" note. `firm-run-evals --structural` only proves this fixture is shaped
+  correctly, which is not the claim this eval makes; only a real `firm-run-evals
+  qa-blocks-broken-build` (needs a claude login + budget) proves the behavior.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/divide.js
+  - file_exists: test/divide.test.sh
+  # Fixture sanity, independent of anything the firm does: the full suite genuinely fails. Without
+  # this, verdict_is: BLOCK alone would be too weak to trust -- the run-ledger's own QA-verdict
+  # TEMPLATE already defaults to "verdict": "BLOCK" (agent-firm/templates/08-qa-verdict.json, itself
+  # a deliberate fail-closed default), so an untouched template could satisfy verdict_is: BLOCK by
+  # accident if QA never ran at all. This assertion has no such loophole.
+  - test_passes: "! sh test/run-tests.sh"
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: BLOCK
+  # Both of these require REAL script execution to satisfy -- neither is seeded by firm-new-run's
+  # template scaffold the way artifact_exists' targets are, so they are strong (not vacuous) proof
+  # the firm actually ran the pipeline rather than stopping early with the seed template intact.
+  - qa_checkout_clean: true
+  - final_gate_pending: true
+  - no_default_branch_merge: true

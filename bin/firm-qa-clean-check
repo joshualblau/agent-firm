@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# firm-qa-clean-check [qa_dir]
+# Checks that the QA checkout was left with NO VISIBLE CHANGES after QA ran.
+#
+# This is NOT read-only enforcement, and the name says so rather than overclaiming it. A clean
+# `git status` proves QA didn't leave anything behind — it does not catch a modify-then-revert inside
+# the checkout, and it says nothing about writes OUTSIDE the checkout (an implementer worktree, the
+# firm repo itself, files above the git root). It is one honest, cheap signal, not a guarantee.
+# See docs/ENFORCEMENT.md for the full claimed-invariant-vs-actual-enforcement table.
+#
+# Run by the LEAD, immediately after QA returns — never by QA checking itself. Self-certification is
+# exactly the thing the firm exists to avoid (see CLAUDE.md / commands/start.md, Test stage).
+#
+# Fails CLOSED, matching the rest of this hardening pass: a missing checkout directory is NOT treated
+# as "nothing to report" (a vacuous pass) — it means the one thing this check exists to verify cannot
+# be verified, so it FAILs, the same way firm-check-assertions' baseline checks fail on a missing
+# run-baseline.json rather than silently passing.
+#
+# Exit codes: 0 = clean. 1 = dirty (tracked or untracked changes present). 2 = cannot verify (missing
+# directory, or the directory isn't a usable git checkout).
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
+
+qa_dir="${1:-}"
+if [[ -z "$qa_dir" ]]; then
+  run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+  run_id="$(basename "${run_dir:-none}")"
+  qa_dir=".agent-firm/qa-checkout/${run_id}"   # the exact path firm-qa-checkout creates
+fi
+
+if [[ ! -d "$qa_dir" ]]; then
+  echo "firm-qa-clean-check: CANNOT VERIFY — '$qa_dir' does not exist (run firm-qa-checkout first)." >&2
+  [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_clean_check status=cannot_verify dir="$qa_dir" reason=missing_dir || true
+  exit 2
+fi
+
+# `if status="$(...)"; then` — NOT a bare `status="$(...)"; rc=$?`. Under `set -e`, the bare form's
+# assignment IS the simple command bash evaluates for -e purposes: if `git status` fails, the script
+# aborts right there, `rc=$?` never runs, and the caller sees git's raw exit code (128) instead of this
+# script's intended exit 2 and message. Wrapping it as an `if` condition is one of the few contexts -e
+# explicitly exempts, so a failure reaches the `else` branch instead of killing the script. Verified
+# live against exactly this qa_dir-is-not-a-git-checkout case before trusting it.
+if status="$(git -C "$qa_dir" status --porcelain 2>&1)"; then
+  :
+else
+  rc=$?
+  echo "firm-qa-clean-check: CANNOT VERIFY — 'git status' failed (rc=$rc) in '$qa_dir' (not a git checkout?):" >&2
+  echo "  $status" >&2
+  [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_clean_check status=cannot_verify dir="$qa_dir" reason=git_status_failed || true
+  exit 2
+fi
+
+if [[ -n "$status" ]]; then
+  echo "firm-qa-clean-check: DIRTY — '$qa_dir' has changes QA left behind:" >&2
+  echo "$status" | sed 's/^/  /' >&2
+  echo "  This proves visible changes were left, not that QA edited source — see docs/ENFORCEMENT.md." >&2
+  [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_clean_check status=dirty dir="$qa_dir" || true
+  exit 1
+fi
+
+echo "firm-qa-clean-check: clean — no visible changes in '$qa_dir'."
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_clean_check status=clean dir="$qa_dir" || true
+exit 0

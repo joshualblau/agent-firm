@@ -1,7 +1,14 @@
 # Interactive live test — driving the firm with a real Claude session
 
-A demo work-project with the firm config installed is at `/tmp/firm-live` (ephemeral; recreate with
-the steps at the bottom if `/tmp` was cleared). Run the firm for real and watch the lifecycle engage.
+A demo work-project with the firm config installed, at `/tmp/firm-live`. **`/tmp` does not survive a
+reboot**, so recreate it first — this is not an edge case, it's the normal state of this doc between
+sessions:
+```bash
+rm -rf /tmp/firm-live && mkdir -p /tmp/firm-live && cd /tmp/firm-live && git init -q
+cp -R ~/agent-firm/.claude ~/agent-firm/CLAUDE.md ~/agent-firm/bin ~/agent-firm/agent-firm .
+git add -A && git commit -qm "init: firm config installed"
+```
+Run the firm for real and watch the lifecycle engage.
 
 ## Run it
 ```bash
@@ -45,9 +52,3 @@ Copy the firm config into that repo, then `cd` there and run `claude`:
 cp -R ~/agent-firm/.claude ~/agent-firm/CLAUDE.md ~/agent-firm/bin ~/agent-firm/agent-firm <your-repo>/
 ```
 
-## Recreate the demo project (if /tmp was cleared)
-```bash
-rm -rf /tmp/firm-live && mkdir -p /tmp/firm-live && cd /tmp/firm-live && git init -q
-cp -R ~/agent-firm/.claude ~/agent-firm/CLAUDE.md ~/agent-firm/bin ~/agent-firm/agent-firm .
-git add -A && git commit -qm "init: firm config installed"
-```

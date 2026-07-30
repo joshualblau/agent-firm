@@ -16,7 +16,13 @@ specialists: []      # durable, promoted specialists live here (job-spec shaped)
 
 governance:
   promotion:
-    criteria: "used successfully >=3 times OR human-approved AND genuinely cross-project"
+    criteria: >-
+      used successfully >=3 times ACROSS >=3 DISTINCT PROJECTS, each with a QA APPROVE, and no eval
+      regression attributable to the specialist -- OR human-approved AND genuinely cross-project.
+      "Used successfully >=3 times" alone (no distinct-project / QA-approve / no-regression bars) is
+      NOT sufficient on its own; it was too weak and, before firm-bench-record's per-project usage
+      log existed, also unmeasurable.
+    evidence: "raw usage events: firm-bench-record, one per retirement, at $(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl (untracked, per-project -- a human aggregates across projects at promotion time; this file itself is durable config, not the evidence)"
     requires: [job_spec_review, tool_and_mcp_scope_review, one_golden_eval]
     owner: lead
   retirement:

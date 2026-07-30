@@ -8,10 +8,13 @@
 # a run that crashed or did nothing could not fake the way the envelope inference could.
 #
 # Assertion vocabulary (assertions.yaml, a top-level `assertions:` list of `- key: value`):
-#   file_exists / file_absent <path>     artifact_exists <ledger-file>     verdict_is APPROVE|BLOCK
-#   test_passes <command>                traceability_passes true          no_default_branch_merge true
-#   final_gate_pending true              (an EXPLICIT firm-ledger-log event, not inferred from the
-#                                          claude -p envelope — see default_branch_status() below)
+#   file_exists / file_absent <path>     artifact_exists / artifact_absent <ledger-file>
+#   verdict_is APPROVE|BLOCK             test_passes <command>              traceability_passes true
+#   no_default_branch_merge true         final_gate_pending true            (an EXPLICIT
+#                                          firm-ledger-log event, not inferred from the claude -p
+#                                          envelope — see default_branch_status() below)
+#   qa_checkout_clean true               (delegates to firm-qa-clean-check; NOT read-only enforcement,
+#                                          only "no visible changes were left" — see that script's header)
 #
 # no_default_branch_merge / final_gate_pending both compare the default branch's CURRENT sha against
 # run-baseline.json (written by firm-new-run at run start). If that baseline is missing or unusable,
@@ -112,6 +115,16 @@ for a in asserts:
         found = bool(led) and (os.path.exists(os.path.join(led, v))
                  or bool(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True)))
         check(f"artifact_exists {v}", found, (led or "no ledger"))
+    elif k == "artifact_absent":
+        # file_absent checks paths relative to the repo root (source files); ledger artifacts like
+        # 10-handoff.md live under the dynamically-named .agent-firm/runs/<run_id>/, which file_absent
+        # can't address. This is artifact_exists' missing negative counterpart -- added for
+        # qa-blocks-broken-build, which needs to prove NO handoff was written (QA blocked, so the
+        # Packager stage the lifecycle gates on APPROVE never ran) rather than a source file.
+        led = find_ledger()
+        found = bool(led) and (os.path.exists(os.path.join(led, v))
+                 or bool(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True)))
+        check(f"artifact_absent {v}", not found, (led or "no ledger"))
     elif k == "verdict_is":
         led = find_ledger(); vf = os.path.join(led or "", "08-qa-verdict.json")
         got = None
@@ -156,6 +169,22 @@ for a in asserts:
             deliberate = event_logged and status
             check("final_gate_pending", deliberate == want,
                   f"final_gate_pending logged={event_logged}, default_branch_unchanged={status} ({detail})")
+    elif k == "qa_checkout_clean":
+        # Delegates to firm-qa-clean-check rather than reimplementing it -- one script owns "what does
+        # a clean QA checkout mean", the same reuse firm-check-assertions already does for
+        # traceability_passes (calls firm-traceability-check) instead of a second parser here.
+        # Exit 0 clean / 1 dirty / 2 CANNOT VERIFY (missing dir, or not a git checkout). Both 1 and 2
+        # fail this assertion when `want` is true -- a checkout we can't even inspect is not evidence
+        # of cleanliness, same fail-closed rule as default_branch_status() above.
+        want = (v.lower() == "true")
+        qcc = os.path.join(selfdir, "firm-qa-clean-check")
+        r = subprocess.run([qcc], capture_output=True, cwd=repo, text=True)
+        msg_lines = (r.stderr or r.stdout or "").strip().splitlines()
+        msg = msg_lines[0] if msg_lines else f"rc={r.returncode}"
+        if r.returncode == 2:
+            check("qa_checkout_clean", False, f"CANNOT VERIFY (fail-closed): {msg}")
+        else:
+            check("qa_checkout_clean", (r.returncode == 0) == want, msg)
     else:
         check(f"unknown_assertion:{k}", False)
 

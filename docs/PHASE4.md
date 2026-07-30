@@ -1,5 +1,9 @@
 # Phase 4 — Portability (plugin distribution · portable secrets · per-project profiles)
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Part 1 packages the firm as a shared, versioned plugin. Part 2 (below the divider) makes each project
 switch to the right **subscription accounts** and load its **secrets** with nothing sensitive in git.
 

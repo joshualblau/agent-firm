@@ -2,8 +2,10 @@
 
 A reusable **AI engineering firm** for Claude Code: a hierarchical Lead orchestrates a team of
 specialized role subagents through a disciplined lifecycle — **intake → plan → build → integrate →
-review → test → package** — pausing for you only at critical decision points and final approval, and
-**testing its own work** (with schema-validated evidence) before it asks you to sign off.
+review → test → package** (the full stage/subagent/artifact/gate table lives in
+[CLAUDE.md](CLAUDE.md#the-lifecycle-delegate-each-stage-to-its-subagent), the operating manual — this
+README doesn't carry a second copy) — pausing for you only at critical decision points and final
+approval, and **testing its own work** (with schema-validated evidence) before it asks you to sign off.
 
 It is built as an **operating system, not a chatty org chart**: every role emits a durable artifact,
 every gate carries evidence, every run is bounded, and the firm improves only through changes you review.
@@ -61,27 +63,34 @@ cp -R ~/agent-firm/.claude/settings.json ~/agent-firm/bin ~/agent-firm/agent-fir
 .claude-plugin/plugin.json    # plugin manifest (name, version) — drives the versioned install
 .claude-plugin/marketplace.json # local marketplace entry (this repo hosts the plugin)
 agents/*.md                   # roles: intake, architect, implementer, integrator, reviewer, qa, packager,
-                              #   recruiter, specialist, scout (Opus 5 for lead/intake/architect/build/
-                              #   integrate/review; Sonnet 5 workhorse; Haiku scout; Fable escalation)
+                              #   recruiter, specialist, scout — model tiers: agent-firm/policy/model-tiers.yaml
 commands/start.md             # /agent-firm:start — activates the firm and begins an engagement
 hooks/hooks.json              # run-ledger logging hook (plugin mode)
 AGENTS.md                     # Codex's instructions (independent GPT QA judge)
 bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
-                              #   firm-integrate, firm-qa-checkout, firm-traceability-check, firm-policy,
-                              #   firm-hire, firm-gpt-qa, firm-propose-system-change, firm-run-evals,
-                              #   firm-check-assertions, firm-visual-check, firm-visual-baseline,
-                              #   firm-notify, firm-install, firm-link, firm-bootstrap, firm-doctor
+                              #   firm-integrate, firm-qa-checkout, firm-qa-clean-check, firm-traceability-check,
+                              #   firm-policy, firm-hire, firm-bench-record, firm-gpt-qa,
+                              #   firm-propose-system-change, firm-run-evals, firm-check-assertions,
+                              #   firm-visual-check, firm-visual-baseline, firm-notify, firm-install,
+                              #   firm-link, firm-bootstrap, firm-doctor
 .envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
 agent-firm/templates/visual/  # Playwright visual-regression config + specs (firm-visual-check gates on these)
-agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy, execution-budget
+agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy,
+                              #   execution-budget, model-tiers, retired-permissions
 agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staffing-plan
 agent-firm/templates/*        # run-ledger artifact templates
 agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
 agent-firm/evals/*            # golden-task evals that guard firm changes
+tests/*                       # dependency-free bash+git regression suite for bin/ (tests/run-tests.sh)
+.github/workflows/ci.yml      # bash -n + the tests/ suite (ubuntu+macOS) + firm-run-evals --structural
 .claude/settings.json         # permission rules (copy-mode + the source firm-install merges)
 CLAUDE.md                     # operating manual (copy-mode reference; plugin uses /agent-firm:start)
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
-docs/PHASE*.md                # what's built per phase + the roadmap
+docs/README.md                # doc index; docs/PHASE*.md — dated build record per phase, not reference docs
+docs/ENFORCEMENT.md           # every claimed invariant vs. what actually enforces it
+bench/registry.yaml           # durable specialist bench (governance, tracked). Raw usage evidence is
+                              #   separate, untracked, per-project runtime state — firm-bench-record,
+                              #   $(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl
 ```
 
 ## Roadmap (see the plan)
@@ -91,3 +100,23 @@ docs/PHASE*.md                # what's built per phase + the roadmap
 - **Phase 3 (done):** independent Codex/GPT QA judge via `codex exec --output-schema` on the ChatGPT subscription (`firm-gpt-qa`, two-voice QA); needs `codex login` (see docs/PHASE3.md).
 - **Phase 4 (done):** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
 - **Phase 5 (done):** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
+- **Hardening and measurement phase (done):** the firm's OWN tooling gets the same evidence-not-
+  confidence bar it holds the deliverable to — a dependency-free `bin/` regression suite + CI
+  (`.github/workflows/ci.yml`), a fail-closed `run-baseline.json` SHA comparison replacing the old
+  commit-count heuristic for `no_default_branch_merge`/`final_gate_pending`, a negative golden eval
+  (`qa-blocks-broken-build`) proving QA will actually **BLOCK**, `firm-qa-clean-check` (Lead-run, not
+  self-certified), and a per-project bench usage log (`firm-bench-record`). See the system-change
+  record for the full account: `system-changes/20260728T184311Z-hardening-and-measurement.md`.
+
+### Not yet: self-improvement
+"Continuous-improvement loop" (above, Phase 1) and the hardening pass just above it both **record**
+outcomes and **guard** against regressions — they do not yet **improve** the firm on their own. The
+loop still runs entirely through a human: a retrospective proposes a System Change PR, a human reviews
+and approves it, and only then does a golden eval guard the change. What's genuinely missing, so
+"continuous improvement" isn't read as more than it is:
+- **Lesson extraction** — nothing mines retrospectives or run ledgers across engagements for patterns.
+- **Change proposal** — System Change PRs are hand-written from what a Lead noticed, not synthesized.
+- **Benchmarking a proposed change before adoption** — `firm-run-evals` guards an ALREADY-approved
+  change; nothing runs the eval suite against a candidate change to inform the approval decision itself.
+- **Automated versioning or rollback** — reverting a System Change PR today is a manual `git revert`.
+Each of these is a real, larger project, not a small addition — deliberately out of scope here.

@@ -1,5 +1,9 @@
 # Phase 1 — Deterministic lifecycle and evidence
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Goal: make the lifecycle **deterministic and evidence-driven** — parallel build with real isolation,
 a true integration step, clean-checkout QA, acceptance traceability, and the loop by which the firm
 improves itself under review.

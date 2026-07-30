@@ -10,6 +10,14 @@
 #
 # Requires: the agent-firm plugin installed (firm-bootstrap) so the firm's subagents + bin/firm-* tools
 # are available, and `claude` logged in. Run mode does NOT run in CI without a Claude login.
+#
+# `Bash(sh test/run-tests.sh)` is the EXACT command, not `Bash(sh:*)` — the qa-blocks-broken-build eval
+# fixture's suite is a shell script (no node in this environment), and this is the narrowest rule that
+# lets the qa-tester agent execute it. Arbitrary command execution is already reachable in this posture
+# via the existing node/npm/pytest entries plus Write, so this adds no new class of exposure -- but a
+# bare `sh:*` would, and is deliberately not granted. UNVERIFIED at authoring time whether Claude Code's
+# permission engine actually matches this rule as intended against the live agent's tool call -- only a
+# real model-driven run of that eval proves it, and this file's own `--structural` mode cannot.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -61,7 +69,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
       --append-system-prompt "$(cat "$MANUAL")" \
       --settings "$out/settings.json" \
       --permission-mode default \
-      --allowedTools "Read,Edit,Write,Grep,Glob,Bash(firm-new-run:*),Bash(firm-ledger-log:*),Bash(firm-validate-verdict:*),Bash(firm-traceability-check:*),Bash(firm-qa-checkout:*),Bash(firm-integrate:*),Bash(firm-new-worktree:*),Bash(firm-gpt-qa:*),Bash(git add:*),Bash(git commit:*),Bash(git worktree:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(node --test),Bash(node --test:*),Bash(npm test:*),Bash(npm run test:*),Bash(pytest:*)" \
+      --allowedTools "Read,Edit,Write,Grep,Glob,Bash(firm-new-run:*),Bash(firm-ledger-log:*),Bash(firm-validate-verdict:*),Bash(firm-traceability-check:*),Bash(firm-qa-checkout:*),Bash(firm-qa-clean-check:*),Bash(firm-integrate:*),Bash(firm-new-worktree:*),Bash(firm-gpt-qa:*),Bash(firm-bench-record:*),Bash(git add:*),Bash(git commit:*),Bash(git worktree:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(node --test),Bash(node --test:*),Bash(npm test:*),Bash(npm run test:*),Bash(pytest:*),Bash(sh test/run-tests.sh)" \
       --disallowedTools "Bash(git push:*),Bash(git merge:*)" \
       --max-budget-usd "${FIRM_EVAL_BUDGET_USD:-5.00}" \
       --output-format json ) > "$out/result.json" 2>"$out/stderr.log" \
