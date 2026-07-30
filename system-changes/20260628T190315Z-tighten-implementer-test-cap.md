@@ -5,7 +5,9 @@ reviewed for generalizability, approved by the human, versioned, and guarded by 
 
 - **Proposed by run:** <run_id>
 - **Date (UTC):**
-- **Status:** proposed | approved | rejected | merged
+- **Status:** abandoned (stub, never filled in — no motivation, proposed change, or eval was ever
+  recorded here; found unfilled during the hardening-and-measurement pass, 2026-07-30, and marked
+  rather than silently deleted so the history stays honest)
 
 ## Motivation
 <!-- What recurring problem or opportunity did the engagement surface? Cite the retrospective. -->

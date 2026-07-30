@@ -1,5 +1,9 @@
 # Phase 3 — The Codex/GPT QA judge (independent, cross-provider)
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Goal: make QA **two voices from different providers**, so a blind spot the implementer's model shares
 with a same-provider reviewer still gets caught. The Claude `qa-tester` checks acceptance/evidence
 coverage; a **GPT judge via Codex** independently hunts implementation blind spots. Both must APPROVE.

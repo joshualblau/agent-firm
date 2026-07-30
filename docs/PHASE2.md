@@ -1,5 +1,9 @@
 # Phase 2 — Dynamic staffing (hire per engagement, stay general)
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Goal: let the firm bring in whatever expertise a project needs **without** carrying permanent domain
 experts. The firm keeps a small set of core roles and **hires specialists on demand**, then retires them.
 

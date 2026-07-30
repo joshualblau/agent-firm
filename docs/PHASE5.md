@@ -1,5 +1,9 @@
 # Phase 5 — Hardening
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Phase 5 makes the firm safer to run unsupervised and closes the last gaps in "tests its own work" and
 "minimal supervision." Five tracks: an **egress firewall**, a **visual-regression suite**, **remote
 approval notifications**, **full golden-eval execution**, and docs for **adversarial panels** +

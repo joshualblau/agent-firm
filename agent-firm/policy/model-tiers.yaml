@@ -1,0 +1,44 @@
+# Model tiers — the single source for which model runs which role, and why.
+#
+# `commands/start.md` keeps its OWN inline copy of this table rather than referencing this file: it is
+# the prompt injected into the runtime session and has to stand alone (a live Lead can't `cat` a policy
+# file mid-instruction the way a human reading docs can). Treat that copy and this file as needing to
+# stay in sync by hand when either changes — CLAUDE.md and README.md link here instead of repeating it.
+#
+# Agent frontmatter (agents/*.md `model:` field) also carries a literal value per role — the format
+# requires a concrete value there, so those are a THIRD place this has to be kept consistent, not a
+# duplicate to eliminate.
+
+principle: >-
+  Effort matters as much as tier (default high, xhigh for coding/agentic work, low for cheap
+  subagents). On a Claude subscription, cost is a quota/latency proxy, not a bill — reserve the top
+  tier for what actually needs it rather than defaulting up out of habit.
+
+tiers:
+  fable_5:
+    role: "The ceiling — slowest and quota-heaviest."
+    used_for: "Escalate TO it only for the hardest/novel design work, or a genuinely hard specialist."
+    never: "Not the Lead. Keep the security_privacy review lens OFF Fable — its safety classifiers can refuse security-adjacent work."
+
+  opus_5:
+    role: "Default heavyweight."
+    roles: [lead, intake-analyst, architect, implementer, integrator, reviewer]
+    why: >-
+      The strongest tier for agentic coding, long-horizon execution, and bug-finding (high precision
+      AND recall) — why Build (implementer) and Integrate (integrator) run here rather than on Sonnet.
+
+  sonnet_5:
+    role: "Workhorse."
+    roles: [recruiter, packager, "qa-tester (Claude-side voice)", "hired specialists, unless the job spec justifies more"]
+
+  haiku_4_5:
+    role: "Cheap/fast."
+    roles: [scout]
+    used_for: "Broad read-only sweeps, simple classification, mechanical work — keeps expensive models focused on the diff."
+
+quota_discipline: >-
+  With Build and Integrate on Opus 5, wide parallel implementer fan-out is the most likely way to hit a
+  plan rate-limit. Respect max_specialists_concurrent (agent-firm/policy/execution-budget.yaml), prefer
+  fewer/larger work-orders over many tiny ones, and dispatch scout (Haiku) for read-only reconnaissance
+  so Opus implementers stay focused on the diff. A rate-limit pause is a stop condition — surface it to
+  the human rather than silently downgrading a role's tier.

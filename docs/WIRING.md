@@ -140,6 +140,12 @@ echo '{"message":"wiring test","title":"agent-firm"}' | firm-notify
 Slack / Pushover / ntfy work the same way (see `docs/PHASE5.md §3`). It is **notify-only** — the phone
 alert tells you a gate is waiting; you still approve in the session.
 
+**ntfy caveat:** `firm-notify`'s default `FIRM_NTFY_SERVER` is the **public** `https://ntfy.sh` —
+the topic name is the *only* secret protecting the alert, and the message body carries your project's
+basename. Anyone who learns (or guesses) the topic name can read your notifications, including that
+basename. Use a long, random topic name, or self-host an ntfy server (`FIRM_NTFY_SERVER`) if that's not
+acceptable for a given project.
+
 ## H. Calibrate the golden evals (once)
 
 ```bash

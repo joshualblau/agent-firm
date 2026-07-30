@@ -1,5 +1,9 @@
 # Phase 0 — Minimal Safe Operating System
 
+> **This is a dated build-journal entry, not reference documentation.** It records what shipped
+> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
+> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+
 Goal: a working, bounded, evidence-producing firm with the core roles — **before** any dynamic staffing
 (Phase 2) or the GPT teammate (Phase 3), so blast radius is small while the lifecycle is proven.
 
