@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # validate-verdict <path-to-qa-verdict.json>
 # Validates a QA verdict against qa-verdict.schema.json.
-# Uses python `jsonschema` if installed; otherwise a structural fallback (valid JSON +
-# required top-level keys + verdict in {APPROVE,BLOCK}). Exit 0 = valid, non-zero = invalid.
+#
+# Exit codes:
+#   0 = VALID    — schema-validated with `jsonschema`
+#   1 = INVALID  — malformed JSON, missing required keys, or a bad verdict value
+#   2 = usage error
+#   4 = DEGRADED — structurally plausible but NOT schema-validated (`jsonschema` missing)
+#
+# 4 is deliberately non-zero. This used to exit 0 with a parenthetical, which meant a machine with
+# no `jsonschema` silently downgraded the firm's only mechanical evidence check to "has the right
+# top-level keys" — and the Final gate cleared on it. A gate that cannot verify its evidence must
+# not pass: see policy/gate-matrix.md. `jsonschema` is a declared prerequisite (docs/INSTALL.md,
+# `firm-bootstrap --with-python-deps`), and firm-doctor FAILs without it.
 set -euo pipefail
 
 verdict="${1:-}"
@@ -34,7 +44,12 @@ except ImportError:
         print("INVALID (structural): missing keys:", ", ".join(missing)); sys.exit(1)
     if data.get("verdict") not in ("APPROVE","BLOCK"):
         print("INVALID (structural): verdict must be APPROVE or BLOCK"); sys.exit(1)
-    print("VALID (structural fallback — install `jsonschema` for full validation): verdict =", data["verdict"]); sys.exit(0)
+    print("DEGRADED: verdict is structurally plausible but NOT schema-validated —",
+          "`jsonschema` is not installed.")
+    print("  verdict =", data["verdict"], "(unverified)")
+    print("  This does NOT satisfy the Final gate. Install the prerequisite:")
+    print("    python3 -m pip install --user jsonschema pyyaml     (or: firm-bootstrap --with-python-deps)")
+    sys.exit(4)
 except Exception as e:
     print("INVALID (jsonschema):", e); sys.exit(1)
 PY

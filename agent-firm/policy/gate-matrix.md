@@ -44,6 +44,20 @@ what keeps "minimal supervision" from degrading into a stream of vague interrupt
 
 The Lead decides the track at intake and records it in `00-intake.md`.
 
+## Verdict validation is itself gate evidence
+
+`firm-validate-verdict` must exit **0** before the Final gate. Its exit codes are not interchangeable:
+
+- **0 = VALID** — schema-validated against `qa-verdict.schema.json`. This is the only passing state.
+- **1 = INVALID** — malformed, missing required keys, or a verdict outside `{APPROVE, BLOCK}`. Reject it.
+- **4 = DEGRADED** — structurally plausible but **never schema-checked**, because `jsonschema` isn't
+  installed. This does **not** pass the gate. It is the same class of event as an unavailable second
+  voice: the check didn't run, so it cannot be reported as though it did. Install the prerequisite
+  (`firm-bootstrap --with-python-deps`) and re-validate; `firm-doctor` FAILs while it's missing.
+
+The same rule binds `firm-integrate`: integration runs on `integration/*` branches only, and refuses
+any other target. Merging to the default branch is a **human gate**, never a script's decision.
+
 ## Second-voice (GPT) QA judge policy
 
 The firm's independent cross-provider QA judge (`bin/firm-gpt-qa`, run via the Codex CLI) is

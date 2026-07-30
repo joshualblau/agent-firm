@@ -8,7 +8,9 @@ definition_of_done:
   - unit tests pass
   - integration / e2e tests pass where applicable
   - visual checks pass or are marked not_applicable with a reason
-  - QA verdict is APPROVE and validates against qa-verdict.schema.json
+  - QA verdict is APPROVE and validates against qa-verdict.schema.json — `firm-validate-verdict` must
+    exit 0. Exit 4 (DEGRADED — `jsonschema` absent, so the verdict was never schema-checked) does NOT
+    satisfy this item: install the prerequisite and re-validate. An unverifiable verdict is not evidence.
   - no unexplained snapshot/baseline changes
   - secret scan run with no findings (or findings triaged + justified)
   - changelog / docs updated if the change is user-facing

@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Permission rules the firm has WITHDRAWN. firm-install only ever unions rules into a project's",
+    "settings.json, so a project installed from an older version keeps a retired rule forever unless",
+    "something removes it. `firm-install --migrate` is that something, and firm-doctor FAILS while a",
+    "retired rule is still present — a warning would leave the hole open in every existing project.",
+    "",
+    "The ENFORCED fix is removing Bash(cat:*)/Bash(jq:*) from `allow`: that unconditionally stops the",
+    "blanket auto-approval, regardless of anything below. It falls through to the tool-default prompt.",
+    "",
+    "UNVERIFIED SUPPLEMENTAL PROTECTION, not enforced security: .claude/settings.json also adds `deny`",
+    "entries (Bash(cat .env*), Bash(cat ~/.ssh/**), etc.) as a second layer. Their pattern syntax was",
+    "never confirmed against Claude Code's live permission engine — every existing Bash rule in that",
+    "file uses the `Bash(cmd:*)` colon-prefix form, these use a bare-glob form instead, and nothing in",
+    "the firm exercises real permission matching (the test suite only checks the rules are present as",
+    "JSON strings). Treat them as best-effort, not as proof a matching command will actually be denied.",
+    "Even a working deny rule is not a sandbox: `cat -A ~/.ssh/id_rsa`, a pipe through `awk`, or reading",
+    "the file from python all sit outside a simple command-prefix pattern. The dev-container and scoped,",
+    "read-only credentials are the actual containment; these deny rules are a bonus, not a guarantee."
+  ],
+  "retired": [
+    {
+      "rule": "Bash(cat:*)",
+      "scope": "allow",
+      "since": "2026-07-28",
+      "reason": "Read-tool deny rules (Read(./.env), Read(~/.ssh/**), Read(~/.aws/**), Read(~/.codex/auth.json)) bind ONLY the Read tool. An allow-listed `cat` reads straight around every one of them.",
+      "replacement": "Use the Read tool, which the deny rules actually bind. Ad-hoc `cat` now falls through to the normal permission prompt."
+    },
+    {
+      "rule": "Bash(jq:*)",
+      "scope": "allow",
+      "since": "2026-07-28",
+      "reason": "Same read-around as `cat`, aimed at JSON credential stores (~/.claude.json, ~/.codex/auth.json, cloud credential files).",
+      "replacement": "Read the file with the Read tool. jq on the firm's own ledger artifacts now prompts once rather than being blanket-granted."
+    }
+  ]
+}
