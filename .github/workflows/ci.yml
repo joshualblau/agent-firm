@@ -1,0 +1,50 @@
+name: ci
+
+# The firm's first CI. Deliberately narrow: bash syntax across bin/, the dependency-free tests/ suite
+# on both bash 3.2 (macOS's permanent default — this repo's own scripts hold themselves to it) and a
+# modern bash, and firm-run-evals --structural (structure only — no `claude` login, no spend). Model-
+# driven eval execution (`firm-run-evals` without --structural, `firm-gpt-qa`, live `firm-doctor
+# --probe`) stays manual: those need a real login and real budget, which CI does not have.
+
+"on":
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n across every bin/firm-*
+        run: |
+          set -e
+          for f in bin/firm-*; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+  # Two OSes on purpose: ubuntu-latest carries a modern bash, macos-latest is invoked via /bin/bash
+  # specifically to exercise the 3.2.x the scripts claim to support (macOS ships an ancient bash for
+  # licensing reasons and always will — Homebrew's newer bash on the PATH would defeat the point).
+  test:
+    needs: syntax
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: git identity for scratch-repo fixtures
+        run: |
+          git config --global user.email ci@agent-firm.local
+          git config --global user.name "agent-firm CI"
+          git config --global init.defaultBranch main
+      - name: install the declared prerequisite (jsonschema, pyyaml)
+        run: python3 -m pip install --user jsonschema pyyaml
+      - name: run the suite (default bash)
+        run: bash tests/run-tests.sh
+      - name: run the suite (bash 3.2 compatibility — /bin/bash specifically)
+        run: /bin/bash tests/run-tests.sh
+      - name: firm-run-evals --structural (structure only — no claude login, no spend)
+        run: bin/firm-run-evals --structural
