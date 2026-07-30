@@ -275,22 +275,41 @@ fi
 # Retired permission rules. firm-install only unions rules, so a project installed before a rule was
 # withdrawn keeps it forever. This is a FAIL, not a warning: the retired rules read around the
 # Read-tool deny rules, and a warning would leave that open in every project that already has one.
+#
+# The checker below must not report a clean PASS on a settings.json it couldn't actually verify. The
+# first version of this check did exactly that: `except Exception: sys.exit(0)` treated invalid JSON,
+# or `permissions` shaped as a list instead of an object, as "no retired rules found" — a false PASS on
+# the one file this check exists to inspect. Every parse failure now prints nothing but an error to
+# stderr and exits 2, which the caller turns into a WARN, never a silent PASS.
 RETIRED_JSON="$SELF/../agent-firm/policy/retired-permissions.json"
 if [ -f "$RETIRED_JSON" ]; then
   for _scope in project user; do
     if [ "$_scope" = project ]; then _sfile=".claude/settings.json"; _sflag=""; else _sfile="$HOME/.claude/settings.json"; _sflag=" --user"; fi
     [ -f "$_sfile" ] || continue
-    _found="$(python3 - "$RETIRED_JSON" "$_sfile" <<'PY' 2>/dev/null
+    _out="$(python3 - "$RETIRED_JSON" "$_sfile" <<'PY' 2>&1
 import json, sys
-retired = {r["rule"] for r in json.load(open(sys.argv[1])).get("retired", [])}
-try: perms = json.load(open(sys.argv[2])).get("permissions", {})
-except Exception: sys.exit(0)
-hits = sorted({r for k in ("allow","ask","deny") for r in perms.get(k, []) if r in retired})
-print(" ".join(hits))
+try:
+    retired = {r["rule"] for r in json.load(open(sys.argv[1])).get("retired", [])}
+    perms = json.load(open(sys.argv[2])).get("permissions", {})
+    if not isinstance(perms, dict):
+        raise ValueError("`permissions` is not a JSON object")
+    hits = []
+    for k in ("allow", "ask", "deny"):
+        bucket = perms.get(k, [])
+        if not isinstance(bucket, list):
+            raise ValueError(f"`permissions.{k}` is not a JSON array")
+        hits.extend(r for r in bucket if r in retired)
+    print(" ".join(sorted(set(hits))))
+except Exception as e:
+    print(f"{type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
 PY
 )"
-    if [ -n "$_found" ]; then
-      fail "$_scope settings still grant RETIRED permission rule(s): $_found"
+    _py_rc=$?
+    if [ "$_py_rc" -eq 2 ]; then
+      warn "$_scope settings.json could not be checked for retired permission rules ($_out) — fix the file's JSON, then re-run firm-doctor."
+    elif [ -n "$_out" ]; then
+      fail "$_scope settings still grant RETIRED permission rule(s): $_out"
       info "these read around the Read-tool deny rules. Fix: firm-install$_sflag --migrate"
     else
       pass "$_scope settings carry no retired permission rules"
