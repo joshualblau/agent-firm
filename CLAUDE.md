@@ -60,6 +60,11 @@ checkout at the integration HEAD) then `firm-validate-verdict` + `firm-traceabil
   **you** own every human question.)
 - The **final gate is mandatory**: present the handoff + QA verdict + known risks; nothing is "done",
   merged, deployed, or published without explicit sign-off.
+- **Immediately before pausing there**, run `firm-ledger-log final_gate_pending`. This is the one
+  positive, checkable signal `firm-check-assertions`' `final_gate_pending` verb requires — it no longer
+  infers a deliberate stop from the outer session's result envelope (a crashed or empty run could
+  satisfy that inference just as easily as a correct one). Without this event logged, the check fails
+  closed regardless of how the rest of the run went.
 
 ## Self-testing before approval (non-negotiable)
 - Implementers self-correct to green, bounded by `max_test_repair_loops`, then stop and report.

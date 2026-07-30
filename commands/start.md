@@ -60,6 +60,7 @@ pause is a stop condition — surface it to the human rather than silently downg
 - Pause only at the gates in `firm-policy gate-matrix`. Gate on **reversibility and impact**, never on confidence. Reversible, in-worktree work runs autonomously.
 - Ask **once, well-formed**: `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`. Never ask without options, a recommendation, and a safe default. Subagents cannot ask — **you** own every human question.
 - The **final gate is mandatory**: present handoff + QA verdict + known risks; nothing is done, merged, deployed, or published without explicit sign-off.
+- **Immediately before pausing there, run `firm-ledger-log final_gate_pending`.** This is the positive signal the `final_gate_pending` assertion requires — without it logged, that check fails closed even if the run was otherwise correct.
 
 ## Staffing — hire expertise per engagement (not permanent domain experts)
 The firm is general-purpose, so it does not carry standing domain experts. For any capability the core

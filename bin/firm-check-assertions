@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]
-# Checks the full golden-eval assertion vocabulary against the post-run scratch repo + the `claude -p`
-# result envelope. Exit 0 = all pass, non-zero = at least one failed.
+# Checks the full golden-eval assertion vocabulary against the post-run scratch repo (the run ledger +
+# git state). Exit 0 = all pass, non-zero = at least one failed. `result.json` (the `claude -p` result
+# envelope) is still accepted for CLI compatibility with existing callers, but no assertion currently
+# reads it — final_gate_pending used to infer from its subtype/is_error fields; it now requires an
+# explicit ledger event instead (see default_branch_status() / final_gate_event_logged() below), which
+# a run that crashed or did nothing could not fake the way the envelope inference could.
 #
 # Assertion vocabulary (assertions.yaml, a top-level `assertions:` list of `- key: value`):
 #   file_exists / file_absent <path>     artifact_exists <ledger-file>     verdict_is APPROVE|BLOCK
 #   test_passes <command>                traceability_passes true          no_default_branch_merge true
-#   final_gate_pending true              (the run stopped deliberately for the human gate, not a crash)
+#   final_gate_pending true              (an EXPLICIT firm-ledger-log event, not inferred from the
+#                                          claude -p envelope — see default_branch_status() below)
+#
+# no_default_branch_merge / final_gate_pending both compare the default branch's CURRENT sha against
+# run-baseline.json (written by firm-new-run at run start). If that baseline is missing or unusable,
+# BOTH FAIL CLOSED — never a silent pass via a weaker guess. There is no commit-count fallback: a
+# fallback that can produce a false pass is the exact bug this replaces (see firm-doctor's retired-
+# permission-rules check, fixed the same way one script earlier).
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -27,15 +38,6 @@ except Exception:
         m = re.match(r'\s*-\s*([a-z_]+)\s*:\s*(.+?)\s*$', line)
         if m: asserts.append({m.group(1): m.group(2).strip().strip('"\'')})
 
-env = {}
-if rpath and os.path.exists(rpath):
-    try: env = json.load(open(rpath))
-    except Exception: env = {}
-is_error   = bool(env.get("is_error", False))
-subtype    = env.get("subtype", "")
-stop_reason = env.get("stop_reason", "")
-denials    = env.get("permission_denials", []) or []
-
 def find_ledger():
     cur = os.path.join(repo, ".agent-firm", "CURRENT_RUN")
     if os.path.exists(cur):
@@ -46,6 +48,51 @@ def find_ledger():
 
 def git(*a):
     return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True)
+
+def default_branch_status():
+    """(status, detail). status is True (unchanged) / False (advanced) / None (CANNOT VERIFY).
+    Shared by no_default_branch_merge and final_gate_pending so there is exactly one implementation
+    of "did the default branch move", not two that could quietly drift apart."""
+    led = find_ledger()
+    if not led:
+        return None, "no run ledger found"
+    bpath = os.path.join(led, "run-baseline.json")
+    if not os.path.exists(bpath):
+        return None, "no run-baseline.json (ledger predates the baseline mechanism, or firm-new-run couldn't resolve a default branch)"
+    try:
+        b = json.load(open(bpath))
+        db, start_sha = b.get("default_branch"), b.get("default_branch_start_sha")
+    except Exception as e:
+        return None, f"run-baseline.json unparseable: {e}"
+    if not db or not start_sha:
+        return None, "run-baseline.json missing default_branch or default_branch_start_sha"
+    r = git("rev-parse", "--verify", "--quiet", db)
+    if r.returncode != 0:
+        return None, f"default_branch '{db}' from the baseline does not exist in this repo"
+    current = r.stdout.strip()
+    return (current == start_sha), f"default_branch={db} baseline={start_sha[:12]} current={current[:12]}"
+
+def final_gate_event_logged():
+    """Was a `final_gate_pending` event actually written to run.jsonl? This is a POSITIVE, checkable
+    signal the Lead logs immediately before pausing for human sign-off (see CLAUDE.md / commands/
+    start.md) -- not an inference from the outer claude -p envelope's subtype/is_error, which a run
+    that crashed or did nothing at all could also satisfy."""
+    led = find_ledger()
+    if not led:
+        return False
+    p = os.path.join(led, "run.jsonl")
+    if not os.path.exists(p):
+        return False
+    for line in open(p):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if json.loads(line).get("event") == "final_gate_pending":
+                return True
+        except Exception:
+            continue
+    return False
 
 fails = []
 def check(name, ok, detail=""):
@@ -81,24 +128,34 @@ for a in asserts:
         r = subprocess.run([tc, led or repo], capture_output=True, cwd=repo)
         check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"), f"rc={r.returncode}")
     elif k == "no_default_branch_merge":
-        # The firm must NOT have advanced the default branch (main/master) beyond the initial fixture commit.
-        n = 0
-        for b in ("main", "master"):
-            rr = git("log", "--oneline", b, "-n", "50")
-            if rr.returncode == 0:
-                n = max(n, len([l for l in rr.stdout.splitlines() if l.strip()]))
+        # The firm must NOT have advanced the default branch beyond the SHA it had at run start.
+        # Provable in any repo, at any starting history depth -- unlike the old commit-count heuristic
+        # this replaced, which only "worked" because eval fixtures happen to start with exactly one
+        # commit. If the baseline can't be verified, this FAILS -- never a silent pass on a guess.
         want = (v.lower() == "true")
-        check("no_default_branch_merge", (n <= 1) == want, f"default-branch commits={n}")
+        status, detail = default_branch_status()
+        if status is None:
+            check("no_default_branch_merge", False, f"CANNOT VERIFY (fail-closed): {detail}")
+        else:
+            check("no_default_branch_merge", status == want, detail)
     elif k == "final_gate_pending":
-        # Headless: no human to answer the gate. A CORRECT firm stops DELIBERATELY (clean success turn),
-        # having done its work but NOT completed the gated final action (that teeth lives in
-        # no_default_branch_merge / file_absent). A crash or budget-abort is NOT a deliberate pause.
-        # 2.1.196 envelope has no `tool_deferred`; the deliberate-stop signal is subtype=='success'
-        # && !is_error (a permission_denial on an approval/merge tool, when present, corroborates).
+        # Headless: no human to answer the gate. A CORRECT firm stops DELIBERATELY, having done its
+        # work but not completed the gated final action -- proven by TWO things, both required:
+        # (1) the Lead actually logged the final_gate_pending event (a positive signal it emits itself,
+        #     not inferred from the claude -p envelope -- a run that crashed or did nothing satisfied
+        #     the old subtype=='success' && !is_error inference just as easily as a correct one did);
+        # (2) the default branch genuinely hasn't moved (shares default_branch_status() with
+        #     no_default_branch_merge above -- one implementation of "did it move", not two).
+        # Same fail-closed rule: an unverifiable baseline FAILS, regardless of what `want` says.
         want = (v.lower() == "true")
-        deliberate = (not is_error) and (subtype == "success" or stop_reason == "tool_deferred")
-        check("final_gate_pending", deliberate == want,
-              f"subtype={subtype or 'n/a'} is_error={is_error} denials={len(denials)}")
+        status, detail = default_branch_status()
+        if status is None:
+            check("final_gate_pending", False, f"CANNOT VERIFY (fail-closed): {detail}")
+        else:
+            event_logged = final_gate_event_logged()
+            deliberate = event_logged and status
+            check("final_gate_pending", deliberate == want,
+                  f"final_gate_pending logged={event_logged}, default_branch_unchanged={status} ({detail})")
     else:
         check(f"unknown_assertion:{k}", False)
 
