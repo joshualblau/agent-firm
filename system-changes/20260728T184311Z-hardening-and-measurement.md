@@ -64,15 +64,35 @@ Three stacked PRs. Files:
 - `agent-firm/policy/gate-matrix.md`, `definition-of-done.yaml`, `docs/INSTALL.md` — the rules above.
 - `tests/` — harness + `test-integrate.sh`, `test-validate-verdict.sh`, `test-install-migrate.sh`.
 
-**PR 2 — tests + CI**: the rest of the `bin/` suite; `final_gate_pending` and
-`no_default_branch_merge` rebuilt on a `default_branch_start_sha` baseline recorded by `firm-new-run`;
-GitHub Actions running `bash -n`, the suite on ubuntu + macOS (bash 3.2), and `firm-run-evals
---structural`.
+**PR 2 — tests + CI (merged `1eb9943`, 2026-07-30):** the rest of the `bin/` suite (13 new test files);
+`final_gate_pending` and `no_default_branch_merge` rebuilt on a `default_branch_start_sha` baseline
+recorded by `firm-new-run`, both **fail closed** with no fallback to the old commit-count heuristic;
+an explicit `firm-ledger-log final_gate_pending` event required (wired into `CLAUDE.md` /
+`commands/start.md`) rather than inferred from the `claude -p` result envelope; GitHub Actions
+(`.github/workflows/ci.yml`) running `bash -n`, the suite on ubuntu + macOS (bash 3.2 via `/bin/bash`),
+and `firm-run-evals --structural` — green on both OS legs after one follow-up fix (macOS's
+externally-managed system Python rejected `pip install`; fixed with `actions/setup-python@v7` pinned
+to 3.12). 244 assertions at merge time. A latent `tests/lib.sh` variable-shadowing bug (bare
+`desc`/`out`/`rc` clobbered across direct calls, inherited from PR 1) was also found and fixed, with
+all of PR 1's original 85 assertions re-run to confirm no regression.
 
-**PR 3 — eval, measurement, docs**: the `qa-blocks-broken-build` BLOCK eval (shell fixture, not
-`node --test` — node isn't present in this environment); `firm-qa-clean-check` run by the Lead, named
-for what it actually proves; `bench/usage-log.jsonl` (append-only, `mkdir`-locked) with tightened
-promotion criteria; `docs/ENFORCEMENT.md`; doc de-duplication and drift fixes.
+**PR 3 — eval, measurement, docs (this pass):** the `qa-blocks-broken-build` BLOCK eval (shell fixture,
+not `node --test` — node isn't present in this environment; the fixture's suite command needed an
+*exact* `Bash(sh test/run-tests.sh)` allowlist entry added to `firm-run-evals`, found only by trying to
+run it); `firm-qa-clean-check` (Lead-run, never QA self-certifying) + a new `qa_checkout_clean`
+assertion verb, plus a new `artifact_absent` verb (the negative counterpart `artifact_exists` was
+missing); a bench usage log at `$(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl` —
+**not** a tracked `bench/usage-log.jsonl` as originally sketched: a tracked file would give every
+linked worktree its own separate copy, so parallel writers in different worktrees would append to
+different files entirely (proven with a real concurrent cross-worktree test); tightened promotion
+criteria in `bench/registry.yaml` + `agents/recruiter.md`; `docs/ENFORCEMENT.md`, `docs/README.md`, a
+banner on the dated `docs/PHASE*.md` files (kept in place, not moved — 11 reference updates for the
+same signalling value banners give); doc de-duplication (`agent-firm/policy/model-tiers.yaml`) and
+drift fixes. Also found and fixed: `agent-firm/policy/definition-of-done.yaml` shipped in PR 1 with
+invalid YAML (a bare colon-space inside a multi-line plain-scalar list item) that sat broken through
+PR 2 because nothing ever parses that file programmatically — fixed, with a new generic regression
+test (`tests/test-policy-yaml-valid.sh`) guarding every `agent-firm/policy/*.yaml` and
+`agent-firm/templates/*.yaml` file, proven against the original bug before restoring the fix.
 
 ## Generalizability check (reviewer)
 
@@ -101,32 +121,21 @@ promotion criteria; `docs/ENFORCEMENT.md`; doc de-duplication and drift fixes.
 
 ## Golden eval to guard it
 
-- Eval: `agent-firm/evals/qa-blocks-broken-build/` (PR 3)
+- Eval: `agent-firm/evals/qa-blocks-broken-build/` (PR 3) — 8 evals total, up from 7.
 - What it asserts: QA emits **BLOCK** on a genuinely failing suite with an uncovered acceptance
-  criterion, does not advance the default branch, and stops at the Final gate.
+  criterion, does not advance the default branch, logs the `final_gate_pending` event, and its QA
+  checkout is left clean. Verified as far as possible without spending real budget: hand-simulated both
+  a correctly-behaving firm (8/8 assertions pass) and a firm that wrongly rationalizes an APPROVE
+  despite the broken suite (fails at exactly `verdict_is`, 7/8) — proving the assertion set actually
+  discriminates correct from incorrect behavior, not just structure.
 - **Status: behaviorally UNVERIFIED.** `firm-run-evals --structural` only proves the fixture is shaped
-  correctly. The behavioral claim requires a real `firm-run-evals qa-blocks-broken-build` (a `claude`
-  login and real budget), which has not been run. The `0.8.0` release is deliberately withheld until
-  it has — releasing on a structural check would be exactly the overclaiming the Definition of Done
-  prohibits.
-- Regression posture: `tests/run-tests.sh` + `firm-run-evals --structural` run in CI from PR 2.
-
-## Known follow-ups (not smuggled into these PRs)
-
-- Convert the remaining `node --test` eval fixtures to a runtime-agnostic shape, or declare node a
-  prerequisite. Today the suite assumes a runtime that isn't checked anywhere.
-- True read-only enforcement for `qa-tester` / `reviewer`. `firm-qa-clean-check` proves the checkout
-  was left clean; it cannot catch modify-then-revert or writes outside the checkout. Documented in
-  `docs/ENFORCEMENT.md` rather than papered over.
-- **This is a hardening and measurement phase, not self-improvement.** It records outcomes; it does
-  not yet extract lessons, propose changes, benchmark a proposed change before adoption, or version
-  and roll back improvements automatically. That loop still runs through a human writing one of these.
-
-## Human decision
-
-- [x] approved by **Matan Kamhi** on **2026-07-28 (UTC)** — reviewed across four plan revisions;
-      approval recorded before PR 1 merges, since PRs 1 and 2 would otherwise change the firm while
-      the record governing them still read `proposed`.
+  correctly. The behavioral claim — and separately, whether the `Bash(sh test/run-tests.sh)` permission
+  rule actually matches at runtime — requires a real `firm-run-evals qa-blocks-broken-build` (a `claude`
+  login and real budget), which has not been run, per explicit instruction for this pass. The `0.8.0`
+  release is deliberately withheld until it has — releasing on a structural check would be exactly the
+  overclaiming the Definition of Done prohibits.
+- Regression posture: `tests/run-tests.sh` (295 assertions, 16 files, at the close of PR 3) +
+  `firm-run-evals --structural` run in CI from PR 2.
 
 ## Independent review of PR 1 (before merge)
 
@@ -156,3 +165,51 @@ covers):
 
 A stale `docs/ENFORCEMENT.md` forward-reference (that file doesn't exist until PR 3) was also caught
 and removed while fixing #2.
+
+## Independent review of PR 2 (before merge)
+
+A second bounded, adversarial review — reproducing claims rather than trusting them, same standard as
+PR 1's — covering diff scope, test quality, the baseline fail-closed behavior, the explicit
+`final_gate_pending` event, and the CI workflow. **No new Critical, High, or Medium issue found.** One
+**Low**-severity gap surfaced and was accepted as a recorded follow-up rather than fixed in PR 2:
+
+- `default_branch_status()` in `firm-check-assertions` resolves the default branch by **bare name
+  only** (`git rev-parse --verify --quiet <branch>`) and never falls back to `origin/<branch>` the way
+  `firm-new-run`'s baseline capture does. In a repo where only a remote-tracking ref exists and no
+  local branch does, the check reports `CANNOT VERIFY` and fails — even though the branch genuinely
+  hasn't moved. Reproduced directly during the review. **Fails safe** (a false FAIL, never a false
+  PASS) and cannot trigger on the paths that matter — eval fixtures and CI both use fresh local-only
+  repos with no `origin` at all. See "Known follow-ups" below; still not fixed as of PR 3, by design
+  (fixing it means touching the load-bearing gate assertion PR 2 just stabilized, for a case no current
+  caller hits).
+
+Independently re-verified: 244/244 assertions on the exact merged commit, both bug-fix claims in the
+PR (the `git rev-parse` ref-echo bug, the `tests/lib.sh` variable-shadowing bug) reproduced empirically
+rather than trusted, and the full coverage-scope claim cross-checked against the real `bin/` directory.
+
+## Known follow-ups (not smuggled into these PRs)
+
+- Convert the remaining `node --test` eval fixtures to a runtime-agnostic shape, or declare node a
+  prerequisite. Today the suite assumes a runtime that isn't checked anywhere. (`qa-blocks-broken-build`
+  is shell-based specifically to avoid adding to this pile — see its own note above.)
+- True read-only enforcement for `qa-tester` / `reviewer`. `firm-qa-clean-check` (PR 3) proves the
+  checkout was left clean; it cannot catch modify-then-revert or writes outside the checkout. Documented
+  in `docs/ENFORCEMENT.md` rather than papered over.
+- **`default_branch_status()`'s bare-branch-name resolution** (found in PR 2's independent review,
+  above). Low severity, fails safe, not fixed. Add the same `origin/<branch>` fallback
+  `firm-new-run`'s baseline capture already has, when it's next touched for another reason.
+- **Sweep other structured-but-never-parsed files for the same latent-YAML-error class.**
+  `definition-of-done.yaml` (found and fixed in PR 3) shipped in PR 1 with invalid YAML that sat broken
+  through PR 2 because nothing ever parsed it programmatically. `tests/test-policy-yaml-valid.sh` now
+  guards `agent-firm/policy/*.yaml` and `agent-firm/templates/*.yaml` specifically, but agent
+  frontmatter (`agents/*.md`), `.claude-plugin/*.json`, and other structured-but-prose-consumed files
+  weren't swept for the same risk.
+- **This is a hardening and measurement phase, not self-improvement.** It records outcomes; it does
+  not yet extract lessons, propose changes, benchmark a proposed change before adoption, or version
+  and roll back improvements automatically. That loop still runs through a human writing one of these.
+
+## Human decision
+
+- [x] approved by **Matan Kamhi** on **2026-07-28 (UTC)** — reviewed across four plan revisions;
+      approval recorded before PR 1 merges, since PRs 1 and 2 would otherwise change the firm while
+      the record governing them still read `proposed`.
