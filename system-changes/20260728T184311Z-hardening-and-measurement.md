@@ -47,8 +47,12 @@ Three stacked PRs. Files:
 **PR 1 — security (this PR)**
 - `bin/firm-integrate` — positive `integration/*` allowlist (no override flag), `git switch` rc
   checked, HEAD asserted against the target before any merge.
-- `.claude/settings.json` — `Bash(cat:*)` / `Bash(jq:*)` removed from `allow`; belt-and-braces `deny`
-  entries for `cat`/`head`/`tail`/`less`/`strings` against `.env*`, `~/.ssh/**`, `~/.aws/**`.
+- `.claude/settings.json` — `Bash(cat:*)` / `Bash(jq:*)` removed from `allow` (the enforced fix: falls
+  through to the tool-default prompt, unconditionally). Additional `deny` entries for
+  `cat`/`head`/`tail`/`less`/`strings` against `.env*`, `~/.ssh/**`, `~/.aws/**` are labeled
+  **unverified supplemental protection, not enforced security** — their bare-glob syntax deviates from
+  every existing `Bash(cmd:*)` rule in the file and was never confirmed against Claude Code's live
+  permission engine (see `agent-firm/policy/retired-permissions.json`).
 - `agent-firm/policy/retired-permissions.json` (new) — withdrawn rules, with reasons.
 - `bin/firm-install` — `--migrate` removes retired rules (the only rule-deleting path in the firm),
   prints exactly what it deleted; plain install warns and exits 3. Order-independent flag parsing.
@@ -87,6 +91,11 @@ promotion criteria; `docs/ENFORCEMENT.md`; doc de-duplication and drift fixes.
   prompts — accepted deliberately over an open read-around.
 - **Risk:** `firm-validate-verdict` returning 4 will newly block Final gates on machines without
   `jsonschema`. That is the intended behavior; `firm-doctor` and `firm-bootstrap` both name the fix.
+- **Risk (accepted, labeled):** the new `deny` entries added alongside the `Bash(cat:*)`/`Bash(jq:*)`
+  removal are **unverified supplemental protection, not enforced security** — their pattern syntax was
+  never confirmed against Claude Code's live permission engine, and no non-interactive way to verify it
+  exists (checked: no dry-run permission flag, binary is compiled Mach-O, not statically inspectable).
+  The enforced part of the fix — removing the `allow` grant — does not depend on them.
 - **Rollback:** revert the PR — firm config is versioned in git. `firm-install` re-adds any rule that
   is restored to `.claude/settings.json`.
 
@@ -118,3 +127,32 @@ promotion criteria; `docs/ENFORCEMENT.md`; doc de-duplication and drift fixes.
 - [x] approved by **Matan Kamhi** on **2026-07-28 (UTC)** — reviewed across four plan revisions;
       approval recorded before PR 1 merges, since PRs 1 and 2 would otherwise change the firm while
       the record governing them still read `proposed`.
+
+## Independent review of PR 1 (before merge)
+
+An independent adversarial review of the pushed PR 1 branch — reproducing claims rather than trusting
+them — found four issues, all fixed on the same branch before merge (no scope change to what PR 1
+covers):
+
+1. `firm-doctor`'s new retired-permission-rules check silently reported PASS on a settings.json it
+   could not actually parse (invalid JSON, or `permissions` shaped as the wrong JSON type). Reproduced
+   two ways; fixed to WARN on any parse failure instead of a false PASS. Regression tests added:
+   `tests/test-doctor-retired-check.sh`.
+2. The new `deny` entries' pattern syntax was asserted as protection without ever being confirmed
+   against the live permission engine. Investigated further (no dry-run permission flag, binary not
+   statically inspectable) and confirmed unverifiable in this environment — relabeled everywhere as
+   **unverified supplemental protection, not enforced security**
+   (`agent-firm/policy/retired-permissions.json`, this record's Risk section). The enforced part of the
+   fix (removing the `allow` grant) does not depend on them and is unaffected.
+3. `firm-install`'s migrate-suggestion message misidentified scope for any project path that happens to
+   start with `~/.claude` as a raw string (e.g. `~/.claude-work/<project>/` — a pattern this repo's own
+   `.gitignore` anticipates). Reproduced end-to-end; fixed to use the scope `firm-install` already
+   resolved from its own arguments rather than re-deriving it from the target path. Regression test
+   added (and a matching one confirming real `--user` installs still say `--user`, so the fix couldn't
+   be over-corrected in the other direction).
+4. `docs/INSTALL.md` said retired rules affect projects "installed before v0.7.0", but this PR ships no
+   version bump and the retired rules are present in the *current* 0.7.0 on `main` — reworded to be
+   version-agnostic and point at `firm-doctor` as the actual check.
+
+A stale `docs/ENFORCEMENT.md` forward-reference (that file doesn't exist until PR 3) was also caught
+and removed while fixing #2.

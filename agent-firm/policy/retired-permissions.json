@@ -5,10 +5,18 @@
     "something removes it. `firm-install --migrate` is that something, and firm-doctor FAILS while a",
     "retired rule is still present — a warning would leave the hole open in every existing project.",
     "",
-    "Honesty note: deleting these from `allow` is the real fix. The matching `deny` entries in",
-    ".claude/settings.json are belt-and-braces against the specific known-bad reads, NOT a sandbox —",
-    "Bash pattern matching cannot enumerate every way to read a file. The dev-container and scoped,",
-    "read-only credentials remain the actual containment. See docs/ENFORCEMENT.md."
+    "The ENFORCED fix is removing Bash(cat:*)/Bash(jq:*) from `allow`: that unconditionally stops the",
+    "blanket auto-approval, regardless of anything below. It falls through to the tool-default prompt.",
+    "",
+    "UNVERIFIED SUPPLEMENTAL PROTECTION, not enforced security: .claude/settings.json also adds `deny`",
+    "entries (Bash(cat .env*), Bash(cat ~/.ssh/**), etc.) as a second layer. Their pattern syntax was",
+    "never confirmed against Claude Code's live permission engine — every existing Bash rule in that",
+    "file uses the `Bash(cmd:*)` colon-prefix form, these use a bare-glob form instead, and nothing in",
+    "the firm exercises real permission matching (the test suite only checks the rules are present as",
+    "JSON strings). Treat them as best-effort, not as proof a matching command will actually be denied.",
+    "Even a working deny rule is not a sandbox: `cat -A ~/.ssh/id_rsa`, a pipe through `awk`, or reading",
+    "the file from python all sit outside a simple command-prefix pattern. The dev-container and scoped,",
+    "read-only credentials are the actual containment; these deny rules are a bonus, not a guarantee."
   ],
   "retired": [
     {
