@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # tests/test-check-assertions.sh — firm-check-assertions' assertion vocabulary, including the PR 2
-# rebuild of no_default_branch_merge / final_gate_pending onto the run-baseline.json SHA comparison,
-# with the fail-closed behavior when that baseline can't be verified.
-#
-# qa_checkout_clean is deliberately NOT tested here — its underlying firm-qa-clean-check script is
-# PR 3 scope (the plan's own scope-correction note). Testing an assertion verb whose checked script
-# doesn't exist yet isn't possible.
+# rebuild of no_default_branch_merge / final_gate_pending onto the run-baseline.json SHA comparison
+# (fail-closed when that baseline can't be verified), and the PR 3 addition of qa_checkout_clean,
+# which delegates to firm-qa-clean-check the same way traceability_passes delegates to
+# firm-traceability-check — see tests/test-qa-clean-check.sh for that script's own direct coverage;
+# the cases here exercise it specifically through the assertion-vocabulary path.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 CA="$BIN/firm-check-assertions"
 NEW_RUN="$BIN/firm-new-run"
 LOG="$BIN/firm-ledger-log"
+NEW_WT="$BIN/firm-new-worktree"
+INTEGRATE="$BIN/firm-integrate"
+QA_CO="$BIN/firm-qa-checkout"
 
 write_assertions() { printf '%s\n' "$1" > "$2/a.yaml"; }
 
@@ -126,5 +128,32 @@ write_assertions 'assertions:
   - final_gate_pending: true' "$repo8"
 assert_rc "both FAIL cleanly (no run ever started here)" 1 "$CA" "$repo8/a.yaml" "$repo8"
 assert_output "no ledger found is named as the reason" "no run ledger found" "$CA" "$repo8/a.yaml" "$repo8"
+
+# ---------------------------------------------------------------------------
+t_case "qa_checkout_clean: missing checkout dir -> fails closed (CANNOT VERIFY), not a vacuous pass"
+repo9="$(mk_repo)"
+( cd "$repo9" && "$NEW_RUN" qcc-missing fast_path >/dev/null )
+write_assertions 'assertions:
+  - qa_checkout_clean: true' "$repo9"
+assert_rc "fails closed" 1 "$CA" "$repo9/a.yaml" "$repo9"
+assert_output "names why: cannot verify" "CANNOT VERIFY" "$CA" "$repo9/a.yaml" "$repo9"
+
+# ---------------------------------------------------------------------------
+t_case "qa_checkout_clean: real end-to-end pipeline (new-run -> new-worktree -> integrate -> qa-checkout)"
+repo10="$(mk_repo)"
+run_out10="$( (cd "$repo10" && "$NEW_RUN" qcc-e2e fast_path) )"
+run_id10="$(basename "$run_out10")"
+( cd "$repo10" && "$NEW_WT" implementer wo1 >/dev/null )
+wt_dir10="$repo10/.agent-firm/worktrees/${run_id10}-implementer-wo1"
+( cd "$wt_dir10" && printf 'work\n' > feature.txt && git add -A && git commit -qm wo1 ) >/dev/null 2>&1
+( cd "$repo10" && "$INTEGRATE" >/dev/null )
+( cd "$repo10" && "$QA_CO" >/dev/null )
+write_assertions 'assertions:
+  - qa_checkout_clean: true' "$repo10"
+
+assert_rc "PASS on a real, clean QA checkout" 0 "$CA" "$repo10/a.yaml" "$repo10"
+
+echo dirty > "$repo10/.agent-firm/qa-checkout/${run_id10}/leftover.txt"
+assert_rc "FAILs once the real checkout is dirtied" 1 "$CA" "$repo10/a.yaml" "$repo10"
 
 t_summary
