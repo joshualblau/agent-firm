@@ -24,7 +24,7 @@ set -uo pipefail
 
 CA="$BIN/firm-check-assertions"
 
-W="$(mktemp -d "${TMPDIR:-/tmp}/firm-ca-parse.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $W"
+W="$(mktemp -d "${TMPDIR:-/tmp}/firm-ca-parse.XXXXXX")"; t_track "$W"
 repo="$(mk_repo)"          # has seed.txt, no nope.txt
 
 # ---- the two parser doubles ------------------------------------------------

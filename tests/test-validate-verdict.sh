@@ -12,7 +12,7 @@ set -uo pipefail
 
 VALIDATE="$BIN/firm-validate-verdict"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/firm-verdict.XXXXXX")"
-T_TMPDIRS="$T_TMPDIRS $WORK"
+t_track "$WORK"
 
 # A complete, schema-conforming verdict.
 cat > "$WORK/good.json" <<'JSON'

@@ -111,8 +111,8 @@ assert_output "project line PASSes on a fresh install" "PASS project settings ca
 # EXIT CODE — each finding must reach FAILS, which is the only thing that gates `exit 1`.
 # One axis varies per comparison; the control run supplies the environment's baseline FAIL count.
 # ===========================================================================
-good_root="$(mk_doctor_root "$GOOD_POLICY")";  T_TMPDIRS="$T_TMPDIRS $good_root"
-clean_proj="$(mk_proj "$CLEAN_SETTINGS")";     T_TMPDIRS="$T_TMPDIRS $clean_proj"
+good_root="$(mk_doctor_root "$GOOD_POLICY")";  t_track "$good_root"
+clean_proj="$(mk_proj "$CLEAN_SETTINGS")";     t_track "$clean_proj"
 
 base_fails="$(fails_at "$good_root" "$clean_proj")"
 
@@ -123,14 +123,14 @@ assert_ne "control run reports a FAIL count at all" "" "$base_fails"
 
 # --- axis: the settings file (policy held constant) -------------------------
 t_case "an unverifiable settings.json costs one FAIL and a non-zero exit"
-bad_proj="$(mk_proj '{ nope')"; T_TMPDIRS="$T_TMPDIRS $bad_proj"
+bad_proj="$(mk_proj '{ nope')"; t_track "$bad_proj"
 assert_eq "FAIL count is exactly one higher than the control" \
   "$((base_fails + 1))" "$(fails_at "$good_root" "$bad_proj")"
 assert_fail "firm-doctor exits non-zero" doctor_run "$good_root" "$bad_proj"
 
 t_case "a settings.json that still grants a retired rule costs one FAIL and a non-zero exit"
 stale_proj="$(mk_proj '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $stale_proj"
+t_track "$stale_proj"
 assert_eq "FAIL count is exactly one higher than the control" \
   "$((base_fails + 1))" "$(fails_at "$good_root" "$stale_proj")"
 assert_fail "firm-doctor exits non-zero" doctor_run "$good_root" "$stale_proj"
@@ -139,7 +139,7 @@ assert_fail "firm-doctor exits non-zero" doctor_run "$good_root" "$stale_proj"
 t_case "a MISSING retirement policy is a FAIL, not a silent skip"
 # The whole check used to be wrapped in `if [ -f "$RETIRED_JSON" ]` with no `else`: deleting the
 # policy file removed the check and its output entirely, and firm-doctor called that healthy.
-gone_root="$(mk_doctor_root MISSING)"; T_TMPDIRS="$T_TMPDIRS $gone_root"
+gone_root="$(mk_doctor_root MISSING)"; t_track "$gone_root"
 assert_output "says the check could not run" "SKIPPED, not passed" lines_at "$gone_root" "$clean_proj"
 assert_output "reports it as a FAIL" "FAIL retired-permission policy NOT FOUND" lines_at "$gone_root" "$clean_proj"
 assert_ok "does NOT silently claim the settings are clean" \
@@ -149,7 +149,7 @@ assert_eq "FAIL count is exactly one higher than the control (same settings file
 assert_fail "firm-doctor exits non-zero" doctor_run "$gone_root" "$clean_proj"
 
 t_case "an UNREADABLE retirement policy is a FAIL, not a silent skip"
-junk_root="$(mk_doctor_root 'not json at all')"; T_TMPDIRS="$T_TMPDIRS $junk_root"
+junk_root="$(mk_doctor_root 'not json at all')"; t_track "$junk_root"
 assert_output "reports it as a FAIL" "FAIL retired-permission policy" lines_at "$junk_root" "$clean_proj"
 assert_output "says the check could not run" "SKIPPED, not passed" lines_at "$junk_root" "$clean_proj"
 assert_eq "FAIL count is exactly one higher than the control (same settings file)" \
@@ -160,7 +160,7 @@ t_case "a retirement policy that scopes a DENY rule for deletion is a FAIL"
 # firm-install refuses such an entry outright (exit 4). firm-doctor must surface the same refusal
 # rather than quietly reporting on a policy it would never honour.
 deny_root="$(mk_doctor_root '{ "retired": [ { "rule": "Bash(sudo:*)", "scope": "deny" } ] }')"
-T_TMPDIRS="$T_TMPDIRS $deny_root"
+t_track "$deny_root"
 assert_output "names the deny-scoping problem" "scopes a DENY rule" lines_at "$deny_root" "$clean_proj"
 assert_output "reports it as a FAIL" "FAIL" lines_at "$deny_root" "$clean_proj"
 assert_eq "FAIL count is exactly one higher than the control (same settings file)" \
@@ -171,7 +171,7 @@ t_case "one bad policy costs ONE FAIL, even with both a project and a user setti
 # The policy is validated once, up front, rather than re-reported inside the per-scope loop. Two
 # settings files must not turn one defective policy into two FAILs and two confusing "your
 # settings.json could not be checked" lines about files that are actually fine.
-two_proj="$(mk_proj "$CLEAN_SETTINGS")"; T_TMPDIRS="$T_TMPDIRS $two_proj"
+two_proj="$(mk_proj "$CLEAN_SETTINGS")"; t_track "$two_proj"
 mkdir -p "$two_proj/fake-home/.claude"
 printf '%s\n' "$CLEAN_SETTINGS" > "$two_proj/fake-home/.claude/settings.json"
 two_base="$(fails_at "$good_root" "$two_proj")"
@@ -188,7 +188,7 @@ t_case "a retired rule sitting in \`deny\` is reported but is NOT a grant, so it
 # retired rule" and prescribing --migrate would be both wrong and unfixable — a permanent FAIL with
 # no remedy. It stays visible as an INFO line instead.
 deny_hit_proj="$(mk_proj '{ "permissions": { "allow": [], "ask": [], "deny": ["Bash(cat:*)"] } }')"
-T_TMPDIRS="$T_TMPDIRS $deny_hit_proj"
+t_track "$deny_hit_proj"
 assert_output "still reports the rule is there" "also list retired rule(s) under" lines_at "$good_root" "$deny_hit_proj"
 assert_output "does not call a deny a grant" "PASS project settings carry no retired" lines_at "$good_root" "$deny_hit_proj"
 assert_eq "FAIL count matches the control — no new failure" \

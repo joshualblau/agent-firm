@@ -125,7 +125,7 @@ t_case "the migrate suggestion names the RIGHT scope, even for a .claude*-prefix
 # "~/.claude" too, such as ~/.claude-work/<project>/ (a pattern this repo's own .gitignore already
 # anticipates: `.claude-*/`). A project-scope fix would be told to run --user, silently migrating the
 # WRONG file while the real grant stayed in place. It must use the scope firm-install already knows.
-base="$(mktemp -d)"; T_TMPDIRS="$T_TMPDIRS $base"
+base="$(mktemp -d)"; t_track "$base"
 weird_proj="$base/.claude-work/some-profile"
 mkdir -p "$weird_proj/.claude"
 printf '%s\n' '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }' > "$weird_proj/.claude/settings.json"
@@ -141,7 +141,7 @@ case "$out" in
 esac
 
 t_case "the migrate suggestion still says --user for an actual --user install"
-user_home="$(mktemp -d)"; T_TMPDIRS="$T_TMPDIRS $user_home"
+user_home="$(mktemp -d)"; t_track "$user_home"
 mkdir -p "$user_home/.claude"
 printf '%s\n' '{ "permissions": { "allow": ["Bash(jq:*)"], "ask": [], "deny": [] } }' > "$user_home/.claude/settings.json"
 some_cwd="$(mk_repo)"
@@ -156,9 +156,9 @@ t_case "a retirement entry that scopes a DENY rule is REFUSED, not honoured"
 # the old all-buckets sweep, have deleted that protection from every project someone ran --migrate in,
 # printed as a routine "removing retired rules" line. A data file must not be able to grant privilege.
 hostile_root="$(mk_firm_root '{ "retired": [ { "rule": "Bash(sudo:*)", "scope": "deny", "since": "2026-08-01", "reason": "hostile entry" } ] }')"
-T_TMPDIRS="$T_TMPDIRS $hostile_root"
+t_track "$hostile_root"
 victim="$(mk_target '{ "permissions": { "allow": [], "ask": [], "deny": ["Bash(sudo:*)", "Bash(rm -rf:*)"] } }')"
-T_TMPDIRS="$T_TMPDIRS $victim"
+t_track "$victim"
 VS="$victim/.claude/settings.json"
 cp "$VS" "$victim/before.json"
 
@@ -178,7 +178,7 @@ t_case "a retired rule sitting in the target's own \`deny\` list survives --migr
 # Same rule string, both a retired GRANT and a live protection. Removing it from allow is the fix;
 # removing it from deny would be a privilege escalation performed in the name of a security cleanup.
 both_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": ["Bash(cat:*)"] } }')"
-T_TMPDIRS="$T_TMPDIRS $both_proj"
+t_track "$both_proj"
 BS="$both_proj/.claude/settings.json"
 assert_ok "fixture precondition: rule is in allow" has_rule "$BS" allow "Bash(cat:*)"
 assert_ok "fixture precondition: rule is in deny"  has_rule "$BS" deny  "Bash(cat:*)"
@@ -192,9 +192,9 @@ t_case "scope is honoured: a rule is not deleted from a list its entry does not 
 # The `scope` field used to be read and thrown away. Here it names allow only, so the same rule
 # sitting in `ask` must be left alone — the deletion authority is exactly what the policy declared.
 allow_only_root="$(mk_firm_root '{ "retired": [ { "rule": "Bash(cat:*)", "scope": "allow" } ] }')"
-T_TMPDIRS="$T_TMPDIRS $allow_only_root"
+t_track "$allow_only_root"
 scoped_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": ["Bash(cat:*)"], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $scoped_proj"
+t_track "$scoped_proj"
 PS="$scoped_proj/.claude/settings.json"
 assert_ok "migrate succeeds"                          install_at "$allow_only_root" "$scoped_proj" --migrate
 assert_ok "deleted from allow — the list scope names" lacks_rule "$PS" allow "Bash(cat:*)"
@@ -218,32 +218,32 @@ for e in entries:
 
 t_case "a malformed retirement policy is REFUSED, with nothing written"
 noscope_root="$(mk_firm_root '{ "retired": [ { "rule": "Bash(cat:*)" } ] }')"
-T_TMPDIRS="$T_TMPDIRS $noscope_root"
+t_track "$noscope_root"
 ns_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $ns_proj"
+t_track "$ns_proj"
 cp "$ns_proj/.claude/settings.json" "$ns_proj/before.json"
 assert_rc "a scope-less entry exits 4" 4 install_at "$noscope_root" "$ns_proj" --migrate
 assert_output "refuses to guess" "refusing to guess" install_at "$noscope_root" "$ns_proj" --migrate
 assert_ok "nothing was written" cmp -s "$ns_proj/before.json" "$ns_proj/.claude/settings.json"
 
 badbucket_root="$(mk_firm_root '{ "retired": [ { "rule": "Bash(cat:*)", "scope": ["allow","everything"] } ] }')"
-T_TMPDIRS="$T_TMPDIRS $badbucket_root"
+t_track "$badbucket_root"
 assert_rc "an unknown permission list in scope exits 4" 4 install_at "$badbucket_root" "$ns_proj" --migrate
 assert_ok "still nothing written" cmp -s "$ns_proj/before.json" "$ns_proj/.claude/settings.json"
 
 t_case "--migrate with NO retirement policy says so instead of looking like it cleaned something"
 # Not fatal (nothing to delete means nothing unsafe happens), but silence here would let a --migrate
 # run against a missing policy read as a successful cleanup. firm-doctor separately FAILs on it.
-gone_root="$(mk_firm_root MISSING)"; T_TMPDIRS="$T_TMPDIRS $gone_root"
+gone_root="$(mk_firm_root MISSING)"; t_track "$gone_root"
 gone_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $gone_proj"
+t_track "$gone_proj"
 assert_output "says there was nothing to migrate against" "nothing to migrate" \
   install_at "$gone_root" "$gone_proj" --migrate
 assert_ok "and it did NOT delete the rule it had no policy for" \
   has_rule "$gone_proj/.claude/settings.json" allow "Bash(cat:*)"
 
 t_case "an unreadable retirement policy is REFUSED (exit 5), with nothing written"
-junk_root="$(mk_firm_root 'not json at all')"; T_TMPDIRS="$T_TMPDIRS $junk_root"
+junk_root="$(mk_firm_root 'not json at all')"; t_track "$junk_root"
 assert_rc "exits 5" 5 install_at "$junk_root" "$ns_proj" --migrate
 assert_output "names the file it could not read" "cannot read the retirement policy" \
   install_at "$junk_root" "$ns_proj" --migrate
@@ -254,7 +254,7 @@ assert_ok "nothing was written" cmp -s "$ns_proj/before.json" "$ns_proj/.claude/
 # ===========================================================================
 t_case "--migrate backs the settings file up before deleting, and prints the path"
 bk_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)", "Bash(keep-me:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $bk_proj"
+t_track "$bk_proj"
 KS="$bk_proj/.claude/settings.json"
 assert_eq "no backups before the run" "0" "$(bak_count "$bk_proj")"
 assert_output "prints the backup path" "backed up the previous settings to" install_in "$bk_proj" --migrate
@@ -273,7 +273,7 @@ t_case "the settings file is renamed into place, never truncated where it stands
 # changes (a rename installs a NEW inode; an in-place rewrite keeps the old one), and a write that
 # cannot even begin leaves the original completely intact.
 at_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $at_proj"
+t_track "$at_proj"
 AS="$at_proj/.claude/settings.json"
 ino_before="$(inode_of "$AS")"
 assert_ok "migrate succeeds"           install_in "$at_proj" --migrate
@@ -282,7 +282,7 @@ assert_eq "no temp file was left behind" "0" "$(tmp_count "$at_proj")"
 
 if [ "$(id -u)" != "0" ]; then
   fail_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-  T_TMPDIRS="$T_TMPDIRS $fail_proj"
+  t_track "$fail_proj"
   FS="$fail_proj/.claude/settings.json"
   cp "$FS" "$fail_proj/before.json"
   chmod 500 "$fail_proj/.claude"
@@ -295,7 +295,7 @@ else
 fi
 
 t_case "an install with nothing to change writes nothing and takes no backup"
-noop_proj="$(mktemp -d "${TMPDIR:-/tmp}/firm-iproj.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $noop_proj"
+noop_proj="$(mktemp -d "${TMPDIR:-/tmp}/firm-iproj.XXXXXX")"; t_track "$noop_proj"
 assert_ok "first install creates the file" install_in "$noop_proj"
 ino1="$(inode_of "$noop_proj/.claude/settings.json")"
 assert_output "second install reports the no-op" "already matches the firm's permissions" install_in "$noop_proj"

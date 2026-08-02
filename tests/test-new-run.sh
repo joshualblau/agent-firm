@@ -100,7 +100,7 @@ assert_ne "fixture precondition: main and the feature branch actually differ" "$
 
 # ---------------------------------------------------------------------------
 t_case "no baseline is written when no default branch can be resolved (fail-closed downstream)"
-nogit="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $nogit"
+nogit="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$nogit"
 outN="$( (cd "$nogit" && "$NEW_RUN" no-git-at-all) )"
 assert_no_file "no run-baseline.json outside a git repo" "$nogit/$outN/run-baseline.json"
 assert_output "empty default_branch fields recorded, not omitted or garbled" \
@@ -112,7 +112,7 @@ with open('$nogit/$outN/run.jsonl') as f:
 "
 
 t_case "no baseline is written for a repo with zero commits"
-empty="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $empty"
+empty="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$empty"
 ( cd "$empty" && git init -q . && git symbolic-ref HEAD refs/heads/main ) >/dev/null 2>&1
 outE="$( (cd "$empty" && "$NEW_RUN" zero-commits) )"
 assert_no_file "no run-baseline.json with zero commits" "$empty/$outE/run-baseline.json"

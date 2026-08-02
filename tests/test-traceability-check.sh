@@ -7,7 +7,7 @@ TC="$BIN/firm-traceability-check"
 
 # Hide pyyaml the same way test-validate-verdict.sh does, to exercise the regex fallback without
 # needing pyyaml actually absent on this machine.
-NOSCHEMA="$(mktemp -d "${TMPDIR:-/tmp}/firm-tc-noyaml.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $NOSCHEMA"
+NOSCHEMA="$(mktemp -d "${TMPDIR:-/tmp}/firm-tc-noyaml.XXXXXX")"; t_track "$NOSCHEMA"
 printf 'raise ImportError("hidden for the traceability regex-fallback test")\n' > "$NOSCHEMA/yaml.py"
 without_yaml() { ( PYTHONPATH="$NOSCHEMA${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 
@@ -26,7 +26,7 @@ mk_ledger() {
 
 # ---------------------------------------------------------------------------
 t_case "usage / missing inputs"
-d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $d"
+d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$d"
 assert_rc "no run dir, no CURRENT_RUN -> exit 2" 2 sh -c "cd '$d' && '$TC'"
 
 led1="$d/led1"; mkdir -p "$led1"
@@ -84,7 +84,7 @@ assert_rc "PASS" 0 "$TC" "$led6"
 
 # ---------------------------------------------------------------------------
 t_case "defaults to CURRENT_RUN when no run_dir argument is given"
-d2="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $d2"
+d2="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$d2"
 led7="$d2/.agent-firm/runs/r1"
 mk_ledger "$led7" 'criteria:
   - id: AC-001' '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}'

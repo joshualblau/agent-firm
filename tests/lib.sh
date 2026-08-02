@@ -16,23 +16,36 @@ T_PASS=0
 T_FAIL=0
 
 # ---- temp-dir bookkeeping -------------------------------------------------
-# Two accumulators, on purpose:
-#   T_TMPDIRS         — the space-separated variable several test files append to directly. Those
-#                       appends happen in the test's own shell, so they work.
-#   T_TMPDIR_REGISTRY — a FILE, one absolute path per line. Fixtures like mk_repo/mk_linked_worktree
-#                       are invoked as `d="$(mk_repo)"`, i.e. inside a command-substitution SUBSHELL,
-#                       so their `T_TMPDIRS=...` appends died with that subshell and the parent's
-#                       cleanup trap saw an empty list — every suite run leaked its throwaway git
-#                       repos into $TMPDIR. A file is the one channel that crosses back out of a
-#                       subshell without restructuring the fixtures into out-parameters.
-# Newline-delimited (not space-delimited) so a path containing spaces stays one entry.
+# ONE registration channel: t_track, backed by a FILE of NUL-TERMINATED absolute paths.
+#
+# Why a file. Fixtures like mk_repo/mk_linked_worktree are invoked as `d="$(mk_repo)"`, i.e. inside a
+# command-substitution SUBSHELL, so a plain variable append died with that subshell and the parent's
+# cleanup trap saw an empty list — every suite run leaked its throwaway git repos into $TMPDIR. A file
+# is the one channel that crosses back out of a subshell without restructuring the fixtures into
+# out-parameters.
+#
+# Why NUL framing, and not spaces or newlines (SEC-R8). Teardown DELETES what it reads back, so the
+# framing has to be lossless. A delimiter that can legally occur inside a path lets one entry split
+# into FRAGMENTS — and the first fragment of an absolute path is itself absolute, so it satisfies
+# every shape check _t_rm_fixture applies while pointing somewhere else entirely. A space-framed list
+# deletes "/x/my" when the real fixture is "/x/my tmp/fix" (and leaks the fixture); a newline-framed
+# list fails identically on a path containing a newline. NUL is the one byte a POSIX path cannot
+# contain, so it is the one framing that cannot split. With it, a fixture path containing a space, a
+# tab, a newline or a glob character is registered and removed exactly, and nothing else is touched.
+#
+# T_TMPDIRS is a RETIRED compatibility shim, kept only so `$T_TMPDIRS` still expands under `set -u`.
+# It is space-framed — precisely the case above that cannot be split back safely — so teardown refuses
+# to act on it and warns instead (see t_cleanup). A leaked temp dir is the cheap failure; deleting a
+# fragment of somebody's real path is not. Register fixtures with `t_track "$dir"`.
 T_TMPDIRS=""
 T_TMPDIR_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-test-reg.XXXXXX" 2>/dev/null || printf '')"
 
-# t_track <dir> — register an absolute path for teardown. Safe to call from inside a subshell.
+# t_track <dir> — register an absolute path for teardown. Safe to call from inside a subshell, and
+# safe for any path a filesystem can actually hold: the record is NUL-terminated here and every
+# expansion of it in t_cleanup/_t_rm_fixture is quoted, so it can never split or glob.
 t_track() {
   [ -n "${1:-}" ] || return 0
-  if [ -n "$T_TMPDIR_REGISTRY" ]; then printf '%s\n' "$1" >> "$T_TMPDIR_REGISTRY"; fi
+  if [ -n "$T_TMPDIR_REGISTRY" ]; then printf '%s\0' "$1" >> "$T_TMPDIR_REGISTRY"; fi
   return 0
 }
 
@@ -174,9 +187,39 @@ sha_of() { git -C "$1" rev-parse "$2" 2>/dev/null; }
 
 # ---- teardown ------------------------------------------------------------
 # _t_rm_fixture <dir> — delete ONE registered fixture directory. This is the ONLY `rm -rf` in the
-# harness, so every constraint on what teardown may delete lives here and nowhere else. Anything
-# that is not an absolute path to a real, non-symlink directory is skipped silently: the cost of
-# skipping is a leaked temp dir, the cost of a wrong delete is somebody's working tree.
+# harness, so every constraint on what teardown may delete lives here and nowhere else. Anything that
+# fails a check is skipped silently: the cost of skipping is a leaked temp dir, the cost of a wrong
+# delete is somebody's working tree.
+#
+# The checks are deliberately two kinds, because shape alone is not enough (SEC-R8). Most constrain
+# the SHAPE of the string — absolute, no traversal component, not "/", a real non-symlink directory.
+# One constrains its IDENTITY: a fixture lives under the temp root this shell makes fixtures in, so
+# anything outside that is not ours to remove however well-formed it looks. (Shape was all the guard
+# checked when a space-split FRAGMENT of a real fixture path sailed through every one of them.) The
+# two kinds overlap on relative paths, so that case is guarded twice; tests/test-lib.sh says so, and
+# 09-test-evidence records which single deletions the redundancy masks.
+
+# _t_norm <path> — set _t_normed to <path> with runs of "/" collapsed. "$TMPDIR/x" is routinely
+# spelled "/a/T//x" (TMPDIR usually ends in a slash) while the same directory reached through $PWD is
+# spelled "/a/T/x", and the identity check below compares strings. Without this, two spellings of one
+# path fail to match: the fixture leaks, and — worse for a test suite — a case meant to exercise some
+# other guard passes for this reason instead, which is how a guard test goes quietly decorative.
+_t_norm() {
+  _t_normed="$1"
+  while :; do
+    case "$_t_normed" in
+      *//*)
+        _t_prev="$_t_normed"
+        _t_normed="${_t_normed//\/\///}"          # s|//|/| — bash 3.2 wants the replacement unescaped
+        # If some shell ever declines that substitution, stop rather than spin: an un-normalized path
+        # simply fails the identity check below, which leaks a temp dir instead of hanging teardown.
+        [ "$_t_normed" != "$_t_prev" ] || break
+        ;;
+      *) break ;;
+    esac
+  done
+}
+
 _t_rm_fixture() {
   _t_target="${1:-}"
   [ -n "$_t_target" ] || return 0
@@ -185,36 +228,48 @@ _t_rm_fixture() {
     *)  return 0 ;;          # relative entry — would delete relative to $PWD
   esac
   case "$_t_target" in
-    */..|*/../*) return 0 ;; # no traversal components
+    */..|*/../*) return 0 ;; # no traversal components: `<dir>/sub/../keepme` IS a delete rm performs
   esac
   [ "$_t_target" = "/" ] && return 0
+  # Identity: strictly inside this shell's temp root. Both sides are slash-normalized and the root's
+  # trailing slashes stripped; an unusable root refuses everything rather than widening to "/".
+  _t_norm "${TMPDIR:-/tmp}"; _t_root="$_t_normed"
+  while :; do case "$_t_root" in */) _t_root="${_t_root%/}" ;; *) break ;; esac; done
+  case "$_t_root" in /?*) ;; *) return 0 ;; esac
+  _t_norm "$_t_target"
+  case "$_t_normed" in
+    "$_t_root"/?*) ;;        # quoted pattern: a glob character in $TMPDIR matches itself, literally
+    *) return 0 ;;
+  esac
   [ -d "$_t_target" ] || return 0   # already gone, or never a directory
   [ -L "$_t_target" ] && return 0   # a symlink: delete nothing rather than chase it somewhere else
   rm -rf "$_t_target"
 }
 
 t_cleanup() {
-  # 1) Fixtures registered from inside a command-substitution subshell, via the registry file.
+  # 1) Every registered fixture, read back with the same NUL framing t_track wrote. `IFS=` + `-r`
+  #    + `-d ''` means the record arrives byte-for-byte as registered, and the QUOTED argument keeps
+  #    it one argument no matter what whitespace or glob characters it holds.
   if [ -n "$T_TMPDIR_REGISTRY" ] && [ -f "$T_TMPDIR_REGISTRY" ]; then
-    # `|| [ -n "$_t_entry" ]` picks up a final line with no trailing newline — otherwise `read`
-    # returns non-zero on it and the last fixture registered silently never gets cleaned.
-    while IFS= read -r _t_entry || [ -n "$_t_entry" ]; do
+    # `|| [ -n "$_t_entry" ]` picks up a final record with no terminating NUL (an append that was
+    # cut short) — otherwise `read` returns non-zero on it and that fixture never gets cleaned.
+    _t_entry=""
+    while IFS= read -r -d '' _t_entry || [ -n "$_t_entry" ]; do
       _t_rm_fixture "$_t_entry"
       _t_entry=""
     done < "$T_TMPDIR_REGISTRY"
     rm -f "$T_TMPDIR_REGISTRY"
   fi
-  # 2) The space-separated T_TMPDIRS variable that several test files append to directly. Word
-  #    splitting is the point here (that is the format), but `set -f` goes on FIRST: an unquoted
-  #    expansion feeding an `rm -rf` argument list must never be able to glob — one stray `*` in
-  #    that variable and teardown deletes whatever happens to be in $PWD. Restore the caller's
-  #    noglob setting afterwards so a test that relied on it is unaffected.
-  case "$-" in *f*) _t_had_f=1 ;; *) _t_had_f=0 ;; esac
-  set -f
-  for _t_d in $T_TMPDIRS; do
-    _t_rm_fixture "$_t_d"
-  done
-  [ "$_t_had_f" -eq 1 ] || set +f
+  # 2) The retired T_TMPDIRS variable. It is NOT iterated: splitting a space-framed list back into
+  #    paths is the SEC-R8 bug itself, and no amount of per-entry validation can tell a whole entry
+  #    from the first fragment of one. So teardown deletes nothing from here and says so — a leaked
+  #    temp dir is loud and cheap, a fragment delete is silent and destructive.
+  if [ -n "${T_TMPDIRS:-}" ]; then
+    printf '%s\n' \
+      "tests/lib.sh: T_TMPDIRS is retired and is NOT cleaned up — space framing cannot be split back" \
+      "tests/lib.sh: into paths safely (SEC-R8). Use: t_track \"\$dir\". Leaked, not deleted:" \
+      "tests/lib.sh:   $T_TMPDIRS" >&2
+  fi
 }
 trap t_cleanup EXIT
 

@@ -12,7 +12,7 @@ is_valid_json() { printf '%s' "$1" | python3 -c "import json,sys; json.load(sys.
 
 # a PATH with no jq on it, so the no-jq fallback branch is genuinely exercised regardless of whether
 # this machine has jq installed.
-NOJQ_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-nojq.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $NOJQ_DIR"
+NOJQ_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-nojq.XXXXXX")"; t_track "$NOJQ_DIR"
 for tool in bash sh cat mkdir date printf basename dirname readlink python3 git; do
   real="$(command -v "$tool" 2>/dev/null)"; [ -n "$real" ] && ln -sf "$real" "$NOJQ_DIR/$tool"
 done
