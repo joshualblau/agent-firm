@@ -16,19 +16,28 @@
     "JSON strings). Treat them as best-effort, not as proof a matching command will actually be denied.",
     "Even a working deny rule is not a sandbox: `cat -A ~/.ssh/id_rsa`, a pipe through `awk`, or reading",
     "the file from python all sit outside a simple command-prefix pattern. The dev-container and scoped,",
-    "read-only credentials are the actual containment; these deny rules are a bonus, not a guarantee."
+    "read-only credentials are the actual containment; these deny rules are a bonus, not a guarantee.",
+    "",
+    "\"scope\" IS LOAD-BEARING, NOT DOCUMENTATION. It names the permission list(s) `firm-install",
+    "--migrate` is authorised to delete the rule from, and firm-install removes it from those and no",
+    "others. It may name \"allow\" and/or \"ask\" — the two GRANT lists. It may NEVER name \"deny\":",
+    "retiring a grant makes a project safer, while deleting a deny is a privilege ESCALATION, so it is",
+    "not something a data file is allowed to request. firm-install REFUSES to run (exit 4, nothing",
+    "written) on any entry whose scope names deny, is missing, or names an unknown list. Both entries",
+    "below name allow AND ask because the two are interchangeable places for the same grant to sit: a",
+    "rule that drifted from allow into ask is the same withdrawn grant and must still be cleaned up."
   ],
   "retired": [
     {
       "rule": "Bash(cat:*)",
-      "scope": "allow",
+      "scope": ["allow", "ask"],
       "since": "2026-07-28",
       "reason": "Read-tool deny rules (Read(./.env), Read(~/.ssh/**), Read(~/.aws/**), Read(~/.codex/auth.json)) bind ONLY the Read tool. An allow-listed `cat` reads straight around every one of them.",
       "replacement": "Use the Read tool, which the deny rules actually bind. Ad-hoc `cat` now falls through to the normal permission prompt."
     },
     {
       "rule": "Bash(jq:*)",
-      "scope": "allow",
+      "scope": ["allow", "ask"],
       "since": "2026-07-28",
       "reason": "Same read-around as `cat`, aimed at JSON credential stores (~/.claude.json, ~/.codex/auth.json, cloud credential files).",
       "replacement": "Read the file with the Read tool. jq on the firm's own ledger artifacts now prompts once rather than being blanket-granted."
