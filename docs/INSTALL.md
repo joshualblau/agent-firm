@@ -52,22 +52,29 @@ See `agent-firm/policy/retired-permissions.json` for the full list of retired ru
 **What `--migrate` is allowed to delete.** Deletion is the one destructive thing `firm-install` does,
 so it is fenced in rather than trusted:
 
-- **Scope-honouring.** Each entry in `retired-permissions.json` declares a `scope` (both current
-  entries say `allow`). `--migrate` removes the rule *only from that list*. A retired `allow` rule
-  will not be stripped out of `ask`, and vice versa.
+- **Scope-honouring.** Each entry in `retired-permissions.json` declares a `scope` naming the
+  permission list(s) it may be deleted from, and `--migrate` removes the rule *only from those*. Both
+  current entries declare `["allow", "ask"]` — deliberately, not redundantly: `allow` and `ask` are
+  interchangeable places for the same grant to sit, so a rule that drifted from `allow` into `ask` is
+  the same withdrawn grant and must still be cleaned up. An entry that named only `allow` would leave
+  that drifted copy in place. A `scope` this entry does *not* name is never touched.
 - **It refuses to delete from `deny` — exit 4.** If a retired entry ever names `deny`, `firm-install`
   stops and changes nothing. Removing a deny rule *widens* what the agent may do; a cleanup path that
   can quietly do that is a privilege escalation with a tidy name. Fixing it means editing the policy
   file deliberately, not passing a flag.
-- **Exit 5 if the policy file can't be read or parsed.** Not a silent no-op "success" — a migration
-  that cannot see the list of what to retire has not verified anything.
+- **Exit 5 if the policy file exists but can't be read or parsed.** Not a silent no-op "success" — a
+  migration that cannot see the list of what to retire has not verified anything. A policy file that is
+  *absent altogether* is a different case: that is non-fatal, and the install proceeds as union-only
+  while printing that there was nothing to migrate. (`firm-doctor` FAILs on the missing file; that is
+  where absence is caught.)
 - **Atomic write + backup.** The new settings are written to a temp file and `rename`d into place, so
   an interrupted run cannot leave a truncated `settings.json`, and the previous contents are kept as a
   timestamped backup.
 
 `firm-install` exit codes: **0** applied (or already current) · **2** bad arguments · **3** a retired
-rule is present, re-run with `--migrate` · **4** refused: a retired entry targets `deny` · **5**
-`retired-permissions.json` missing, unreadable, or unparseable.
+rule is present, re-run with `--migrate` · **4** refused: `retired-permissions.json` has a malformed
+entry, or an entry whose `scope` is missing, names an unknown list, or names `deny` · **5**
+`retired-permissions.json` exists but is unreadable or unparseable. Exits 4 and 5 both write nothing.
 
 ### How `firm-*` gets on your shell PATH
 A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,
