@@ -1,20 +1,35 @@
 name: ci
 
-# The firm's first CI. Deliberately narrow: bash syntax across bin/, the dependency-free tests/ suite
-# on both bash 3.2 (macOS's permanent default — this repo's own scripts hold themselves to it) and a
-# modern bash, and firm-run-evals --structural (structure only — no `claude` login, no spend). Model-
-# driven eval execution (`firm-run-evals` without --structural, `firm-gpt-qa`, live `firm-doctor
-# --probe`) stays manual: those need a real login and real budget, which CI does not have.
+# The firm's first CI. Deliberately narrow: bash syntax across bin/, the tests/ suite on both bash 3.2
+# (macOS's permanent default — this repo's own scripts hold themselves to it) and a modern bash, and
+# firm-run-evals --structural (structure only — no `claude` login, no spend). Model-driven eval
+# execution (`firm-run-evals` without --structural, `firm-gpt-qa`, live `firm-doctor --probe`) stays
+# manual: those need a real login and real budget, which CI does not have.
+#
+# The suite is NOT dependency-free: the scripts under test and several tests themselves shell out to
+# python3, `test-validate-verdict` needs `jsonschema`, and `test-policy-yaml-valid` needs `pyyaml`.
+# Both are installed, at pinned versions, in the step below.
 
 "on":
   push:
   pull_request:
 
+# Least privilege for GITHUB_TOKEN. Declared explicitly because an absent `permissions:` key silently
+# inherits the REPOSITORY default, which may be read/write. Nothing here writes to the repo, posts a
+# comment, or publishes anything — checkout and setup-python only read. A workflow-level block also
+# sets every unlisted scope to `none`, so a later step cannot quietly acquire more; if a job ever does
+# need to write, give that one job its own narrower `permissions:` rather than widening this.
+permissions:
+  contents: read
+
 jobs:
   syntax:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a full commit SHA, not a tag: `@v4` is a MUTABLE ref the action's owner
+      # can repoint at any commit, so a tag pin is a standing supply-chain hole. The trailing comment
+      # carries the human-readable version so this stays reviewable; re-resolve it when bumping.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: bash -n across every bin/firm-*
         run: |
           set -e
@@ -34,8 +49,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: git identity for scratch-repo fixtures
@@ -43,8 +58,11 @@ jobs:
           git config --global user.email ci@agent-firm.local
           git config --global user.name "agent-firm CI"
           git config --global init.defaultBranch main
-      - name: install the declared prerequisite (jsonschema, pyyaml)
-        run: python -m pip install jsonschema pyyaml
+      # Versions are pinned so a CI result is reproducible and a bad upstream release can't turn a
+      # green run red (or vice versa) without a reviewed commit here. Both have cp312 wheels for the
+      # ubuntu-x86_64 and macos-arm64 runners, so no build toolchain is needed.
+      - name: install the declared prerequisites (pinned)
+        run: python -m pip install jsonschema==4.26.0 pyyaml==6.0.3
       - name: run the suite (default bash)
         run: bash tests/run-tests.sh
       - name: run the suite (bash 3.2 compatibility — /bin/bash specifically)

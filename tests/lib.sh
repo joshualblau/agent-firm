@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# tests/lib.sh — dependency-free assertions for the firm's own tooling.
+# tests/lib.sh — framework-free assertions for the firm's own tooling.
 #
-# Deliberately plain: no bats, no node, no python. The bin/ scripts hold themselves to bash 3.2
+# Deliberately plain: no bats, no node. (python3 IS used — by the scripts under test and by tests that
+# check JSON/YAML; test-validate-verdict needs jsonschema and test-policy-yaml-valid needs pyyaml, the
+# firm's own declared prerequisites. What's avoided is a test FRAMEWORK, not a runtime.)
+# The bin/ scripts hold themselves to bash 3.2
 # (macOS ships 3.2.57 and always will), so their tests must run there too — that means no
 # associative arrays, no `mapfile`, no `${var^^}`, no process substitution in the hot path.
 #

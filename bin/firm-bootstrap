@@ -58,7 +58,9 @@ fi
 
 # 4. Python prerequisites. `jsonschema` is gate-critical: without it firm-validate-verdict cannot
 #    schema-validate a QA verdict and exits 4 (DEGRADED), which does not satisfy the Final gate.
-#    `pyyaml` is advisory — the yaml parsers fall back to regex without it.
+#    `pyyaml` is required to run the firm's own test suite (tests/test-policy-yaml-valid.sh) and CI
+#    installs it. It is non-fatal at runtime in a work project — the yaml parsers fall back to regex —
+#    but that fallback is looser and fails CLOSED (CANNOT VERIFY) on files pyyaml would parse exactly.
 PIP_CMD="python3 -m pip install --user jsonschema pyyaml"
 missing_py=""
 python3 -c 'import jsonschema' >/dev/null 2>&1 || missing_py="$missing_py jsonschema"

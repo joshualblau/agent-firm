@@ -9,8 +9,10 @@ Two different kinds of document live here — know which one you're reading.
   profiles, egress firewall, visual baselines, phone approvals, eval calibration).
 - [INTERACTIVE-TEST.md](INTERACTIVE-TEST.md) — drive the firm with a real Claude session and watch the
   lifecycle engage, end to end.
-- [ENFORCEMENT.md](ENFORCEMENT.md) — every claimed invariant in this repo, and what actually enforces
-  it: tool scope, permission rule, sandbox, a script, or prompt instructions alone.
+- [ENFORCEMENT.md](ENFORCEMENT.md) — the repo's load-bearing claimed invariants and what actually
+  enforces each: tool scope, permission rule, sandbox, a script, or prompt instructions alone. The
+  table is hand-maintained, so treat it as the best current map rather than a complete inventory — an
+  invariant with no row there is tier 4 (prompt-only) until someone shows otherwise.
 
 For the operating model itself (lifecycle, gates, roles, policies), read
 [CLAUDE.md](../CLAUDE.md) and [agent-firm/policy/*](../agent-firm/policy/) directly — this directory

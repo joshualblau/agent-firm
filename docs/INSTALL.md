@@ -15,8 +15,13 @@ python3 -m pip install --user jsonschema pyyaml
 - **`jsonschema` is required.** Without it `firm-validate-verdict` cannot schema-check a QA verdict
   and exits **4 (DEGRADED)**, which does not satisfy the Final gate — an unverifiable verdict is not
   evidence. `firm-doctor` FAILs while it's missing.
-- **`pyyaml` is advisory.** Without it the acceptance-criteria and eval-assertion parsers fall back to
-  regex, which is looser.
+- **`pyyaml` is required to work ON the firm, and non-fatal (but degrading) to work WITH it.** It used
+  to be described as merely "advisory"; that stopped being true when the regression suite landed —
+  `tests/test-policy-yaml-valid.sh` needs it, so the suite cannot pass without it, and CI installs it.
+  In a *work project* the firm still runs without it: the acceptance-criteria and eval-assertion
+  parsers fall back to regex. But that fallback is looser and **fails closed**:
+  `firm-traceability-check` reports `CANNOT VERIFY` and exits non-zero on criteria files pyyaml would
+  have parsed exactly. `firm-doctor` WARNs (not FAILs) while it's missing.
 
 `firm-bootstrap` reports what's missing and prints this command; pass `--with-python-deps` to have it
 run the install for you. It never installs packages as a side effect — changing your machine should
@@ -43,6 +48,26 @@ firm-install --migrate                   # removes retired rules, prints exactly
 firm-install --user --migrate            # same, for user-scope settings
 ```
 See `agent-firm/policy/retired-permissions.json` for the full list of retired rules and why.
+
+**What `--migrate` is allowed to delete.** Deletion is the one destructive thing `firm-install` does,
+so it is fenced in rather than trusted:
+
+- **Scope-honouring.** Each entry in `retired-permissions.json` declares a `scope` (both current
+  entries say `allow`). `--migrate` removes the rule *only from that list*. A retired `allow` rule
+  will not be stripped out of `ask`, and vice versa.
+- **It refuses to delete from `deny` — exit 4.** If a retired entry ever names `deny`, `firm-install`
+  stops and changes nothing. Removing a deny rule *widens* what the agent may do; a cleanup path that
+  can quietly do that is a privilege escalation with a tidy name. Fixing it means editing the policy
+  file deliberately, not passing a flag.
+- **Exit 5 if the policy file can't be read or parsed.** Not a silent no-op "success" — a migration
+  that cannot see the list of what to retire has not verified anything.
+- **Atomic write + backup.** The new settings are written to a temp file and `rename`d into place, so
+  an interrupted run cannot leave a truncated `settings.json`, and the previous contents are kept as a
+  timestamped backup.
+
+`firm-install` exit codes: **0** applied (or already current) · **2** bad arguments · **3** a retired
+rule is present, re-run with `--migrate` · **4** refused: a retired entry targets `deny` · **5**
+`retired-permissions.json` missing, unreadable, or unparseable.
 
 ### How `firm-*` gets on your shell PATH
 A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,
