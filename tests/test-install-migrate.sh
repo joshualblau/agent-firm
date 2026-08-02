@@ -359,10 +359,10 @@ t_case "a pre-planted DANGLING symlink at the backup path is never written throu
 # loop skipped it and copy2 wrote the user's whole permission policy THROUGH the link, to a path the
 # planter chose. Anyone who can create a name in .claude/ — but who cannot write settings.json — thus
 # gets an arbitrary-file-write primitive whose payload is the settings JSON.
-sym_out="$(mktemp -d "${TMPDIR:-/tmp}/firm-isym.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $sym_out"
+sym_out="$(mktemp -d "${TMPDIR:-/tmp}/firm-isym.XXXXXX")"; t_track "$sym_out"
 EXFIL="$sym_out/exfil"        # nothing in this test ever creates it; only a follow-the-link write can
 sym_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)", "Bash(keep-me:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $sym_proj"
+t_track "$sym_proj"
 YS="$sym_proj/.claude/settings.json"
 plant_baks "$sym_proj" link "$EXFIL"
 assert_no_file "precondition: the planter's chosen path does not exist yet" "$EXFIL"
@@ -392,7 +392,7 @@ t_case "pre-planted REGULAR backup files are never clobbered — the collision s
 # (This one passes before and after the symlink fix; it is here so the fix cannot be 'achieved' by
 # dropping the never-clobber behaviour.)
 coll_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $coll_proj"
+t_track "$coll_proj"
 plant_baks "$coll_proj" file 'PLANTED-DO-NOT-TOUCH'
 assert_ok "migrate succeeds over the occupied names" install_in "$coll_proj" --migrate
 assert_eq "11 backup names now exist: the 10 planted plus one new" "11" \
@@ -415,7 +415,7 @@ t_case "a NEWLY created settings.json is 0600 whatever the umask — never group
 # It was chmod'd to `0o666 & ~umask` on creation, so `umask 000` produced -rw-rw-rw-: every local
 # account could add itself an allow rule to the file that decides what the firm may do unattended.
 for _u in 000 002 022 077; do
-  um_proj="$(mktemp -d "${TMPDIR:-/tmp}/firm-iumask.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $um_proj"
+  um_proj="$(mktemp -d "${TMPDIR:-/tmp}/firm-iumask.XXXXXX")"; t_track "$um_proj"
   assert_ok "fresh install under umask $_u succeeds" install_umask "$_u" "$um_proj"
   assert_eq "umask $_u -> mode 0600" "0600" "$(perm_of "$um_proj/.claude/settings.json")"
   assert_fail "umask $_u -> not group- or world-WRITABLE (the actual defect)" \
@@ -442,7 +442,7 @@ t_case "an EXISTING settings.json keeps its own mode across the atomic replace"
 # The complement: creation is tightened, but a file the user already owns is not re-permissioned
 # underneath them (someone may have deliberately set 0640 for a shared checkout).
 mode_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
-T_TMPDIRS="$T_TMPDIRS $mode_proj"
+t_track "$mode_proj"
 MS="$mode_proj/.claude/settings.json"
 chmod 640 "$MS"
 assert_eq "precondition: the file is 0640" "0640" "$(perm_of "$MS")"
