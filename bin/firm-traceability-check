@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 # traceability-check [run_dir]
 # Cross-references acceptance criteria (01-acceptance-criteria.yaml) against the QA verdict's
-# acceptance_criteria_coverage (08-qa-verdict.json). Fails if any criterion is uncovered without
-# a justification. Defaults to the active run (.agent-firm/CURRENT_RUN).
+# acceptance_criteria_coverage (08-qa-verdict.json). Defaults to the active run
+# (.agent-firm/CURRENT_RUN).
+#
+# The schema allows covered: yes | no | partial (agent-firm/schemas/qa-verdict.schema.json). This
+# script used to look at `no` ONLY, so a verdict where every criterion was `partial` printed
+# "PASS — every criterion is covered or justified" and exited 0: a gate claiming full coverage over
+# work that was, by QA's own admission, only partly verified. Rules now, all three coverage values
+# handled explicitly:
+#
+#   covered: yes                  fully covered.
+#   covered: partial + evidence   ALLOWED (exit 0) but reported as a GAP, and the headline says
+#                                 INCOMPLETE, never PASS. Deliberately NOT harsher than a justified
+#                                 `no`: if a justified partial blocked while a justified waiver
+#                                 passed, the cheapest way out would be to downgrade `partial` to
+#                                 `no`, which is less coverage, not more.
+#   covered: partial + no evidence   FAIL (exit 1) — same bar as `no` with no justification.
+#   covered: no + evidence        ALLOWED (exit 0), reported as a waived GAP (unchanged verdict,
+#                                 newly visible in the output).
+#   covered: no + no evidence     FAIL (exit 1) — unchanged.
+#   covered: missing / not in the enum / a malformed coverage entry   FAIL — a coverage value this
+#                                 script cannot interpret is not evidence of coverage.
+#
+# Exit 0 = no problems (headline PASS if every criterion is `yes`, INCOMPLETE if justified gaps
+# remain). 1 = FAIL / cannot verify. 2 = missing inputs.
 set -euo pipefail
 
 run_dir="${1:-}"
@@ -17,39 +39,132 @@ v_path  = os.path.join(run, "08-qa-verdict.json")
 if not os.path.exists(ac_path): print(f"MISSING {ac_path}"); sys.exit(2)
 if not os.path.exists(v_path):  print(f"MISSING {v_path}");  sys.exit(2)
 
-# Acceptance-criteria ids: prefer yaml, fall back to a regex that handles BOTH block style
+# Acceptance-criteria ids: pyyaml when installed, else a regex that handles BOTH block style
 # (`- id: AC-001`) and flow style (`- {id: AC-001, ...}`).
+#
+# "pyyaml is missing" and "this YAML is broken" are NOT the same condition and are no longer caught
+# by one bare `except`. A missing library is a legitimate degraded path; a SYNTAX ERROR is not
+# something to regex around, because a half-readable criteria file yields a SHORT id list, and every
+# criterion that fell out of that list is then never checked for coverage at all — silently shrinking
+# the very set this gate exists to enforce.
 ac_ids = []
 text = open(ac_path).read()
 try:
     import yaml
-    doc = yaml.safe_load(text) or {}
+except ImportError:
+    yaml = None
+if yaml is not None:
+    try:
+        doc = yaml.safe_load(text)
+    except Exception as e:
+        print(f"TRACEABILITY: CANNOT VERIFY — {ac_path} is not valid YAML: {e}")
+        sys.exit(1)
+    if doc is None:
+        doc = {}
+    if not isinstance(doc, dict):
+        print(f"TRACEABILITY: CANNOT VERIFY — {ac_path} top level is {type(doc).__name__}, "
+              f"expected a mapping with a `criteria:` list")
+        sys.exit(1)
     ac_ids = [c.get("id") for c in (doc.get("criteria") or []) if isinstance(c, dict) and c.get("id")]
-except Exception:
+else:
+    # Degraded path. It can find only what it can match, and cannot detect a syntax error at all —
+    # hence the fail-closed guard below when nothing parses.
     ac_ids = re.findall(r'(?:^|[\s\-{,])id:\s*["\']?([A-Za-z0-9_-]+)', text, re.M)
 ac_ids = [a for a in ac_ids if a]
 
-# Fail-closed: if the file declares criteria but we couldn't extract any ids, we cannot verify
-# coverage — do NOT pass vacuously (matches the firm's "BLOCK on uncertainty" stance).
-if not ac_ids and re.search(r'^\s*criteria\s*:', text, re.M):
-    print("TRACEABILITY: CANNOT VERIFY — 'criteria:' present but no ids parsed (install pyyaml or fix the file format)")
+# Fail-closed: no ids means there is nothing to trace, which is NOT the same as full coverage — do
+# not pass vacuously (matches the firm's "BLOCK on uncertainty" stance). Covers both "the file
+# declares criteria but we couldn't extract any ids" and "the file declares none at all"; a zero-
+# criterion run reaching this gate is itself a defect worth surfacing, not a clean bill of health.
+if not ac_ids:
+    if re.search(r'^\s*criteria\s*:', text, re.M):
+        print("TRACEABILITY: CANNOT VERIFY — 'criteria:' present but no ids parsed (install pyyaml or fix the file format)")
+    else:
+        print(f"TRACEABILITY: CANNOT VERIFY — no acceptance criteria ids found in {ac_path}; nothing to trace is not coverage")
     sys.exit(1)
 
-verdict = json.load(open(v_path))
-cov = { c.get("id"): c for c in verdict.get("acceptance_criteria_coverage", []) }
+try:
+    verdict = json.load(open(v_path))
+except Exception as e:
+    print(f"TRACEABILITY: CANNOT VERIFY — {v_path} is not valid JSON: {e}")
+    sys.exit(1)
+if not isinstance(verdict, dict):
+    print(f"TRACEABILITY: CANNOT VERIFY — {v_path} is not a JSON object")
+    sys.exit(1)
 
+raw_cov = verdict.get("acceptance_criteria_coverage")
+if raw_cov is None:
+    raw_cov = []
+if not isinstance(raw_cov, list):
+    print("TRACEABILITY: CANNOT VERIFY — acceptance_criteria_coverage is not a list")
+    sys.exit(1)
+
+# Malformed coverage entries are COUNTED, never quietly dropped: a dropped entry for an id that is
+# in the criteria would resurface as "NOT in verdict coverage", but one for any other id would just
+# vanish, and the summary would then over-report how much QA actually looked at.
 problems = []
+cov = {}
+for i, c in enumerate(raw_cov):
+    if not isinstance(c, dict) or not str(c.get("id") or "").strip():
+        problems.append(f"coverage entry #{i} is malformed (needs an object with a non-empty id): {c!r}")
+        continue
+    cov[str(c["id"]).strip()] = c
+
+VALID_COVERED = ("yes", "no", "partial")   # mirrors agent-firm/schemas/qa-verdict.schema.json
+n_yes = n_partial = n_waived = 0
+gaps = []    # justified, non-blocking — but NOT full coverage, so they must be visible
+notes = []   # neither blocking nor a coverage gap; still worth saying out loud
+
 for ac in ac_ids:
     c = cov.get(ac)
     if c is None:
         problems.append(f"{ac}: NOT in verdict coverage")
-    elif c.get("covered") == "no" and not (c.get("evidence") or "").strip():
-        problems.append(f"{ac}: covered=no with no justification")
+        continue
+    covered  = str(c.get("covered") if c.get("covered") is not None else "").strip().lower()
+    evidence = str(c.get("evidence") if c.get("evidence") is not None else "").strip()
+    if not covered:
+        problems.append(f"{ac}: no `covered` value — coverage cannot be verified")
+    elif covered not in VALID_COVERED:
+        problems.append(f"{ac}: covered={c.get('covered')!r} is not one of yes/no/partial — cannot be verified")
+    elif covered == "yes":
+        n_yes += 1
+        if not evidence:
+            # Not a downgrade of `yes` (still counted as covered, still exit 0) — but an unsourced
+            # claim of coverage is worth naming rather than printing as indistinguishable from a
+            # cited one.
+            notes.append(f"{ac}: covered=yes but cites NO evidence")
+    elif covered == "partial":
+        if not evidence:
+            problems.append(f"{ac}: covered=partial with no justification")
+        else:
+            n_partial += 1
+            gaps.append(f"{ac}: PARTIAL — {evidence}")
+    else:  # covered == "no"
+        if not evidence:
+            problems.append(f"{ac}: covered=no with no justification")
+        else:
+            n_waived += 1
+            gaps.append(f"{ac}: NOT COVERED (waived) — {evidence}")
 
-print(f"acceptance criteria: {len(ac_ids)}  covered entries: {len(cov)}")
+print(f"acceptance criteria: {len(ac_ids)}  verdict coverage entries: {len(cov)}")
+print(f"coverage: {n_yes} full (yes) · {n_partial} partial · {n_waived} waived (no + justification) "
+      f"· {len(problems)} problem(s)")
+for n in notes: print("  note:", n)
+
 if problems:
     print("TRACEABILITY: FAIL")
     for p in problems: print("  -", p)
     sys.exit(1)
-print("TRACEABILITY: PASS — every criterion is covered or justified.")
+
+if gaps:
+    # Headline deliberately avoids the substring "TRACEABILITY: PASS": anything grepping for that
+    # (a human, a log scan, a future script) must not read a partially-covered run as a clean one.
+    print("GAPS — these criteria are NOT fully covered (each carries a justification):")
+    for g in gaps: print("  -", g)
+    print(f"TRACEABILITY: INCOMPLETE — {n_yes}/{len(ac_ids)} criteria fully covered, "
+          f"{len(gaps)} justified gap(s) above. Exit 0 because every gap is justified, but this is "
+          f"NOT full coverage — carry these gaps into the Final gate.")
+    sys.exit(0)
+
+print(f"TRACEABILITY: PASS — all {len(ac_ids)} criteria marked fully covered (covered=yes).")
 PY

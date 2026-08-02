@@ -42,7 +42,11 @@ comment for the reasoning.
 - `test_passes: <command>` — the command must exit 0. To assert the OPPOSITE (a command must genuinely
   fail — useful as a fixture-sanity check independent of anything the firm does), negate it with a
   shell `!`: `test_passes: "! sh test/run-tests.sh"`.
-- `traceability_passes: true` — runs `firm-traceability-check` against the run.
+- `traceability_passes: true` — runs `firm-traceability-check` against the run: every acceptance
+  criterion must appear in the verdict's coverage, and every gap (`covered: no` or `covered: partial`)
+  must carry a justification. A justified gap still exits 0 (so this assertion still passes) but the
+  check prints `TRACEABILITY: INCOMPLETE`, never `PASS` — read its output, not just the exit code, if
+  you care whether coverage was *full* or merely *justified*.
 - `qa_checkout_clean: true` — delegates to `firm-qa-clean-check` against the run's QA checkout. Proves
   QA left **no visible changes**, not that QA is read-only (see `docs/ENFORCEMENT.md`). Fails closed
   (not a vacuous pass) if the checkout directory doesn't exist.
@@ -57,3 +61,24 @@ comment for the reasoning.
   inferred from the outer `claude -p` result envelope's `subtype`/`is_error` fields — an earlier version
   was, and a run that crashed or did nothing at all could satisfy that inference just as easily as a
   correct one. Same fail-closed rule: no ledger, or no logged event, FAILs — never inferred as true.
+
+## How `assertions.yaml` is parsed — and when the checker refuses to run
+`firm-check-assertions` exits **0** only when every assertion ran and passed, **1** when an assertion
+failed, and **2** when it could not evaluate the file at all. That third code exists because "nothing
+was checked" must never be reportable as "everything passed" — an empty, prose-only, or
+parses-to-nothing `assertions.yaml` used to print `0/0 assertions passed` and exit 0.
+
+- **Zero parsed assertions is a hard failure.** An eval that checks nothing cannot pass.
+- **pyyaml when installed; a narrow `- key: value` line parser when not.** These are separate paths
+  and separate risks. A **YAML syntax error is never a fallback trigger** — it is a hard failure, so a
+  typo that moves an assertion out of the `assertions:` list reads as "this file is broken", not "that
+  assertion simply isn't there".
+- **The fallback accounts for every list item it sees.** Anything under `assertions:` it can't turn
+  into a `- key: value` mapping is reported with its line number and fails the file, because a dropped
+  assertion is an unrun check. It reads only the `assertions:` block, so a `- key: value` line under
+  some other top-level key is not silently promoted into an assertion.
+- **A list entry that isn't a single-key mapping FAILs** instead of being skipped and then counted in
+  the `N/N assertions passed` denominator.
+- Keep values simple. The fallback strips at most one matched pair of surrounding quotes and does not
+  interpret flow style (`assertions: [ ... ]`), anchors, or multi-line scalars; it refuses rather than
+  guessing.
