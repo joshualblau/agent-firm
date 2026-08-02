@@ -220,6 +220,12 @@ assert_rc "--structural exits 1" 1 "$FAKE" --structural synthetic-empty
 assert_output "reports BAD, not ok" "BAD  synthetic-empty (assertions)" "$FAKE" --structural synthetic-empty
 assert_output "surfaces the checker's own reason" "CANNOT EVALUATE" "$FAKE" --structural synthetic-empty
 assert_output "the summary is a failure" "some evals FAILED" "$FAKE" --structural synthetic-empty
+# Pin the exit-2 branch SPECIFICALLY, not just "it failed somehow". --structural also has a catch-all
+# for any rc outside 0/1/2, and that catch-all would produce a failure here too -- so without this
+# assertion, deleting the deliberate "2 means CANNOT EVALUATE" handling leaves the suite green, which
+# is precisely the guarantee this work-order exists to give CI teeth about.
+assert_output "attributes the failure to the checker's exit 2 specifically" \
+  "NOT EVALUABLE — firm-check-assertions exited 2" "$FAKE" --structural synthetic-empty
 
 t_case "a PROSE-ONLY assertions.yaml (0 assertions) FAILS --structural"
 sb_p="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_p"
@@ -311,6 +317,31 @@ assert_rc "completed exit 1 -> --structural exits 0" 0 \
   "$root_ok/bin/firm-run-evals" --structural synthetic-stub
 assert_output "and reports the stub's parsed count" "ok   synthetic-stub (1 assertions)" \
   "$root_ok/bin/firm-run-evals" --structural synthetic-stub
+
+# (d) CONTROL: exit 0 with landmarks -> also a pass, so (a)/(b) are not just "any stub fails".
+root_zero="$(mk_eval_root)"
+printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via stub"\necho "--- 1/1 assertions passed"\nexit 0\n' \
+  > "$root_zero/bin/firm-check-assertions"; chmod +x "$root_zero/bin/firm-check-assertions"
+printf '%s\n' "$stub_eval" | mk_eval "$root_zero" synthetic-stub
+assert_rc "completed exit 0 -> --structural exits 0" 0 \
+  "$root_zero/bin/firm-run-evals" --structural synthetic-stub
+
+# (e) exit 2 WITH the landmarks present. This isolates the "2 = CANNOT EVALUATE" rule from the
+#     completeness guard above: the real checker always exits 2 *before* printing anything, so the
+#     completeness guard alone would catch every real exit-2 file, and deleting the exit-2 handling
+#     would leave the suite green on outcome. Only a stub can hold the two rules apart. Exit 2 must
+#     win over a green-looking tally.
+t_case "checker exit 2 fails --structural even when its output looks complete"
+root_two="$(mk_eval_root)"
+printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via stub"\necho "--- 1/1 assertions passed"\nexit 2\n' \
+  > "$root_two/bin/firm-check-assertions"; chmod +x "$root_two/bin/firm-check-assertions"
+printf '%s\n' "$stub_eval" | mk_eval "$root_two" synthetic-stub
+assert_rc "exit 2 beats a 1/1-passed tally -> --structural exits 1" 1 \
+  "$root_two/bin/firm-run-evals" --structural synthetic-stub
+assert_output "reports BAD" "BAD  synthetic-stub (assertions)" \
+  "$root_two/bin/firm-run-evals" --structural synthetic-stub
+assert_output "names exit 2 as the reason" "exited 2" \
+  "$root_two/bin/firm-run-evals" --structural synthetic-stub
 
 # ---------------------------------------------------------------------------
 # Invoking the real checker means its `test_passes` verb executes shell straight out of the eval file,
