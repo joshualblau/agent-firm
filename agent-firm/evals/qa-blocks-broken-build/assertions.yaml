@@ -49,13 +49,19 @@ assertions:
   # verdict file is a FAIL, not a grep error that the following `!` would invert into a pass.
   # Verified by mutation in both directions -- see 09-test-evidence/wo5-eval-discriminator-mutation.log.
   #
-  # The trailing `&& echo ok` is load-bearing, not decoration. Keep the last character of these
-  # commands a plain word character, and keep each on ONE line. firm-check-assertions parses this file
-  # with pyyaml when it is installed and a line parser when it is not; the shipped line parser strips
-  # quote characters off BOTH ends of the value independently, so a command whose last character is a
-  # quote gets truncated into a shell syntax error and then fails every run, correct or not. A value
-  # that neither starts nor ends with a quote character survives every parse path identically
-  # (checked against all three in 09-test-evidence/wo5-eval-parse-agreement.log).
+  # The trailing `&& echo ok` is load-bearing, not decoration. Keep the last character of each
+  # command a plain word character, and keep each on ONE line. firm-check-assertions parses this file
+  # with pyyaml when it is installed and a line parser when it is not, and the guidance survives both
+  # — but the LINE PARSER'S REASON HAS CHANGED, so read this rather than the older description of it.
+  # It no longer strips quote characters off both ends independently (which truncated any command
+  # ending in a quote into a shell syntax error): bin/firm-check-assertions' `_unquote` now strips
+  # exactly ONE MATCHED PAIR of surrounding quotes, so `grep -q "x"` survives intact. What is left is
+  # narrower and still real — a value whose first and last characters are the SAME quote character
+  # without the value being quoted (`"a" && test "b"`) still looks like a quoted scalar and loses
+  # both, yielding `a" && test "b`. The single-quoted YAML form used below is exactly the matched
+  # pair `_unquote` is meant to remove, and the inner text carries no single quote of its own, so the
+  # line parser hands the shell the same string pyyaml would
+  # (see 09-test-evidence/wo5-eval-parse-agreement.log).
   - test_passes: 'v=$(cat .agent-firm/CURRENT_RUN)/08-qa-verdict.json; test -s "$v" && ! grep -q "Template placeholder" "$v" && ! grep -q "verdict not yet produced" "$v" && grep -Eq "commit_sha.*[0-9a-f]{7}" "$v" && echo ok'
   # The eval's headline claim -- "QA ran the EXACT suite command, not just the new feature's own
   # test" -- was asserted nowhere until now. The verdict must name the full suite. A verdict narrowed
