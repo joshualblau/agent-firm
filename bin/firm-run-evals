@@ -1,7 +1,34 @@
 #!/usr/bin/env bash
 # firm-run-evals [--structural] [eval-name]
 # Golden evals: DRIVE the firm headlessly against each fixture under a BOUNDED permission posture, then
-# check assertions.yaml. `--structural` keeps the Phase-1 structure-only check (no model run).
+# check assertions.yaml. `--structural` is the OFFLINE mode (no model run) — see below.
+#
+# --------------------------------------------------------------------------------------------------
+# WHAT `--structural` CLAIMS, AND WHAT IT DOES NOT (read before changing it — SEC-R15)
+#
+# It is the mode CI runs, because it is hermetic: no `claude`, no `codex`, no `firm-gpt-qa`, no network,
+# no credentials, no spend, ~1s for the whole suite. It answers exactly one question per eval:
+#
+#     is this eval WELL-FORMED, and can bin/firm-check-assertions actually EVALUATE its assertions?
+#
+# It does NOT answer "does the firm PASS this eval" — that is a behavioural claim only a real
+# `firm-run-evals <name>` can make. An eval whose assertions are perfectly parseable but impossible to
+# SATISFY without a live run is structurally GREEN here, on purpose. Structural-green is not
+# behavioural-green, and the output says so on every line that could be misread as the latter.
+#
+# It used to APPROXIMATE the assertion count by grepping dash-lines out of assertions.yaml and never
+# invoked firm-check-assertions at all. Two consequences, both real defects:
+#   (1) every fail-closed guarantee in firm-check-assertions (exit 2 on zero parsed assertions, on a
+#       YAML syntax error, or on any list item the fallback parser had to DROP) had ZERO CI coverage —
+#       CI ran the one mode that could not reach that code;
+#   (2) the grep's count and the checker's real parsed count could silently DISAGREE, which is the
+#       precise "the check and the thing it checks drifted apart" failure this tooling exists to catch.
+# Both are closed below: the checker is invoked for real, exit 2 is a HARD FAILURE (never "non-zero is
+# fine", never a pass), and a count disagreement is reported loudly and FAILS rather than being
+# reconciled silently. THERE IS NO FALLBACK PATH: if the checker is missing or the offline sandbox
+# cannot be built, structural FAILS. Falling back to the grep approximation would re-create the exact
+# hole this replaces.
+# --------------------------------------------------------------------------------------------------
 #
 # NEVER uses --dangerously-skip-permissions / bypassPermissions: the eval must exercise the firm's own
 # guardrails, and the `final_gate_pending` assertion relies on the firm stopping deliberately (not
@@ -26,6 +53,7 @@ ROOT="$(cd "$SELF/.." && pwd)"
 EVALS="$ROOT/agent-firm/evals"
 MANUAL="$ROOT/CLAUDE.md"                 # firm operating manual — injected as an appended system prompt
 SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
+CHECKER="$SELF/firm-check-assertions"
 
 mode=run
 [ "${1:-}" = "--structural" ] && { mode=structural; shift; }
@@ -37,6 +65,138 @@ structural_check() { # $1 = eval dir -> 0 ok, 1 bad
   [ -f "$d/assertions.yaml" ] || { echo "  MISSING assertions.yaml"; ok=0; }
   [ -d "$d/fixture" ]         || { echo "  MISSING fixture/"; ok=0; }
   [ "$ok" -eq 1 ]
+}
+
+# ==================================================================================================
+# The offline sandbox --structural runs firm-check-assertions inside.
+#
+# Invoking the real checker means its assertion VERBS run too, and one of them (`test_passes`) executes
+# arbitrary shell from the eval file. In this repo those commands include `node --test` and
+# `sh -c '... firm-gpt-qa ...'` — i.e. running the checker with the ambient environment would make the
+# hermetic CI mode shell out to a second-voice QA judge (which shells out to `codex`). That is exactly
+# the "structural must not drive a live agent" line, so the sandbox is not decoration:
+#
+#   * PATH is REPLACED by a directory of symlinks to an ALLOW-LIST of boring POSIX utilities — the ones
+#     firm-check-assertions and the two sibling scripts it delegates to (firm-traceability-check,
+#     firm-qa-clean-check) need in order to run correctly. It is an allow-list, not a deny-list, so
+#     `claude`, `codex`, `firm-gpt-qa`, `node`, `npm`, `pytest` and anything else are unreachable BY
+#     CONSTRUCTION rather than by enumeration. (Residual, documented: a `test_passes` naming an
+#     ABSOLUTE path still resolves. Nothing in-tree does, and the alternative — not invoking the
+#     checker — is the defect being fixed.)
+#   * the "repo" handed to the checker is a FRESH EMPTY directory per eval, so ledger/git/file verbs
+#     have nothing to find and nothing to damage, and one eval cannot leave state for the next.
+#   * HOME points into the sandbox, so nothing reads the caller's ~/.gitconfig or agent config.
+#
+# The verbs therefore all evaluate to FAIL (checker exit 1) — which is CORRECT and IGNORED here. The
+# only exit code --structural interprets is 2 = CANNOT EVALUATE. Verb PASS/FAIL lines are deliberately
+# NOT echoed: in this null environment they are meaningless, and printing them would invite exactly the
+# structural-green-means-behavioural-green misreading this mode has to avoid.
+# ==================================================================================================
+SANDBOX=""
+sandbox_cleanup() {
+  case "${SANDBOX:-}" in
+    /*/firm-structural.*) ;;
+    *) return 0 ;;                       # empty, relative, or not ours — delete nothing
+  esac
+  case "$SANDBOX" in */..|*/../*) return 0 ;; esac
+  [ -d "$SANDBOX" ] || return 0
+  [ -L "$SANDBOX" ] && return 0
+  rm -rf "$SANDBOX"
+  return 0
+}
+trap sandbox_cleanup EXIT
+
+# sandbox_init -> 0 ok (SANDBOX set), 1 could not build one. A failure here is FATAL to the caller:
+# there is deliberately no degraded path back to the dash-line approximation.
+sandbox_init() {
+  [ -n "$SANDBOX" ] && return 0
+  local d b p
+  d="$(mktemp -d "${TMPDIR:-/tmp}/firm-structural.XXXXXX" 2>/dev/null)" || return 1
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  mkdir -p "$d/path" "$d/home" 2>/dev/null || return 1
+  # bash: every firm-* script's `#!/usr/bin/env bash` shebang. python3: the checker's body.
+  # git: default_branch_status(). dirname/readlink: the shared symlink-resolution preamble.
+  # basename/cat/sed/grep/find: firm-qa-clean-check + firm-traceability-check.
+  for b in bash python3 git dirname readlink basename cat sed grep find; do
+    p="$(command -v "$b" 2>/dev/null)" || p=""
+    [ -n "$p" ] && ln -s "$p" "$d/path/$b" 2>/dev/null
+  done
+  SANDBOX="$d"
+  return 0
+}
+
+SA_COUNT=0      # assertions firm-check-assertions actually PARSED (authoritative)
+SA_DETAIL=""    # multi-line explanation when structural_assertions fails
+sa_detail() { if [ -z "$SA_DETAIL" ]; then SA_DETAIL="$1"; else SA_DETAIL="$SA_DETAIL
+$1"; fi; }
+
+# structural_assertions <eval-dir> <name> -> 0 = assertions are EVALUABLE, 1 = they are not.
+# "Evaluable", not "satisfied": an assertion that can only pass after a real run is fine here.
+structural_assertions() {
+  local d="$1" af="$1/assertions.yaml" repo out rc parsed grepn completed
+  SA_COUNT=0; SA_DETAIL=""
+
+  if [ ! -x "$CHECKER" ]; then
+    sa_detail "firm-check-assertions is missing or not executable at: $CHECKER"
+    sa_detail "structural CANNOT verify assertions without it, and will not guess — this is a FAILURE,"
+    sa_detail "not a reason to fall back to counting dash-lines."
+    return 1
+  fi
+  if ! sandbox_init; then
+    sa_detail "could not build the offline sandbox (mktemp -d under ${TMPDIR:-/tmp} failed)."
+    sa_detail "refusing to run firm-check-assertions unsandboxed — a shipped eval's test_passes names"
+    sa_detail "firm-gpt-qa, and --structural must never reach a live judge. FAILING instead."
+    return 1
+  fi
+  repo="$(mktemp -d "$SANDBOX/repo.XXXXXX" 2>/dev/null)" || {
+    sa_detail "could not create a per-eval scratch dir inside the sandbox"; return 1; }
+
+  out="$(PATH="$SANDBOX/path" HOME="$SANDBOX/home" "$CHECKER" "$af" "$repo" 2>&1)"; rc=$?
+
+  # EXIT 2 IS THE WHOLE POINT. The checker uses it for "I could not evaluate this file at all" (empty
+  # or prose-only, no `assertions:` key, YAML syntax error, or a fallback parse that had to drop a list
+  # item). A check that could not run has proven nothing, so it can never be a pass — and it is not
+  # merely "non-zero", either: 1 means the assertions RAN and some failed, which in this null sandbox
+  # is the expected, meaningless outcome.
+  if [ "$rc" -eq 2 ]; then
+    sa_detail "assertions are NOT EVALUABLE — firm-check-assertions exited 2 (cannot evaluate):"
+    sa_detail "$(printf '%s\n' "$out" | sed -n '1,10p' | sed 's/^/  | /')"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    sa_detail "firm-check-assertions exited $rc — expected 0/1 (evaluated) or 2 (cannot evaluate):"
+    sa_detail "$(printf '%s\n' "$out" | sed -n '1,10p' | sed 's/^/  | /')"
+    return 1
+  fi
+
+  # A crash mid-run also exits 1 (an uncaught Python traceback does), which would otherwise be read as
+  # the benign "evaluated, some failed". Require the checker's own two structural landmarks — the parse
+  # line and the closing tally — before believing the run completed.
+  parsed="$(printf '%s\n' "$out" | sed -n 's/^assertions: \([0-9][0-9]*\) parsed from .*$/\1/p')"
+  case "$out" in *" assertions passed"*) completed=1 ;; *) completed=0 ;; esac
+  if [ -z "$parsed" ] || [ "$completed" -ne 1 ]; then
+    sa_detail "firm-check-assertions exited $rc but did not complete (missing its parse line and/or"
+    sa_detail "its closing tally) — treating that as NOT EVALUABLE rather than as a pass:"
+    sa_detail "$(printf '%s\n' "$out" | sed -n '1,10p' | sed 's/^/  | /')"
+    return 1
+  fi
+
+  # The retired approximation, kept ONLY as a tripwire against itself. If the dumb dash-line count and
+  # the checker's real parsed count disagree, one of the two views of this file is wrong, and silently
+  # preferring either is how the original defect happened. Report both numbers and FAIL.
+  grepn="$(grep -cE '^[[:space:]]*-[[:space:]]' "$af" 2>/dev/null)"
+  grepn="$(printf '%s' "$grepn" | tr -cd '0-9')"; [ -n "$grepn" ] || grepn=0
+  if [ "$parsed" != "$grepn" ]; then
+    sa_detail "ASSERTION COUNT DISAGREEMENT — the legacy dash-line grep counts $grepn, but"
+    sa_detail "firm-check-assertions PARSED $parsed. The checker's count is the authoritative one; the"
+    sa_detail "grep is retained only to detect this drift. Usual causes: a '- ' line outside the"
+    sa_detail "\`assertions:\` block (grep over-counts), or a flow-style list only pyyaml can read."
+    sa_detail "Fix the file or the expectation — do not reconcile this by deleting the cross-check."
+    return 1
+  fi
+
+  SA_COUNT="$parsed"
+  return 0
 }
 
 # A hook-free copy of the firm settings: the real settings.json registers a PreToolUse hook pointing at
@@ -90,6 +250,12 @@ PY
   return $rc
 }
 
+if [ "$mode" = "structural" ]; then
+  echo "structural mode: OFFLINE shape + assertion-PARSE check (no model run, no network, no spend)."
+  echo "  Proves: each eval is well-FORMED and firm-check-assertions can EVALUATE its assertions."
+  echo "  Does NOT prove: that the firm SATISFIES them — that needs a real 'firm-run-evals <name>'."
+fi
+
 rc=0; n=0
 for d in "$EVALS"/*/; do
   [ -d "$d" ] || continue
@@ -98,12 +264,20 @@ for d in "$EVALS"/*/; do
   n=$((n+1))
   if ! structural_check "$d"; then echo "BAD  $name (structure)"; rc=1; continue; fi
   if [ "$mode" = "structural" ]; then
-    a="$(grep -cE '^[[:space:]]*-[[:space:]]' "$d/assertions.yaml" 2>/dev/null || echo 0)"
-    echo "ok   $name ($a assertions)"; continue
+    if structural_assertions "$d" "$name"; then
+      echo "ok   $name ($SA_COUNT assertions) — parsed + EVALUABLE by firm-check-assertions [structural only]"
+    else
+      echo "BAD  $name (assertions)"
+      printf '%s\n' "$SA_DETAIL" | sed 's/^/       /'
+      rc=1
+    fi
+    continue
   fi
   if run_one "$d" "$name"; then echo "PASS $name"; else echo "FAIL $name"; rc=1; fi
 done
 [ "$n" -eq 0 ] && { echo "no evals in $EVALS"; exit 0; }
 echo "---"
-[ "$rc" -eq 0 ] && echo "all evals passed" || echo "some evals FAILED"
+sfx=""
+[ "$mode" = "structural" ] && sfx=" (structural: well-formed + assertions EVALUABLE — NOT a behavioural pass)"
+if [ "$rc" -eq 0 ]; then echo "all evals passed$sfx"; else echo "some evals FAILED$sfx"; fi
 exit "$rc"
