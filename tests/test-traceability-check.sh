@@ -399,16 +399,21 @@ printf '    (UTF-8 control runs via: %s)\n' "$UTF8_HOW"
 t_case "preconditions: the two locale helpers really give python3 different stdout encodings"
 # Without these, every assertion below could pass because BOTH helpers ran in UTF-8 — the locale axis
 # would be named in the titles and varied nowhere, which is exactly the overclaim this suite forbids.
+# U+00B7 is written as an ASCII escape, never as a literal byte. Under a strict C locale glibc decodes
+# argv with the locale encoding, so a literal here crashes python3 while it is still decoding its own
+# arguments — before the test body runs. macOS decodes argv as UTF-8 regardless, which is why the
+# literal form passed locally and would have reddened the Linux CI runner. The runtime value is
+# identical; only the source bytes change.
 assert_ok "the ASCII helper gives a stdout that CANNOT encode U+00B7" ascii_locale python3 -c '
 import sys
 try:
-    "·".encode(sys.stdout.encoding or "ascii")
+    "\u00b7".encode(sys.stdout.encoding or "ascii")
 except (UnicodeEncodeError, LookupError):
     sys.exit(0)
 sys.exit(1)'
 assert_ok "the UTF-8 helper gives a stdout that CAN" utf8_locale python3 -c '
 import sys
-"·".encode(sys.stdout.encoding or "ascii")'
+"\u00b7".encode(sys.stdout.encoding or "ascii")'
 
 t_case "the script emits no non-ASCII byte at all (nothing to encode, so nothing can raise)"
 # The streams are also reconfigured to escape-on-error (see the script), which is what protects
