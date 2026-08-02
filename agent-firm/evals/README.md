@@ -30,15 +30,24 @@ comment for the reasoning.
 
 ## Assertion vocabulary (assertions.yaml)
 - `artifact_exists: <ledger file>` / `artifact_absent: <ledger file>` — presence/absence relative to
-  the run ledger (resolved via `CURRENT_RUN`), e.g. `08-qa-verdict.json`. **Caution:** every file
-  `agent-firm/templates/*` seeds is copied into a run at `firm-new-run` time, so `artifact_exists` on
-  one of those is true from the moment the run starts, before anything real has happened — it is not,
-  on its own, proof the corresponding stage ran. Pair it with a content-checking assertion
-  (`verdict_is`, `traceability_passes`) or a signal that genuinely requires real execution
-  (`qa_checkout_clean`, `final_gate_pending`) to prove anything.
+  the run ledger (resolved via `CURRENT_RUN`), plus a recursive `.agent-firm/**` scan. **Caution:**
+  every file `agent-firm/templates/*` seeds is copied into a run at `firm-new-run` time, so
+  `artifact_exists` on one of those is true from the moment the run starts, before anything real has
+  happened — it is not, on its own, proof the corresponding stage ran. Pair it with a
+  content-checking assertion (`verdict_is`, `traceability_passes`) or a signal that genuinely
+  requires real execution (`qa_checkout_clean`, `final_gate_pending`) to prove anything.
+  The mirror-image caution applies to `artifact_absent`: it **cannot** express "this stage never
+  ran" for any template-seeded file (`10-handoff.md`, `08-qa-verdict.json`, …) — those exist at t=0,
+  so such an assertion FAILs on a perfectly correct run. It is usable only for a ledger path the
+  template scaffold does not create. Both verbs **fail closed** when no ledger can be resolved:
+  `artifact_absent` used to read "no ledger" as "absent" and PASS on a repo where nothing had ever
+  run, while skipping the `.agent-firm/**` scan that would have found the artifact anyway.
 - `file_exists: <path>` / `file_absent: <path>` — relative to the scratch repo root (source files, not
   ledger artifacts).
-- `verdict_is: APPROVE|BLOCK` — checks `08-qa-verdict.json`'s `verdict` field.
+- `verdict_is: APPROVE|BLOCK` — checks the `verdict` field of the RUN LEDGER's `08-qa-verdict.json`.
+  **Fails closed** when no ledger can be resolved: it used to build its path from `led or ""`, which
+  left a bare relative name that resolved against the checker process's own working directory, so a
+  run that produced no ledger at all could be satisfied by a verdict file in an unrelated folder.
 - `test_passes: <command>` — the command must exit 0. To assert the OPPOSITE (a command must genuinely
   fail — useful as a fixture-sanity check independent of anything the firm does), negate it with a
   shell `!`: `test_passes: "! sh test/run-tests.sh"`.

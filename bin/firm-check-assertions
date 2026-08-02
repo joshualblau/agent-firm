@@ -30,6 +30,15 @@
 # BOTH FAIL CLOSED — never a silent pass via a weaker guess. There is no commit-count fallback: a
 # fallback that can produce a false pass is the exact bug this replaces (see firm-doctor's retired-
 # permission-rules check, fixed the same way one script earlier).
+#
+# EVERY LEDGER-READING VERB FAILS CLOSED WHEN NO LEDGER CAN BE RESOLVED — artifact_exists,
+# artifact_absent and verdict_is included. Two of them did not. artifact_absent read "no ledger" as
+# "the artifact is absent" and PASSED on a repo where nothing had ever run, while skipping the
+# `.agent-firm/**` scan that would have found the artifact anyway; verdict_is built its path from
+# `led or ""`, so with no ledger it read 08-qa-verdict.json out of the CHECKER'S OWN CWD and could
+# report APPROVE from a file in an unrelated directory. Both are closed at their branches below.
+# This script is how the firm proves an accepted change did not regress: a fail-open HERE silently
+# disarms every golden eval, so treat any "it cannot look, so it passes" path as a defect.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -218,22 +227,57 @@ for a in asserts:
     elif k == "file_absent":
         check(f"file_absent {v}", not os.path.exists(os.path.join(repo, v)))
     elif k == "artifact_exists":
+        # Already fail-closed and pinned as such by a regression test: with no ledger to resolve,
+        # this reports FAIL. "I could not look" is not evidence the artifact is there. Written as an
+        # explicit `led is None` test rather than leaning on `bool(led)` short-circuiting, because
+        # that same short-circuit is exactly what broke artifact_absent below.
         led = find_ledger()
-        found = bool(led) and (os.path.exists(os.path.join(led, v))
+        found = led is not None and (os.path.exists(os.path.join(led, v))
                  or bool(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True)))
         check(f"artifact_exists {v}", found, (led or "no ledger"))
     elif k == "artifact_absent":
         # file_absent checks paths relative to the repo root (source files); ledger artifacts like
-        # 10-handoff.md live under the dynamically-named .agent-firm/runs/<run_id>/, which file_absent
-        # can't address. This is artifact_exists' missing negative counterpart -- added for
-        # qa-blocks-broken-build, which needs to prove NO handoff was written (QA blocked, so the
-        # Packager stage the lifecycle gates on APPROVE never ran) rather than a source file.
+        # 08-qa-verdict.json live under the dynamically-named .agent-firm/runs/<run_id>/, which
+        # file_absent can't address. This is artifact_exists' negative counterpart.
+        #
+        # TWO FAIL-OPENS USED TO LIVE HERE. Both are closed below; keep them closed.
+        #  (1) NO LEDGER IS NOT ABSENCE. `not found` was True whenever no ledger could be resolved,
+        #      so this verb reported PASS on a repo where nothing had ever run -- the exact opposite
+        #      of artifact_exists, which correctly FAILs in that same state. A check that cannot
+        #      look must never report success, so an unresolvable ledger now FAILs here too.
+        #  (2) THE GLOB IS NEVER SHORT-CIRCUITED. The old `bool(led) and (... or glob(...))` skipped
+        #      the recursive `.agent-firm/**` scan whenever the ledger was unresolvable, so a REAL
+        #      artifact planted at `.agent-firm/stray/08-qa-verdict.json` was reported "absent" --
+        #      a false negative on a file that demonstrably exists, not merely a vacuous pass. The
+        #      scan now runs unconditionally and is reported on BOTH paths.
+        #
+        # SCOPE -- read this before writing an `artifact_absent` assertion. It CANNOT express "this
+        # stage never ran" for any of the twelve files bin/firm-new-run seeds from
+        # agent-firm/templates/* (10-handoff.md, 08-qa-verdict.json, 01-acceptance-criteria.yaml,
+        # ...): those exist from t=0, so such an assertion FAILs on a perfectly correct run. Pinned
+        # by tests/test-check-assertions.sh, "artifact_absent CANNOT express 'this stage never ran'
+        # for a template-seeded artifact". The verb is usable only for a ledger path the template
+        # scaffold does not create.
         led = find_ledger()
-        found = bool(led) and (os.path.exists(os.path.join(led, v))
-                 or bool(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True)))
-        check(f"artifact_absent {v}", not found, (led or "no ledger"))
+        stray = sorted(glob.glob(os.path.join(repo, ".agent-firm", "**", v), recursive=True))
+        if led is None:
+            check(f"artifact_absent {v}", False,
+                  "CANNOT VERIFY (fail-closed): no run ledger"
+                  + (f" -- and {v} EXISTS at {stray[0]}" if stray else ""))
+            continue
+        found = os.path.exists(os.path.join(led, v)) or bool(stray)
+        check(f"artifact_absent {v}", not found, led)
     elif k == "verdict_is":
-        led = find_ledger(); vf = os.path.join(led or "", "08-qa-verdict.json")
+        # `os.path.join(led or "", "08-qa-verdict.json")` used to leave a BARE RELATIVE NAME when no
+        # ledger could be resolved, and os.path.exists then resolved it against the CHECKER
+        # PROCESS'S OWN CWD -- so a run that produced no ledger at all could satisfy
+        # `verdict_is: APPROVE` by reading a verdict file belonging to an entirely unrelated
+        # directory. Resolve against the ledger or fail closed; never build a path from `led or ""`.
+        led = find_ledger()
+        if led is None:
+            check(f"verdict_is {v}", False, "CANNOT VERIFY (fail-closed): no run ledger")
+            continue
+        vf = os.path.join(led, "08-qa-verdict.json")
         got = None
         if os.path.exists(vf):
             try: got = json.load(open(vf)).get("verdict")
@@ -245,8 +289,17 @@ for a in asserts:
     elif k == "traceability_passes":
         led = find_ledger()
         tc = os.path.join(selfdir, "firm-traceability-check")
-        r = subprocess.run([tc, led or repo], capture_output=True, cwd=repo)
-        check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"), f"rc={r.returncode}")
+        r = subprocess.run([tc, led or repo], capture_output=True, cwd=repo, text=True, errors="replace")
+        # Carry the child's own words into the detail. Discarding them made a failing eval print only
+        # `rc=1`, naming neither the uncovered criterion nor the reason coverage could not be
+        # verified. `.split()` collapses all whitespace, so the detail stays exactly one line; the
+        # ascii round-trip keeps firm-traceability-check's non-ASCII bullets from raising
+        # UnicodeEncodeError under an ASCII stdout locale.
+        why = " ".join((r.stdout or "").split() + (r.stderr or "").split())
+        why = why.encode("ascii", "replace").decode("ascii")
+        if len(why) > 240: why = why[:240] + " ..."
+        check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"),
+              f"rc={r.returncode}" + (f": {why}" if why else ""))
     elif k == "no_default_branch_merge":
         # The firm must NOT have advanced the default branch beyond the SHA it had at run start.
         # Provable in any repo, at any starting history depth -- unlike the old commit-count heuristic

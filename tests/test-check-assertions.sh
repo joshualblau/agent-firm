@@ -245,4 +245,120 @@ assert_rc "PASS on a real, clean QA checkout" 0 "$CA" "$repo10/a.yaml" "$repo10"
 echo dirty > "$repo10/.agent-firm/qa-checkout/${run_id10}/leftover.txt"
 assert_rc "FAILs once the real checkout is dirtied" 1 "$CA" "$repo10/a.yaml" "$repo10"
 
+# ===========================================================================================
+# LEDGER-READING VERBS WHEN THERE IS NO LEDGER TO READ.
+#
+# Every verb that resolves a path through find_ledger() must FAIL when no ledger can be resolved:
+# "I could not look" is not a result, and this script is the firm's own regression guard, so a
+# fail-open here silently disarms every golden eval. Two verbs used to report PASS in that state:
+#
+#   artifact_absent — `not found` is trivially true when nothing was searched, so it PASSED on a
+#     repo where nothing had ever run. Worse, `bool(led) and (... or glob(...))` SHORT-CIRCUITED the
+#     recursive `.agent-firm/**` scan, so a real artifact planted outside any run directory was
+#     also reported "absent" — a false negative on a file that demonstrably exists.
+#   verdict_is — `os.path.join(led or "", "08-qa-verdict.json")` left a bare relative name, which
+#     os.path.exists resolved against the CHECKER'S OWN CWD; a matching verdict lying in an
+#     unrelated directory satisfied `verdict_is: APPROVE`.
+#
+# Both were reproduced live before the fix. Every case below asserts the CORRECT (fail-closed)
+# behaviour — none of them pins the old pass, because a green test over a fail-open blesses it.
+# ===========================================================================================
+
+# Run the checker with a chosen CWD. The checker's own working directory is a real axis here (it is
+# what verdict_is used to resolve against), so it has to be varied deliberately rather than
+# inherited from wherever the suite happens to be started.
+ca_in() { local _d="$1"; shift; ( cd "$_d" && "$CA" "$@" ); }
+
+t_case "no ledger: artifact_absent fails closed, exactly as artifact_exists already did"
+repo11="$(mk_repo)"
+assert_no_file "precondition: this repo has no .agent-firm at all" "$repo11/.agent-firm"
+write_assertions 'assertions:
+  - artifact_absent: 08-qa-verdict.json' "$repo11"
+assert_rc "FAILs -- nothing was searched, so nothing was proven absent" 1 "$CA" "$repo11/a.yaml" "$repo11"
+assert_output "and names the reason" "CANNOT VERIFY (fail-closed): no run ledger" "$CA" "$repo11/a.yaml" "$repo11"
+write_assertions 'assertions:
+  - artifact_exists: 08-qa-verdict.json' "$repo11"
+assert_rc "artifact_exists FAILs in the SAME state (regression guard on the branch already correct)" 1 \
+  "$CA" "$repo11/a.yaml" "$repo11"
+
+t_case "no ledger + the artifact IS present under .agent-firm/** : artifact_absent still FAILs"
+repo12="$(mk_repo)"
+mkdir -p "$repo12/.agent-firm/stray"
+printf '{"verdict":"APPROVE"}\n' > "$repo12/.agent-firm/stray/08-qa-verdict.json"
+assert_no_file "precondition: no CURRENT_RUN, so no ledger resolves" "$repo12/.agent-firm/CURRENT_RUN"
+assert_no_file "precondition: and no runs/ directory to fall back to" "$repo12/.agent-firm/runs"
+assert_file "precondition: but the artifact demonstrably EXISTS" "$repo12/.agent-firm/stray/08-qa-verdict.json"
+write_assertions 'assertions:
+  - artifact_absent: 08-qa-verdict.json' "$repo12"
+assert_rc "FAILs -- an artifact that exists is never 'absent'" 1 "$CA" "$repo12/a.yaml" "$repo12"
+assert_output "the .agent-firm/** scan runs even with no ledger, and names where it found the file" \
+  "EXISTS at $repo12/.agent-firm/stray/08-qa-verdict.json" "$CA" "$repo12/a.yaml" "$repo12"
+
+t_case "artifact_absent: the .agent-firm/** scan is still wired when a ledger DOES resolve"
+repo13="$(mk_repo)"
+( cd "$repo13" && "$NEW_RUN" absent-glob fast_path >/dev/null )
+run_dir13="$repo13/$(cat "$repo13/.agent-firm/CURRENT_RUN")"
+assert_no_file "precondition: 99-stray-only.md is NOT in the run ledger" "$run_dir13/99-stray-only.md"
+mkdir -p "$repo13/.agent-firm/stray"
+printf 'x\n' > "$repo13/.agent-firm/stray/99-stray-only.md"
+write_assertions 'assertions:
+  - artifact_absent: 99-stray-only.md' "$repo13"
+assert_rc "FAILs on an artifact only the recursive scan can find" 1 "$CA" "$repo13/a.yaml" "$repo13"
+# Discriminator: same ledger, same scan, a name that exists NOWHERE must still PASS. Without this,
+# every case above would also be satisfied by a verb that had been broken into always failing.
+write_assertions 'assertions:
+  - artifact_absent: 99-nowhere-at-all.md' "$repo13"
+assert_rc "and PASSes for a name in neither the ledger nor anywhere under .agent-firm/" 0 \
+  "$CA" "$repo13/a.yaml" "$repo13"
+
+t_case "no ledger: verdict_is does NOT resolve 08-qa-verdict.json against the checker's own CWD"
+repo14="$(mk_repo)"
+elsewhere14="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$elsewhere14"
+printf '{"verdict":"APPROVE"}\n' > "$elsewhere14/08-qa-verdict.json"
+assert_no_file "precondition: the repo under test has no ledger" "$repo14/.agent-firm"
+assert_file "precondition: a MATCHING verdict sits in an unrelated directory" "$elsewhere14/08-qa-verdict.json"
+write_assertions 'assertions:
+  - verdict_is: APPROVE' "$repo14"
+assert_rc "FAILs when run FROM that unrelated directory -- a stranger's file is not this run's verdict" 1 \
+  ca_in "$elsewhere14" "$repo14/a.yaml" "$repo14"
+assert_output "and names the reason rather than reporting 'got APPROVE'" \
+  "CANNOT VERIFY (fail-closed): no run ledger" ca_in "$elsewhere14" "$repo14/a.yaml" "$repo14"
+# Same repo, different CWD: one that holds no verdict file at all. This FAILed before the fix too,
+# but for the wrong reason ("got None" — it looked, in the wrong place, and found nothing). Assert
+# the REASON, not just the code, so the two CWDs now agree on why.
+assert_rc "still FAILs from a neutral CWD holding no verdict at all" 1 \
+  ca_in "$repo14" "$repo14/a.yaml" "$repo14"
+assert_output "and for the same fail-closed reason, not an incidental miss" \
+  "CANNOT VERIFY (fail-closed): no run ledger" ca_in "$repo14" "$repo14/a.yaml" "$repo14"
+
+t_case "verdict_is reads the LEDGER's verdict even when a different one sits in the CWD"
+repo15="$(mk_repo)"
+( cd "$repo15" && "$NEW_RUN" verdict-cwd fast_path >/dev/null )
+run_dir15="$repo15/$(cat "$repo15/.agent-firm/CURRENT_RUN")"
+printf '{"verdict":"BLOCK"}\n' > "$run_dir15/08-qa-verdict.json"
+write_assertions 'assertions:
+  - verdict_is: APPROVE' "$repo15"
+assert_rc "FAILs: the ledger says BLOCK, and the APPROVE lying in the CWD does not override it" 1 \
+  ca_in "$elsewhere14" "$repo15/a.yaml" "$repo15"
+assert_output "the detail reports the LEDGER's value" "got BLOCK" \
+  ca_in "$elsewhere14" "$repo15/a.yaml" "$repo15"
+# Third axis: flip the LEDGER (not the CWD file, which is untouched and still says APPROVE) and the
+# identical command PASSes -- so the failures above are the ledger being read, not the checker
+# refusing everything launched from $elsewhere14.
+printf '{"verdict":"APPROVE"}\n' > "$run_dir15/08-qa-verdict.json"
+assert_rc "PASSes once the LEDGER says APPROVE, from that same unrelated CWD" 0 \
+  ca_in "$elsewhere14" "$repo15/a.yaml" "$repo15"
+
+t_case "traceability_passes: a failure names the criterion, not just an exit code"
+# The child's stdout used to be discarded, so an eval failure printed `rc=1` and nothing else --
+# neither the uncovered criterion nor the reason coverage could not be verified. repo2e's verdict
+# (set further up) still omits AC-002.
+write_assertions 'assertions:
+  - traceability_passes: true' "$repo2e"
+assert_rc "precondition: this run really does fail traceability" 1 "$CA" "$repo2e/a.yaml" "$repo2e"
+assert_output "the uncovered criterion appears in the detail" "AC-002" "$CA" "$repo2e/a.yaml" "$repo2e"
+tp_lines="$( "$CA" "$repo2e/a.yaml" "$repo2e" 2>&1 | wc -l | tr -d ' ' )"
+assert_eq "the child's multi-line output is COLLAPSED onto the one result line, not pasted in" \
+  "3" "$tp_lines"
+
 t_summary
