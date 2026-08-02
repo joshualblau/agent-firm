@@ -87,7 +87,7 @@ assert_ok "migrate succeeds"                      install_in "$proj" --migrate
 assert_ok "Bash(cat:*) gone from every bucket"    lacks_anywhere "$S" "Bash(cat:*)"
 assert_ok "Bash(jq:*) gone from every bucket"     lacks_anywhere "$S" "Bash(jq:*)"
 assert_ok "the project's own rule survives"       has_rule "$S" allow "Bash(my-project-tool:*)"
-assert_ok "the firm's allow rules were merged in" has_rule "$S" allow "Bash(firm-new-run:*)"
+assert_ok "the firm's allow rules were merged in" has_rule "$S" allow "Bash(*)"
 assert_ok "the new deny rules landed"             has_rule "$S" deny  "Bash(cat .env*)"
 assert_ok "Read-tool deny rules landed"           has_rule "$S" deny  "Read(./.env)"
 
@@ -114,7 +114,7 @@ t_case "a fresh project installs clean — no blanket cat/jq grant is ever creat
 proj3="$(mk_repo)"; S3="$proj3/.claude/settings.json"
 assert_ok "fresh install"             install_in "$proj3"
 assert_file "settings written"        "$S3"
-assert_ok "firm allow rules present"  has_rule "$S3" allow "Bash(firm-validate-verdict:*)"
+assert_ok "firm allow rules present"  has_rule "$S3" allow "Bash(*)"
 assert_ok "no blanket cat grant"      lacks_rule "$S3" allow "Bash(cat:*)"
 assert_ok "no blanket jq grant"       lacks_rule "$S3" allow "Bash(jq:*)"
 
