@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]
 # Checks the full golden-eval assertion vocabulary against the post-run scratch repo (the run ledger +
-# git state). Exit 0 = all pass, non-zero = at least one failed. `result.json` (the `claude -p` result
+# git state).
+#
+# Exit 0 = every assertion passed. 1 = at least one assertion FAILED. 2 = the assertions file itself
+# could not be evaluated (usage error, unreadable/empty/prose-only file, invalid YAML, or a fallback
+# parse that had to drop entries). That third case used to be exit 0: an EMPTY or prose-only
+# assertions.yaml printed "0/0 assertions passed" and an eval whose checks never ran reported green.
+# ZERO PARSED ASSERTIONS IS NOW A HARD FAILURE — a check that cannot evaluate its input must never
+# report success, which is the same fail-closed rule the baseline checks below already follow.
+#
+# `result.json` (the `claude -p` result
 # envelope) is still accepted for CLI compatibility with existing callers, but no assertion currently
 # reads it — final_gate_pending used to infer from its subtype/is_error fields; it now requires an
 # explicit ledger event instead (see default_branch_status() / final_gate_event_logged() below), which
@@ -30,16 +39,109 @@ python3 - "$1" "$2" "${3:-}" "$SELF" <<'PY'
 import json, os, re, subprocess, sys, glob
 apath, repo, rpath, selfdir = sys.argv[1:5]
 
-# Parse assertions.yaml (pyyaml if available, else a tolerant `- key: value` line parser).
-asserts = []
+def cannot_evaluate(msg):
+    """The assertions file itself is unusable. Exit 2, NEVER 0: an eval whose assertions did not run
+    has proven nothing, and 'nothing was checked' must not be reportable as 'everything passed'."""
+    print(f"ASSERTIONS: CANNOT EVALUATE — {msg}", file=sys.stderr)
+    sys.exit(2)
+
+# ---------------------------------------------------------------------------------------------
+# Parse assertions.yaml. pyyaml when it is installed; otherwise a deliberately narrow `- key: value`
+# line parser. The two failure modes are kept APART, because they are not the same risk:
+#
+#   pyyaml MISSING      -> legitimate degraded path (this repo's tooling holds itself to a stdlib-only
+#                          floor), so the fallback runs -- but it must account for every list item it
+#                          saw. Any item it could not parse is a DROP, and a dropped assertion is an
+#                          unrun check, so any drop fails the whole file (exit 2) with the line quoted.
+#   YAML SYNTAX ERROR   -> hard failure. Never fall back. The old code caught both with one bare
+#                          `except Exception` and silently regex-scanned a broken file, so a typo that
+#                          moved an assertion out of the `assertions:` list read as "that assertion
+#                          simply isn't there" instead of "this file is broken".
+# ---------------------------------------------------------------------------------------------
+try:
+    with open(apath) as fh:
+        atext = fh.read()
+except Exception as e:
+    cannot_evaluate(f"cannot read {apath}: {e}")
+
+def _unquote(s):
+    """Strip ONE matched pair of surrounding quotes. The old `.strip('\"\\'')` stripped quote chars
+    off both ends independently, which turned `sh -c 'cmd'` into `sh -c 'cmd` (unbalanced)."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+def fallback_parse(text):
+    """(items, dropped). Scans the `assertions:` block only, and reports every list item it could not
+    turn into a `- key: value` mapping instead of skipping it."""
+    items, dropped = [], []
+    in_block = False
+    for n, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if not in_block:
+            if re.match(r'^assertions\s*:\s*(#.*)?$', line):
+                in_block = True
+            elif re.match(r'^assertions\s*:\s*\S', line):
+                # An inline/flow value on the key (`assertions: [ ... ]`). The line parser cannot
+                # read that shape; refuse rather than report an empty list.
+                dropped.append((n, stripped))
+            continue
+        # A zero-indent `- item` is still part of this block: YAML lets a block sequence sit at the
+        # same indentation as its key. Only a zero-indent NON-item line is the next top-level key.
+        if indent == 0 and not stripped.startswith("-"):
+            in_block = False
+            continue
+        if not stripped.startswith("-"):
+            dropped.append((n, stripped))   # a continuation/nested line this parser cannot interpret
+            continue
+        m = re.match(r'^\s*-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(\S.*?)\s*$', line)
+        if m:
+            items.append({m.group(1): _unquote(m.group(2))})
+        else:
+            dropped.append((n, stripped))
+    return items, dropped
+
 try:
     import yaml
-    doc = yaml.safe_load(open(apath)) or {}
-    asserts = doc.get("assertions", []) or []
-except Exception:
-    for line in open(apath):
-        m = re.match(r'\s*-\s*([a-z_]+)\s*:\s*(.+?)\s*$', line)
-        if m: asserts.append({m.group(1): m.group(2).strip().strip('"\'')})
+except ImportError:
+    yaml = None
+
+if yaml is not None:
+    parse_mode = "pyyaml"
+    try:
+        doc = yaml.safe_load(atext)
+    except Exception as e:
+        cannot_evaluate(f"{apath} is not valid YAML: {e}")
+    if doc is None:
+        cannot_evaluate(f"{apath} is empty (or parses to nothing) — it declares no assertions")
+    if not isinstance(doc, dict):
+        cannot_evaluate(f"{apath} top level is {type(doc).__name__}, expected a mapping with an `assertions:` list")
+    if "assertions" not in doc:
+        cannot_evaluate(f"{apath} has no top-level `assertions:` key")
+    asserts = doc.get("assertions")
+    if asserts is None:
+        asserts = []
+    if not isinstance(asserts, list):
+        cannot_evaluate(f"{apath}: `assertions:` is {type(asserts).__name__}, expected a list")
+else:
+    parse_mode = "regex fallback (pyyaml not installed)"
+    asserts, dropped = fallback_parse(atext)
+    if dropped:
+        detail = "; ".join(f"line {n}: {t!r}" for n, t in dropped[:10])
+        more = "" if len(dropped) <= 10 else f" (+{len(dropped)-10} more)"
+        cannot_evaluate(
+            f"{apath}: the {parse_mode} could not parse {len(dropped)} of "
+            f"{len(asserts)+len(dropped)} entries under `assertions:` — a dropped assertion is an "
+            f"UNRUN check, so this cannot pass. Install pyyaml or fix these lines: {detail}{more}")
+
+if not asserts:
+    cannot_evaluate(f"{apath}: 0 assertions parsed via {parse_mode} — an eval that checks nothing "
+                    f"cannot pass (a vacuous 0/0 used to exit 0; it no longer does)")
+print(f"assertions: {len(asserts)} parsed from {apath} via {parse_mode}")
 
 def find_ledger():
     cur = os.path.join(repo, ".agent-firm", "CURRENT_RUN")
@@ -103,7 +205,12 @@ def check(name, ok, detail=""):
     if not ok: fails.append(name)
 
 for a in asserts:
-    if not isinstance(a, dict) or not a: continue
+    # A list entry that is not exactly one `key: value` mapping used to be `continue`d — silently
+    # skipped, then counted in the "N/N assertions passed" denominator as though it had run. It is
+    # now a FAILURE, for the same reason an unknown assertion key is one.
+    if not isinstance(a, dict) or len(a) != 1:
+        check(f"malformed_assertion:{a!r}", False, "expected a single `- key: value` mapping")
+        continue
     (k, v), = a.items()
     v = ("" if v is None else str(v)).strip()
     if k == "file_exists":
