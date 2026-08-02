@@ -11,7 +11,27 @@
 
 T_PASS=0
 T_FAIL=0
+
+# ---- temp-dir bookkeeping -------------------------------------------------
+# Two accumulators, on purpose:
+#   T_TMPDIRS         — the space-separated variable several test files append to directly. Those
+#                       appends happen in the test's own shell, so they work.
+#   T_TMPDIR_REGISTRY — a FILE, one absolute path per line. Fixtures like mk_repo/mk_linked_worktree
+#                       are invoked as `d="$(mk_repo)"`, i.e. inside a command-substitution SUBSHELL,
+#                       so their `T_TMPDIRS=...` appends died with that subshell and the parent's
+#                       cleanup trap saw an empty list — every suite run leaked its throwaway git
+#                       repos into $TMPDIR. A file is the one channel that crosses back out of a
+#                       subshell without restructuring the fixtures into out-parameters.
+# Newline-delimited (not space-delimited) so a path containing spaces stays one entry.
 T_TMPDIRS=""
+T_TMPDIR_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-test-reg.XXXXXX" 2>/dev/null || printf '')"
+
+# t_track <dir> — register an absolute path for teardown. Safe to call from inside a subshell.
+t_track() {
+  [ -n "${1:-}" ] || return 0
+  if [ -n "$T_TMPDIR_REGISTRY" ]; then printf '%s\n' "$1" >> "$T_TMPDIR_REGISTRY"; fi
+  return 0
+}
 
 # ---- repo under test -----------------------------------------------------
 # Resolve the firm root from this file's location so tests can be invoked from anywhere.
@@ -94,7 +114,7 @@ assert_no_file() { if [ ! -e "$2" ]; then _t_ok "$1"; else _t_no "$1" "file shou
 # mk_repo — a throwaway git repo with one seed commit on `main`. Echoes its path.
 mk_repo() {
   d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"
-  T_TMPDIRS="$T_TMPDIRS $d"
+  t_track "$d"   # NOT `T_TMPDIRS=...`: this runs inside `$(mk_repo)`, so a variable append is lost
   (
     cd "$d" || exit 1
     git init -q .
@@ -141,7 +161,7 @@ mk_wt_branch() {
 mk_linked_worktree() {
   _r="$1"; _b="$2"
   _parent="$(mktemp -d "${TMPDIR:-/tmp}/firm-wt.XXXXXX")"
-  T_TMPDIRS="$T_TMPDIRS $_parent"
+  t_track "$_parent"   # subshell again — see mk_repo
   _p="$_parent/linked"
   ( cd "$_r" && git worktree add -q "$_p" -b "$_b" ) >/dev/null 2>&1 || return 1
   printf '%s' "$_p"
@@ -150,10 +170,48 @@ mk_linked_worktree() {
 sha_of() { git -C "$1" rev-parse "$2" 2>/dev/null; }
 
 # ---- teardown ------------------------------------------------------------
+# _t_rm_fixture <dir> — delete ONE registered fixture directory. This is the ONLY `rm -rf` in the
+# harness, so every constraint on what teardown may delete lives here and nowhere else. Anything
+# that is not an absolute path to a real, non-symlink directory is skipped silently: the cost of
+# skipping is a leaked temp dir, the cost of a wrong delete is somebody's working tree.
+_t_rm_fixture() {
+  _t_target="${1:-}"
+  [ -n "$_t_target" ] || return 0
+  case "$_t_target" in
+    /*) ;;
+    *)  return 0 ;;          # relative entry — would delete relative to $PWD
+  esac
+  case "$_t_target" in
+    */..|*/../*) return 0 ;; # no traversal components
+  esac
+  [ "$_t_target" = "/" ] && return 0
+  [ -d "$_t_target" ] || return 0   # already gone, or never a directory
+  [ -L "$_t_target" ] && return 0   # a symlink: delete nothing rather than chase it somewhere else
+  rm -rf "$_t_target"
+}
+
 t_cleanup() {
-  for d in $T_TMPDIRS; do
-    [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
+  # 1) Fixtures registered from inside a command-substitution subshell, via the registry file.
+  if [ -n "$T_TMPDIR_REGISTRY" ] && [ -f "$T_TMPDIR_REGISTRY" ]; then
+    # `|| [ -n "$_t_entry" ]` picks up a final line with no trailing newline — otherwise `read`
+    # returns non-zero on it and the last fixture registered silently never gets cleaned.
+    while IFS= read -r _t_entry || [ -n "$_t_entry" ]; do
+      _t_rm_fixture "$_t_entry"
+      _t_entry=""
+    done < "$T_TMPDIR_REGISTRY"
+    rm -f "$T_TMPDIR_REGISTRY"
+  fi
+  # 2) The space-separated T_TMPDIRS variable that several test files append to directly. Word
+  #    splitting is the point here (that is the format), but `set -f` goes on FIRST: an unquoted
+  #    expansion feeding an `rm -rf` argument list must never be able to glob — one stray `*` in
+  #    that variable and teardown deletes whatever happens to be in $PWD. Restore the caller's
+  #    noglob setting afterwards so a test that relied on it is unaffected.
+  case "$-" in *f*) _t_had_f=1 ;; *) _t_had_f=0 ;; esac
+  set -f
+  for _t_d in $T_TMPDIRS; do
+    _t_rm_fixture "$_t_d"
   done
+  [ "$_t_had_f" -eq 1 ] || set +f
 }
 trap t_cleanup EXIT
 

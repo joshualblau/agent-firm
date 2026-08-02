@@ -31,6 +31,10 @@ __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the 
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 
+NL='
+'
+CR="$(printf '\r')"
+
 role="${1:-}"; outcome="${2:-}"; qa_verdict="${3:-}"
 if [[ -z "$role" || -z "$outcome" ]]; then
   echo "usage: firm-bench-record <role> <success|failure> [qa_verdict]" >&2
@@ -41,19 +45,68 @@ case "$outcome" in
   *) echo "firm-bench-record: outcome must be 'success' or 'failure', got '$outcome'" >&2; exit 2 ;;
 esac
 
+# ---- input validation (layer 1 of 2) --------------------------------------
+# `role` and `qa_verdict` are the ONLY caller-supplied free-text fields, and this file is promotion
+# evidence: a single forged line is a forged promotion argument. So they are checked against an
+# explicit ALLOW-list before anything is opened — a role containing a newline (or a quote, or any C0
+# control byte) is rejected outright rather than encoded. Roles here are kebab-case agent names
+# (see bench/registry.yaml) and verdicts are APPROVE/BLOCK-shaped, so this charset costs nothing real.
+# This is layer 1. The encoder below independently escapes every field (layer 2) because `run_id` and
+# `project` derive from filesystem names, which this cannot restrict without mangling legitimate
+# repo/run directory names. Neither layer is a substitute for the other.
+valid_token() {   # <value> — 1..64 bytes of [A-Za-z0-9._:-], first byte alphanumeric
+  local v="$1"
+  [[ -n "$v" ]] || return 1
+  [[ ${#v} -le 64 ]] || return 1
+  case "$v" in
+    [!A-Za-z0-9]*)      return 1 ;;
+    *[!A-Za-z0-9._:-]*) return 1 ;;
+  esac
+  return 0
+}
+# The rejected value is deliberately NOT echoed back: it is attacker-shaped by assumption, and
+# spraying raw control bytes at a terminal or a captured log is how one injection becomes two.
+if ! valid_token "$role"; then
+  echo "firm-bench-record: invalid role — must be 1-64 characters of [A-Za-z0-9._:-] starting with a letter or digit" >&2
+  exit 2
+fi
+if [[ -n "$qa_verdict" ]] && ! valid_token "$qa_verdict"; then
+  echo "firm-bench-record: invalid qa_verdict — must be 1-64 characters of [A-Za-z0-9._:-] starting with a letter or digit" >&2
+  exit 2
+fi
+
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "firm-bench-record: not inside a git work tree — nowhere to record this" >&2
   exit 1
 fi
-common_dir="$(cd -P "$(git rev-parse --git-common-dir)" && pwd)"
+# Guard every step of the path build. An empty capture here used to be silent and catastrophic:
+# `cd -P ""` fails, `$(...)` still yields "", and the log path degenerates to /agent-firm — outside
+# the repo entirely, where a "successful" record is a record nobody will ever find.
+git_common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -z "$git_common" ]]; then
+  echo "firm-bench-record: git reported no --git-common-dir — refusing to guess a log path" >&2
+  exit 1
+fi
+common_dir="$(cd -P "$git_common" 2>/dev/null && pwd)" || common_dir=""
+if [[ -z "$common_dir" || "$common_dir" == "/" ]]; then
+  echo "firm-bench-record: could not resolve the git common dir ('$git_common') to a real directory — nothing recorded" >&2
+  exit 1
+fi
 log_dir="$common_dir/agent-firm"
 log="$log_dir/bench-usage.jsonl"
 lock="$log_dir/.bench-usage.lock"   # a LOCKDIR, not a lockfile — mkdir is atomic on POSIX, no flock needed
-mkdir -p "$log_dir"
+if ! mkdir -p "$log_dir"; then
+  echo "firm-bench-record: cannot create $log_dir — nothing was recorded" >&2
+  exit 1
+fi
 
 run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
 run_id="$(basename "${run_dir:-unknown}")"
-project="$(basename "$(cd -P "$(git rev-parse --show-toplevel)" && pwd)")"
+# Same unguarded-capture shape as --git-common-dir above, one severity lower: this one only feeds a
+# DATA field, not a path, so it degrades to "unknown" (like run_id) instead of aborting the record.
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$toplevel" ]]; then toplevel="$(cd -P "$toplevel" 2>/dev/null && pwd)" || toplevel=""; fi
+project="$(basename "${toplevel:-unknown}")"
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Bounded-retry, stale-lock-tolerant lockdir acquire. mkdir is atomic: exactly one concurrent caller
@@ -61,35 +114,94 @@ ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # than wedging every future call forever.
 stale_after="${FIRM_BENCH_LOCK_STALE_SECONDS:-30}"
 attempts=0
-max_attempts=100   # ~10s at the 0.1s sleep below; bounded so a genuinely stuck lock fails loudly
+reclaims=0
+max_attempts=100   # up to ~10s of contention at the 0.1s sleep below; bounded so a stuck lock fails loudly
+# The counter is incremented at the TOP of the loop, before any branch can `continue`. It used to be
+# incremented at the bottom, past the stale-reclaim `continue` — so a lock that kept looking stale
+# (an unremovable lockdir, a clock skewed into the future, a peer that instantly re-took it) skipped
+# BOTH the counter and the sleep and spun at 100% CPU forever. Every path out of an iteration now
+# costs an attempt, so the loop terminates unconditionally.
 while ! mkdir "$lock" 2>/dev/null; do
+  attempts=$((attempts+1))
+  if [[ $attempts -ge $max_attempts ]]; then
+    echo "firm-bench-record: could not acquire lock at $lock after ${max_attempts} attempts (${reclaims} stale reclaim(s)) — giving up, nothing recorded" >&2
+    exit 1
+  fi
   if [[ -d "$lock" ]]; then
     lock_age=$(( $(date -u +%s) - $(date -u -r "$lock" +%s 2>/dev/null || echo 0) ))
     if [[ $lock_age -gt $stale_after ]]; then
+      reclaims=$((reclaims+1))
       rmdir "$lock" 2>/dev/null || true   # reclaim; if another writer wins the re-race, loop retries
-      continue
+      continue                            # safe now: the attempt above already advanced the counter
     fi
-  fi
-  attempts=$((attempts+1))
-  if [[ $attempts -ge $max_attempts ]]; then
-    echo "firm-bench-record: could not acquire lock at $lock after ${max_attempts} attempts — giving up" >&2
-    exit 1
   fi
   sleep 0.1
 done
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
+# ---- encode (layer 2 of 2), then ONE checked append ------------------------
+# The record is built in memory first and appended by a single checked write, so a failed encode can
+# never leave a half-line in the log and a failed write can never be reported as a success.
 if command -v jq >/dev/null 2>&1; then
-  jq -cn --arg role "$role" --arg run_id "$run_id" --arg project "$project" \
-         --arg outcome "$outcome" --arg qa_verdict "$qa_verdict" --arg ts "$ts" \
-    '{role:$role, run_id:$run_id, project:$project, outcome:$outcome, qa_verdict:$qa_verdict, ts:$ts}' \
-    >> "$log"
+  line="$(jq -cn --arg role "$role" --arg run_id "$run_id" --arg project "$project" \
+                 --arg outcome "$outcome" --arg qa_verdict "$qa_verdict" --arg ts "$ts" \
+    '{role:$role, run_id:$run_id, project:$project, outcome:$outcome, qa_verdict:$qa_verdict, ts:$ts}')" \
+    || line=""
 else
-  # jq-free fallback: these fields are all sanitized to a safe charset already (role/run_id/project
-  # derive from git-known names; outcome is one of two literals), but escape defensively anyway.
-  esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-  printf '{"role":"%s","run_id":"%s","project":"%s","outcome":"%s","qa_verdict":"%s","ts":"%s"}\n' \
-    "$(esc "$role")" "$(esc "$run_id")" "$(esc "$project")" "$(esc "$outcome")" "$(esc "$qa_verdict")" "$ts" >> "$log"
+  # jq-free fallback. The previous version escaped only \ and " with sed and claimed in a comment
+  # that "these fields are all sanitized to a safe charset already" — which was FALSE: `role` and
+  # `qa_verdict` came straight from argv, and `run_id`/`project` from filesystem basenames, none of
+  # them charset-checked. A raw newline in any of them terminated the record early and spliced the
+  # remainder in as a second, forged line. This encoder escapes \, ", and EVERY C0 control byte
+  # (0x01-0x1F) plus DEL, i.e. exactly the set jq escapes — verified byte-identical to jq's output
+  # by tests/test-bench-record.sh, so both branches produce the same record. LC_ALL=C keeps awk
+  # byte-oriented so multi-byte UTF-8 passes through unaltered instead of being split or mangled.
+  # Fields travel via ENVIRON, not `awk -v`, because -v applies its own backslash processing to the
+  # value — which would corrupt exactly the inputs this is here to handle.
+  line="$(role="$role" run_id="$run_id" project="$project" outcome="$outcome" \
+          qa_verdict="$qa_verdict" ts="$ts" LC_ALL=C awk '
+    function esc(s,   out, i, n, c) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if      (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else if (c == "\t") out = out "\\t"
+        else if (c in ctrl) out = out sprintf("\\u%04x", ctrl[c])
+        else                out = out c
+      }
+      return out
+    }
+    BEGIN {
+      for (i = 1; i < 32; i++) ctrl[sprintf("%c", i)] = i
+      ctrl[sprintf("%c", 127)] = 127
+      printf "{\"role\":\"%s\",\"run_id\":\"%s\",\"project\":\"%s\",\"outcome\":\"%s\",\"qa_verdict\":\"%s\",\"ts\":\"%s\"}\n", \
+        esc(ENVIRON["role"]), esc(ENVIRON["run_id"]), esc(ENVIRON["project"]), \
+        esc(ENVIRON["outcome"]), esc(ENVIRON["qa_verdict"]), esc(ENVIRON["ts"])
+    }')" || line=""
+fi
+
+if [[ -z "$line" ]]; then
+  echo "firm-bench-record: could not encode the record — NOTHING was written to $log" >&2
+  exit 1
+fi
+# JSONL invariant, enforced at the last possible moment: one record is exactly one line. If either
+# layer above ever regressed, appending a multi-line string would splice a forged record into the
+# promotion log. Refuse to write instead. (Command substitution already stripped any trailing
+# newline, so this only fires on an EMBEDDED line break.)
+case "$line" in
+  *"$NL"*|*"$CR"*)
+    echo "firm-bench-record: encoded record spans more than one line — refusing to append to $log" >&2
+    exit 1 ;;
+esac
+
+# A promotion log that silently drops records is worse than no log at all: it looks like evidence.
+# The append is checked, and only a checked-successful append is allowed to print "recorded".
+if ! printf '%s\n' "$line" >> "$log"; then
+  echo "firm-bench-record: FAILED to append to $log — this record was NOT recorded" >&2
+  exit 1
 fi
 
 [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" bench_record role="$role" outcome="$outcome" log="$log" || true
