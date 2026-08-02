@@ -94,7 +94,7 @@ assert_rc "PASSes on a command that exits 0" 0 "$CA" "$repo2d/a.yaml" "$repo2d"
 # Second axis: the SAME assertions file, pointed at a directory without seed.txt, must fail — that is
 # what proves the command runs with cwd set to the scratch-repo argument rather than wherever the
 # checker happens to have been invoked from.
-plain2d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $plain2d"
+plain2d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$plain2d"
 assert_rc "the same command FAILs against a different dir -- cwd follows the repo argument" 1 \
   "$CA" "$repo2d/a.yaml" "$plain2d"
 

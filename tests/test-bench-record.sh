@@ -26,7 +26,7 @@ assert_rc "invalid outcome rejected" 2 sh -c "cd '$repo' && '$BR' reviewer maybe
 assert_output "names the valid values" "success" sh -c "cd '$repo' && '$BR' reviewer maybe 2>&1"
 
 t_case "outside a git repo -> fails cleanly, does not crash"
-nogit="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $nogit"
+nogit="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$nogit"
 assert_rc "exit 1, not a git repo" 1 sh -c "cd '$nogit' && '$BR' reviewer success"
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ assert_output "names the fix" "firm-qa-checkout" "$QCC" "$repo/does-not-exist"
 
 # ---------------------------------------------------------------------------
 t_case "a directory that exists but is not a git checkout -> CANNOT VERIFY (rc=2), not a false pass"
-plain="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $plain"
+plain="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$plain"
 assert_rc "exit 2, not a silent pass" 2 "$QCC" "$plain"
 assert_output "names the git-status failure" "git status" "$QCC" "$plain"
 
@@ -92,7 +92,7 @@ assert_output "cannot_verify status logged" '"event":"qa_clean_check","status":"
 assert_output "...and names missing_dir as the reason" '"reason":"missing_dir"' cat "$led4"
 
 # 4/4 — cannot verify: the directory exists but isn't a git checkout (a DIFFERENT reason, same status)
-plain4="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $plain4"
+plain4="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; t_track "$plain4"
 ( cd "$repo4" && "$QCC" "$plain4" ) >/dev/null 2>&1
 assert_output "...and git_status_failed is logged as its own distinct reason" \
   '"reason":"git_status_failed"' cat "$led4"
