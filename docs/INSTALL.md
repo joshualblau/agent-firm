@@ -69,12 +69,19 @@ so it is fenced in rather than trusted:
   where absence is caught.)
 - **Atomic write + backup.** The new settings are written to a temp file and `rename`d into place, so
   an interrupted run cannot leave a truncated `settings.json`, and the previous contents are kept as a
-  timestamped backup.
+  timestamped backup. The backup is created `O_CREAT|O_EXCL|O_NOFOLLOW` at mode `0600`: a name already
+  sitting at `settings.json.<stamp>.bak` — including a **dangling symlink** planted by someone who can
+  write the `.claude/` directory but not the file — is never followed and never overwritten; the run
+  moves to the next `-N` suffix, and refuses (exit 6) rather than force one. A **newly created**
+  `settings.json` is `0600` regardless of your umask, because it is a permission policy and a
+  permissive umask would otherwise make it group/world-writable. An **existing** file keeps its own
+  mode.
 
 `firm-install` exit codes: **0** applied (or already current) · **2** bad arguments · **3** a retired
 rule is present, re-run with `--migrate` · **4** refused: `retired-permissions.json` has a malformed
 entry, or an entry whose `scope` is missing, names an unknown list, or names `deny` · **5**
-`retired-permissions.json` exists but is unreadable or unparseable. Exits 4 and 5 both write nothing.
+`retired-permissions.json` exists but is unreadable or unparseable · **6** refused: no free backup
+name next to the settings file. Exits 4, 5 and 6 all write nothing.
 
 ### How `firm-*` gets on your shell PATH
 A Claude Code plugin's `bin/` joins `$PATH` **only inside a `claude` session** — so `firm-install`,

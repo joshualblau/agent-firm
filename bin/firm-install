@@ -19,7 +19,9 @@
 #              no others. `deny` may never appear in a scope: deny is a PROTECTION, not a grant, and
 #              a policy file that asks for a deny deletion is REFUSED (exit 4) with nothing written.
 #   BACKED UP— if the write would change the file, the previous contents are copied to
-#              <settings>.<UTC timestamp>.bak first and the path is printed.
+#              <settings>.<UTC timestamp>.bak first and the path is printed. The backup is created
+#              O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600, so it can never follow or clobber a name that
+#              already exists there — see the comment at the write below for the attack that closes.
 #   ATOMIC   — the new contents go to a temp file in the same directory and are os.replace()d into
 #              position. There is no truncate-then-write window in which a crash leaves you with an
 #              empty ~/.claude/settings.json.
@@ -32,6 +34,8 @@
 #   4  REFUSED: retired-permissions.json is malformed, or an entry's "scope" names `deny`.
 #      NOTHING was written — this is the supply-chain guard, so it fails closed.
 #   5  retired-permissions.json exists but could not be read or parsed. NOTHING was written.
+#   6  REFUSED: no usable backup name was free next to the settings file. NOTHING was written —
+#      the settings file is only ever replaced once its previous contents are safely on disk.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -46,14 +50,18 @@ for arg in "$@"; do
   case "$arg" in
     --user)    scope=user ;;
     --migrate) migrate=1 ;;
-    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the whole leading comment block — every line from 2 up to the first NON-comment line —
+    # rather than a hardcoded `2,34p`. That literal silently truncated --help the moment the header
+    # grew: adding the exit-6 entry pushed exit codes 5 and 6 past line 34 and out of the help text,
+    # with nothing to notice it. This range cannot drift.
+    -h|--help) sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "firm-install: unknown arg '$arg' (use --user and/or --migrate)" >&2; exit 2 ;;
   esac
 done
 if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
 
 python3 - "$SRC" "$target" "$RETIRED" "$migrate" "$scope" <<'PY'
-import json, os, shutil, sys, tempfile, time
+import json, os, sys, tempfile, time
 src, target, retired_path, migrate, scope = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
 
 BUCKETS = ("allow", "ask", "deny")
@@ -181,11 +189,39 @@ if original == new_bytes:
 else:
     if original is not None:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())   # not datetime.utcnow(): deprecated in 3.12
-        backup = f"{target}.{stamp}.bak"
-        n = 1
-        while os.path.exists(backup):          # never clobber an earlier backup from the same second
-            backup = f"{target}.{stamp}-{n}.bak"; n += 1
-        shutil.copy2(target, backup)
+        # The backup NAME is partly attacker-influenceable: anyone who can create a file in the
+        # .claude/ directory can pre-plant one, and the only secret in the name is the UTC second.
+        # `while os.path.exists(backup)` was not a guard against that, because exists() RESOLVES the
+        # path — a DANGLING symlink there reads as "nothing here", so the never-clobber loop skipped
+        # it and shutil.copy2 wrote the user's permission policy THROUGH the link to whatever path it
+        # named. That is an arbitrary-file-write primitive handed to anyone who can write the
+        # directory but not the file, and planting one link per second defeats guessing the stamp.
+        #
+        # O_CREAT|O_EXCL refuses ANY existing name — regular file, live symlink or dangling symlink
+        # alike (all three give EEXIST) — so the copy can never be redirected and can never clobber.
+        # O_NOFOLLOW states the same intent a second way and does not depend on that O_EXCL subtlety.
+        # The suffix loop stays for the legitimate case (two backups inside one second); it now only
+        # ever advances onto a name nothing occupies, and REFUSES rather than force one.
+        bfd, backup = None, None
+        for n in range(0, 100):
+            backup = f"{target}.{stamp}.bak" if n == 0 else f"{target}.{stamp}-{n}.bak"
+            try:
+                bfd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                break
+            except FileExistsError:
+                continue
+        if bfd is None:
+            print(f"firm-install: REFUSING to write — every backup name {target}.{stamp}[-N].bak is "
+                  f"already taken, so the previous settings could not be preserved.", file=sys.stderr)
+            print("  Nothing was written. Move those .bak entries aside and re-run.", file=sys.stderr)
+            sys.exit(6)
+        # Write the bytes the merge above was computed FROM, rather than re-reading the file: the
+        # backup then cannot disagree with what is about to be replaced, and there is no second
+        # traversal of `target` to race. fsync because a backup exists precisely for the crash case.
+        with os.fdopen(bfd, "wb") as bh:
+            bh.write(original)
+            bh.flush()
+            os.fsync(bh.fileno())
         print(f"firm-install: backed up the previous settings to {backup}")
     d = os.path.dirname(target) or "."
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".firm-install.", suffix=".tmp")
@@ -197,8 +233,14 @@ else:
         if original is not None:
             os.chmod(tmp, os.stat(target).st_mode & 0o7777)   # keep the file's existing permissions
         else:
-            u = os.umask(0); os.umask(u)
-            os.chmod(tmp, 0o666 & ~u)
+            # A NEW file keeps mkstemp's 0600 instead of being widened to `0o666 & ~umask`. This file
+            # is a PERMISSION POLICY: under a permissive umask that widening produced -rw-rw-rw-, i.e.
+            # any local account could add itself an allow rule to whatever the firm is about to be
+            # told it may do. The umask is the wrong input to consult here — it is a convenience
+            # default for ordinary files — and the only reader that needs this file is the user who
+            # just ran the install. Existing files are untouched (branch above): this is creation
+            # only, so nobody's deliberately-shared settings file gets tightened underneath them.
+            os.chmod(tmp, 0o600)
         os.replace(tmp, target)
     except BaseException:
         try:

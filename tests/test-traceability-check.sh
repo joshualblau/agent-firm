@@ -12,10 +12,29 @@ printf 'raise ImportError("hidden for the traceability regex-fallback test")\n' 
 without_yaml() { ( PYTHONPATH="$NOSCHEMA${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 
 # ...and the opposite: force the "a YAML parser IS importable" branch even on a host without pyyaml,
-# using the shared minimal double (see tests/fixtures/stub-yaml/yaml.py — it is not pyyaml, it just
-# parses the block-style subset these fixtures use and raises on anything else).
+# preferring the REAL pyyaml wherever the host has one and falling back to the shared minimal double
+# (tests/fixtures/stub-yaml/yaml.py) only where it does not.
+#
+# The double used to be PREPENDED unconditionally, which SHADOWED a real pyyaml everywhere one
+# existed — CI included, where pyyaml==6.0.3 is installed — so the genuine exact-parser path was
+# exercised on no machine anywhere. It parses only the block-style subset these fixtures use and
+# raises on anything else, and it measurably disagrees with pyyaml (see its docstring), so it is a
+# last resort rather than the default. tests/test-check-assertions-parsing.sh holds the assertion
+# that this preference is actually honoured.
 STUBYAML="$TESTS_DIR/fixtures/stub-yaml"
-with_stub_yaml() { ( PYTHONPATH="$STUBYAML${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+  YAML_KIND=real
+  with_yaml_parser() { ( "$@" ); }
+else
+  YAML_KIND=stub
+  with_yaml_parser() { ( PYTHONPATH="$STUBYAML${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
+fi
+printf '    (parser-present branch runs against: %s)\n' "$YAML_KIND"
+
+t_case "preconditions: the two parser branches really differ"
+assert_ok "the parser-present branch can import a working safe_load" \
+  with_yaml_parser python3 -c "import yaml; assert yaml.safe_load('a: 1') == {'a': 1}"
+assert_fail "and the pyyaml-hidden branch cannot import yaml at all" without_yaml python3 -c "import yaml"
 
 mk_ledger() {
   # mk_ledger <dir> <ac-yaml-content> <verdict-json-content>
@@ -291,23 +310,23 @@ assert_output "says nothing to trace is not coverage" "nothing to trace is not c
 t_case "with a YAML parser present, a BROKEN criteria file is CANNOT VERIFY, not a quiet regex fallback"
 # A half-readable criteria file yields a SHORT id list, and every criterion missing from that list is
 # then never checked for coverage — the gate silently shrinks. Both parser branches are exercised:
-# the stub double proves the hard-failure path, without_yaml proves the degraded path still works.
+# with_yaml_parser proves the hard-failure path, without_yaml proves the degraded path still works.
 led24="$d/led24"
 mk_ledger "$led24" \
   'criteria:
   - id: AC-001
    id: AC-002 [unclosed' \
   '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}'
-assert_rc "exit 1" 1 with_stub_yaml "$TC" "$led24"
-assert_output "names the invalid YAML" "not valid YAML" with_stub_yaml "$TC" "$led24"
-assert_output "did not silently proceed on a partial id list" "CANNOT VERIFY" with_stub_yaml "$TC" "$led24"
+assert_rc "exit 1" 1 with_yaml_parser "$TC" "$led24"
+assert_output "names the invalid YAML" "not valid YAML" with_yaml_parser "$TC" "$led24"
+assert_output "did not silently proceed on a partial id list" "CANNOT VERIFY" with_yaml_parser "$TC" "$led24"
 
 t_case "with a YAML parser present, a criteria file that is not a mapping is CANNOT VERIFY"
 led25="$d/led25"
 mk_ledger "$led25" 'just prose where the criteria should be' \
   '{"acceptance_criteria_coverage": []}'
-assert_rc "exit 1" 1 with_stub_yaml "$TC" "$led25"
-assert_output "names the wrong top-level type" "expected a mapping" with_stub_yaml "$TC" "$led25"
+assert_rc "exit 1" 1 with_yaml_parser "$TC" "$led25"
+assert_output "names the wrong top-level type" "expected a mapping" with_yaml_parser "$TC" "$led25"
 
 t_case "the pyyaml branch agrees with the fallback on a well-formed file (parser axis really varies)"
 led26="$d/led26"
@@ -319,8 +338,8 @@ mk_ledger "$led26" \
     {"id": "AC-001", "covered": "yes", "evidence": "t1"},
     {"id": "AC-002", "covered": "partial", "evidence": "unit only"}
   ]}'
-assert_rc "stub-pyyaml branch: exit 0" 0 with_stub_yaml "$TC" "$led26"
-assert_output "stub-pyyaml branch: INCOMPLETE" "TRACEABILITY: INCOMPLETE" with_stub_yaml "$TC" "$led26"
+assert_rc "parser-present branch: exit 0" 0 with_yaml_parser "$TC" "$led26"
+assert_output "parser-present branch: INCOMPLETE" "TRACEABILITY: INCOMPLETE" with_yaml_parser "$TC" "$led26"
 assert_rc "fallback branch: exit 0" 0 without_yaml "$TC" "$led26"
 assert_output "fallback branch: INCOMPLETE" "TRACEABILITY: INCOMPLETE" without_yaml "$TC" "$led26"
 

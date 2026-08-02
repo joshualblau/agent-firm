@@ -302,4 +302,151 @@ assert_output "second install reports the no-op" "already matches the firm's per
 assert_eq "the file was not rewritten"  "$ino1" "$(inode_of "$noop_proj/.claude/settings.json")"
 assert_eq "and no .bak litter accumulated" "0" "$(bak_count "$noop_proj")"
 
+# ===========================================================================
+# THE BACKUP PATH IS ATTACKER-INFLUENCEABLE — it must never be followed or clobbered
+# ===========================================================================
+# Appended (not woven into the cases above) so the earlier fixtures stay untouched.
+#
+# real_baks: backups that are actual regular files. `bak_count` above uses a bare -name, which counts
+# a planted SYMLINK as a backup too — exactly the thing these cases must be able to tell apart.
+real_baks()   { find "$1/.claude" -name 'settings.json.*.bak' -type f; }
+link_baks()   { find "$1/.claude" -name 'settings.json.*.bak' -type l; }
+count_lines() { printf '%s' "$1" | grep -c . | tr -d ' '; }
+# perm_of <file> — the file's own mode, four octal digits. lstat, not stat: a symlink must report as
+# a symlink here rather than silently reporting whatever it points at.
+perm_of() { python3 -c 'import os,sys; print("%04o" % (os.lstat(sys.argv[1]).st_mode & 0o7777))' "$1"; }
+# plant_baks <proj> <kind:link|file> <link-target-or-content> — occupy the backup names firm-install
+# is about to try. The stamp is the current UTC SECOND, so ONE plant can be dodged simply by the run
+# crossing a second boundary; a 10-second window is planted instead. All ten come from a single clock
+# read inside ONE python3 process: a bash loop calling python3 per second pays process-startup cost
+# between reads, which on a loaded machine leaves GAPS in the window — and a gap does not just make
+# the case flaky, it makes it pass VACUOUSLY, with the trap unarmed at the moment of the write. The
+# cases below therefore also prove, after the fact, that the trap really was hit.
+plant_baks() {
+  python3 -c '
+import os, sys, time
+d, kind, arg = sys.argv[1], sys.argv[2], sys.argv[3]
+t = time.time()
+for i in range(10):
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t + i))
+    p = os.path.join(d, ".claude", "settings.json.%s.bak" % stamp)
+    if kind == "link":
+        os.symlink(arg, p)
+    else:
+        open(p, "w").write(arg)
+' "$1" "$2" "$3"
+}
+# all_dangling <proj> — every planted .bak is a symlink AND resolves to nothing. Fails loudly (with
+# the offending path) rather than returning a bare non-zero, and refuses an empty set.
+all_dangling() {
+  python3 -c '
+import glob, os, sys
+paths = sorted(glob.glob(os.path.join(sys.argv[1], ".claude", "settings.json.*.bak")))
+if not paths:
+    sys.exit("no .bak entries were planted at all")
+for p in paths:
+    if not os.path.islink(p):  sys.exit("not a symlink: " + p)
+    if os.path.exists(p):      sys.exit("symlink is not dangling: " + p)
+' "$1"
+}
+# has_collision_suffix <path> — the name ends .<stamp>-<N>.bak rather than .<stamp>.bak, which only
+# happens when the base name was already occupied at the moment of the write.
+has_collision_suffix() { case "$1" in *-[0-9].bak|*-[0-9][0-9].bak) return 0 ;; *) return 1 ;; esac; }
+
+t_case "a pre-planted DANGLING symlink at the backup path is never written through"
+# The write path used `while os.path.exists(backup)` to avoid clobbering, then shutil.copy2. exists()
+# RESOLVES the path, so a dangling symlink at settings.json.<stamp>.bak reads as "nothing here": the
+# loop skipped it and copy2 wrote the user's whole permission policy THROUGH the link, to a path the
+# planter chose. Anyone who can create a name in .claude/ — but who cannot write settings.json — thus
+# gets an arbitrary-file-write primitive whose payload is the settings JSON.
+sym_out="$(mktemp -d "${TMPDIR:-/tmp}/firm-isym.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $sym_out"
+EXFIL="$sym_out/exfil"        # nothing in this test ever creates it; only a follow-the-link write can
+sym_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)", "Bash(keep-me:*)"], "ask": [], "deny": [] } }')"
+T_TMPDIRS="$T_TMPDIRS $sym_proj"
+YS="$sym_proj/.claude/settings.json"
+plant_baks "$sym_proj" link "$EXFIL"
+assert_no_file "precondition: the planter's chosen path does not exist yet" "$EXFIL"
+assert_ok "precondition: every planted backup name is a DANGLING symlink" all_dangling "$sym_proj"
+assert_eq "precondition: 10 links planted, 0 real backups" "10/0" \
+  "$(count_lines "$(link_baks "$sym_proj")")/$(count_lines "$(real_baks "$sym_proj")")"
+
+assert_ok "the install still succeeds (a planted link must not be a denial of service either)" \
+  install_in "$sym_proj" --migrate
+assert_no_file "THE ASSERTION: nothing was ever written through the planted link" "$EXFIL"
+assert_eq "the planted links are all still links — none was clobbered either" "10" \
+  "$(count_lines "$(link_baks "$sym_proj")")"
+assert_eq "and a REAL backup was still taken, at a name nothing occupied" "1" \
+  "$(count_lines "$(real_baks "$sym_proj")")"
+sym_bak="$(real_baks "$sym_proj" | head -1)"
+assert_ok "the trap was ARMED at write time — the backup had to take a -N suffix, so O_EXCL really \
+did refuse the planted link (without this, a run landing outside the planted window would pass the \
+assertion above vacuously)" has_collision_suffix "$sym_bak"
+assert_ok "that real backup holds the PRE-migration content (the deleted rule is recoverable)" \
+  has_rule "$sym_bak" allow "Bash(cat:*)"
+assert_eq "the backup itself is 0600 — it is a copy of a permission policy" "0600" "$(perm_of "$sym_bak")"
+assert_ok "and the migration itself still happened" lacks_rule "$YS" allow "Bash(cat:*)"
+assert_ok "the project's own rule survived it" has_rule "$YS" allow "Bash(keep-me:*)"
+
+t_case "pre-planted REGULAR backup files are never clobbered — the collision suffix still works"
+# The legitimate half of the same loop: two honest backups inside one UTC second must both survive.
+# (This one passes before and after the symlink fix; it is here so the fix cannot be 'achieved' by
+# dropping the never-clobber behaviour.)
+coll_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
+T_TMPDIRS="$T_TMPDIRS $coll_proj"
+plant_baks "$coll_proj" file 'PLANTED-DO-NOT-TOUCH'
+assert_ok "migrate succeeds over the occupied names" install_in "$coll_proj" --migrate
+assert_eq "11 backup names now exist: the 10 planted plus one new" "11" \
+  "$(count_lines "$(real_baks "$coll_proj")")"
+assert_eq "exactly 10 still hold the planted marker — none was overwritten" "10" \
+  "$(grep -lxF 'PLANTED-DO-NOT-TOUCH' "$coll_proj"/.claude/settings.json.*.bak | wc -l | tr -d ' ')"
+coll_bak="$(grep -LxF 'PLANTED-DO-NOT-TOUCH' "$coll_proj"/.claude/settings.json.*.bak | head -1)"
+assert_ok "the new one carries a -N collision suffix" has_collision_suffix "$coll_bak"
+assert_ok "and it holds the pre-migration settings" has_rule "$coll_bak" allow "Bash(cat:*)"
+
+# ===========================================================================
+# FILE MODE — settings.json IS the permission policy, so its own permissions matter
+# ===========================================================================
+install_umask() { _um="$1"; _dd="$2"; shift 2; ( umask "$_um"; cd "$_dd" && "$BIN/firm-install" "$@" ); }
+# writable_by_others <file> — true if group or other holds the WRITE bit. Phrased as the invariant
+# rather than as an exact mode so it keeps meaning if the exact mode is ever revisited.
+writable_by_others() { python3 -c 'import os,sys; sys.exit(0 if os.lstat(sys.argv[1]).st_mode & 0o022 else 1)' "$1"; }
+
+t_case "a NEWLY created settings.json is 0600 whatever the umask — never group/world writable"
+# It was chmod'd to `0o666 & ~umask` on creation, so `umask 000` produced -rw-rw-rw-: every local
+# account could add itself an allow rule to the file that decides what the firm may do unattended.
+for _u in 000 002 022 077; do
+  um_proj="$(mktemp -d "${TMPDIR:-/tmp}/firm-iumask.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $um_proj"
+  assert_ok "fresh install under umask $_u succeeds" install_umask "$_u" "$um_proj"
+  assert_eq "umask $_u -> mode 0600" "0600" "$(perm_of "$um_proj/.claude/settings.json")"
+  assert_fail "umask $_u -> not group- or world-WRITABLE (the actual defect)" \
+    writable_by_others "$um_proj/.claude/settings.json"
+done
+
+t_case "--help prints the WHOLE header, including every exit code it documents"
+# `sed -n '2,34p'` was a hardcoded range over the header comment: adding an exit code pushed the last
+# entries past line 34 and out of --help entirely, silently. The range is now "up to the first
+# non-comment line", and this case pins the property rather than the number.
+help_out="$("$BIN/firm-install" --help 2>&1)"
+for _code in 0 2 3 4 5 6; do
+  case "$help_out" in
+    *"  $_code  "*) _t_ok "--help documents exit code $_code" ;;
+    *) _t_no "--help documents exit code $_code" "missing from: $(_t_ctx "$help_out")" ;;
+  esac
+done
+case "$help_out" in
+  *"set -euo pipefail"*) _t_no "--help stops at the end of the comment block" "leaked script body" ;;
+  *) _t_ok "--help stops at the end of the comment block (no script body leaked)" ;;
+esac
+
+t_case "an EXISTING settings.json keeps its own mode across the atomic replace"
+# The complement: creation is tightened, but a file the user already owns is not re-permissioned
+# underneath them (someone may have deliberately set 0640 for a shared checkout).
+mode_proj="$(mk_target '{ "permissions": { "allow": ["Bash(cat:*)"], "ask": [], "deny": [] } }')"
+T_TMPDIRS="$T_TMPDIRS $mode_proj"
+MS="$mode_proj/.claude/settings.json"
+chmod 640 "$MS"
+assert_eq "precondition: the file is 0640" "0640" "$(perm_of "$MS")"
+assert_ok "migrate succeeds under umask 000" install_umask 000 "$mode_proj" --migrate
+assert_eq "the replaced file still has the caller's 0640, not a umask-derived mode" "0640" "$(perm_of "$MS")"
+
 t_summary
