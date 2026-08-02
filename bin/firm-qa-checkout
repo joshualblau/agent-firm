@@ -12,7 +12,7 @@ run_id="$(basename "${run_dir:-none}")"
 branch="${1:-integration/${run_id}}"
 
 if ! git show-ref --verify --quiet "refs/heads/${branch}"; then
-  echo "branch '${branch}' not found — run bin/integrate first (or pass a branch)" >&2; exit 1
+  echo "branch '${branch}' not found — run firm-integrate first (or pass a branch)" >&2; exit 1
 fi
 
 qa_dir=".agent-firm/qa-checkout/${run_id}"

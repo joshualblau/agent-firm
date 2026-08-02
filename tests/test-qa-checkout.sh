@@ -12,7 +12,14 @@ t_case "refuses clearly when the target branch doesn't exist"
 repo="$(mk_repo)"
 ( cd "$repo" && "$NEW_RUN" no-integration fast_path >/dev/null )
 assert_rc "exit 1 when integration/<run_id> was never created" 1 sh -c "cd '$repo' && '$QAC'"
-assert_output "names the missing branch and the fix" "run bin/integrate first" sh -c "cd '$repo' && '$QAC'"
+assert_output "names the missing branch and the fix" "run firm-integrate first" sh -c "cd '$repo' && '$QAC'"
+# The remediation the message names has to be a command that EXISTS. It used to say `bin/integrate`,
+# which has never been a file in this repo — a dead-end instruction at the exact moment the operator
+# is stuck. Two assertions, because "names the right thing" and "the right thing is real" are
+# different failures: a rename could satisfy the string match while still pointing at nothing.
+assert_file "the remediation it names is a real script" "$BIN/firm-integrate"
+assert_ok "does not point at the nonexistent bin/integrate" \
+  sh -c "cd '$repo' && ! '$QAC' 2>&1 | grep -q 'bin/integrate'"
 
 t_case "an explicit, nonexistent branch argument is refused the same way"
 repo1b="$(mk_repo)"

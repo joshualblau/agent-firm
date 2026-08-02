@@ -259,7 +259,12 @@ else
   warn "firm-* not on your shell PATH — run '$SELF/firm-link' (a plugin's bin/ is only on PATH inside a claude session)."
 fi
 # Python prerequisites. jsonschema is GATE-CRITICAL: without it firm-validate-verdict exits 4
-# (DEGRADED) and a QA verdict cannot clear the Final gate. pyyaml only degrades parsers to regex.
+# (DEGRADED) and a QA verdict cannot clear the Final gate.
+# pyyaml is NOT "advisory" any more — that wording predates the regression suite. It is REQUIRED to
+# run the firm's own tests (tests/test-policy-yaml-valid.sh) and CI installs it. In a work project it
+# is still non-fatal at runtime, hence WARN and not FAIL here, but "non-fatal" is not "no effect":
+# without it the traceability/assertion parsers drop to a looser regex, which fails CLOSED (CANNOT
+# VERIFY) on criteria files pyyaml would have parsed exactly.
 if python3 -c 'import jsonschema' >/dev/null 2>&1; then
   pass "python jsonschema present — QA verdicts can be schema-validated"
 else
@@ -269,7 +274,7 @@ fi
 if python3 -c 'import yaml' >/dev/null 2>&1; then
   pass "python pyyaml present — acceptance-criteria/assertion parsing is exact"
 else
-  warn "python pyyaml missing — traceability + eval assertion parsing falls back to regex; install with 'python3 -m pip install --user pyyaml'."
+  warn "python pyyaml missing — traceability + eval assertion parsing falls back to a looser regex that can fail closed (CANNOT VERIFY), and the agent-firm repo's own test suite cannot pass; install with 'python3 -m pip install --user pyyaml'."
 fi
 
 # Retired permission rules. firm-install only unions rules, so a project installed before a rule was

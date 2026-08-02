@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # tests/run-tests.sh [test-name ...]
-# Runs the firm's own test suite. No dependencies beyond bash + git — see tests/lib.sh for why.
+# Runs the firm's own test suite. No test framework — just bash + git, plus the firm's own declared
+# python3 prerequisites: jsonschema (test-validate-verdict) and pyyaml (test-policy-yaml-valid). Those
+# two files FAIL if the packages are absent; the rest of the suite runs. See tests/lib.sh for why.
 #
 #   tests/run-tests.sh                 # everything
 #   tests/run-tests.sh integrate       # just tests/test-integrate.sh

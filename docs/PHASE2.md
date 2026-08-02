@@ -12,8 +12,14 @@ A general-purpose firm should not have a standing "crypto investigator" (or fina
 framework-X guru) — that expertise is dead weight on the many projects that don't need it. So:
 - The **bench starts empty** of domain specialists (`bench/registry.yaml`).
 - Expertise is **minted per engagement** and **retired** at the end.
-- A specialist earns a durable spot only after proving **broadly reusable** (≥3 successful uses or human
-  approval, and genuinely cross-project) — reviewed one at a time, guarded by a golden eval.
+- A specialist earns a durable spot only after proving **broadly reusable** — reviewed one at a time,
+  guarded by a golden eval.
+  *(Phase 2 shipped that bar as "≥3 successful uses or human approval, and genuinely cross-project".
+  It has since been tightened, because bare use-counting was both too weak and — before
+  `firm-bench-record` existed — unmeasurable. The rule in force today: **≥3 successful uses across ≥3
+  distinct projects, each with a QA APPROVE, and no eval regression attributable to the specialist** —
+  or explicit human approval, and genuinely cross-project either way. `bench/registry.yaml` is
+  authoritative; this line is history.)*
 
 ## What's added
 - **`recruiter`** (agent, Opus) — given the Architect's expertise-required list, designs the team:

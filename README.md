@@ -57,6 +57,11 @@ mkdir -p <repo>/.claude && cp -R ~/agent-firm/agents <repo>/.claude/agents
 cp -R ~/agent-firm/.claude/settings.json ~/agent-firm/bin ~/agent-firm/agent-firm ~/agent-firm/CLAUDE.md <repo>/
 <repo>/bin/firm-link --dir ~/.local/bin   # put firm-* on PATH, or call them as <repo>/bin/firm-*
 ```
+Either install path — plugin or copy — carries the firm's **runtime** only. Neither brings `tests/` or
+`.github/workflows/ci.yml` into your project: those are the firm's own regression suite and CI, and
+they test `bin/` inside this repo. So don't expect `tests/run-tests.sh` or a `ci` workflow to appear in
+`<repo>`; that's the design, not a broken install. To change the firm's tooling, work in this repo,
+where CI runs.
 
 ## Layout
 ```
@@ -81,13 +86,16 @@ agent-firm/schemas/*.json     # acceptance-criteria, job-spec, qa-verdict, staff
 agent-firm/templates/*        # run-ledger artifact templates
 agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
 agent-firm/evals/*            # golden-task evals that guard firm changes
-tests/*                       # dependency-free bash+git regression suite for bin/ (tests/run-tests.sh)
+tests/*                       # bash+git regression suite for bin/ (tests/run-tests.sh). Also needs
+                              #   python3, plus jsonschema (test-validate-verdict) and pyyaml
+                              #   (test-policy-yaml-valid) — the same prerequisites the firm itself has
 .github/workflows/ci.yml      # bash -n + the tests/ suite (ubuntu+macOS) + firm-run-evals --structural
 .claude/settings.json         # permission rules (copy-mode + the source firm-install merges)
 CLAUDE.md                     # operating manual (copy-mode reference; plugin uses /agent-firm:start)
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
 docs/README.md                # doc index; docs/PHASE*.md — dated build record per phase, not reference docs
-docs/ENFORCEMENT.md           # every claimed invariant vs. what actually enforces it
+docs/ENFORCEMENT.md           # load-bearing claimed invariants vs. what actually enforces each
+                              #   (hand-maintained; no row = prompt-only until shown otherwise)
 bench/registry.yaml           # durable specialist bench (governance, tracked). Raw usage evidence is
                               #   separate, untracked, per-project runtime state — firm-bench-record,
                               #   $(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl
@@ -96,13 +104,14 @@ bench/registry.yaml           # durable specialist bench (governance, tracked). 
 ## Roadmap (see the plan)
 - **Phase 0 (done):** core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff.
 - **Phase 1 (done):** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
-- **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts; promote only via ≥3 uses or approval).
+- **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts). Promotion to the durable bench takes **≥3 successful uses across ≥3 distinct projects, each with a QA APPROVE, and no eval regression attributable to the specialist** — or explicit human approval, and genuinely cross-project either way. (Bare use-counting was the original bar; it was too weak and, before `firm-bench-record`, unmeasurable. `bench/registry.yaml` is authoritative.)
 - **Phase 3 (done):** independent Codex/GPT QA judge via `codex exec --output-schema` on the ChatGPT subscription (`firm-gpt-qa`, two-voice QA); needs `codex login` (see docs/PHASE3.md).
 - **Phase 4 (done):** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
 - **Phase 5 (done):** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
 - **Hardening and measurement phase (done):** the firm's OWN tooling gets the same evidence-not-
-  confidence bar it holds the deliverable to — a dependency-free `bin/` regression suite + CI
-  (`.github/workflows/ci.yml`), a fail-closed `run-baseline.json` SHA comparison replacing the old
+  confidence bar it holds the deliverable to — a `bin/` regression suite + CI
+  (`.github/workflows/ci.yml`; bash + git + the firm's own python3/jsonschema/pyyaml prerequisites, no
+  test framework), a fail-closed `run-baseline.json` SHA comparison replacing the old
   commit-count heuristic for `no_default_branch_merge`/`final_gate_pending`, a negative golden eval
   (`qa-blocks-broken-build`) proving QA will actually **BLOCK**, `firm-qa-clean-check` (Lead-run, not
   self-certified), and a per-project bench usage log (`firm-bench-record`). See the system-change
