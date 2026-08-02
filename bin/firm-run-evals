@@ -130,7 +130,7 @@ SA_DETAIL=""    # multi-line explanation when structural_assertions fails
 sa_detail() { if [ -z "$SA_DETAIL" ]; then SA_DETAIL="$1"; else SA_DETAIL="$SA_DETAIL
 $1"; fi; }
 
-# structural_assertions <eval-dir> <name> -> 0 = assertions are EVALUABLE, 1 = they are not.
+# structural_assertions <eval-dir> -> 0 = assertions are EVALUABLE, 1 = they are not.
 # "Evaluable", not "satisfied": an assertion that can only pass after a real run is fine here.
 structural_assertions() {
   local d="$1" af="$1/assertions.yaml" repo out rc parsed grepn completed
@@ -264,7 +264,7 @@ for d in "$EVALS"/*/; do
   n=$((n+1))
   if ! structural_check "$d"; then echo "BAD  $name (structure)"; rc=1; continue; fi
   if [ "$mode" = "structural" ]; then
-    if structural_assertions "$d" "$name"; then
+    if structural_assertions "$d"; then
       echo "ok   $name ($SA_COUNT assertions) — parsed + EVALUABLE by firm-check-assertions [structural only]"
     else
       echo "BAD  $name (assertions)"
