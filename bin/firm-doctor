@@ -16,6 +16,8 @@
 #   6. Claude profile: CLAUDE_CONFIG_DIR isolated + CLAUDE_CODE_OAUTH_TOKEN present (macOS account switch)
 #   7. Codex profile: CODEX_HOME isolated + has its own auth.json (switches the ChatGPT account)
 #   8. codex present (the Phase-3 GPT QA judge), chezmoi bootstrap sanity (informational)
+#   9. retired permission rules (fail-closed): the retirement policy is present AND readable, and no
+#      settings.json still grants a rule it withdrew. "Could not check" counts as a FAIL, not a WARN.
 #
 # Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
 #   --probe   also run live account probes (op run resolve, codex login status) — needs network.
@@ -27,7 +29,7 @@ SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 PROBE=0
 case "${1:-}" in
   --probe) PROBE=1 ;;
-  -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   '') : ;;
   *) echo "firm-doctor: unknown arg '$1' (use --probe or --help)" >&2; exit 2 ;;
 esac
@@ -280,39 +282,131 @@ fi
 # first version of this check did exactly that: `except Exception: sys.exit(0)` treated invalid JSON,
 # or `permissions` shaped as a list instead of an object, as "no retired rules found" — a false PASS on
 # the one file this check exists to inspect. Every parse failure now prints nothing but an error to
-# stderr and exits 2, which the caller turns into a WARN, never a silent PASS.
+# stderr and exits 2.
+#
+# Every non-verifying outcome below is a FAIL, not a WARN, because WARN does not reach the exit code
+# (see the summary block at the bottom: only FAILS gates it). Downgrading the printed line from a false
+# PASS to a WARN — as the first repair of this check did — still lets `firm-doctor && <run the firm>`
+# proceed on a settings file nobody could read. For a fail-closed check "I could not verify this" and
+# "this is broken" have to cost the same, or the check is advice rather than a gate. The three
+# non-verifying outcomes are: the retirement policy is missing, the retirement policy is unreadable,
+# and a settings.json cannot be parsed. Each is UNVERIFIED, never clean.
 RETIRED_JSON="$SELF/../agent-firm/policy/retired-permissions.json"
-if [ -f "$RETIRED_JSON" ]; then
+_pol_ok=0
+_pol_err=""
+if [ ! -f "$RETIRED_JSON" ]; then
+  # No `else`-less skip here. A deleted, renamed or (in plugin mode) simply not-where-we-looked policy
+  # file used to make this whole FAIL-class check evaporate with no output at all, so the one way to
+  # silence it was to remove the file it reads.
+  fail "retired-permission policy NOT FOUND at $RETIRED_JSON — the retired-rule check could not run (SKIPPED, not passed)"
+  info "restore agent-firm/policy/retired-permissions.json (or reinstall the plugin), then re-run firm-doctor."
+else
+  # Validate the POLICY once, before looking at any settings file. Doing it here rather than inside
+  # the per-scope loop keeps the message honest ("the policy is unusable", not "your settings.json
+  # could not be checked") and costs one FAIL for one defect instead of one per settings file.
+  _pol_err="$(python3 - "$RETIRED_JSON" <<'PY' 2>&1 >/dev/null
+import json, sys
+try:
+    entries = json.load(open(sys.argv[1])).get("retired", [])
+    if not isinstance(entries, list):
+        raise ValueError("`retired` is not a JSON array")
+    for i, e in enumerate(entries):
+        rule = e.get("rule") if isinstance(e, dict) else None
+        if not isinstance(rule, str) or not rule:
+            raise ValueError(f"entry #{i} has no usable `rule`")
+        declared = e.get("scope")
+        if declared is None:
+            raise ValueError(f"entry `{rule}` declares no `scope`")
+        buckets = [declared] if isinstance(declared, str) else declared
+        if not isinstance(buckets, list) or not buckets or not all(isinstance(b, str) for b in buckets):
+            raise ValueError(f"entry `{rule}` has a malformed `scope`")
+        if "deny" in buckets:
+            raise ValueError(f"entry `{rule}` scopes a DENY rule for deletion — deny is a protection, "
+                             f"and firm-install refuses such a policy outright (exit 4)")
+        unknown = [b for b in buckets if b not in ("allow", "ask")]
+        if unknown:
+            raise ValueError(f"entry `{rule}` names unknown permission list(s) {unknown}")
+except Exception as e:
+    print(f"{type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
+PY
+)"
+  if [ $? -eq 0 ]; then
+    _pol_ok=1
+  else
+    fail "retired-permission policy at $RETIRED_JSON is unusable — the retired-rule check could not run (SKIPPED, not passed)"
+    info "retired-permission policy problem: $_pol_err"
+    info "fix agent-firm/policy/retired-permissions.json, then re-run firm-doctor."
+  fi
+fi
+
+if [ "$_pol_ok" -eq 1 ]; then
   for _scope in project user; do
     if [ "$_scope" = project ]; then _sfile=".claude/settings.json"; _sflag=""; else _sfile="$HOME/.claude/settings.json"; _sflag=" --user"; fi
     [ -f "$_sfile" ] || continue
+    # `scope` is honoured the same way firm-install honours it: a rule is only reported as a live
+    # grant in the list(s) its retirement entry names. Reporting a hit in `deny` as "still grants a
+    # retired rule" would be both wrong (deny withholds, it does not grant) and unactionable — the fix
+    # it prints, `firm-install --migrate`, refuses to delete deny rules. A deny hit is INFO instead.
+    #
+    # This re-validates the policy the guard above already validated. That duplication is deliberate:
+    # this is the script that decides what gets reported as a live grant, and in a fail-closed check it
+    # should not be able to produce a PASS from a policy it never checked, however it came to be run.
     _out="$(python3 - "$RETIRED_JSON" "$_sfile" <<'PY' 2>&1
 import json, sys
 try:
-    retired = {r["rule"] for r in json.load(open(sys.argv[1])).get("retired", [])}
+    entries = json.load(open(sys.argv[1])).get("retired", [])
+    if not isinstance(entries, list):
+        raise ValueError("`retired` is not a JSON array")
+    scoped = {"allow": set(), "ask": set()}
+    every = set()
+    for i, e in enumerate(entries):
+        rule = e.get("rule") if isinstance(e, dict) else None
+        if not isinstance(rule, str) or not rule:
+            raise ValueError(f"retired entry #{i} has no usable `rule`")
+        declared = e.get("scope")
+        if declared is None:
+            raise ValueError(f"retired entry `{rule}` declares no `scope`")
+        buckets = [declared] if isinstance(declared, str) else declared
+        if not isinstance(buckets, list) or not buckets or not all(isinstance(b, str) for b in buckets):
+            raise ValueError(f"retired entry `{rule}` has a malformed `scope`")
+        if "deny" in buckets:
+            raise ValueError(f"retired entry `{rule}` scopes a DENY rule for deletion — deny is a protection")
+        unknown = [b for b in buckets if b not in ("allow", "ask")]
+        if unknown:
+            raise ValueError(f"retired entry `{rule}` names unknown permission list(s) {unknown}")
+        every.add(rule)
+        for b in buckets:
+            scoped[b].add(rule)
     perms = json.load(open(sys.argv[2])).get("permissions", {})
     if not isinstance(perms, dict):
         raise ValueError("`permissions` is not a JSON object")
-    hits = []
     for k in ("allow", "ask", "deny"):
-        bucket = perms.get(k, [])
-        if not isinstance(bucket, list):
+        if not isinstance(perms.get(k, []), list):
             raise ValueError(f"`permissions.{k}` is not a JSON array")
-        hits.extend(r for r in bucket if r in retired)
-    print(" ".join(sorted(set(hits))))
+    hits = sorted({r for k in ("allow", "ask") for r in perms.get(k, []) if r in scoped[k]})
+    deny_hits = sorted({r for r in perms.get("deny", []) if r in every})
+    print(" ".join(hits))
+    print(" ".join(deny_hits))
 except Exception as e:
     print(f"{type(e).__name__}: {e}", file=sys.stderr)
     sys.exit(2)
 PY
 )"
     _py_rc=$?
-    if [ "$_py_rc" -eq 2 ]; then
-      warn "$_scope settings.json could not be checked for retired permission rules ($_out) — fix the file's JSON, then re-run firm-doctor."
-    elif [ -n "$_out" ]; then
-      fail "$_scope settings still grant RETIRED permission rule(s): $_out"
+    _hits="$(printf '%s\n' "$_out" | sed -n '1p')"
+    _deny_hits="$(printf '%s\n' "$_out" | sed -n '2p')"
+    if [ "$_py_rc" -ne 0 ]; then
+      fail "$_scope settings.json could not be checked for retired permission rules ($_out) — fix the file's JSON, then re-run firm-doctor."
+      info "firm-doctor fails closed: a settings file it cannot parse is UNVERIFIED, not clean."
+    elif [ -n "$_hits" ]; then
+      fail "$_scope settings still grant RETIRED permission rule(s): $_hits"
       info "these read around the Read-tool deny rules. Fix: firm-install$_sflag --migrate"
     else
       pass "$_scope settings carry no retired permission rules"
+    fi
+    if [ -n "$_deny_hits" ]; then
+      info "$_scope settings also list retired rule(s) under \`deny\` ($_deny_hits) — left alone; deny withholds, it does not grant."
     fi
   done
 fi

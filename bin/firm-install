@@ -12,6 +12,26 @@
 # named in retired-permissions.json. Union-only installs cannot fix a rule that turned out to be
 # unsafe: every project installed from an older version keeps it forever. It prints the exact
 # before/after so the deletion is reviewable, never silent.
+#
+# Three properties make that deletion safe to point at a file you own:
+#   SCOPED   — each retired entry's "scope" names the permission list(s) it may be deleted from, and
+#              that field is LOAD-BEARING, not documentation. A rule is removed from those lists and
+#              no others. `deny` may never appear in a scope: deny is a PROTECTION, not a grant, and
+#              a policy file that asks for a deny deletion is REFUSED (exit 4) with nothing written.
+#   BACKED UP— if the write would change the file, the previous contents are copied to
+#              <settings>.<UTC timestamp>.bak first and the path is printed.
+#   ATOMIC   — the new contents go to a temp file in the same directory and are os.replace()d into
+#              position. There is no truncate-then-write window in which a crash leaves you with an
+#              empty ~/.claude/settings.json.
+#
+# Exit codes (stable; firm-bootstrap and docs/INSTALL.md depend on 0/2/3):
+#   0  merged (and, with --migrate, retired rules removed). Also the no-op case: nothing to change.
+#   2  bad usage — unknown argument.
+#   3  ADVISORY: this settings file still grants a retired rule. NOTHING was deleted; re-run
+#      with --migrate to remove it. The merge itself succeeded.
+#   4  REFUSED: retired-permissions.json is malformed, or an entry's "scope" names `deny`.
+#      NOTHING was written — this is the supply-chain guard, so it fails closed.
+#   5  retired-permissions.json exists but could not be read or parsed. NOTHING was written.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -26,48 +46,174 @@ for arg in "$@"; do
   case "$arg" in
     --user)    scope=user ;;
     --migrate) migrate=1 ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "firm-install: unknown arg '$arg' (use --user and/or --migrate)" >&2; exit 2 ;;
   esac
 done
 if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
 
 python3 - "$SRC" "$target" "$RETIRED" "$migrate" "$scope" <<'PY'
-import json, os, sys
+import json, os, shutil, sys, tempfile, time
 src, target, retired_path, migrate, scope = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+
+BUCKETS = ("allow", "ask", "deny")
+# The lists --migrate is ever allowed to delete from. `deny` is deliberately absent and must stay
+# absent: allow/ask GRANT (or gate) an action, deny WITHHOLDS one. Retiring a grant makes a project
+# safer; deleting a deny makes it less safe, so "retirement" is not a coherent reason to do it.
+DELETABLE = ("allow", "ask")
+
+# --------------------------------------------------------------------------
+# Load the retirement policy. Each entry's "scope" is LOAD-BEARING: it names the permission list(s)
+# --migrate may delete that rule from, and the rule is removed from those and no others.
+#
+# The previous version read only entry["rule"] and swept allow, ask AND deny alike. That made
+# retired-permissions.json a permission-DELETING channel: one line naming, say, "Bash(sudo:*)" would
+# have stripped that deny from every project the migration touched, printed as a routine "removing
+# retired rules" line. Nothing about a data file justifies that much authority, so scope is now
+# enforced and a deny-scoped entry is refused outright rather than honoured or silently ignored.
+# --------------------------------------------------------------------------
+retired_by_bucket = {k: set() for k in DELETABLE}
+refusals = []
+if os.path.exists(retired_path):
+    try:
+        entries = json.load(open(retired_path)).get("retired", [])
+        if not isinstance(entries, list):
+            raise ValueError('"retired" is not a JSON array')
+    except Exception as e:
+        print(f"firm-install: REFUSING to run — cannot read the retirement policy {retired_path}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        print("  Nothing was written. Fix the file's JSON, or remove it, then re-run.", file=sys.stderr)
+        sys.exit(5)
+    for i, entry in enumerate(entries):
+        rule = entry.get("rule") if isinstance(entry, dict) else None
+        if not isinstance(rule, str) or not rule:
+            refusals.append(f'entry #{i}: no usable "rule" string')
+            continue
+        declared = entry.get("scope")
+        if declared is None:
+            refusals.append(f'{rule}: no "scope" declared — refusing to guess which list to delete from')
+            continue
+        buckets = [declared] if isinstance(declared, str) else declared
+        if not isinstance(buckets, list) or not buckets or not all(isinstance(b, str) for b in buckets):
+            refusals.append(f'{rule}: "scope" must be a permission-list name or a list of them, got {declared!r}')
+            continue
+        unknown = [b for b in buckets if b not in BUCKETS]
+        if unknown:
+            refusals.append(f'{rule}: "scope" names unknown permission list(s) {unknown}')
+            continue
+        if "deny" in buckets:
+            refusals.append(f'{rule}: "scope" names `deny`. deny is a PROTECTION, not a grant — '
+                            f'firm-install will never delete a deny rule.')
+            continue
+        for b in buckets:
+            retired_by_bucket[b].add(rule)
+elif migrate:
+    # Not fatal — with no policy there is nothing to delete, so this stays a union-only install. But
+    # --migrate must not be allowed to LOOK like it cleaned something when it had no list to clean
+    # against. (firm-doctor treats the same missing file as a FAIL; here it only removes a capability.)
+    print(f"firm-install --migrate: no retirement policy at {retired_path} — nothing to migrate. "
+          f"This install only ADDED rules.", file=sys.stderr)
+
+if refusals:
+    print("firm-install: REFUSING to run — unsafe or malformed entries in "
+          f"{retired_path}:", file=sys.stderr)
+    for msg in refusals:
+        print(f"    ✗ {msg}", file=sys.stderr)
+    print("  Nothing was written and no rule was deleted. A retirement entry must name the exact "
+          "permission list(s) it may be removed from.", file=sys.stderr)
+    if any("`deny`" in m for m in refusals):
+        print("  A retirement policy may only withdraw GRANTS (allow/ask). Removing a deny rule is a "
+              "privilege ESCALATION and has to be a reviewed edit to the firm's own settings.json, "
+              "never a 'retirement'.", file=sys.stderr)
+    sys.exit(4)
+
 src_perms = json.load(open(src)).get("permissions", {})
-os.makedirs(os.path.dirname(target), exist_ok=True)
-tgt = json.load(open(target)) if os.path.exists(target) else {}
+os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+original = None
+if os.path.exists(target):
+    with open(target, "rb") as fh:
+        original = fh.read()
+tgt = json.loads(original.decode("utf-8")) if original is not None else {}
 perms = tgt.setdefault("permissions", {})
 
-# Retired rules present in the target, regardless of which bucket they drifted into.
-retired = []
-if os.path.exists(retired_path):
-    retired = [r["rule"] for r in json.load(open(retired_path)).get("retired", [])]
-present = sorted({r for k in ("allow", "ask", "deny") for r in perms.get(k, []) if r in retired})
+# Retired rules the target still GRANTS, per bucket, honouring each entry's declared scope.
+present = sorted({r for k in DELETABLE for r in perms.get(k, []) if r in retired_by_bucket[k]})
+# Visibility without authority: a retired rule sitting in `deny` is reported so it is never invisible,
+# and is never touched. (Harmless there — it withholds rather than grants — but silence would make it
+# look like the file had been fully cleaned.)
+_all_retired = set().union(*retired_by_bucket.values()) if retired_by_bucket else set()
+in_deny = sorted({r for r in perms.get("deny", []) if r in _all_retired})
 
 removed = 0
 if migrate and present:
     print("firm-install --migrate: removing retired rules")
-    for k in ("allow", "ask", "deny"):
-        before = perms.get(k, [])
-        after = [r for r in before if r not in retired]
-        for r in before:
-            if r in retired:
+    for k in DELETABLE:
+        if k not in perms:
+            continue
+        keep = []
+        for r in perms[k]:
+            if r in retired_by_bucket[k]:
                 print(f"    - {k}: {r}")
                 removed += 1
-        if k in perms:
-            perms[k] = after
+            else:
+                keep.append(r)
+        perms[k] = keep
 
 added = 0
-for k in ("allow", "ask", "deny"):
+for k in BUCKETS:
     cur = perms.setdefault(k, [])
     for rule in src_perms.get(k, []):
         if rule not in cur:
             cur.append(rule); added += 1
 
-json.dump(tgt, open(target, "w"), indent=2)
-print(f"firm-install: merged firm permissions into {target} (+{added} rules, -{removed} retired)")
+# --------------------------------------------------------------------------
+# Write: no-op if unchanged, else back up, then swap atomically. `json.dump(..., open(target, "w"))`
+# truncated the caller's real permission policy before it had produced a single byte of replacement —
+# an interrupt, a full disk or an exception in between left an empty ~/.claude/settings.json, which at
+# user scope is every project's policy at once. os.replace() is atomic on POSIX and on Windows.
+# --------------------------------------------------------------------------
+new_text = json.dumps(tgt, indent=2) + "\n"
+new_bytes = new_text.encode("utf-8")
+backup = None
+if original == new_bytes:
+    print(f"firm-install: {target} already matches the firm's permissions — left untouched "
+          f"(+0 rules, -0 retired)")
+else:
+    if original is not None:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())   # not datetime.utcnow(): deprecated in 3.12
+        backup = f"{target}.{stamp}.bak"
+        n = 1
+        while os.path.exists(backup):          # never clobber an earlier backup from the same second
+            backup = f"{target}.{stamp}-{n}.bak"; n += 1
+        shutil.copy2(target, backup)
+        print(f"firm-install: backed up the previous settings to {backup}")
+    d = os.path.dirname(target) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".firm-install.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if original is not None:
+            os.chmod(tmp, os.stat(target).st_mode & 0o7777)   # keep the file's existing permissions
+        else:
+            u = os.umask(0); os.umask(u)
+            os.chmod(tmp, 0o666 & ~u)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    print(f"firm-install: merged firm permissions into {target} (+{added} rules, -{removed} retired)")
+
+if in_deny:
+    print()
+    print("NOTE: retired rule(s) also appear in this file's `deny` list and were LEFT IN PLACE:")
+    for r in in_deny:
+        print(f"    {r}")
+    print("  deny is a protection, not a grant — firm-install never deletes from it.")
 
 if present and not migrate:
     print()
