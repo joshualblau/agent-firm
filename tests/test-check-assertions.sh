@@ -5,6 +5,13 @@
 # which delegates to firm-qa-clean-check the same way traceability_passes delegates to
 # firm-traceability-check — see tests/test-qa-clean-check.sh for that script's own direct coverage;
 # the cases here exercise it specifically through the assertion-vocabulary path.
+#
+# Scope note: this file covers the assertion VOCABULARY (one case per verb, driving the real
+# delegated scripts). The assertions.yaml PARSING layer — pyyaml vs the regex fallback, dropped
+# entries, zero-assertion files — is covered separately in tests/test-check-assertions-parsing.sh.
+# artifact_absent, test_passes and traceability_passes were added here because all three shipped with
+# zero coverage: the traceability_passes branch could be deleted from firm-check-assertions outright
+# and this file still reported 25/25 green.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -35,7 +42,11 @@ write_assertions 'assertions:
 assert_rc "file_exists on a missing file FAILs" 1 "$CA" "$repo/a.yaml" "$repo"
 
 # ---------------------------------------------------------------------------
-t_case "artifact_exists / verdict_is / traceability_passes (unchanged vocabulary)"
+# TITLE SCOPE: this case covers artifact_exists and verdict_is ONLY. It used to also claim
+# traceability_passes, which appeared nowhere in its body — deleting the whole
+# `elif k == "traceability_passes"` branch from firm-check-assertions left this file at 25/25 green.
+# That verb now has its own cases further down, which do drive the real script.
+t_case "artifact_exists / verdict_is (unchanged vocabulary)"
 repo2="$(mk_repo)"
 ( cd "$repo2" && "$NEW_RUN" ledger-check fast_path >/dev/null )
 run_dir2="$repo2/$(cat "$repo2/.agent-firm/CURRENT_RUN")"
@@ -48,6 +59,84 @@ assert_rc "both pass" 0 "$CA" "$repo2/a.yaml" "$repo2"
 write_assertions 'assertions:
   - verdict_is: BLOCK' "$repo2"
 assert_rc "verdict_is mismatch FAILs" 1 "$CA" "$repo2/a.yaml" "$repo2"
+
+# ---------------------------------------------------------------------------
+# artifact_absent — the negative counterpart of artifact_exists, and the verb most easily misused.
+t_case "artifact_absent: absent artifact PASSes, present artifact FAILs"
+repo2c="$(mk_repo)"
+( cd "$repo2c" && "$NEW_RUN" artifact-absent fast_path >/dev/null )
+run_dir2c="$repo2c/$(cat "$repo2c/.agent-firm/CURRENT_RUN")"
+write_assertions 'assertions:
+  - artifact_absent: 99-never-written.md' "$repo2c"
+assert_rc "PASSes for an artifact this run never produced" 0 "$CA" "$repo2c/a.yaml" "$repo2c"
+
+write_assertions 'assertions:
+  - artifact_absent: 08-qa-verdict.json' "$repo2c"
+assert_rc "FAILs for an artifact that IS in the ledger" 1 "$CA" "$repo2c/a.yaml" "$repo2c"
+
+t_case "artifact_absent CANNOT express 'this stage never ran' for a template-seeded artifact"
+# Pins why `- artifact_absent: 10-handoff.md` must NOT be used to prove "QA blocked, so no handoff was
+# written": firm-new-run seeds every agent-firm/templates/* file into the ledger at run start, so
+# 10-handoff.md exists from t=0 and that assertion fails on a perfectly correct run. Encoded as a test
+# so the suggestion cannot be re-adopted without turning this red.
+assert_file "precondition: firm-new-run really does seed 10-handoff.md at t=0" "$run_dir2c/10-handoff.md"
+write_assertions 'assertions:
+  - artifact_absent: 10-handoff.md' "$repo2c"
+assert_rc "FAILs on a brand-new run where nothing has happened yet" 1 "$CA" "$repo2c/a.yaml" "$repo2c"
+
+# ---------------------------------------------------------------------------
+# test_passes — the escape-hatch verb the qa-blocks-broken-build eval leans on hardest.
+t_case "test_passes: runs a real command, in the scratch repo, and reads its exit code"
+repo2d="$(mk_repo)"
+write_assertions 'assertions:
+  - test_passes: test -f seed.txt' "$repo2d"
+assert_rc "PASSes on a command that exits 0" 0 "$CA" "$repo2d/a.yaml" "$repo2d"
+# Second axis: the SAME assertions file, pointed at a directory without seed.txt, must fail — that is
+# what proves the command runs with cwd set to the scratch-repo argument rather than wherever the
+# checker happens to have been invoked from.
+plain2d="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $plain2d"
+assert_rc "the same command FAILs against a different dir -- cwd follows the repo argument" 1 \
+  "$CA" "$repo2d/a.yaml" "$plain2d"
+
+write_assertions 'assertions:
+  - test_passes: test -f definitely-not-here.txt' "$repo2d"
+assert_rc "FAILs on a command that exits non-zero" 1 "$CA" "$repo2d/a.yaml" "$repo2d"
+
+t_case "test_passes: the shell-! negation form qa-blocks-broken-build's fixture-sanity check uses"
+write_assertions 'assertions:
+  - test_passes: "! test -f definitely-not-here.txt"' "$repo2d"
+assert_rc "a negated command PASSes when the inner command genuinely fails" 0 "$CA" "$repo2d/a.yaml" "$repo2d"
+write_assertions 'assertions:
+  - test_passes: "! test -f seed.txt"' "$repo2d"
+assert_rc "and FAILs when the inner command unexpectedly succeeds" 1 "$CA" "$repo2d/a.yaml" "$repo2d"
+
+# ---------------------------------------------------------------------------
+# traceability_passes — delegates to firm-traceability-check. Every case below drives that real
+# script against a real ledger; none of them mocks it.
+t_case "traceability_passes: every criterion covered -> PASS"
+repo2e="$(mk_repo)"
+( cd "$repo2e" && "$NEW_RUN" trace-verb fast_path >/dev/null )
+run_dir2e="$repo2e/$(cat "$repo2e/.agent-firm/CURRENT_RUN")"
+# Written out explicitly instead of relying on the seeded template, so firm-traceability-check's
+# pyyaml path and its regex-fallback path both extract exactly these two ids.
+printf '%s\n' 'criteria:' \
+  '  - id: AC-001' '    statement: divide returns a quotient' \
+  '  - id: AC-002' '    statement: divide throws on a zero divisor' > "$run_dir2e/01-acceptance-criteria.yaml"
+printf '%s' '{"verdict":"APPROVE","acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/unit.log"},{"id":"AC-002","covered":"yes","evidence":"09-test-evidence/unit.log"}]}' \
+  > "$run_dir2e/08-qa-verdict.json"
+write_assertions 'assertions:
+  - traceability_passes: true' "$repo2e"
+assert_rc "PASS when the verdict covers every criterion" 0 "$CA" "$repo2e/a.yaml" "$repo2e"
+
+t_case "traceability_passes: an UNCOVERED criterion -> FAIL (the verb is not a no-op)"
+printf '%s' '{"verdict":"APPROVE","acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/unit.log"}]}' \
+  > "$run_dir2e/08-qa-verdict.json"
+assert_rc "FAILs while AC-002 is missing from the verdict's coverage" 1 "$CA" "$repo2e/a.yaml" "$repo2e"
+
+t_case "traceability_passes: false INVERTS the check -- the declared value is read, not ignored"
+write_assertions 'assertions:
+  - traceability_passes: false' "$repo2e"
+assert_rc "PASSes precisely because the traceability check itself fails" 0 "$CA" "$repo2e/a.yaml" "$repo2e"
 
 t_case "unknown assertion key FAILs, not silently ignored"
 repo2b="$(mk_repo)"

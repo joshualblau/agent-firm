@@ -59,13 +59,45 @@ echo dirty > "$repo3/.agent-firm/qa-checkout/runid-clean-check/x.txt"
 assert_rc "resolves via CURRENT_RUN and correctly fails" 1 sh -c "cd '$repo3' && '$QCC'"
 
 # ---------------------------------------------------------------------------
-t_case "a firm-ledger-log event is recorded for every outcome"
+# firm-qa-clean-check logs from FOUR places (:35 cannot_verify/missing_dir, :51
+# cannot_verify/git_status_failed, :59 dirty, :64 clean). This case used to drive only the `clean`
+# one while its title claimed "every outcome" — three of the four log calls could have been deleted
+# without turning it red. All four are exercised below, each immediately after the invocation that
+# produces it, and the event count is checked so a missing call can't hide behind an earlier line.
+t_case "a firm-ledger-log event is recorded for every outcome (clean, dirty, and both cannot-verify reasons)"
 repo4="$(mk_repo)"
 mk_run "$repo4" "runid-ledger"
 ( cd "$repo4" && git worktree add -q -b "integration/runid-ledger" \
     ".agent-firm/qa-checkout/runid-ledger" ) >/dev/null 2>&1
+led4="$repo4/.agent-firm/runs/runid-ledger/run.jsonl"
+qadir4="$repo4/.agent-firm/qa-checkout/runid-ledger"
+# The status/reason fields only reach run.jsonl when jq is installed (firm-ledger-log's jq-less
+# fallback writes ts+event only), so name that prerequisite rather than failing cryptically below.
+assert_ok "prerequisite: jq is installed, so key=value pairs are actually encoded" \
+  sh -c "command -v jq >/dev/null 2>&1"
+
+# 1/4 — clean
 ( cd "$repo4" && "$QCC" ) >/dev/null
-assert_output "clean status logged" '"event":"qa_clean_check","status":"clean"' \
-  cat "$repo4/.agent-firm/runs/runid-ledger/run.jsonl"
+assert_output "clean status logged" '"event":"qa_clean_check","status":"clean"' cat "$led4"
+
+# 2/4 — dirty
+echo leftover > "$qadir4/leftover.txt"
+( cd "$repo4" && "$QCC" ) >/dev/null 2>&1
+assert_output "dirty status logged" '"event":"qa_clean_check","status":"dirty"' cat "$led4"
+rm -f "$qadir4/leftover.txt"
+
+# 3/4 — cannot verify: the checkout directory doesn't exist
+( cd "$repo4" && "$QCC" "$repo4/never-created" ) >/dev/null 2>&1
+assert_output "cannot_verify status logged" '"event":"qa_clean_check","status":"cannot_verify"' cat "$led4"
+assert_output "...and names missing_dir as the reason" '"reason":"missing_dir"' cat "$led4"
+
+# 4/4 — cannot verify: the directory exists but isn't a git checkout (a DIFFERENT reason, same status)
+plain4="$(mktemp -d "${TMPDIR:-/tmp}/firm-test.XXXXXX")"; T_TMPDIRS="$T_TMPDIRS $plain4"
+( cd "$repo4" && "$QCC" "$plain4" ) >/dev/null 2>&1
+assert_output "...and git_status_failed is logged as its own distinct reason" \
+  '"reason":"git_status_failed"' cat "$led4"
+
+n_events4="$(grep -c '"event":"qa_clean_check"' "$led4" | tr -d ' ')"
+assert_eq "exactly one event per invocation — four invocations, four events" 4 "$n_events4"
 
 t_summary

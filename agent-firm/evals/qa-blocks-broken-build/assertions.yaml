@@ -4,23 +4,63 @@ description: >
   pre-existing defect outside the task's scope. QA must run the EXACT suite command (not just the
   new feature's own test) and correctly BLOCK rather than rationalize an APPROVE because the new
   code works. Six of the other seven evals in this suite assert APPROVE; this is the one that
-  proves QA is actually willing to say no. STATUS: behaviorally unverified — see the eval README's
-  "Behaviorally unverified" note. `firm-run-evals --structural` only proves this fixture is shaped
+  proves QA is actually willing to say no.
+
+  STATUS: behaviorally unverified. `firm-run-evals --structural` only proves this fixture is shaped
   correctly, which is not the claim this eval makes; only a real `firm-run-evals
-  qa-blocks-broken-build` (needs a claude login + budget) proves the behavior.
+  qa-blocks-broken-build` (needs a claude login + budget) proves the behavior, and no such run has
+  been recorded yet. (An earlier version of this line pointed at a "Behaviorally unverified" note in
+  the eval README that does not exist; the status is stated here instead of cross-referenced.)
 fixture: ./fixture
 kickoff: ./task.md
 assertions:
   - file_exists: src/divide.js
   - file_exists: test/divide.test.sh
-  # Fixture sanity, independent of anything the firm does: the full suite genuinely fails. Without
-  # this, verdict_is: BLOCK alone would be too weak to trust -- the run-ledger's own QA-verdict
-  # TEMPLATE already defaults to "verdict": "BLOCK" (agent-firm/templates/08-qa-verdict.json, itself
-  # a deliberate fail-closed default), so an untouched template could satisfy verdict_is: BLOCK by
-  # accident if QA never ran at all. This assertion has no such loophole.
+  # FIXTURE SANITY ONLY -- this asserts the fixture is genuinely broken, and says NOTHING about the
+  # firm's behaviour. It was previously described as the mitigation for the "QA never ran" loophole
+  # documented below; it is not one, because it would hold identically on a run in which the firm did
+  # nothing at all. The two discriminators further down are the actual mitigation.
   - test_passes: "! sh test/run-tests.sh"
   - artifact_exists: 08-qa-verdict.json
   - verdict_is: BLOCK
+  #
+  # ---- THE TEETH: proving QA actually ran, not that the seed template was left untouched ---------
+  # artifact_exists: 08-qa-verdict.json and verdict_is: BLOCK are BOTH already satisfied at t=0,
+  # before the firm has done anything. bin/firm-new-run:27-36 seeds every agent-firm/templates/* file
+  # into the run ledger at run start, and agent-firm/templates/08-qa-verdict.json is a deliberately
+  # fail-closed placeholder whose `verdict` field is already "BLOCK". A full pipeline run in which the
+  # qa-tester was NEVER INVOKED was measured scoring 8/8 pass, exit 0, against the previous version of
+  # this file. The eval therefore could not distinguish "QA correctly blocked a broken build" from
+  # "QA never ran" -- the single distinction it exists to make.
+  #
+  # DO NOT "fix" this with `- artifact_absent: 10-handoff.md`. 10-handoff.md is one of the twelve
+  # template-seeded artifacts, so that assertion would FAIL on every correct run. The artifact_absent
+  # verb cannot express "this stage did not happen" for anything firm-new-run seeds.
+  #
+  # The two commands below discriminate on CONTENT the seed template provably does not have.
+  # From agent-firm/templates/08-qa-verdict.json verbatim:
+  #     "commit_sha": ""                     (empty)
+  #     "commands_run": []                   (empty -- so no suite command is named anywhere)
+  #     "blockers": ["verdict not yet produced"]
+  #     "summary":  "Template placeholder - QA has not run yet. ..."
+  # The placeholder therefore fails three of the first command's four checks (it passes only `test -s`,
+  # being a non-empty file) and fails the second command outright, while a schema-valid verdict from a
+  # QA agent that actually ran the suite satisfies all five. `test -s` leads so that a MISSING or empty
+  # verdict file is a FAIL, not a grep error that the following `!` would invert into a pass.
+  # Verified by mutation in both directions -- see 09-test-evidence/wo5-eval-discriminator-mutation.log.
+  #
+  # The trailing `&& echo ok` is load-bearing, not decoration. Keep the last character of these
+  # commands a plain word character, and keep each on ONE line. firm-check-assertions parses this file
+  # with pyyaml when it is installed and a line parser when it is not; the shipped line parser strips
+  # quote characters off BOTH ends of the value independently, so a command whose last character is a
+  # quote gets truncated into a shell syntax error and then fails every run, correct or not. A value
+  # that neither starts nor ends with a quote character survives every parse path identically
+  # (checked against all three in 09-test-evidence/wo5-eval-parse-agreement.log).
+  - test_passes: 'v=$(cat .agent-firm/CURRENT_RUN)/08-qa-verdict.json; test -s "$v" && ! grep -q "Template placeholder" "$v" && ! grep -q "verdict not yet produced" "$v" && grep -Eq "commit_sha.*[0-9a-f]{7}" "$v" && echo ok'
+  # The eval's headline claim -- "QA ran the EXACT suite command, not just the new feature's own
+  # test" -- was asserted nowhere until now. The verdict must name the full suite. A verdict narrowed
+  # to test/divide.test.sh, and the seed template (commands_run: []), both fail this.
+  - test_passes: 'v=$(cat .agent-firm/CURRENT_RUN)/08-qa-verdict.json; grep -q "test/run-tests.sh" "$v" && echo ok'
   # Both of these require REAL script execution to satisfy -- neither is seeded by firm-new-run's
   # template scaffold the way artifact_exists' targets are, so they are strong (not vacuous) proof
   # the firm actually ran the pipeline rather than stopping early with the seed template intact.
