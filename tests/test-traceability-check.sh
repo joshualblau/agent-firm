@@ -350,4 +350,296 @@ mk_ledger "$led23" 'criteria:
 assert_rc "exit 1" 1 "$TC" "$led23"
 assert_output "names the bad JSON" "not valid JSON" "$TC" "$led23"
 
+# ===========================================================================
+# LOCALE INDEPENDENCE.
+#
+# This is a GATE: its exit code must be decided by the run's coverage and by nothing else. It used to
+# be decided, in part, by the ambient locale. The coverage-summary line printed U+00B7 BEFORE any
+# verdict line, so under an ASCII stdout encoding the script died with UnicodeEncodeError at the same
+# point on EVERY run and exited 1 regardless of coverage:
+#
+#     `traceability_passes: true`  could NEVER pass
+#     `traceability_passes: false` passed VACUOUSLY   <- the gate silently inverted
+#
+# Same class, second door: the ledger files were read with open()'s locale-default encoding, so one
+# UTF-8 character in a criterion statement or an evidence string (an em dash is routine) raised
+# UnicodeDecodeError under that locale before a single criterion had been read.
+#
+# The axis under test here is the LOCALE, so the locale is what varies; coverage is held at two known
+# values (fully covered / gapped) so that "the verdict did not change" is a statement with content.
+# ---------------------------------------------------------------------------
+
+# ascii_locale <cmd...> — run <cmd> with a stdout encoding that cannot represent U+00B7.
+# PYTHONCOERCECLOCALE=0 stops Python 3.7+ silently coercing C -> C.UTF-8; PYTHONUTF8=0 stops UTF-8
+# mode doing the same. Without both, this helper quietly becomes a second UTF-8 run.
+ascii_locale() { ( LC_ALL=C LANG=C LC_CTYPE=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 "$@" ); }
+
+# utf8_locale <cmd...> — the control. Prefer a real UTF-8 locale, PROBED rather than assumed (locale
+# names are not portable: en_US.UTF-8 is absent on many CI images, C.UTF-8 on many macs). If the host
+# has none, Python's UTF-8 mode gives the same stdout encoding by the other door, so the control is
+# never skipped.
+UTF8_LOCALE_NAME=""
+for _cand in C.UTF-8 en_US.UTF-8 en_US.utf8 UTF-8; do
+  if LC_ALL="$_cand" LANG="$_cand" LC_CTYPE="$_cand" PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 \
+       python3 -c "import sys; sys.exit(0 if 'utf' in (sys.stdout.encoding or '').lower() else 1)" \
+       </dev/null >/dev/null 2>&1; then
+    UTF8_LOCALE_NAME="$_cand"; break
+  fi
+done
+if [ -n "$UTF8_LOCALE_NAME" ]; then
+  utf8_locale() { ( LC_ALL="$UTF8_LOCALE_NAME" LANG="$UTF8_LOCALE_NAME" LC_CTYPE="$UTF8_LOCALE_NAME" \
+                    PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 "$@" ); }
+  UTF8_HOW="locale $UTF8_LOCALE_NAME"
+else
+  utf8_locale() { ( LC_ALL=C LANG=C LC_CTYPE=C PYTHONUTF8=1 "$@" ); }
+  UTF8_HOW="PYTHONUTF8=1 (no UTF-8 locale on this host)"
+fi
+printf '    (UTF-8 control runs via: %s)\n' "$UTF8_HOW"
+
+t_case "preconditions: the two locale helpers really give python3 different stdout encodings"
+# Without these, every assertion below could pass because BOTH helpers ran in UTF-8 — the locale axis
+# would be named in the titles and varied nowhere, which is exactly the overclaim this suite forbids.
+assert_ok "the ASCII helper gives a stdout that CANNOT encode U+00B7" ascii_locale python3 -c '
+import sys
+try:
+    "·".encode(sys.stdout.encoding or "ascii")
+except (UnicodeEncodeError, LookupError):
+    sys.exit(0)
+sys.exit(1)'
+assert_ok "the UTF-8 helper gives a stdout that CAN" utf8_locale python3 -c '
+import sys
+"·".encode(sys.stdout.encoding or "ascii")'
+
+t_case "the script emits no non-ASCII byte at all (nothing to encode, so nothing can raise)"
+# The streams are also reconfigured to escape-on-error (see the script), which is what protects
+# DATA-derived text. This assertion covers the other half: the script's own LITERALS. Both layers are
+# wanted — the first stops a future decorative bullet reintroducing the bug, the second covers text
+# the script never chose.
+assert_ok "bin/firm-traceability-check is pure ASCII" python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read()
+bad = []
+for lineno, line in enumerate(data.split(b"\n"), 1):
+    for byte in line:
+        if byte > 127:
+            bad.append(lineno); break
+if bad:
+    print("non-ASCII byte(s) on line(s):", bad[:20])
+    sys.exit(1)' "$TC"
+
+t_case "a FULLY COVERED run passes under an ASCII stdout locale (it used to be unable to)"
+led27="$d/led27"
+mk_ledger "$led27" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "t2"}
+  ]}'
+assert_rc "exit 0 under LC_ALL=C" 0 ascii_locale "$TC" "$led27"
+assert_output "prints its PASS headline there" "TRACEABILITY: PASS" ascii_locale "$TC" "$led27"
+assert_output "and the coverage summary line survives" "2 full (yes)" ascii_locale "$TC" "$led27"
+assert_not_output "no UnicodeEncodeError" "UnicodeEncodeError" ascii_locale "$TC" "$led27"
+assert_not_output "no traceback of any kind" "Traceback" ascii_locale "$TC" "$led27"
+
+t_case "a GAPPED run still FAILs under an ASCII stdout locale (and for the right reason)"
+led28="$d/led28"
+mk_ledger "$led28" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"}
+  ]}'
+assert_rc "exit 1 under LC_ALL=C" 1 ascii_locale "$TC" "$led28"
+assert_output "names the uncovered criterion, not an encoding error" \
+  "AC-002: NOT in verdict coverage" ascii_locale "$TC" "$led28"
+assert_not_output "no UnicodeEncodeError" "UnicodeEncodeError" ascii_locale "$TC" "$led28"
+
+t_case "the verdict is the SAME under both locales, and still tells the two runs apart"
+ascii_locale "$TC" "$led27" >/dev/null 2>&1; rc_ascii_full=$?
+utf8_locale  "$TC" "$led27" >/dev/null 2>&1; rc_utf8_full=$?
+ascii_locale "$TC" "$led28" >/dev/null 2>&1; rc_ascii_gap=$?
+utf8_locale  "$TC" "$led28" >/dev/null 2>&1; rc_utf8_gap=$?
+assert_eq "fully-covered run: identical exit code under UTF-8 and ASCII" "$rc_utf8_full" "$rc_ascii_full"
+assert_eq "gapped run: identical exit code under UTF-8 and ASCII" "$rc_utf8_gap" "$rc_ascii_gap"
+# The load-bearing one. Before the fix both ASCII runs exited 1, so they were indistinguishable: the
+# `true` assertion could never hold and the `false` assertion held for a reason unrelated to coverage.
+assert_ne "under ASCII the gate still DISTINGUISHES covered from gapped" "$rc_ascii_full" "$rc_ascii_gap"
+
+t_case "non-ASCII in the LEDGER DATA cannot crash the gate under an ASCII locale either"
+# Built from octal escapes rather than a literal character so this file stays readable in any editor
+# and this fixture cannot be flattened to '-' by a well-meaning reformat.
+EMDASH="$(printf '\342\200\224')"
+led29="$d/led29"
+mk_ledger "$led29" \
+  "criteria:
+  - id: AC-001
+    statement: \"the gate ${EMDASH} an em dash ${EMDASH} lives in a criterion statement\"
+  - id: AC-002
+    statement: \"plain ascii\"" \
+  "{\"acceptance_criteria_coverage\": [
+    {\"id\": \"AC-001\", \"covered\": \"yes\", \"evidence\": \"t1\"},
+    {\"id\": \"AC-002\", \"covered\": \"partial\", \"evidence\": \"happy path only ${EMDASH} error branch untested\"}
+  ]}"
+assert_rc "exit 0 under LC_ALL=C (justified partial)" 0 ascii_locale "$TC" "$led29"
+assert_not_output "no UnicodeDecodeError reading the criteria file" \
+  "UnicodeDecodeError" ascii_locale "$TC" "$led29"
+assert_not_output "no UnicodeEncodeError printing the evidence" \
+  "UnicodeEncodeError" ascii_locale "$TC" "$led29"
+assert_output "still reports the gap" "TRACEABILITY: INCOMPLETE" ascii_locale "$TC" "$led29"
+assert_output "still names the partial criterion" "AC-002: PARTIAL" ascii_locale "$TC" "$led29"
+ascii_locale "$TC" "$led29" >/dev/null 2>&1; rc_ascii_data=$?
+utf8_locale  "$TC" "$led29" >/dev/null 2>&1; rc_utf8_data=$?
+assert_eq "same exit code under UTF-8" "$rc_utf8_data" "$rc_ascii_data"
+
+t_case "a ledger file that is not valid UTF-8 is CANNOT VERIFY, under either locale"
+# Reading it as the locale's encoding was one of the two doors; reading it with errors="replace" would
+# have been the other kind of mistake — a file this script cannot decode yields a SHORT or subtly
+# wrong id list, silently shrinking the set the gate enforces. So it fails closed, the same way a
+# YAML syntax error does, and says the same thing under every locale.
+BADBYTE="$(printf '\377')"
+led34="$d/led34"
+mk_ledger "$led34" \
+  "criteria:
+  - id: AC-001
+    statement: \"a lone ${BADBYTE} byte is not valid UTF-8 in any encoding\"" \
+  '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}'
+assert_rc "undecodable criteria file -> exit 1 [ascii]" 1 ascii_locale "$TC" "$led34"
+assert_rc "undecodable criteria file -> exit 1 [utf-8]" 1 utf8_locale "$TC" "$led34"
+assert_output "says CANNOT VERIFY, naming the encoding [ascii]" "not valid UTF-8" ascii_locale "$TC" "$led34"
+assert_output "says CANNOT VERIFY, naming the encoding [utf-8]" "not valid UTF-8" utf8_locale "$TC" "$led34"
+assert_not_output "never PASSes it [ascii]" "TRACEABILITY: PASS" ascii_locale "$TC" "$led34"
+assert_not_output "no raw traceback [ascii]" "Traceback" ascii_locale "$TC" "$led34"
+
+led35="$d/led35"
+mk_ledger "$led35" \
+  'criteria:
+  - id: AC-001' \
+  "{\"acceptance_criteria_coverage\": [{\"id\": \"AC-001\", \"covered\": \"yes\", \"evidence\": \"${BADBYTE}\"}]}"
+assert_rc "undecodable VERDICT file -> exit 1 [ascii]" 1 ascii_locale "$TC" "$led35"
+assert_rc "undecodable VERDICT file -> exit 1 [utf-8]" 1 utf8_locale "$TC" "$led35"
+assert_output "names the encoding, not a bogus JSON error [ascii]" "not valid UTF-8" ascii_locale "$TC" "$led35"
+assert_not_output "never PASSes it [ascii]" "TRACEABILITY: PASS" ascii_locale "$TC" "$led35"
+
+t_case "regression under BOTH locales: the partial / waiver semantics are unchanged"
+# Two axes, both varied: the coverage value (yes / partial+justified / partial+bare / no+justified)
+# AND the stdout locale. The fixtures are the ones the partial cases above already pin down, re-driven
+# under the ASCII locale that used to swallow every one of them.
+for _loc_fn in ascii_locale utf8_locale; do
+  assert_rc "justified partial -> exit 0 [$_loc_fn]" 0 $_loc_fn "$TC" "$led11"
+  assert_output "justified partial -> INCOMPLETE headline [$_loc_fn]" \
+    "TRACEABILITY: INCOMPLETE" $_loc_fn "$TC" "$led11"
+  assert_not_output "justified partial -> never the substring TRACEABILITY: PASS [$_loc_fn]" \
+    "TRACEABILITY: PASS" $_loc_fn "$TC" "$led11"
+  assert_output "justified partial -> counts truthfully [$_loc_fn]" \
+    "1/2 criteria fully covered" $_loc_fn "$TC" "$led11"
+  assert_rc "EVERY criterion partial -> still exit 0, still not a PASS [$_loc_fn]" 0 $_loc_fn "$TC" "$led12"
+  assert_not_output "EVERY criterion partial -> no PASS headline [$_loc_fn]" \
+    "TRACEABILITY: PASS" $_loc_fn "$TC" "$led12"
+  assert_rc "partial with NO justification -> exit 1 [$_loc_fn]" 1 $_loc_fn "$TC" "$led13"
+  assert_output "partial with NO justification -> names why [$_loc_fn]" \
+    "covered=partial with no justification" $_loc_fn "$TC" "$led13"
+  assert_rc "justified waiver -> exit 0 [$_loc_fn]" 0 $_loc_fn "$TC" "$led16"
+  assert_not_output "justified waiver -> never the substring TRACEABILITY: PASS [$_loc_fn]" \
+    "TRACEABILITY: PASS" $_loc_fn "$TC" "$led16"
+  assert_output "justified waiver -> shown as a gap [$_loc_fn]" \
+    "AC-002: NOT COVERED (waived)" $_loc_fn "$TC" "$led16"
+  assert_rc "all yes -> exit 0 [$_loc_fn]" 0 $_loc_fn "$TC" "$led20"
+  assert_output "all yes -> PASS headline [$_loc_fn]" "TRACEABILITY: PASS" $_loc_fn "$TC" "$led20"
+done
+
+# ===========================================================================
+# SEC-R13 — the regex fallback must not accept a document SHAPE the real parser refuses.
+#
+# `re.findall(r'...id:\s*...')` harvests ids out of ANY text. A criteria file whose TOP LEVEL is a
+# LIST (`- id: AC-001`, no `criteria:` key) is loaded by pyyaml as a list and refused by the
+# parser-present branch as "not a mapping" — but the fallback returned two ids from it and the run
+# PASSED. Same file, opposite verdicts, decided by whether the host happens to have pyyaml installed,
+# and diverging in the dangerous direction: the looser reader was the one saying yes.
+# ---------------------------------------------------------------------------
+
+t_case "SEC-R13: a LIST-shaped criteria file is REFUSED by the regex fallback, not silently accepted"
+led30="$d/led30"
+# The top level is a SEQUENCE — no `criteria:` key anywhere. Deliberately kept to the block shapes
+# both parser doubles handle (tests/fixtures/stub-yaml/yaml.py cannot read a nested mapping under a
+# list item), so the parser branch refuses this for its SHAPE rather than for a syntax error.
+mk_ledger "$led30" \
+  '- id: AC-001
+- id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "t2"}
+  ]}'
+assert_rc "fallback: exit 1" 1 without_yaml "$TC" "$led30"
+assert_output "fallback: says CANNOT VERIFY" "CANNOT VERIFY" without_yaml "$TC" "$led30"
+assert_output "fallback: names the missing top-level criteria: key" \
+  "no top-level" without_yaml "$TC" "$led30"
+assert_not_output "fallback: never PASSes it" "TRACEABILITY: PASS" without_yaml "$TC" "$led30"
+
+t_case "SEC-R13: and the two parser branches now AGREE on that file (the divergence is what was wrong)"
+# Both axes vary: the parser branch (fallback vs a real/stubbed parser) and — implicitly — the answer
+# each gives. The point is not merely that each exits 1; it is that they exit the SAME.
+assert_rc "parser-present branch: exit 1" 1 with_yaml_parser "$TC" "$led30"
+assert_output "parser-present branch: also CANNOT VERIFY" "CANNOT VERIFY" with_yaml_parser "$TC" "$led30"
+without_yaml    "$TC" "$led30" >/dev/null 2>&1; rc_fb_list=$?
+with_yaml_parser "$TC" "$led30" >/dev/null 2>&1; rc_yaml_list=$?
+assert_eq "fallback and parser-present return the same exit code" "$rc_yaml_list" "$rc_fb_list"
+
+t_case "SEC-R13: the refusal is SHAPE-specific — the same ids in a proper mapping still PASS"
+# Guards the other failure mode: a shape check that just rejects everything would also make every
+# assertion above green while breaking the tool. Same ids, same verdict, correct shape.
+led31="$d/led31"
+# Same two ids as led30, correct shape: a mapping whose `criteria:` key holds the sequence.
+mk_ledger "$led31" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "t2"}
+  ]}'
+assert_rc "fallback: exit 0" 0 without_yaml "$TC" "$led31"
+assert_output "fallback: PASS" "TRACEABILITY: PASS" without_yaml "$TC" "$led31"
+assert_rc "parser-present branch agrees: exit 0" 0 with_yaml_parser "$TC" "$led31"
+
+t_case "SEC-R13: an id: key nested under some OTHER top-level key is refused too"
+led32="$d/led32"
+mk_ledger "$led32" \
+  'metadata:
+  criteria:
+    - id: AC-001
+    - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "t2"}
+  ]}'
+# pyyaml reads this as {"metadata": {...}} — doc.get("criteria") is None, so the parser branch finds
+# no ids and fails closed. The fallback used to find two and PASS.
+assert_rc "fallback: exit 1" 1 without_yaml "$TC" "$led32"
+assert_not_output "fallback: never PASSes it" "TRACEABILITY: PASS" without_yaml "$TC" "$led32"
+assert_rc "parser-present branch agrees: exit 1" 1 with_yaml_parser "$TC" "$led32"
+
+t_case "SEC-R13: a uniformly INDENTED criteria mapping is not falsely refused by the fallback"
+# The shape check measures the top-level indent from the document's first structural line instead of
+# hard-coding column 0, so an indented — but still mapping-shaped — document is accepted. Asserted
+# about the FALLBACK only: this file makes no claim here about what pyyaml does with it.
+led33="$d/led33"
+mk_ledger "$led33" \
+  '  criteria:
+    - id: AC-001
+    - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "t2"}
+  ]}'
+assert_rc "fallback: exit 0" 0 without_yaml "$TC" "$led33"
+
+t_case "SEC-R13: the pre-existing zero-id messages are unchanged (the new guard did not swallow them)"
+assert_output "criteria: present, no ids -> the 'install pyyaml or fix the format' message" \
+  "'criteria:' present but no ids parsed" without_yaml "$TC" "$led8"
+assert_output "no criteria: and no ids -> the 'nothing to trace' message" \
+  "nothing to trace is not coverage" without_yaml "$TC" "$led22"
+
 t_summary
