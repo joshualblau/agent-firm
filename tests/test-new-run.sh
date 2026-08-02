@@ -57,15 +57,22 @@ esac
 # ---------------------------------------------------------------------------
 t_case "template seeding: files copied, the visual/ DIRECTORY is skipped (not a crash)"
 repo4="$(mk_repo)"
-out4="$( (cd "$repo4" && "$NEW_RUN" tmpl-check) )"
+# Capture the REAL exit code on the line that produces it. `rc4=$?` must be the very next statement:
+# any command in between (including an assert_*) overwrites $?. The earlier version of this case
+# discarded the return code here and then "checked" it with `assert_ok ... true`, which is a
+# tautology — the literal `true` always exits 0, so that assertion reported ok even when
+# firm-new-run aborted. Reintroducing the templates/visual/ regression left it green while 20 other
+# assertions in this file correctly went red.
+out4="$( (cd "$repo4" && "$NEW_RUN" tmpl-check) )"; rc4=$?
 rd4="$repo4/$out4"
 assert_file "00-intake.md seeded"                 "$rd4/00-intake.md"
 assert_file "01-acceptance-criteria.yaml seeded"   "$rd4/01-acceptance-criteria.yaml"
 assert_file "08-qa-verdict.json seeded"            "$rd4/08-qa-verdict.json"
 assert_no_file "visual/ was NOT copied as a file"  "$rd4/visual"
 # The regression this guards: `cp -n` on a directory fails, and under the script's `set -e` that used
-# to abort run creation entirely. If firm-new-run got this far and returned 0, the regression holds.
-assert_ok "script exited 0 despite templates/visual/ being a directory" true
+# to abort run creation entirely — so the exit code, not just the resulting files, is the evidence.
+assert_eq "script exited 0 despite templates/visual/ being a directory" 0 "$rc4"
+assert_ne "and it printed a run dir rather than dying mid-scaffold" "" "$out4"
 
 # ---------------------------------------------------------------------------
 t_case "default_branch / default_branch_start_sha baseline (new in PR 2)"
