@@ -361,4 +361,165 @@ tp_lines="$( "$CA" "$repo2e/a.yaml" "$repo2e" 2>&1 | wc -l | tr -d ' ' )"
 assert_eq "the child's multi-line output is COLLAPSED onto the one result line, not pasted in" \
   "3" "$tp_lines"
 
+# ===========================================================================================
+# traceability_passes must CLASSIFY firm-traceability-check's exit code, not merely INVERT it.
+#
+# The verb was `check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"), ...)`.
+# With `traceability_passes: false` — the way an eval asserts "this run SHOULD fail traceability" —
+# ANY non-zero exit satisfied it. A genuine coverage gap, a usage error, an unparseable verdict, a
+# missing run dir and an outright crash were indistinguishable, so an eval passed when the checker
+# merely blew up. Third instance of one defect class in this file's neighbourhood (the ASCII-locale
+# inversion in firm-traceability-check, artifact_absent's vacuous pass above): A CHECK THAT CANNOT
+# EVALUATE ITS INPUT MUST NEVER REPORT SUCCESS.
+#
+# Contract, from firm-traceability-check's header: 0 = evaluated/acceptable, 1 = evaluated/coverage
+# INADEQUATE, anything else = CANNOT EVALUATE. Only 0 and 1 may satisfy this verb; anything else is
+# a hard FAIL on BOTH expectations.
+#
+# TWO axes vary across the cases below and both matter: the DECLARED expectation (true / false) and
+# the CHILD'S OUTCOME (covered / genuine gap / unevaluable). Varying only the first would leave the
+# fail-open untouched; varying only the second would not show that `false` is where it bit.
+#
+# SEAM, stated rather than overclaimed: these cases drive the child to exit 2. The mapping from an
+# unexpected CRASH to exit 2 lives in firm-traceability-check and is pinned there
+# (tests/test-traceability-check.sh, "an UNEXPECTED internal error is exit 2"); it cannot be injected
+# through this script, because the only injection point — PYTHONPATH — would break this script's own
+# `import yaml` before the child ever runs. The branch exercised here is `rc not in (0, 1)`, which is
+# the same branch any other unexpected code takes.
+# ===========================================================================================
+
+# stdout+stderr must NOT contain <needle>. (lib.sh has assert_output but no negative form.)
+assert_not_output() {
+  local desc="$1" needle="$2" out; shift 2
+  out="$("$@" 2>&1)"
+  case "$out" in
+    *"$needle"*) _t_no "$desc" "unexpectedly found '$needle' in: $(_t_ctx "$out")" ;;
+    *) _t_ok "$desc" ;;
+  esac
+}
+
+# mk_trace_repo <slug> <criteria-content> <verdict-content> — a scratch repo with a real run ledger
+# whose two traceability inputs are written EXPLICITLY over firm-new-run's seeded templates, so the
+# condition under test is the only thing wrong with the ledger. Echoes the repo path.
+mk_trace_repo() {
+  local _slug="$1" _crit="$2" _verdict="$3" _r _run
+  _r="$(mk_repo)"
+  ( cd "$_r" && "$NEW_RUN" "$_slug" fast_path >/dev/null )
+  _run="$_r/$(cat "$_r/.agent-firm/CURRENT_RUN")"
+  printf '%s' "$_crit"    > "$_run/01-acceptance-criteria.yaml"
+  printf '%s' "$_verdict" > "$_run/08-qa-verdict.json"
+  printf '%s' "$_r"
+}
+
+GOOD_CRIT='criteria:
+  - id: AC-001
+  - id: AC-002'
+GOOD_COV='{"verdict":"APPROVE","acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"e1"},{"id":"AC-002","covered":"yes","evidence":"e2"}]}'
+BADBYTE="$(printf '\377')"
+
+t_case "traceability_passes: false does NOT pass when the checker CANNOT EVALUATE"
+# One repo per distinct cannot-evaluate condition firm-traceability-check defines. Every one of these
+# satisfied `traceability_passes: false` before the fix.
+tp_bad=""
+tp_add() { tp_bad="$tp_bad$1|$2
+"; }
+
+r_nocrit="$(mk_trace_repo tp-nocrit "$GOOD_CRIT" "$GOOD_COV")"
+rm -f "$r_nocrit/$(cat "$r_nocrit/.agent-firm/CURRENT_RUN")/01-acceptance-criteria.yaml"
+tp_add "01-acceptance-criteria.yaml is missing" "$r_nocrit"
+
+r_noverd="$(mk_trace_repo tp-noverd "$GOOD_CRIT" "$GOOD_COV")"
+rm -f "$r_noverd/$(cat "$r_noverd/.agent-firm/CURRENT_RUN")/08-qa-verdict.json"
+tp_add "08-qa-verdict.json is missing" "$r_noverd"
+
+r_dircrit="$(mk_trace_repo tp-dircrit "$GOOD_CRIT" "$GOOD_COV")"
+_dc="$r_dircrit/$(cat "$r_dircrit/.agent-firm/CURRENT_RUN")/01-acceptance-criteria.yaml"
+rm -f "$_dc"; mkdir -p "$_dc"
+tp_add "the criteria path exists but is a directory" "$r_dircrit"
+
+tp_add "the verdict is not valid JSON" \
+  "$(mk_trace_repo tp-badjson "$GOOD_CRIT" '{not json at all')"
+tp_add "the verdict top level is not an object" \
+  "$(mk_trace_repo tp-notobj "$GOOD_CRIT" '["not","an","object"]')"
+tp_add "acceptance_criteria_coverage is not a list" \
+  "$(mk_trace_repo tp-notlist "$GOOD_CRIT" '{"acceptance_criteria_coverage":{"AC-001":"yes"}}')"
+tp_add "there are zero acceptance criteria" \
+  "$(mk_trace_repo tp-nocrits 'task_slug: nothing-here
+' '{"acceptance_criteria_coverage":[]}')"
+tp_add "a coverage entry is malformed" \
+  "$(mk_trace_repo tp-malformed "$GOOD_CRIT" \
+     '{"acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"e"},"a bare string"]}')"
+tp_add "a covered value is outside the schema enum" \
+  "$(mk_trace_repo tp-badenum "$GOOD_CRIT" \
+     '{"acceptance_criteria_coverage":[{"id":"AC-001","covered":"mostly","evidence":"e"},{"id":"AC-002","covered":"yes","evidence":"e"}]}')"
+tp_add "the criteria file is not valid UTF-8" \
+  "$(mk_trace_repo tp-badutf8 "criteria:
+  - id: AC-001
+    statement: \"a lone ${BADBYTE} byte\"" "$GOOD_COV")"
+
+while IFS='|' read -r _lbl _r; do
+  [ -n "$_lbl" ] || continue
+  write_assertions 'assertions:
+  - traceability_passes: false' "$_r"
+  assert_rc "false must NOT be satisfied by a checker that could not evaluate: $_lbl" 1 \
+    "$CA" "$_r/a.yaml" "$_r"
+  assert_output "and says WHY it refused: $_lbl" \
+    "CANNOT VERIFY (fail-closed): firm-traceability-check reached no coverage verdict" \
+    "$CA" "$_r/a.yaml" "$_r"
+  # The other expectation, same state: `true` must fail too. A fix that merely flipped the polarity
+  # would show up here.
+  write_assertions 'assertions:
+  - traceability_passes: true' "$_r"
+  assert_rc "true also fails in that same state: $_lbl" 1 "$CA" "$_r/a.yaml" "$_r"
+done <<EOF
+$tp_bad
+EOF
+
+t_case "traceability_passes: false STILL passes on a GENUINE coverage failure (not made unsatisfiable)"
+# The load-bearing discriminator. If closing the fail-open had made `false` unsatisfiable, every eval
+# that inverts this gate would silently break — so the exit-1 class is pinned here, in the verb, with
+# the same fixture shape as the cannot-evaluate cases above and only the defect changed.
+r_gap="$(mk_trace_repo tp-realgap "$GOOD_CRIT" \
+  '{"verdict":"APPROVE","acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"e1"}]}')"
+write_assertions 'assertions:
+  - traceability_passes: false' "$r_gap"
+assert_rc "PASSes: AC-002 is genuinely uncovered, and the checker said so" 0 "$CA" "$r_gap/a.yaml" "$r_gap"
+assert_output "the child's own words still reach the detail (not regressed)" "AC-002" \
+  "$CA" "$r_gap/a.yaml" "$r_gap"
+assert_not_output "and it is NOT reported as unevaluable" "CANNOT VERIFY" "$CA" "$r_gap/a.yaml" "$r_gap"
+write_assertions 'assertions:
+  - traceability_passes: true' "$r_gap"
+assert_rc "and true FAILs on that same gap" 1 "$CA" "$r_gap/a.yaml" "$r_gap"
+
+t_case "traceability_passes: covered/unevaluable/gapped are three DIFFERENT results, not two"
+# Same assertions file (`false`), three ledger states. Without this, "false fails on a bad ledger"
+# could be satisfied by a verb that had simply been broken into always failing.
+r_full="$(mk_trace_repo tp-full "$GOOD_CRIT" "$GOOD_COV")"
+write_assertions 'assertions:
+  - traceability_passes: false' "$r_full"
+assert_rc "false FAILs on a fully covered run" 1 "$CA" "$r_full/a.yaml" "$r_full"
+write_assertions 'assertions:
+  - traceability_passes: true' "$r_full"
+assert_rc "true PASSes on that same fully covered run" 0 "$CA" "$r_full/a.yaml" "$r_full"
+
+t_case "traceability_passes: NO LEDGER is not a coverage verdict either"
+# `subprocess.run([tc, led or repo])` handed the SCRATCH-REPO ROOT to the child as though it were a
+# run directory when no ledger resolved. A criteria/verdict pair lying at the repo root was then read
+# as this run's coverage — the same shape as verdict_is' CWD bug closed further up, and it pointed
+# the dangerous way: a run that produced no ledger at all could satisfy `traceability_passes: true`.
+repo16="$(mk_repo)"
+printf '%s' "$GOOD_CRIT" > "$repo16/01-acceptance-criteria.yaml"
+printf '%s' "$GOOD_COV"  > "$repo16/08-qa-verdict.json"
+assert_no_file "precondition: no run ever started here" "$repo16/.agent-firm"
+assert_file "precondition: but a fully-covered pair sits at the repo ROOT" "$repo16/08-qa-verdict.json"
+write_assertions 'assertions:
+  - traceability_passes: true' "$repo16"
+assert_rc "true FAILs -- stray root files are not this run's coverage" 1 "$CA" "$repo16/a.yaml" "$repo16"
+assert_output "and names the reason" "CANNOT VERIFY (fail-closed): no run ledger" \
+  "$CA" "$repo16/a.yaml" "$repo16"
+write_assertions 'assertions:
+  - traceability_passes: false' "$repo16"
+assert_rc "false FAILs in that same state -- fail-closed on both expectations" 1 \
+  "$CA" "$repo16/a.yaml" "$repo16"
+
 t_summary

@@ -122,7 +122,7 @@ mk_ledger "$led8" \
   - "AC-001 description with no id key"
   - "AC-002 description with no id key"' \
   '{"acceptance_criteria_coverage": []}'
-assert_rc "CANNOT VERIFY -> exit 1, not a silent pass" 1 without_yaml "$TC" "$led8"
+assert_rc "CANNOT VERIFY -> exit 2 (cannot evaluate), not a silent pass" 2 without_yaml "$TC" "$led8"
 assert_output "says CANNOT VERIFY" "CANNOT VERIFY" without_yaml "$TC" "$led8"
 
 t_case "regex fallback (pyyaml hidden) still correctly parses BLOCK-style ids"
@@ -253,7 +253,7 @@ mk_ledger "$led17" \
   'criteria:
   - id: AC-001' \
   '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "mostly", "evidence": "e"}]}'
-assert_rc "FAIL" 1 "$TC" "$led17"
+assert_rc "CANNOT EVALUATE -> exit 2, not exit 1" 2 "$TC" "$led17"
 assert_output "names the bad value" "is not one of yes/no/partial" "$TC" "$led17"
 
 t_case "a coverage entry with no covered value at all -> FAIL"
@@ -262,7 +262,7 @@ mk_ledger "$led18" \
   'criteria:
   - id: AC-001' \
   '{"acceptance_criteria_coverage": [{"id": "AC-001", "evidence": "e"}]}'
-assert_rc "FAIL" 1 "$TC" "$led18"
+assert_rc "CANNOT EVALUATE -> exit 2, not exit 1" 2 "$TC" "$led18"
 assert_output "names why" "no \`covered\` value" "$TC" "$led18"
 
 t_case "a malformed coverage entry is counted as a problem, not dropped"
@@ -274,7 +274,7 @@ mk_ledger "$led19" \
     {"id": "AC-001", "covered": "yes", "evidence": "t"},
     "this entry is a bare string"
   ]}'
-assert_rc "FAIL" 1 "$TC" "$led19"
+assert_rc "CANNOT EVALUATE -> exit 2, not exit 1" 2 "$TC" "$led19"
 assert_output "names the malformed entry" "malformed" "$TC" "$led19"
 
 t_case "all-yes still PASSes, and the headline says so precisely"
@@ -304,7 +304,7 @@ t_case "zero acceptance criteria is CANNOT VERIFY, not a vacuous PASS"
 led22="$d/led22"
 mk_ledger "$led22" 'task_slug: nothing-here
 ' '{"acceptance_criteria_coverage": []}'
-assert_rc "exit 1" 1 "$TC" "$led22"
+assert_rc "exit 2 (cannot evaluate)" 2 "$TC" "$led22"
 assert_output "says nothing to trace is not coverage" "nothing to trace is not coverage" "$TC" "$led22"
 
 t_case "with a YAML parser present, a BROKEN criteria file is CANNOT VERIFY, not a quiet regex fallback"
@@ -317,7 +317,7 @@ mk_ledger "$led24" \
   - id: AC-001
    id: AC-002 [unclosed' \
   '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}'
-assert_rc "exit 1" 1 with_yaml_parser "$TC" "$led24"
+assert_rc "exit 2 (cannot evaluate)" 2 with_yaml_parser "$TC" "$led24"
 assert_output "names the invalid YAML" "not valid YAML" with_yaml_parser "$TC" "$led24"
 assert_output "did not silently proceed on a partial id list" "CANNOT VERIFY" with_yaml_parser "$TC" "$led24"
 
@@ -325,7 +325,7 @@ t_case "with a YAML parser present, a criteria file that is not a mapping is CAN
 led25="$d/led25"
 mk_ledger "$led25" 'just prose where the criteria should be' \
   '{"acceptance_criteria_coverage": []}'
-assert_rc "exit 1" 1 with_yaml_parser "$TC" "$led25"
+assert_rc "exit 2 (cannot evaluate)" 2 with_yaml_parser "$TC" "$led25"
 assert_output "names the wrong top-level type" "expected a mapping" with_yaml_parser "$TC" "$led25"
 
 t_case "the pyyaml branch agrees with the fallback on a well-formed file (parser axis really varies)"
@@ -347,7 +347,7 @@ t_case "an unparseable verdict is CANNOT VERIFY, not a crash and not a pass"
 led23="$d/led23"
 mk_ledger "$led23" 'criteria:
   - id: AC-001' '{not json at all'
-assert_rc "exit 1" 1 "$TC" "$led23"
+assert_rc "exit 2 (cannot evaluate)" 2 "$TC" "$led23"
 assert_output "names the bad JSON" "not valid JSON" "$TC" "$led23"
 
 # ===========================================================================
@@ -511,8 +511,8 @@ mk_ledger "$led34" \
   - id: AC-001
     statement: \"a lone ${BADBYTE} byte is not valid UTF-8 in any encoding\"" \
   '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}'
-assert_rc "undecodable criteria file -> exit 1 [ascii]" 1 ascii_locale "$TC" "$led34"
-assert_rc "undecodable criteria file -> exit 1 [utf-8]" 1 utf8_locale "$TC" "$led34"
+assert_rc "undecodable criteria file -> exit 2 (cannot evaluate) [ascii]" 2 ascii_locale "$TC" "$led34"
+assert_rc "undecodable criteria file -> exit 2 (cannot evaluate) [utf-8]" 2 utf8_locale "$TC" "$led34"
 assert_output "says CANNOT VERIFY, naming the encoding [ascii]" "not valid UTF-8" ascii_locale "$TC" "$led34"
 assert_output "says CANNOT VERIFY, naming the encoding [utf-8]" "not valid UTF-8" utf8_locale "$TC" "$led34"
 assert_not_output "never PASSes it [ascii]" "TRACEABILITY: PASS" ascii_locale "$TC" "$led34"
@@ -523,8 +523,8 @@ mk_ledger "$led35" \
   'criteria:
   - id: AC-001' \
   "{\"acceptance_criteria_coverage\": [{\"id\": \"AC-001\", \"covered\": \"yes\", \"evidence\": \"${BADBYTE}\"}]}"
-assert_rc "undecodable VERDICT file -> exit 1 [ascii]" 1 ascii_locale "$TC" "$led35"
-assert_rc "undecodable VERDICT file -> exit 1 [utf-8]" 1 utf8_locale "$TC" "$led35"
+assert_rc "undecodable VERDICT file -> exit 2 (cannot evaluate) [ascii]" 2 ascii_locale "$TC" "$led35"
+assert_rc "undecodable VERDICT file -> exit 2 (cannot evaluate) [utf-8]" 2 utf8_locale "$TC" "$led35"
 assert_output "names the encoding, not a bogus JSON error [ascii]" "not valid UTF-8" ascii_locale "$TC" "$led35"
 assert_not_output "never PASSes it [ascii]" "TRACEABILITY: PASS" ascii_locale "$TC" "$led35"
 
@@ -577,7 +577,7 @@ mk_ledger "$led30" \
     {"id": "AC-001", "covered": "yes", "evidence": "t1"},
     {"id": "AC-002", "covered": "yes", "evidence": "t2"}
   ]}'
-assert_rc "fallback: exit 1" 1 without_yaml "$TC" "$led30"
+assert_rc "fallback: exit 2 (cannot evaluate)" 2 without_yaml "$TC" "$led30"
 assert_output "fallback: says CANNOT VERIFY" "CANNOT VERIFY" without_yaml "$TC" "$led30"
 assert_output "fallback: names the missing top-level criteria: key" \
   "no top-level" without_yaml "$TC" "$led30"
@@ -586,7 +586,7 @@ assert_not_output "fallback: never PASSes it" "TRACEABILITY: PASS" without_yaml 
 t_case "SEC-R13: and the two parser branches now AGREE on that file (the divergence is what was wrong)"
 # Both axes vary: the parser branch (fallback vs a real/stubbed parser) and — implicitly — the answer
 # each gives. The point is not merely that each exits 1; it is that they exit the SAME.
-assert_rc "parser-present branch: exit 1" 1 with_yaml_parser "$TC" "$led30"
+assert_rc "parser-present branch: exit 2 (cannot evaluate)" 2 with_yaml_parser "$TC" "$led30"
 assert_output "parser-present branch: also CANNOT VERIFY" "CANNOT VERIFY" with_yaml_parser "$TC" "$led30"
 without_yaml    "$TC" "$led30" >/dev/null 2>&1; rc_fb_list=$?
 with_yaml_parser "$TC" "$led30" >/dev/null 2>&1; rc_yaml_list=$?
@@ -622,9 +622,9 @@ mk_ledger "$led32" \
   ]}'
 # pyyaml reads this as {"metadata": {...}} — doc.get("criteria") is None, so the parser branch finds
 # no ids and fails closed. The fallback used to find two and PASS.
-assert_rc "fallback: exit 1" 1 without_yaml "$TC" "$led32"
+assert_rc "fallback: exit 2 (cannot evaluate)" 2 without_yaml "$TC" "$led32"
 assert_not_output "fallback: never PASSes it" "TRACEABILITY: PASS" without_yaml "$TC" "$led32"
-assert_rc "parser-present branch agrees: exit 1" 1 with_yaml_parser "$TC" "$led32"
+assert_rc "parser-present branch agrees: exit 2 (cannot evaluate)" 2 with_yaml_parser "$TC" "$led32"
 
 t_case "SEC-R13: a uniformly INDENTED criteria mapping is not falsely refused by the fallback"
 # The shape check measures the top-level indent from the document's first structural line instead of
@@ -646,5 +646,159 @@ assert_output "criteria: present, no ids -> the 'install pyyaml or fix the forma
   "'criteria:' present but no ids parsed" without_yaml "$TC" "$led8"
 assert_output "no criteria: and no ids -> the 'nothing to trace' message" \
   "nothing to trace is not coverage" without_yaml "$TC" "$led22"
+
+# ===========================================================================
+# EXIT-CODE CLASSIFICATION — "evaluated, coverage is inadequate" vs "could not evaluate".
+#
+# This gate is INVERTED by its callers: `traceability_passes: false` in a golden eval asserts "this
+# run SHOULD fail traceability". Every CANNOT VERIFY path used to exit 1, exactly like a genuine
+# coverage gap, so bin/firm-check-assertions' `(rc == 0) == (want == "true")` was satisfied by a
+# usage error, an unparseable verdict, a missing run dir, or an outright crash. An eval asserting
+# "traceability correctly fails here" passed when the checker merely blew up.
+#
+# The contract now has THREE codes: 0 evaluated/acceptable, 1 evaluated/INADEQUATE, 2 CANNOT
+# EVALUATE. The axis under test in this whole section is WHICH KIND OF BAD INPUT the checker was
+# given, so that is what varies; every case below asserts the exact code, never merely "non-zero" —
+# "non-zero" is the very conflation being removed, and a test that only asserted it would go green
+# against the bug.
+# ---------------------------------------------------------------------------
+
+t_case "a GENUINE coverage failure is exit 1 — the only code that means 'the gate looked and said no'"
+# Held first and separately: if the fix made cannot-evaluate exit 2 by making EVERYTHING exit 2,
+# `traceability_passes: false` would become unsatisfiable and every eval that inverts this gate would
+# break. These three are the whole of the exit-1 class.
+assert_rc "an uncovered criterion -> exit 1" 1 "$TC" "$led4"
+assert_rc "covered=no with no justification -> exit 1" 1 "$TC" "$led5"
+assert_rc "covered=partial with no justification -> exit 1" 1 "$TC" "$led13"
+assert_output "and it is reported as a FAIL, not as CANNOT VERIFY" "TRACEABILITY: FAIL" "$TC" "$led4"
+assert_not_output "a real coverage gap never claims the run was unevaluable" \
+  "CANNOT VERIFY" "$TC" "$led4"
+
+# --- fixtures for the cannot-evaluate conditions this script defines -------
+# Three are new here because they had no coverage at all before: a non-list
+# acceptance_criteria_coverage, a verdict whose top level is not an object, and a criteria PATH that
+# exists but cannot be read as a file (a directory). The last one used to escape read_text as a bare
+# OSError and take Python's default exit code — 1, i.e. "coverage is inadequate", for a file the
+# script never managed to open.
+led36="$d/led36"
+mk_ledger "$led36" 'criteria:
+  - id: AC-001' '{"acceptance_criteria_coverage": {"AC-001": "yes"}}'
+
+led37="$d/led37"
+mk_ledger "$led37" 'criteria:
+  - id: AC-001' '["not", "an", "object"]'
+
+led38="$d/led38"
+mkdir -p "$led38/01-acceptance-criteria.yaml"      # a DIRECTORY where the criteria file belongs
+printf '%s' '{"acceptance_criteria_coverage": [{"id": "AC-001", "covered": "yes", "evidence": "t"}]}' \
+  > "$led38/08-qa-verdict.json"
+assert_file "precondition: the criteria path exists (so the MISSING guard does not catch it first)" \
+  "$led38/01-acceptance-criteria.yaml"
+
+led39="$d/led39"   # BOTH kinds at once: an uninterpretable entry AND a genuine uncovered criterion
+mk_ledger "$led39" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002
+  - id: AC-003' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "t1"},
+    {"id": "AC-002", "covered": "mostly", "evidence": "e"}
+  ]}'
+
+t_case "every CANNOT-EVALUATE condition exits 2, and none of them exits 1"
+# One loop, one assertion shape, every condition the script defines as unevaluable. `|`-separated
+# because bash 3.2 has no associative arrays; the label is only for the failure message.
+while IFS='|' read -r _lbl _dir; do
+  [ -n "$_lbl" ] || continue
+  assert_rc "cannot evaluate -> exit 2: $_lbl" 2 "$TC" "$_dir"
+  assert_not_output "and never claims a coverage verdict: $_lbl" "TRACEABILITY: PASS" "$TC" "$_dir"
+  assert_not_output "and never reports it as a coverage FAIL: $_lbl" "TRACEABILITY: FAIL" "$TC" "$_dir"
+done <<EOF
+run dir does not exist|$d/no-such-run-dir
+missing 01-acceptance-criteria.yaml|$led1
+missing 08-qa-verdict.json|$d/led2
+criteria path is a directory, not a file|$led38
+criteria file is not valid UTF-8|$led34
+verdict file is not valid UTF-8|$led35
+verdict is not valid JSON|$led23
+verdict top level is not an object|$led37
+acceptance_criteria_coverage is not a list|$led36
+zero acceptance criteria|$led22
+a coverage entry is malformed|$led19
+covered value is outside the schema enum|$led17
+no covered value at all|$led18
+EOF
+
+t_case "cannot-evaluate conditions that need a specific parser branch exit 2 there too"
+# Same class, but each only reachable on one side of the pyyaml/regex split, so they cannot ride the
+# loop above (which runs with whatever parser the host has).
+assert_rc "broken YAML, parser present -> exit 2" 2 with_yaml_parser "$TC" "$led24"
+assert_rc "criteria top level is not a mapping, parser present -> exit 2" 2 with_yaml_parser "$TC" "$led25"
+assert_rc "criteria: present but no ids parseable, fallback -> exit 2" 2 without_yaml "$TC" "$led8"
+assert_rc "LIST-shaped criteria file, fallback -> exit 2" 2 without_yaml "$TC" "$led30"
+assert_rc "criteria nested under another key, fallback -> exit 2" 2 without_yaml "$TC" "$led32"
+
+t_case "an UNEXPECTED internal error is exit 2, not Python's default exit 1"
+# Python exits 1 on an unhandled exception — the exact code reserved for a real coverage failure. So
+# a crash was indistinguishable from "this run has an uncovered criterion", and a caller inverting
+# the gate counted the crash as the failure it wanted. Injected the same way this file already hides
+# pyyaml (a PYTHONPATH double), but raising something the script CANNOT classify as "pyyaml absent":
+# a real broken/partial install behaves exactly like this.
+BROKENYAML="$(mktemp -d "${TMPDIR:-/tmp}/firm-tc-badyaml.XXXXXX")"; t_track "$BROKENYAML"
+printf 'raise RuntimeError("simulated broken pyyaml install")\n' > "$BROKENYAML/yaml.py"
+with_broken_yaml() { ( PYTHONPATH="$BROKENYAML${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
+assert_ok "precondition: the double raises at import, and NOT an ImportError" \
+  with_broken_yaml python3 -c '
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(1)          # would be the legitimate degraded path, not a crash — wrong axis
+except RuntimeError:
+    sys.exit(0)
+sys.exit(1)'
+# led3 is FULLY COVERED: without the crash this run exits 0, so a non-zero code here is the crash and
+# nothing else — the fixture cannot pass for an unrelated coverage reason.
+assert_rc "precondition: this ledger exits 0 when nothing goes wrong" 0 "$TC" "$led3"
+assert_rc "a crashing run -> exit 2 (cannot evaluate), NOT 1" 2 with_broken_yaml "$TC" "$led3"
+assert_output "and says so in one line, on top of the traceback" \
+  "TRACEABILITY: CANNOT VERIFY -- internal error" with_broken_yaml "$TC" "$led3"
+assert_not_output "a crash is never dressed up as a coverage verdict" \
+  "TRACEABILITY: FAIL" with_broken_yaml "$TC" "$led3"
+assert_not_output "and certainly never as a PASS" "TRACEABILITY: PASS" with_broken_yaml "$TC" "$led3"
+
+t_case "unevaluable coverage takes PRECEDENCE over a real gap found alongside it"
+# AC-002's value cannot be interpreted and AC-003 is genuinely uncovered. The run has NO verdict: the
+# uninterpretable value could have gone either way. Reporting exit 1 here would let a caller treat a
+# half-unreadable verdict as a decided coverage failure.
+assert_rc "exit 2, not 1" 2 "$TC" "$led39"
+assert_output "names the uninterpretable value" "is not one of yes/no/partial" "$TC" "$led39"
+assert_output "AND still surfaces the genuine gap rather than hiding it" \
+  "AC-003: NOT in verdict coverage" "$TC" "$led39"
+assert_not_output "but does not call the run a coverage FAIL" "TRACEABILITY: FAIL" "$TC" "$led39"
+assert_output "the summary counts both kinds separately" "1 problem(s) | 1 unverifiable" "$TC" "$led39"
+
+t_case "the three codes are genuinely DISTINCT (this is the whole point)"
+"$TC" "$led3"  >/dev/null 2>&1; rc_cls_ok=$?
+"$TC" "$led4"  >/dev/null 2>&1; rc_cls_gap=$?
+"$TC" "$led17" >/dev/null 2>&1; rc_cls_unv=$?
+assert_eq "covered run -> 0" "0" "$rc_cls_ok"
+assert_eq "genuine coverage failure -> 1" "1" "$rc_cls_gap"
+assert_eq "cannot evaluate -> 2" "2" "$rc_cls_unv"
+assert_ne "a coverage failure is NOT reported with the cannot-evaluate code" "$rc_cls_unv" "$rc_cls_gap"
+assert_ne "and neither is confusable with success" "$rc_cls_ok" "$rc_cls_gap"
+
+t_case "the classification survives an ASCII stdout locale (both axes vary: locale AND outcome)"
+# The locale property this script already holds must cover the NEW code too: an exit code decided by
+# the ambient locale rather than by the input is the original fail-open in this file, one door along.
+for _loc_fn in ascii_locale utf8_locale; do
+  assert_rc "covered -> 0 [$_loc_fn]" 0 $_loc_fn "$TC" "$led3"
+  assert_rc "genuine coverage failure -> 1 [$_loc_fn]" 1 $_loc_fn "$TC" "$led4"
+  assert_rc "cannot evaluate (bad enum value) -> 2 [$_loc_fn]" 2 $_loc_fn "$TC" "$led17"
+  assert_rc "cannot evaluate (unparseable verdict) -> 2 [$_loc_fn]" 2 $_loc_fn "$TC" "$led23"
+  assert_not_output "no UnicodeEncodeError on the new CANNOT VERIFY path [$_loc_fn]" \
+    "UnicodeEncodeError" $_loc_fn "$TC" "$led17"
+done
 
 t_summary
