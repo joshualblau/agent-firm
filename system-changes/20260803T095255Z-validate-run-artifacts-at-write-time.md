@@ -104,11 +104,20 @@ Consequences a reviewer should weigh:
 - The firm's first principle is "artifacts are the source of truth", and those artifacts are outside
   version control — so the source of truth is unreviewable by anyone but the machine that wrote it.
 
-Found by independent review (F-22). Not fixed here, because the fix is a policy decision with real
-tradeoffs (ledgers contain full run transcripts and can be large; some may hold sensitive output).
-Options, for a separate decision: commit ledgers under a size/retention policy; commit only the
-decision-bearing artifacts (`00`, `01`, `03`, `07`, `08`, `10`, `11`) and keep `09-test-evidence/` local;
-or accept the gap and stop citing ledger paths as if they were durable references.
+Found by independent review (F-22). **No longer an open question.** It is now a specific proposal:
+`system-changes/20260803T101922Z-commit-the-decision-bearing-ledger.md`, whose shape was settled at the
+Requirements gate of run `20260803T120043Z-cleanup-and-identity-gate` — tier A is the decision artifacts
+`00`-`12` **plus `run.jsonl`** (measured 0.44 MB/run over seven closed runs, ~44 MB at 100 runs), and
+bulk `09-test-evidence/` stays local but **curated**: the specific artifacts an approved PR cites are
+copied into `system-changes/evidence/<pr-slug>/` so the document is checkable from a clone. That PR is
+still `Status: proposed` and still needs its own approval; only its shape is settled.
+
+*(Corrected on third review: this footer previously offered three undecided options and named a narrower
+tier — `00`, `01`, `03`, `07`, `08`, `10`, `11`, without `run.jsonl`. That enumeration is superseded and was
+stale in six files at once. `run.jsonl` in particular belongs in tier A: it is the only durable source for
+the agent-active measurement in the wall-clock PR, and the judge-round attribution in the stop-rule PR is
+recoverable from nothing else. Fixing it in one file and not the other five is the failure mode this batch
+was rejected for three times.)*
 
 ## Human decision
 - [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
