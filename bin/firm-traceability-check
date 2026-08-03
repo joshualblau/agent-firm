@@ -20,11 +20,39 @@
 #   covered: no + evidence        ALLOWED (exit 0), reported as a waived GAP (unchanged verdict,
 #                                 newly visible in the output).
 #   covered: no + no evidence     FAIL (exit 1) -- unchanged.
-#   covered: missing / not in the enum / a malformed coverage entry   FAIL -- a coverage value this
-#                                 script cannot interpret is not evidence of coverage.
+#   covered: missing / not in the enum / a malformed coverage entry   CANNOT EVALUATE -- a coverage
+#                                 value this script cannot interpret is not evidence of coverage,
+#                                 and it is not evidence of a coverage GAP either. It is evidence of
+#                                 nothing at all, which is a third outcome; see the contract below.
 #
-# Exit 0 = no problems (headline PASS if every criterion is `yes`, INCOMPLETE if justified gaps
-# remain). 1 = FAIL / cannot verify. 2 = missing inputs.
+# EXIT-CODE CONTRACT -- THREE outcomes, never two.
+#
+# Callers INVERT this gate: `traceability_passes: false` in a golden eval asserts "this run SHOULD
+# fail traceability". So "the checker reached a coverage verdict and the answer is no" and "the
+# checker could not reach a verdict at all" must not share an exit code. They used to -- every
+# CANNOT VERIFY path below exited 1, exactly like a genuine coverage gap -- so
+# bin/firm-check-assertions' `(rc == 0) == (want == "true")` was satisfied by a usage error, an
+# unparseable verdict, a missing run dir, or an outright crash. An eval asserting "traceability
+# correctly fails here" passed when the checker merely blew up. Same defect class as the two closed
+# before it (the ASCII-locale inversion above, artifact_absent's vacuous pass): A CHECK THAT CANNOT
+# EVALUATE ITS INPUT MUST NEVER REPORT SUCCESS -- and must never be mistakable for a real verdict.
+#
+#   0  EVALUATED, coverage acceptable. Headline PASS when every criterion is `yes`, INCOMPLETE when
+#      justified gaps remain.
+#   1  EVALUATED, coverage INADEQUATE. A real, criterion-level coverage failure: a criterion missing
+#      from the verdict, or `no`/`partial` with no justification. THE ONLY CODE THAT MEANS "the gate
+#      looked, and the answer is no".
+#   2  CANNOT EVALUATE. Nothing whatsoever was decided about coverage: usage errors, missing inputs,
+#      an unreadable/unparseable criteria file or verdict, zero criteria, a coverage entry or
+#      `covered` value this script cannot interpret, and any unexpected internal error (an unhandled
+#      exception exits 1 by default, which would land squarely on the "coverage is inadequate" code
+#      -- see the excepthook in the Python block).
+#
+# 2 ABSORBS the previous "missing inputs" meaning rather than adding a fourth code: a missing input
+# IS a cannot-evaluate, and a single such code matches bin/firm-qa-clean-check (0 clean / 1 dirty /
+# 2 CANNOT VERIFY), which firm-check-assertions already classifies correctly. Callers must read
+# ANYTHING other than 0 or 1 -- including a code this script never deliberately returns -- as
+# cannot-evaluate, and must fail their assertion on it whichever way they were inverting the gate.
 #
 # This file is deliberately ASCII end to end -- see the locale-hardening note in the Python block
 # below, and the assertion in tests/test-traceability-check.sh that keeps it that way.
@@ -35,7 +63,12 @@ if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent
 if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
 
 python3 - "$run_dir" <<'PY'
-import json, re, sys, os
+import json, re, sys, os, traceback
+
+# --- exit-code contract (spelled out in the shell header above) -------------
+EXIT_OK              = 0   # evaluated; coverage acceptable
+EXIT_COVERAGE_FAIL   = 1   # evaluated; coverage INADEQUATE -- the only "the gate says no" code
+EXIT_CANNOT_EVALUATE = 2   # nothing decided about coverage; not a verdict in either direction
 
 # --- locale hardening -------------------------------------------------------
 # This script is a GATE. Its exit code must depend on the run's coverage and on NOTHING else -- least
@@ -78,6 +111,40 @@ def emit(msg):
         print(msg.encode(enc, "backslashreplace").decode(enc, "replace"))
 
 
+def _crash_is_cannot_evaluate(exc_type, exc, tb):
+    """An UNEXPECTED exception is CANNOT EVALUATE (exit 2), never "coverage is inadequate" (exit 1).
+
+    Python exits 1 on an unhandled exception -- precisely the code this gate reserves for a real,
+    criterion-level coverage failure. Without this hook a crash is INDISTINGUISHABLE from "the run
+    has an uncovered criterion", so a caller inverting the gate (`traceability_passes: false`)
+    counts the crash as the failure it was hoping for. Reachable for real: a broken pyyaml install
+    that raises something other than ImportError at import time, a corrupt .pyc, an interpreter-level
+    failure -- none of which this script can enumerate in advance, which is the whole point of
+    catching them by class rather than by case.
+
+    The traceback is still printed (diagnosis matters), and the exit goes through os._exit so no
+    later handler or interpreter-shutdown path can put the code back to 1. os._exit skips stdio
+    flushing, hence the explicit flushes.
+    """
+    try:
+        traceback.print_exception(exc_type, exc, tb)
+    except Exception:
+        pass
+    try:
+        emit(f"TRACEABILITY: CANNOT VERIFY -- internal error: {exc_type.__name__}: {exc}")
+    except Exception:
+        pass
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.flush()
+        except Exception:
+            pass
+    os._exit(EXIT_CANNOT_EVALUATE)
+
+
+sys.excepthook = _crash_is_cannot_evaluate
+
+
 class LedgerReadError(Exception):
     """A ledger file could not be read as text at all -- reported, never guessed around."""
 
@@ -94,8 +161,16 @@ def read_text(path):
     below is over the document alone): json.loads rejects a leading U+FEFF outright, and YAML would
     carry it into the first key.
     """
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as e:
+        # The path EXISTS (os.path.exists said so) but cannot be read as a file: a directory where a
+        # file belongs, a permission problem, an I/O error. Unhandled, this escaped read_text and
+        # Python exited 1 -- the coverage-failure code -- for something that is plainly a
+        # cannot-evaluate. The excepthook above would now catch it anyway; naming it here gets a
+        # one-line reason instead of a traceback.
+        raise LedgerReadError(f"{path} cannot be read: {e}")
     if raw[:3] == b"\xef\xbb\xbf":
         raw = raw[3:]
     try:
@@ -107,8 +182,12 @@ def read_text(path):
 run = sys.argv[1]
 ac_path = os.path.join(run, "01-acceptance-criteria.yaml")
 v_path  = os.path.join(run, "08-qa-verdict.json")
-if not os.path.exists(ac_path): emit(f"MISSING {ac_path}"); sys.exit(2)
-if not os.path.exists(v_path):  emit(f"MISSING {v_path}");  sys.exit(2)
+# A missing input is a CANNOT EVALUATE, and always was exit 2 -- which is now the one code for that
+# whole class rather than a separate "missing inputs" meaning.
+if not os.path.exists(ac_path):
+    emit(f"TRACEABILITY: CANNOT VERIFY -- MISSING {ac_path}"); sys.exit(EXIT_CANNOT_EVALUATE)
+if not os.path.exists(v_path):
+    emit(f"TRACEABILITY: CANNOT VERIFY -- MISSING {v_path}");  sys.exit(EXIT_CANNOT_EVALUATE)
 
 
 def top_level_criteria_key(text):
@@ -151,7 +230,7 @@ try:
     text = read_text(ac_path)
 except LedgerReadError as e:
     emit(f"TRACEABILITY: CANNOT VERIFY -- {e}")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 try:
     import yaml
 except ImportError:
@@ -161,13 +240,13 @@ if yaml is not None:
         doc = yaml.safe_load(text)
     except Exception as e:
         emit(f"TRACEABILITY: CANNOT VERIFY -- {ac_path} is not valid YAML: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_CANNOT_EVALUATE)
     if doc is None:
         doc = {}
     if not isinstance(doc, dict):
         emit(f"TRACEABILITY: CANNOT VERIFY -- {ac_path} top level is {type(doc).__name__}, "
              f"expected a mapping with a `criteria:` list")
-        sys.exit(1)
+        sys.exit(EXIT_CANNOT_EVALUATE)
     ac_ids = [c.get("id") for c in (doc.get("criteria") or []) if isinstance(c, dict) and c.get("id")]
 else:
     # Degraded path. It can find only what it can match, and cannot detect a syntax error at all --
@@ -191,7 +270,7 @@ else:
         emit(f"TRACEABILITY: CANNOT VERIFY -- {ac_path} has `id:` entries but no top-level "
              f"`criteria:` key, so its top level is not the mapping this gate reads; a YAML parser "
              f"would refuse this document. Fix the file, or install pyyaml for an exact parse.")
-        sys.exit(1)
+        sys.exit(EXIT_CANNOT_EVALUATE)
 ac_ids = [a for a in ac_ids if a]
 
 # Fail-closed: no ids means there is nothing to trace, which is NOT the same as full coverage -- do
@@ -203,35 +282,48 @@ if not ac_ids:
         emit("TRACEABILITY: CANNOT VERIFY -- 'criteria:' present but no ids parsed (install pyyaml or fix the file format)")
     else:
         emit(f"TRACEABILITY: CANNOT VERIFY -- no acceptance criteria ids found in {ac_path}; nothing to trace is not coverage")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 
 try:
     verdict = json.loads(read_text(v_path))
 except LedgerReadError as e:          # before the bare `Exception`: this is not a JSON problem
     emit(f"TRACEABILITY: CANNOT VERIFY -- {e}")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 except Exception as e:
     emit(f"TRACEABILITY: CANNOT VERIFY -- {v_path} is not valid JSON: {e}")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 if not isinstance(verdict, dict):
     emit(f"TRACEABILITY: CANNOT VERIFY -- {v_path} is not a JSON object")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 
 raw_cov = verdict.get("acceptance_criteria_coverage")
 if raw_cov is None:
     raw_cov = []
 if not isinstance(raw_cov, list):
     emit("TRACEABILITY: CANNOT VERIFY -- acceptance_criteria_coverage is not a list")
-    sys.exit(1)
+    sys.exit(EXIT_CANNOT_EVALUATE)
 
+# TWO buckets, not one -- this is the exit-code contract at the criterion level.
+#
+#   problems      the gate LOOKED and the answer is no: a criterion absent from the verdict, or
+#                 `no`/`partial` asserted with no justification. Exit 1.
+#   unverifiable  the gate could not look: a coverage entry or `covered` value it cannot interpret.
+#                 Exit 2. This is NOT a coverage gap and must never be reported as one -- a caller
+#                 asserting "this run should fail traceability" would otherwise be satisfied by a
+#                 verdict file the checker could not read a single coverage value out of.
+#
+# `unverifiable` takes PRECEDENCE over `problems`: if any part of the coverage could not be
+# interpreted, the whole run has no verdict, because the uninterpretable part could have changed it.
+#
 # Malformed coverage entries are COUNTED, never quietly dropped: a dropped entry for an id that is
 # in the criteria would resurface as "NOT in verdict coverage", but one for any other id would just
 # vanish, and the summary would then over-report how much QA actually looked at.
 problems = []
+unverifiable = []
 cov = {}
 for i, c in enumerate(raw_cov):
     if not isinstance(c, dict) or not str(c.get("id") or "").strip():
-        problems.append(f"coverage entry #{i} is malformed (needs an object with a non-empty id): {c!r}")
+        unverifiable.append(f"coverage entry #{i} is malformed (needs an object with a non-empty id): {c!r}")
         continue
     cov[str(c["id"]).strip()] = c
 
@@ -248,9 +340,11 @@ for ac in ac_ids:
     covered  = str(c.get("covered") if c.get("covered") is not None else "").strip().lower()
     evidence = str(c.get("evidence") if c.get("evidence") is not None else "").strip()
     if not covered:
-        problems.append(f"{ac}: no `covered` value -- coverage cannot be verified")
+        # "cannot be verified", said in the message all along -- so it is an unverifiable, not a
+        # coverage gap. An absent value tells us nothing about whether the criterion is covered.
+        unverifiable.append(f"{ac}: no `covered` value -- coverage cannot be verified")
     elif covered not in VALID_COVERED:
-        problems.append(f"{ac}: covered={c.get('covered')!r} is not one of yes/no/partial -- cannot be verified")
+        unverifiable.append(f"{ac}: covered={c.get('covered')!r} is not one of yes/no/partial -- cannot be verified")
     elif covered == "yes":
         n_yes += 1
         if not evidence:
@@ -273,13 +367,24 @@ for ac in ac_ids:
 
 emit(f"acceptance criteria: {len(ac_ids)}  verdict coverage entries: {len(cov)}")
 emit(f"coverage: {n_yes} full (yes) | {n_partial} partial | {n_waived} waived (no + justification) "
-     f"| {len(problems)} problem(s)")
+     f"| {len(problems)} problem(s) | {len(unverifiable)} unverifiable")
 for n in notes: emit(f"  note: {n}")
+
+if unverifiable:
+    # Precedence over `problems`: an uninterpretable coverage value could have gone either way, so
+    # the run has NO traceability verdict -- not a passing one, and not a failing one either.
+    emit("TRACEABILITY: CANNOT VERIFY -- coverage could not be evaluated, so this run has no "
+         "traceability verdict in either direction:")
+    for p in unverifiable: emit(f"  - {p}")
+    if problems:
+        emit("  ...and these criterion-level coverage failures were found as well:")
+        for p in problems: emit(f"  - {p}")
+    sys.exit(EXIT_CANNOT_EVALUATE)
 
 if problems:
     emit("TRACEABILITY: FAIL")
     for p in problems: emit(f"  - {p}")
-    sys.exit(1)
+    sys.exit(EXIT_COVERAGE_FAIL)
 
 if gaps:
     # Headline deliberately avoids the substring "TRACEABILITY: PASS": anything grepping for that
@@ -289,7 +394,8 @@ if gaps:
     emit(f"TRACEABILITY: INCOMPLETE -- {n_yes}/{len(ac_ids)} criteria fully covered, "
          f"{len(gaps)} justified gap(s) above. Exit 0 because every gap is justified, but this is "
          f"NOT full coverage -- carry these gaps into the Final gate.")
-    sys.exit(0)
+    sys.exit(EXIT_OK)
 
 emit(f"TRACEABILITY: PASS -- all {len(ac_ids)} criteria marked fully covered (covered=yes).")
+sys.exit(EXIT_OK)
 PY

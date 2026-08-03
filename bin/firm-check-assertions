@@ -37,6 +37,13 @@
 # `.agent-firm/**` scan that would have found the artifact anyway; verdict_is built its path from
 # `led or ""`, so with no ledger it read 08-qa-verdict.json out of the CHECKER'S OWN CWD and could
 # report APPROVE from a file in an unrelated directory. Both are closed at their branches below.
+# The same rule applies to every verb that INVERTS a delegated script's exit code. traceability_passes
+# used to do `(rc == 0) == (want == "true")`, so `traceability_passes: false` was satisfied by ANY
+# non-zero exit from firm-traceability-check -- a genuine coverage gap, a usage error, an unparseable
+# verdict, a missing run dir and a crash all alike. It now CLASSIFIES: rc 0 = evaluated/covered,
+# rc 1 = evaluated/inadequate, anything else = cannot evaluate, which FAILS the assertion on both
+# `true` and `false`. qa_checkout_clean has always classified its child's rc=2 the same way.
+#
 # This script is how the firm proves an accepted change did not regress: a fail-open HERE silently
 # disarms every golden eval, so treat any "it cannot look, so it passes" path as a defect.
 set -uo pipefail
@@ -287,19 +294,46 @@ for a in asserts:
         r = subprocess.run(v, shell=True, cwd=repo, capture_output=True)
         check(f"test_passes '{v}'", r.returncode == 0, f"rc={r.returncode}")
     elif k == "traceability_passes":
+        # THREE outcomes from the child, not two. firm-traceability-check returns 0 = evaluated and
+        # coverage is acceptable, 1 = evaluated and coverage is INADEQUATE, anything else = COULD NOT
+        # EVALUATE (usage error, missing/unreadable/unparseable inputs, zero criteria, an
+        # uninterpretable coverage value, an internal error). See that script's exit-code contract.
+        #
+        # This verb used to be `(r.returncode == 0) == (want)`, which INVERTED the child's exit code
+        # without CLASSIFYING it. With `traceability_passes: false` -- the way an eval asserts "this
+        # run SHOULD fail traceability" -- ANY non-zero exit satisfied the assertion, so a genuine
+        # coverage gap, a usage error, an unparseable verdict, a missing run dir and an outright
+        # crash were all indistinguishable, and an eval passed when the checker merely blew up.
+        # Third instance of one defect class in this file's neighbourhood (the ASCII-locale
+        # inversion, artifact_absent's vacuous pass): A CHECK THAT CANNOT EVALUATE ITS INPUT MUST
+        # NEVER REPORT SUCCESS. So cannot-evaluate is a HARD FAIL on BOTH expectations -- `true` and
+        # `false` alike -- and only rc 0/1 may satisfy either.
+        want = (v.lower() == "true")
         led = find_ledger()
         tc = os.path.join(selfdir, "firm-traceability-check")
-        r = subprocess.run([tc, led or repo], capture_output=True, cwd=repo, text=True, errors="replace")
+        if led is None:
+            # Same fail-closed rule as verdict_is above, and for the same reason: `led or repo`
+            # handed the SCRATCH-REPO ROOT to the child as though it were a run directory, so a
+            # 01-acceptance-criteria.yaml / 08-qa-verdict.json pair sitting anywhere at the repo
+            # root would have been read as this run's coverage. No ledger is not a verdict.
+            check("traceability_passes", False, "CANNOT VERIFY (fail-closed): no run ledger")
+            continue
+        r = subprocess.run([tc, led], capture_output=True, cwd=repo, text=True, errors="replace")
         # Carry the child's own words into the detail. Discarding them made a failing eval print only
         # `rc=1`, naming neither the uncovered criterion nor the reason coverage could not be
         # verified. `.split()` collapses all whitespace, so the detail stays exactly one line; the
-        # ascii round-trip keeps firm-traceability-check's non-ASCII bullets from raising
-        # UnicodeEncodeError under an ASCII stdout locale.
+        # ascii round-trip keeps any non-ASCII the child echoed back out of its DATA (evidence
+        # strings, paths) from raising UnicodeEncodeError under an ASCII stdout locale.
         why = " ".join((r.stdout or "").split() + (r.stderr or "").split())
         why = why.encode("ascii", "replace").decode("ascii")
         if len(why) > 240: why = why[:240] + " ..."
-        check("traceability_passes", (r.returncode == 0) == (v.lower() == "true"),
-              f"rc={r.returncode}" + (f": {why}" if why else ""))
+        if r.returncode not in (0, 1):
+            check("traceability_passes", False,
+                  f"CANNOT VERIFY (fail-closed): firm-traceability-check reached no coverage verdict "
+                  f"(rc={r.returncode})" + (f": {why}" if why else ""))
+        else:
+            check("traceability_passes", (r.returncode == 0) == want,
+                  f"rc={r.returncode}" + (f": {why}" if why else ""))
     elif k == "no_default_branch_merge":
         # The firm must NOT have advanced the default branch beyond the SHA it had at run start.
         # Provable in any repo, at any starting history depth -- unlike the old commit-count heuristic
