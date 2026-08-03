@@ -1214,4 +1214,386 @@ if bad:
     print("non-ASCII byte(s) on line(s):", bad[:20])
     sys.exit(1)' "$TC"
 
+# ---------------------------------------------------------------------------
+# THE RECIPROCAL DIRECTION: coverage -> criteria.
+#
+# The gate checked that every CRITERION appears in the coverage. It never checked that every COVERAGE
+# ENTRY names a criterion that exists, so a verdict claiming coverage for AC-999-DOES-NOT-EXIST PASSED
+# — while PRINTING the discrepancy it ignored (`acceptance criteria: 2  verdict coverage entries: 4`).
+# A verdict written against a DIFFERENT criteria set satisfied the acceptance-coverage gate as long as
+# it also happened to name the real ids, so the gate could not tell "this verdict describes this run"
+# from "this verdict describes some other run".
+#
+# Classified as CANNOT EVALUATE (exit 2), not as a coverage FAILURE (exit 1): a phantom id is a fact
+# about the verdict's PROVENANCE, not about coverage, and once provenance is broken the entries whose
+# ids DO match are untrustworthy too (an id is only a label). The full argument, degree included, is in
+# bin/firm-traceability-check's header. Exit 2 is also the only classification that fails closed for
+# BOTH caller polarities — firm-check-assertions rejects anything outside {0,1} for
+# `traceability_passes: true` AND `false` — so a mismatched verdict can prove nothing in either
+# direction.
+t_case "phantom coverage: a verdict claiming coverage for ids NO criterion declares does not pass"
+led40="$d/led40"
+mk_ledger "$led40" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e2"},
+    {"id": "AC-999-DOES-NOT-EXIST", "covered": "yes", "evidence": "phantom"},
+    {"id": "TOTALLY-MADE-UP", "covered": "yes", "evidence": "phantom"}
+  ]}'
+assert_rc "exit 2 (CANNOT EVALUATE) -- it used to exit 0 with every real criterion 'covered'" 2 "$TC" "$led40"
+assert_not_output "never the substring TRACEABILITY: PASS" "TRACEABILITY: PASS" "$TC" "$led40"
+assert_output "says CANNOT VERIFY" "TRACEABILITY: CANNOT VERIFY" "$TC" "$led40"
+assert_output "names the first offending id" "AC-999-DOES-NOT-EXIST" "$TC" "$led40"
+assert_output "names the second offending id" "TOTALLY-MADE-UP" "$TC" "$led40"
+assert_output "says what is wrong with it" "NO criterion declares this id" "$TC" "$led40"
+assert_output "and quotes the phantom entry's coverage claim, so the report is self-contained" \
+  "(covered='yes')" "$TC" "$led40"
+assert_output "explains that the verdict describes some other criteria set" \
+  "this verdict does not describe THIS run's acceptance criteria" "$TC" "$led40"
+assert_output "and why that is cannot-evaluate rather than a coverage failure" \
+  "Not a coverage FAILURE (exit 1)" "$TC" "$led40"
+assert_output "lists the ids that ARE declared, so reconciling is possible from the output alone" \
+  "AC-001, AC-002" "$TC" "$led40"
+assert_not_output "and is NOT reported as a criterion-level coverage FAIL" "TRACEABILITY: FAIL" "$TC" "$led40"
+# The 2-vs-4 line already existed and was acted on by NOTHING — a printed fact nobody uses is not a
+# check. It now carries the conclusion, in both directions.
+assert_output "the criteria-vs-coverage counts now state a conclusion instead of leaving the arithmetic to the reader" \
+  "acceptance criteria: 2  verdict coverage entries: 4  -- MISMATCH" "$TC" "$led40"
+assert_output "the conclusion names the previously-ignored direction and the count" \
+  "MISMATCH: 2 of these entries name NO criterion" "$TC" "$led40"
+assert_output "the coverage summary counts phantoms separately from problems and unverifiables" \
+  "0 problem(s) | 0 unverifiable | 2 phantom" "$TC" "$led40"
+
+t_case "phantom coverage: the DEGENERATE case -- zero overlap between the two id sets"
+# Deliberate behaviour CHANGE: this used to exit 1 ("every criterion is missing from coverage"). With
+# non-empty coverage naming nothing this run declares, "this is not my verdict" explains the state far
+# better than "I am uncovered" does, and calling it a coverage verdict would let an eval PROVE the gate
+# "correctly fails" on a ledger whose coverage was never evaluated at all.
+led41="$d/led41"
+mk_ledger "$led41" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "XX-1", "covered": "yes", "evidence": "e"},
+    {"id": "XX-2", "covered": "yes", "evidence": "e"}
+  ]}'
+"$TC" "$led41" >/dev/null 2>&1; rc_zero_overlap=$?
+assert_eq "zero overlap -> exit 2 (CANNOT EVALUATE)" "2" "$rc_zero_overlap"
+assert_ne "and NOT exit 1 -- it is not a coverage verdict of any kind" "1" "$rc_zero_overlap"
+assert_ne "and NOT exit 0" "0" "$rc_zero_overlap"
+assert_output "names the first phantom id" "'XX-1'" "$TC" "$led41"
+assert_output "names the second phantom id" "'XX-2'" "$TC" "$led41"
+assert_not_output "never the substring TRACEABILITY: PASS" "TRACEABILITY: PASS" "$TC" "$led41"
+assert_output "the criterion-level findings are still printed, not swallowed by the reclassification" \
+  "AC-001: NOT in verdict coverage" "$TC" "$led41"
+assert_output "...and are explicitly subordinated to the cannot-evaluate finding" \
+  "criterion-level coverage failures were found as well" "$TC" "$led41"
+assert_output "the counts line flags the reciprocal direction" \
+  "MISMATCH: 2 of these entries name NO criterion" "$TC" "$led41"
+assert_output "and the report states the mismatch from the other side too, which is what makes it diagnosable" \
+  "2 of this run's 2 criteria have no coverage entry at all" "$TC" "$led41"
+assert_output "...naming the total non-overlap explicitly, since that is the crispest form of the finding" \
+  "the two id sets do not overlap AT ALL" "$TC" "$led41"
+assert_not_output "and 'no overlap AT ALL' is NOT claimed when there is partial overlap" \
+  "do not overlap AT ALL" "$TC" "$led40"
+
+t_case "an EMPTY coverage list is untouched: still an evaluated coverage FAILURE (exit 1), not cannot-evaluate"
+# The boundary of the change. A verdict that names nothing holds no phantom ids, and "coverage is zero"
+# is a question this gate CAN answer — so widening exit 2 to cover it would have made the commonest
+# real state (two of this repo's own ledgers) unevaluable and `traceability_passes: false` harder to
+# satisfy honestly.
+led42="$d/led42"
+mk_ledger "$led42" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": []}'
+assert_rc "empty coverage -> exit 1" 1 "$TC" "$led42"
+assert_output "reported as a FAIL, with the reason" "AC-001: NOT in verdict coverage" "$TC" "$led42"
+assert_output "and as a FAIL headline" "TRACEABILITY: FAIL" "$TC" "$led42"
+assert_output "with 0 phantoms" "0 unverifiable | 0 phantom" "$TC" "$led42"
+assert_not_output "never the substring TRACEABILITY: PASS" "TRACEABILITY: PASS" "$TC" "$led42"
+assert_not_output "and no MISMATCH clause: 2-vs-0 is fully explained by the itemised report below" \
+  "MISMATCH" "$TC" "$led42"
+
+t_case "regression: a verdict whose coverage matches the criteria EXACTLY still exits 0"
+led43="$d/led43"
+mk_ledger "$led43" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002
+  - id: AC-003' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e1"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e2"},
+    {"id": "AC-003", "covered": "yes", "evidence": "e3"}
+  ]}'
+assert_rc "exact reconciliation -> exit 0" 0 "$TC" "$led43"
+assert_output "and PASSes" "TRACEABILITY: PASS -- all 3 criteria marked fully covered" "$TC" "$led43"
+assert_output "the counts line reports the two numbers, which now agree" \
+  "acceptance criteria: 3  verdict coverage entries: 3" "$TC" "$led43"
+assert_not_output "and carries no MISMATCH clause, because there is no mismatch" "MISMATCH" "$TC" "$led43"
+assert_output "the phantom counter reports zero, so the reciprocal check is visibly running" \
+  "0 unverifiable | 0 phantom" "$TC" "$led43"
+assert_not_output "no phantom is invented out of a well-formed verdict" "NO criterion declares this id" "$TC" "$led43"
+assert_rc "and the pre-existing all-yes fixture is unaffected too" 0 "$TC" "$led20"
+assert_not_output "...also with no MISMATCH clause" "MISMATCH" "$TC" "$led20"
+
+t_case "PINNED pre-existing behaviour: duplicate coverage entries for the SAME declared id"
+# Not this work-order's subject and NOT changed here: a repeated id overwrites, so the LAST entry for
+# an id decides that criterion. Pinned in both orders so a later change cannot alter it silently, and
+# so the reciprocal check above is provably not what decides these cases. The only thing that changed
+# is that the collapse is now VISIBLE (a note), because it is the sole remaining reason the reported
+# entry count can differ from the number of entries in the file.
+led44="$d/led44"        # identical duplicates
+mk_ledger "$led44" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e"}
+  ]}'
+assert_rc "identical duplicates -> exit 0 (unchanged)" 0 "$TC" "$led44"
+assert_output "still PASSes" "TRACEABILITY: PASS" "$TC" "$led44"
+assert_not_output "a duplicate of a DECLARED id is not a phantom" "NO criterion declares this id" "$TC" "$led44"
+assert_output "the reported entry count is of DISTINCT ids (3 entries in the file, 2 ids)" \
+  "verdict coverage entries: 2" "$TC" "$led44"
+assert_output "...and the collapse is now stated instead of being an unexplained gap" \
+  "coverage id(s) appear MORE THAN ONCE" "$TC" "$led44"
+assert_output "the note names which id collapsed, and which of its entries wins" \
+  "(earlier ones are discarded): AC-001" "$TC" "$led44"
+assert_not_output "and no MISMATCH is claimed: a collapsed duplicate is not a criteria-set mismatch" \
+  "MISMATCH" "$TC" "$led44"
+
+led45="$d/led45"        # yes THEN an unjustified no -> the LAST entry decides
+mk_ledger "$led45" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "AC-001", "covered": "no"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e"}
+  ]}'
+led46="$d/led46"        # the same two entries, ORDER SWAPPED
+mk_ledger "$led46" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "no"},
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e"}
+  ]}'
+"$TC" "$led45" >/dev/null 2>&1; rc_dup_last_no=$?
+"$TC" "$led46" >/dev/null 2>&1; rc_dup_last_yes=$?
+assert_eq "conflicting duplicates, unjustified 'no' LAST -> exit 1 (pinned)"  "1" "$rc_dup_last_no"
+assert_eq "conflicting duplicates, 'yes' LAST -> exit 0 (pinned, NOT endorsed)" "0" "$rc_dup_last_yes"
+assert_ne "the two orders are therefore NOT equivalent: order decides the verdict" \
+  "$rc_dup_last_no" "$rc_dup_last_yes"
+assert_output "and in BOTH orders the collapse is at least visible now [last=no]" \
+  "appear MORE THAN ONCE" "$TC" "$led45"
+assert_output "and in BOTH orders the collapse is at least visible now [last=yes]" \
+  "appear MORE THAN ONCE" "$TC" "$led46"
+
+t_case "an id TYPO is now diagnosable, because the mismatch is reported in both directions at once"
+# The everyday shape of this defect: not a fabricated criterion, a mistyped one. Before, the operator
+# was told only "AC-002 is not in the coverage" and had to spot the near-identical typo unaided; the
+# near-miss entry itself was invisible. Case is significant here and stays so — treating 'ac-002' as
+# covering 'AC-002' would be a looser gate, not a better message.
+led47="$d/led47"
+mk_ledger "$led47" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "ac-002", "covered": "yes", "evidence": "e"}
+  ]}'
+assert_rc "a case-mismatched id -> exit 2" 2 "$TC" "$led47"
+assert_output "half one: the criterion is reported as absent from coverage (unchanged)" \
+  "AC-002: NOT in verdict coverage" "$TC" "$led47"
+assert_output "half two: the near-miss entry is now reported too (this is the new half)" \
+  "'ac-002'" "$TC" "$led47"
+assert_not_output "never the substring TRACEABILITY: PASS" "TRACEABILITY: PASS" "$TC" "$led47"
+
+t_case "phantom AND an uninterpretable covered value together: exit 2, and BOTH are reported"
+led48="$d/led48"
+mk_ledger "$led48" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "mostly", "evidence": "e"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e"},
+    {"id": "PHANTOM-1", "covered": "yes", "evidence": "e"}
+  ]}'
+assert_rc "exit 2" 2 "$TC" "$led48"
+assert_output "the uninterpretable value is named" "is not one of yes/no/partial" "$TC" "$led48"
+assert_output "the phantom id is named" "'PHANTOM-1'" "$TC" "$led48"
+assert_output "and the two are counted separately" "1 unverifiable | 1 phantom" "$TC" "$led48"
+assert_not_output "never the substring TRACEABILITY: PASS" "TRACEABILITY: PASS" "$TC" "$led48"
+
+t_case "a phantom id takes precedence over a REAL coverage failure, which is still printed in full"
+led49="$d/led49"
+mk_ledger "$led49" \
+  'criteria:
+  - id: AC-001
+  - id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "no"},
+    {"id": "AC-002", "covered": "yes", "evidence": "e"},
+    {"id": "PHANTOM-2", "covered": "yes", "evidence": "e"}
+  ]}'
+assert_rc "exit 2, not 1: an unjustified waiver in a verdict of unknown provenance decides nothing" \
+  2 "$TC" "$led49"
+assert_output "the real coverage failure is not discarded" "covered=no with no justification" "$TC" "$led49"
+assert_output "it is subordinated, with the relationship spelled out" \
+  "criterion-level coverage failures were found as well" "$TC" "$led49"
+assert_output "and the phantom id is named as the reason the run has no verdict" "'PHANTOM-2'" "$TC" "$led49"
+
+t_case "the reciprocal check is not parser-dependent: pyyaml-present and pyyaml-absent agree (both axes vary)"
+# Two axes, both varied: the parser branch AND the ledger (phantom vs. exactly-reconciled). Without the
+# control ledger, "both branches say 2" would also be satisfied by a branch that fails everything.
+without_yaml     "$TC" "$led40" >/dev/null 2>&1; rc_ph_absent=$?
+with_yaml_parser "$TC" "$led40" >/dev/null 2>&1; rc_ph_present=$?
+without_yaml     "$TC" "$led43" >/dev/null 2>&1; rc_ok_absent=$?
+with_yaml_parser "$TC" "$led43" >/dev/null 2>&1; rc_ok_present=$?
+assert_eq "phantom, pyyaml ABSENT  -> 2" "2" "$rc_ph_absent"
+assert_eq "phantom, pyyaml PRESENT -> 2" "2" "$rc_ph_present"
+assert_eq "control: reconciled, pyyaml ABSENT  -> 0" "0" "$rc_ok_absent"
+assert_eq "control: reconciled, pyyaml PRESENT -> 0" "0" "$rc_ok_present"
+assert_output "and the offending id is named on the fallback path too" \
+  "AC-999-DOES-NOT-EXIST" without_yaml "$TC" "$led40"
+
+t_case "a BROKEN pyyaml still outranks the reciprocal check: no coverage is evaluated at all"
+# Ordering matters. If the phantom check ran first it would report a criteria-set mismatch derived from
+# an id list the gate never managed to parse — a diagnosis invented out of nothing.
+assert_rc "broken install + phantom coverage -> exit 2" 2 with_broken_partial "$TC" "$led40"
+assert_output "and the reason given is the BROKEN PARSER, not the coverage" \
+  "pyyaml IS installed" with_broken_partial "$TC" "$led40"
+assert_not_output "no coverage was evaluated" "verdict coverage entries" with_broken_partial "$TC" "$led40"
+assert_not_output "so no phantom is claimed either" "NO criterion declares this id" \
+  with_broken_partial "$TC" "$led40"
+
+t_case "the regex fallback's top-level criteria: shape check still runs BEFORE the reciprocal check"
+led50="$d/led50"
+mk_ledger "$led50" \
+  '- id: AC-001
+- id: AC-002' \
+  '{"acceptance_criteria_coverage": [
+    {"id": "AC-001", "covered": "yes", "evidence": "e"},
+    {"id": "PHANTOM-3", "covered": "yes", "evidence": "e"}
+  ]}'
+assert_rc "LIST-shaped criteria + phantom coverage -> exit 2" 2 without_yaml "$TC" "$led50"
+assert_output "and the reason is the document SHAPE, which is the earlier and more fundamental one" \
+  "no top-level" without_yaml "$TC" "$led50"
+assert_not_output "the id list was never trusted, so no phantom is asserted from it" \
+  "NO criterion declares this id" without_yaml "$TC" "$led50"
+
+t_case "the three-code contract is not widened: 0, 1 and 2 all stay reachable on both parser branches"
+# The mutation this guards is "make any mismatch cannot-evaluate", which would take exit 1 out of
+# circulation and silently break every eval that inverts this gate with `traceability_passes: false`.
+for _pfn in without_yaml with_yaml_parser; do
+  assert_rc "exactly reconciled + all yes -> 0 [$_pfn]"                  0 $_pfn "$TC" "$led43"
+  assert_rc "justified partial -> 0 [$_pfn]"                             0 $_pfn "$TC" "$led11"
+  assert_rc "a criterion absent from a non-phantom verdict -> 1 [$_pfn]" 1 $_pfn "$TC" "$led4"
+  assert_rc "empty coverage -> 1 [$_pfn]"                                1 $_pfn "$TC" "$led42"
+  assert_rc "partial with no justification -> 1 [$_pfn]"                 1 $_pfn "$TC" "$led13"
+  assert_rc "a covered value outside the enum -> 2 [$_pfn]"              2 $_pfn "$TC" "$led17"
+  assert_rc "phantom coverage -> 2 [$_pfn]"                              2 $_pfn "$TC" "$led40"
+  assert_output "and the exit-1 class is still reported as a FAIL [$_pfn]" \
+    "TRACEABILITY: FAIL" $_pfn "$TC" "$led4"
+done
+
+t_case "every preserved property still holds on the fixtures the earlier waves built"
+assert_rc "justified partial -> exit 0" 0 "$TC" "$led11"
+assert_output "justified partial -> INCOMPLETE headline" "TRACEABILITY: INCOMPLETE" "$TC" "$led11"
+assert_not_output "justified partial -> never the substring TRACEABILITY: PASS" \
+  "TRACEABILITY: PASS" "$TC" "$led11"
+assert_rc "EVERY criterion partial -> exit 0, still not a PASS" 0 "$TC" "$led12"
+assert_not_output "EVERY criterion partial -> no PASS headline" "TRACEABILITY: PASS" "$TC" "$led12"
+assert_rc "partial with NO justification -> exit 1" 1 "$TC" "$led13"
+assert_rc "justified waiver -> exit 0" 0 "$TC" "$led16"
+assert_output "justified waiver -> visible as a gap" "NOT COVERED (waived)" "$TC" "$led16"
+assert_not_output "justified waiver -> never the substring TRACEABILITY: PASS" \
+  "TRACEABILITY: PASS" "$TC" "$led16"
+assert_rc "zero acceptance criteria -> exit 2" 2 "$TC" "$led22"
+assert_rc "an unreadable (non-UTF-8) ledger -> exit 2" 2 "$TC" "$led34"
+
+t_case "the reciprocal check survives an ASCII stdout locale, and non-ASCII bytes in the offending id"
+# Both axes vary: the stdout encoding AND the id's bytes. The new report interpolates DATA (ids the
+# gate does not control) into a message emitted BEFORE the exit, so an encoding crash there would exit
+# 1 — a coverage verdict — which is this file's original fail-open one door along.
+led51="$d/led51"
+mkdir -p "$led51"
+printf '%s\n' 'criteria:' '  - id: AC-001' > "$led51/01-acceptance-criteria.yaml"
+printf '{"acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"e"},{"id":"AC-caf\xc3\xa9-\xe2\x80\x94-002","covered":"yes","evidence":"e"}]}' \
+  > "$led51/08-qa-verdict.json"
+assert_ok "precondition: the phantom id really does carry non-ASCII bytes" python3 -c '
+import sys
+raw = open(sys.argv[1], "rb").read()
+assert any(b > 127 for b in raw), "the verdict is pure ASCII -- this axis would be decorative"' \
+  "$led51/08-qa-verdict.json"
+for _lfn in ascii_locale utf8_locale; do
+  assert_rc "phantom coverage -> exit 2 [$_lfn]" 2 $_lfn "$TC" "$led40"
+  assert_output "names the offending id [$_lfn]" "AC-999-DOES-NOT-EXIST" $_lfn "$TC" "$led40"
+  assert_not_output "never the substring TRACEABILITY: PASS [$_lfn]" "TRACEABILITY: PASS" \
+    $_lfn "$TC" "$led40"
+  assert_rc "a NON-ASCII phantom id is also exit 2, not an encoding crash [$_lfn]" 2 $_lfn "$TC" "$led51"
+  assert_output "and still says CANNOT VERIFY [$_lfn]" "TRACEABILITY: CANNOT VERIFY" $_lfn "$TC" "$led51"
+  assert_not_output "no encoding crash escaped [$_lfn]" "UnicodeEncodeError" $_lfn "$TC" "$led51"
+  assert_rc "control: a reconciled ledger is still 0 under the same locale [$_lfn]" 0 $_lfn "$TC" "$led43"
+done
+# Only asserted for the ASCII stream, which is where backslashreplace guarantees it. Under a UTF-8
+# locale the id's own bytes legitimately reach the report, exactly as evidence strings and paths
+# already do.
+_ph_ascii_out="$(ascii_locale "$TC" "$led51" 2>&1)"
+assert_ok "under an ASCII stdout locale the report itself stays pure ASCII" python3 -c '
+import sys
+bad = [c for c in sys.argv[1] if ord(c) > 127]
+if bad:
+    print("non-ASCII in the report: %r" % (bad[:8],))
+    sys.exit(1)' "$_ph_ascii_out"
+
+t_case "the new output still fits the 240-character detail window its caller collapses it into"
+# This is WHY the counts line is annotated only for the reciprocal direction, and it is measured, not
+# asserted from taste. bin/firm-check-assertions renders this script's whole output as one 240-character
+# detail line; an exit-1 run had 38 characters of headroom, and any unconditional reconciliation clause
+# (27 characters at the shortest) pushed the uncovered criterion's NAME out of the window. That would
+# have been a silent diagnostic regression -- the eval would still fail, just without saying which
+# criterion -- so it is pinned here, on this side of the boundary, rather than only in the caller's
+# suite where it surfaced.
+collapsed_detail() {
+  # Exactly what firm-check-assertions does to the child's output: collapse all whitespace, cut at 240.
+  "$@" 2>&1 | python3 -c 'import sys
+print(" ".join(sys.stdin.read().split())[:240])'
+}
+assert_output "the uncovered criterion's id survives the collapse (led4: AC-002 is the missing one)" \
+  "AC-002: NOT in verdict coverage" collapsed_detail "$TC" "$led4"
+assert_output "so does the FAIL headline that classifies it" "TRACEABILITY: FAIL" collapsed_detail "$TC" "$led4"
+assert_output "and on the empty-coverage ledger, the first uncovered criterion survives too" \
+  "AC-001: NOT in verdict coverage" collapsed_detail "$TC" "$led42"
+assert_output "the phantom finding leads the window on a phantom ledger, where it is the finding" \
+  "MISMATCH: 2 of these entries name NO criterion" collapsed_detail "$TC" "$led40"
+
+t_case "the script is STILL pure ASCII with the reciprocal-check messages added"
+assert_ok "bin/firm-traceability-check is pure ASCII" python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read()
+bad = []
+for lineno, line in enumerate(data.split(b"\n"), 1):
+    for byte in line:
+        if byte > 127:
+            bad.append(lineno); break
+if bad:
+    print("non-ASCII byte(s) on line(s):", bad[:20])
+    sys.exit(1)' "$TC"
+
 t_summary

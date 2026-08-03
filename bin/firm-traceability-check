@@ -25,6 +25,50 @@
 #                                 and it is not evidence of a coverage GAP either. It is evidence of
 #                                 nothing at all, which is a third outcome; see the contract below.
 #
+# THE CHECK RUNS IN BOTH DIRECTIONS -- criteria -> coverage AND coverage -> criteria.
+#
+# It used to run in one: for each CRITERION, is there a coverage entry? A coverage entry naming an id
+# that NO criterion declares was simply never looked at, so a verdict could claim coverage for
+# AC-999-DOES-NOT-EXIST and the gate passed. It even PRINTED the discrepancy -- `acceptance criteria: 2
+# verdict coverage entries: 4` -- and then acted on neither number: a fact nobody acted on is not a
+# check. Consequence: a verdict written against a DIFFERENT criteria set satisfied this gate as long as
+# it happened to also cover the real ids, so the gate could not tell "this verdict describes this run"
+# from "this verdict describes some other run". Tenth instance of this repo's characteristic defect (a
+# check that cannot evaluate its input reports success) and the third in this file.
+#
+# So: any coverage entry whose id is declared by no criterion is CANNOT EVALUATE (exit 2), at the same
+# precedence as an uninterpretable `covered` value, and the reasoning is the same reasoning. Why 2 and
+# not 1 -- the substantive call, argued out rather than picked:
+#
+#   * Exit 1 would say "the gate looked, and this run's coverage is inadequate". But a phantom id is not
+#     a fact about coverage at all; it is a fact about PROVENANCE -- evidence that at least part of this
+#     verdict was not written against this criteria file. Correspondence between the two documents is a
+#     PRECONDITION for comparing them, and every other exit-2 case in this file is exactly that: an
+#     input state that did not permit the comparison (missing file, unparseable, no ids, no usable
+#     parser, an uninterpretable coverage value).
+#   * Once provenance is broken, the entries whose ids DO match cannot be trusted either. An id is only a
+#     label; the same label names a different criterion in a different revision of the criteria file. So
+#     `AC-001: covered yes` may be a truthful statement about some OTHER AC-001. The gate therefore has
+#     no coverage verdict for ANY criterion, which is the definition of exit 2 -- and it is the same
+#     argument that already makes one uninterpretable value poison the whole run ("the uninterpretable
+#     part could have changed it").
+#   * Exit 2 also fails CLOSED for every caller polarity. bin/firm-check-assertions treats anything
+#     other than 0/1 as cannot-evaluate and fails the assertion whichever way it was inverting the gate,
+#     so a mismatched-verdict ledger can satisfy neither `traceability_passes: true` nor `false`. Exit 1
+#     would let `traceability_passes: false` be PROVEN by a ledger whose coverage was never evaluated --
+#     re-creating, one door along, the laundering the 1-vs-2 split exists to stop.
+#
+# DEGREE DOES NOT CHANGE THE ANSWER, deliberately. A single phantom id and zero id overlap get the same
+# exit 2. Grading by degree was considered and rejected twice over: partial overlap is where the
+# "evaluated" claim is LEAST safe (it is precisely the case where the gate relied on id-matching that
+# the phantom ids just falsified), so a rule that called partial overlap "evaluated" would be backwards;
+# and any threshold creates a boundary where one id flips the classification, which is an argument a
+# gate should not have. One sentence, no threshold, fails closed everywhere. Note this DOES move the
+# degenerate zero-overlap case (non-empty coverage, no id in common) from 1 to 2, on purpose: "no entry
+# names any of my criteria" is far better explained by "this is not my verdict" than by "I am uncovered".
+# An EMPTY coverage list is untouched and stays exit 1 -- it holds no phantom ids, and a verdict that
+# names nothing is a verdict this gate CAN evaluate: coverage is zero.
+#
 # EXIT-CODE CONTRACT -- THREE outcomes, never two.
 #
 # Callers INVERT this gate: `traceability_passes: false` in a golden eval asserts "this run SHOULD
@@ -44,7 +88,9 @@
 #      looked, and the answer is no".
 #   2  CANNOT EVALUATE. Nothing whatsoever was decided about coverage: usage errors, missing inputs,
 #      an unreadable/unparseable criteria file or verdict, zero criteria, a coverage entry or
-#      `covered` value this script cannot interpret, NO USABLE PARSER (a pyyaml that is installed but
+#      `covered` value this script cannot interpret, A COVERAGE ENTRY NAMING AN ID NO CRITERION
+#      DECLARES (the verdict does not describe this run -- see the both-directions note above),
+#      NO USABLE PARSER (a pyyaml that is installed but
 #      whose import fails -- see the find_spec discriminator in the Python block; genuine absence is
 #      NOT this case, it is the legitimate regex fallback), and any unexpected internal error (an
 #      unhandled exception exits 1 by default, which would land squarely on the "coverage is
@@ -390,7 +436,7 @@ if not isinstance(raw_cov, list):
     emit("TRACEABILITY: CANNOT VERIFY -- acceptance_criteria_coverage is not a list")
     sys.exit(EXIT_CANNOT_EVALUATE)
 
-# TWO buckets, not one -- this is the exit-code contract at the criterion level.
+# THREE buckets, not one -- this is the exit-code contract at the criterion level.
 #
 #   problems      the gate LOOKED and the answer is no: a criterion absent from the verdict, or
 #                 `no`/`partial` asserted with no justification. Exit 1.
@@ -398,9 +444,14 @@ if not isinstance(raw_cov, list):
 #                 Exit 2. This is NOT a coverage gap and must never be reported as one -- a caller
 #                 asserting "this run should fail traceability" would otherwise be satisfied by a
 #                 verdict file the checker could not read a single coverage value out of.
+#   phantom       the gate cannot trust that it is looking at the right verdict: a coverage entry
+#                 naming an id declared by no criterion. Exit 2, same precedence and same reasoning as
+#                 `unverifiable`; the long argument is in the both-directions note in the shell header.
 #
-# `unverifiable` takes PRECEDENCE over `problems`: if any part of the coverage could not be
-# interpreted, the whole run has no verdict, because the uninterpretable part could have changed it.
+# `unverifiable` and `phantom` take PRECEDENCE over `problems`: if any part of the coverage could not
+# be interpreted, or the verdict is not about this criteria set, the whole run has no verdict -- the
+# uninterpretable or mismatched part could have changed it. `problems` is still reported alongside, so
+# nothing the gate did manage to find is thrown away; it just does not set the exit code.
 #
 # Malformed coverage entries are COUNTED, never quietly dropped: a dropped entry for an id that is
 # in the criteria would resurface as "NOT in verdict coverage", but one for any other id would just
@@ -408,16 +459,48 @@ if not isinstance(raw_cov, list):
 problems = []
 unverifiable = []
 cov = {}
+dup_ids = []
 for i, c in enumerate(raw_cov):
     if not isinstance(c, dict) or not str(c.get("id") or "").strip():
         unverifiable.append(f"coverage entry #{i} is malformed (needs an object with a non-empty id): {c!r}")
         continue
-    cov[str(c["id"]).strip()] = c
+    cid = str(c["id"]).strip()
+    if cid in cov and cid not in dup_ids:
+        # PRE-EXISTING behaviour, deliberately unchanged here (it is not this fix's subject): a repeated
+        # id overwrites, so the LAST entry for an id decides that criterion and the earlier ones are
+        # discarded. Two entries that DISAGREE (`no` then `yes`) therefore resolve to whichever came
+        # last, which is a latent hazard of its own -- it is now at least VISIBLE (a note below) instead
+        # of being the unexplained gap between the raw entry count and the count this gate reports.
+        dup_ids.append(cid)
+    cov[cid] = c
+
+# --- the reciprocal direction: coverage -> criteria ---------------------------------------------
+# Compared against the criteria ids under the SAME normalisation the coverage keys got (str + strip),
+# never against the raw values: a criteria file with `id: 001` yields the int 1 from pyyaml, and
+# flagging a coverage entry "1" as phantom because the two sides differ in TYPE would be a false
+# accusation. That asymmetry still leaves the per-criterion lookup below failing on such a file --
+# unchanged, pre-existing, and exit 1 either way -- but the new guard must not manufacture a
+# provenance failure out of it.
+declared = {str(a).strip() for a in ac_ids}
+phantom = [
+    f"coverage entry names id {cid!r} (covered={cov[cid].get('covered')!r}) -- NO criterion declares "
+    f"this id"
+    for cid in cov if cid not in declared
+]
+# Named separately from `problems` so the reconciliation line below can state BOTH directions.
+uncovered_ids = [a for a in ac_ids if cov.get(a) is None]
 
 VALID_COVERED = ("yes", "no", "partial")   # mirrors agent-firm/schemas/qa-verdict.schema.json
 n_yes = n_partial = n_waived = 0
 gaps = []    # justified, non-blocking -- but NOT full coverage, so they must be visible
 notes = []   # neither blocking nor a coverage gap; still worth saying out loud
+
+if dup_ids:
+    # Informational only -- it changes no count and no exit code. It exists because the reported entry
+    # count is of DISTINCT ids, so without this the line below silently disagrees with the number of
+    # entries in the file.
+    notes.append(f"{len(dup_ids)} coverage id(s) appear MORE THAN ONCE and the LAST entry for each one "
+                 f"decides that criterion (earlier ones are discarded): {', '.join(sorted(dup_ids))}")
 
 for ac in ac_ids:
     c = cov.get(ac)
@@ -452,16 +535,55 @@ for ac in ac_ids:
             n_waived += 1
             gaps.append(f"{ac}: NOT COVERED (waived) -- {evidence}")
 
-emit(f"acceptance criteria: {len(ac_ids)}  verdict coverage entries: {len(cov)}")
+# The two counts used to be printed side by side and acted on by NOTHING -- which is how a 2-vs-4
+# mismatch sat, unremarked, in the output of a PASSING run. Every way the two numbers can now differ is
+# accounted for somewhere in this output:
+#   * a criterion with no coverage entry   -> itemised BY NAME in the report below (always was)
+#   * a coverage entry naming no criterion -> the clause on this line, plus the block below, plus a
+#                                             non-zero exit. This is the direction that was ignored.
+#   * duplicate ids collapsing             -> the note above (the reported count is of DISTINCT ids)
+# The clause is added only for the reciprocal direction, and that is a MEASURED constraint, not
+# indifference: bin/firm-check-assertions collapses this whole output into a 240-character detail, and
+# an exit-1 run's detail is 202 characters at its longest pinned fixture. Any unconditional clause
+# (the shortest sensible one is 27 characters) pushes the uncovered criterion's NAME past the cut, so
+# restating a fact already itemised below would buy a tidier line at the cost of the operator no longer
+# being told WHICH criterion is uncovered -- a diagnostic regression tests/test-check-assertions.sh
+# pins. The one direction that has nowhere else to be reported is the one that gets the bytes.
+_recon = (f"  -- MISMATCH: {len(phantom)} of these entries name NO criterion" if phantom else "")
+emit(f"acceptance criteria: {len(ac_ids)}  verdict coverage entries: {len(cov)}{_recon}")
 emit(f"coverage: {n_yes} full (yes) | {n_partial} partial | {n_waived} waived (no + justification) "
-     f"| {len(problems)} problem(s) | {len(unverifiable)} unverifiable")
+     f"| {len(problems)} problem(s) | {len(unverifiable)} unverifiable | {len(phantom)} phantom")
 for n in notes: emit(f"  note: {n}")
 
-if unverifiable:
-    # Precedence over `problems`: an uninterpretable coverage value could have gone either way, so
-    # the run has NO traceability verdict -- not a passing one, and not a failing one either.
+if phantom or unverifiable:
+    # Precedence over `problems`: an uninterpretable coverage value could have gone either way, and a
+    # verdict written against some other criteria set says nothing reliable about this one, so the run
+    # has NO traceability verdict -- not a passing one, and not a failing one either.
     emit("TRACEABILITY: CANNOT VERIFY -- coverage could not be evaluated, so this run has no "
          "traceability verdict in either direction:")
+    if phantom:
+        emit("  this verdict does not describe THIS run's acceptance criteria:")
+        for p in phantom: emit(f"  - {p}")
+        emit("    A coverage entry for an id this run does not declare means the verdict was written "
+             "against a DIFFERENT criteria set (renumbered, stale, or another run's). The entries whose "
+             "ids DO match are then untrustworthy too -- an id is only a label, and the same label names "
+             "a different criterion in a different revision -- so NO criterion here has a coverage "
+             "verdict. Not a coverage FAILURE (exit 1): a coverage question this gate cannot answer.")
+        if uncovered_ids:
+            # The same mismatch from the other side. Stated here rather than on the counts line
+            # because the exit-2 report has no byte budget to protect (see the note there), and
+            # because "no id in common" is the crispest possible statement of "not my verdict".
+            emit(f"    seen from the other side: {len(uncovered_ids)} of this run's {len(ac_ids)} "
+                 "criteria have no coverage entry at all"
+                 + (" -- the two id sets do not overlap AT ALL."
+                    if len(uncovered_ids) == len(ac_ids) else "."))
+        _decl = sorted(declared)
+        # Bounded: a real ledger can declare dozens of criteria, and this gate's caller collapses the
+        # child's output to 240 characters -- an unbounded id dump would push the ids that are actually
+        # the problem out of the report the operator sees.
+        emit(f"    the {len(_decl)} id(s) {ac_path} declares: " + ", ".join(_decl[:12])
+             + (" ..." if len(_decl) > 12 else ""))
+        emit(f"    reconcile {v_path} against it and re-run.")
     for p in unverifiable: emit(f"  - {p}")
     if problems:
         emit("  ...and these criterion-level coverage failures were found as well:")
