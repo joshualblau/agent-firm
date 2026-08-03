@@ -44,9 +44,11 @@
 #      looked, and the answer is no".
 #   2  CANNOT EVALUATE. Nothing whatsoever was decided about coverage: usage errors, missing inputs,
 #      an unreadable/unparseable criteria file or verdict, zero criteria, a coverage entry or
-#      `covered` value this script cannot interpret, and any unexpected internal error (an unhandled
-#      exception exits 1 by default, which would land squarely on the "coverage is inadequate" code
-#      -- see the excepthook in the Python block).
+#      `covered` value this script cannot interpret, NO USABLE PARSER (a pyyaml that is installed but
+#      whose import fails -- see the find_spec discriminator in the Python block; genuine absence is
+#      NOT this case, it is the legitimate regex fallback), and any unexpected internal error (an
+#      unhandled exception exits 1 by default, which would land squarely on the "coverage is
+#      inadequate" code -- see the excepthook in the Python block).
 #
 # 2 ABSORBS the previous "missing inputs" meaning rather than adding a fourth code: a missing input
 # IS a cannot-evaluate, and a single such code matches bin/firm-qa-clean-check (0 clean / 1 dirty /
@@ -63,7 +65,7 @@ if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent
 if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
 
 python3 - "$run_dir" <<'PY'
-import json, re, sys, os, traceback
+import json, re, sys, os, traceback, importlib.util
 
 # --- exit-code contract (spelled out in the shell header above) -------------
 EXIT_OK              = 0   # evaluated; coverage acceptable
@@ -111,16 +113,35 @@ def emit(msg):
         print(msg.encode(enc, "backslashreplace").decode(enc, "replace"))
 
 
+def _one_line_ascii(x, limit=240):
+    """A third-party exception's text is DATA: it can be multi-line and non-ASCII.
+
+    Collapse it to one greppable line and transliterate it, so a broken-install report stays readable
+    and cannot itself raise UnicodeEncodeError on the way out. emit() would already survive that, but
+    the two layers cover different things: emit() keeps the process alive, this keeps the REPORT on one
+    line and in the ASCII this file is otherwise held to. Same helper, same wording, as
+    bin/firm-check-assertions -- the two gate scripts answer "is pyyaml usable?" with one voice.
+    """
+    s = " ".join(str(x).split()).encode("ascii", "replace").decode("ascii")
+    return (s[:limit] + " ...") if len(s) > limit else s
+
+
 def _crash_is_cannot_evaluate(exc_type, exc, tb):
     """An UNEXPECTED exception is CANNOT EVALUATE (exit 2), never "coverage is inadequate" (exit 1).
 
     Python exits 1 on an unhandled exception -- precisely the code this gate reserves for a real,
     criterion-level coverage failure. Without this hook a crash is INDISTINGUISHABLE from "the run
     has an uncovered criterion", so a caller inverting the gate (`traceability_passes: false`)
-    counts the crash as the failure it was hoping for. Reachable for real: a broken pyyaml install
-    that raises something other than ImportError at import time, a corrupt .pyc, an interpreter-level
-    failure -- none of which this script can enumerate in advance, which is the whole point of
-    catching them by class rather than by case.
+    counts the crash as the failure it was hoping for. Reachable for real: a corrupt .pyc, an
+    interpreter-level failure, an OSError from a path this script did not think to guard -- none of
+    which it can enumerate in advance, which is the whole point of catching them by class rather than
+    by case.
+
+    A BROKEN PYYAML NO LONGER ARRIVES HERE. It used to be this hook's headline example, and a generic
+    "internal error" was all the operator got. The parser-selection block below now classifies that
+    state explicitly -- naming the exception AND saying pyyaml is installed rather than missing -- so
+    this hook is back to being the net for the genuinely unforeseen. Both land on exit 2 either way;
+    what changed is that the diagnosis is no longer lost.
 
     The traceback is still printed (diagnosis matters), and the exit goes through os._exit so no
     later handler or interpreter-shutdown path can put the code back to 1. os._exit skips stdio
@@ -217,24 +238,90 @@ def top_level_criteria_key(text):
     return re.search(r"(?m)^" + re.escape(base) + r"criteria[ \t]*:", text) is not None
 
 
-# Acceptance-criteria ids: pyyaml when installed, else a regex that handles BOTH block style
-# (`- id: AC-001`) and flow style (`- {id: AC-001, ...}`).
+# Acceptance-criteria ids: pyyaml when it is installed AND WORKS, else a regex that handles BOTH
+# block style (`- id: AC-001`) and flow style (`- {id: AC-001, ...}`).
 #
 # "pyyaml is missing" and "this YAML is broken" are NOT the same condition and are no longer caught
 # by one bare `except`. A missing library is a legitimate degraded path; a SYNTAX ERROR is not
 # something to regex around, because a half-readable criteria file yields a SHORT id list, and every
 # criterion that fell out of that list is then never checked for coverage at all -- silently shrinking
-# the very set this gate exists to enforce.
+# the very set this gate exists to enforce. Nor is "pyyaml is INSTALLED BUT BROKEN" either of those
+# two: see the discriminator below.
 ac_ids = []
 try:
     text = read_text(ac_path)
 except LedgerReadError as e:
     emit(f"TRACEABILITY: CANNOT VERIFY -- {e}")
     sys.exit(EXIT_CANNOT_EVALUATE)
+
+# ---------------------------------------------------------------------------------------------
+# WHICH PARSER RUNS -- and the THIRD state the old code could not see.
+#
+# `try: import yaml / except ImportError: yaml = None` recognised two worlds: pyyaml importable, or
+# pyyaml missing. A pyyaml that is INSTALLED BUT BROKEN (a partial or corrupted install, a missing
+# internal submodule, an extension module that will not load, a module-level sys.exit) is a THIRD, and
+# it was mishandled in the one shape that stays SILENT: an ImportError raised from INSIDE the package
+# was swallowed by the `except`, so this gate DOWNGRADED ITSELF to the weaker regex reader while
+# reporting -- through the fallback's own messages -- that the host has no pyyaml. That matters here
+# more than almost anywhere: the fallback cannot see a YAML syntax error at all, so a document the
+# real parser would REFUSE can yield a SHORT id list, and every criterion missing from that list is
+# never checked for coverage. The set this gate enforces shrinks, and nothing says so.
+# (The other shape -- an import raising something that is not an ImportError -- has always been
+# caught by the excepthook above, which is why only the exit CODE was right there and not the
+# diagnosis. Both shapes are now named explicitly.)
+#
+# Sixth instance of this repo's characteristic defect, and the same discriminator, ordering and
+# wording as bin/firm-check-assertions (which is this script's caller, so the two must not disagree
+# about whether a host has a usable YAML parser): importlib.util.find_spec("yaml") asks the import
+# system whether the module is FINDABLE, without executing it.
+#   the probe RAISED    -> INCONCLUSIVE (a broken import hook, a poisoned sys.modules entry, a corrupt
+#                          parent package). Checked FIRST, deliberately: an unknown state must not be
+#                          mistaken for either of the two known ones. Exit 2 -- guessing "absent"
+#                          would silently downgrade the reader on no evidence, which is the very
+#                          fail-open being closed here.
+#   spec is not None    -> pyyaml IS installed and importing it still failed => BROKEN => exit 2,
+#                          naming the real exception type and text.
+#   spec is None        -> pyyaml is genuinely NOT INSTALLED. Legitimate degraded path (this repo's
+#                          tooling holds itself to a stdlib-only floor); the regex fallback below runs
+#                          exactly as it always has, shape check included.
+# The import is wrapped in `except BaseException` deliberately -- `except Exception` still lets a
+# module-level SystemExit set this process's exit code to something a caller reads as a coverage
+# verdict, 0 included, and SystemExit does not pass through sys.excepthook.
+# ---------------------------------------------------------------------------------------------
+yaml = None
+yaml_exc = None
 try:
     import yaml
-except ImportError:
-    yaml = None
+except BaseException as e:            # NOT just ImportError -- see the note above
+    yaml_exc = e
+
+if yaml is None:
+    yaml_spec, probe_exc = None, None
+    try:
+        yaml_spec = importlib.util.find_spec("yaml")
+    except BaseException as e:
+        probe_exc = e
+    if probe_exc is not None:
+        emit("TRACEABILITY: CANNOT VERIFY -- cannot tell whether pyyaml is absent or broken: "
+             f"`import yaml` raised {type(yaml_exc).__name__}: {_one_line_ascii(yaml_exc)}, and "
+             "probing for it with importlib.util.find_spec('yaml') itself raised "
+             f"{type(probe_exc).__name__}: {_one_line_ascii(probe_exc)}. Refusing to assume 'not "
+             "installed' and downgrade to the regex reader on a guess -- an unexplained parser "
+             "downgrade is exactly the silent fail-open this gate exists to prevent. Repair the "
+             "python environment and re-run.")
+        sys.exit(EXIT_CANNOT_EVALUATE)
+    if yaml_spec is not None:
+        emit("TRACEABILITY: CANNOT VERIFY -- pyyaml IS installed "
+             f"({getattr(yaml_spec, 'origin', None) or 'origin unknown'}) but `import yaml` FAILED: "
+             f"{type(yaml_exc).__name__}: {_one_line_ascii(yaml_exc)}. That is a BROKEN install, not "
+             "a missing one -- so this is NOT the legitimate degraded path and it is NOT quietly "
+             "retried with the weaker regex reader, which would report a parser you do not have and "
+             "could hand this gate a SHORTER id list than the criteria file declares. Repair or "
+             "reinstall pyyaml (pip install --force-reinstall pyyaml), or remove it if you mean to "
+             "run on the fallback.")
+        sys.exit(EXIT_CANNOT_EVALUATE)
+    # spec is None: pyyaml really is not installed. Fall through to the documented fallback.
+
 if yaml is not None:
     try:
         doc = yaml.safe_load(text)
