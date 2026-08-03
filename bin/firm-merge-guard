@@ -712,7 +712,14 @@ if [ "$MODE" = "command" ]; then
     exit 2
   fi
   FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="$CMD" _mg_py
-  exit $?
+  rc=$?
+  # The contract is exactly three-way, so an exit code from OUTSIDE it (python3 itself failing, a
+  # SIGKILL, an exec error) must be reported as cannot-evaluate — not passed through raw. It is
+  # still non-zero either way, but a caller told "99" cannot tell that from a decision.
+  case "$rc" in 0|1|2) exit "$rc" ;; *)
+    printf 'firm-merge-guard: CANNOT EVALUATE — the checker itself exited %s.\n' "$rc" >&2
+    exit 2 ;;
+  esac
 fi
 
 # ---- hook mode ------------------------------------------------------------------------------
