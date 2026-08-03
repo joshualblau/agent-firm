@@ -5,7 +5,8 @@
 # WHAT THIS IS NOT (read first — this disclosure is a deliverable, not a caveat)
 #   This is a CLIENT-SIDE control. It is BYPASSABLE by anyone with repo write access, four
 #   different ways: edit this script, delete the hook entry from .claude/settings.json (or
-#   hooks/hooks.json), set `git config user.email` to a listed value, or run git in a terminal
+#   hooks/hooks.json), rewrite the git identity as a FILE (`.git/config`, `~/.gitconfig` — the
+#   `git config` COMMAND is on the gated surface, the FILE is not), or run git in a terminal
 #   outside the AI tool. It is therefore:
 #     · NOT a security boundary,
 #     · NOT branch protection,
@@ -14,20 +15,30 @@
 #   Its actual scope is narrower and is the whole of the ask it satisfies: preventing an AI agent
 #   from performing an unauthorised merge or push through the tool surface. It stops an agent; it
 #   does not stop a determined human. Rated at its honest tier in docs/ENFORCEMENT.md.
+#   DO NOT trust this paragraph for SCOPE. `firm-merge-guard --surface` prints what is COVERED and
+#   what is a known GAP, and every line of BOTH lists has its own assertion in
+#   tests/test-merge-guard.sh — a covered line has a test that it BLOCKS, a gap line has a test
+#   that it does NOT. That is the only claim of scope worth reading.
 # ============================================================================================
 #
 # IDENTITY SOURCES (the only two; AC-017)
 #   1. `gh api user --jq .login`  -> matched against `gh_login`  in the allowlist
 #   2. `git config user.email`    -> matched against `git_emails` in the allowlist
-#   BOTH must resolve AND both must be allow-listed. `user.name` is NOT read (equally spoofable,
-#   pure false-block surface). The allowlist lives in exactly ONE file:
+#   BOTH must resolve AND both must be allow-listed. `user.name` is NOT read for the decision
+#   (equally spoofable, pure false-block surface). Both are read in the HOOK'S WORKING DIRECTORY —
+#   NOT in the repository named by a `-C` / `--git-dir` in the command being checked. This is a
+#   consistency check on the operator's own configuration, not a property of the target repo.
+#   The allowlist lives in exactly ONE file:
 #       agent-firm/policy/merge-authority.yaml
 #   Nothing here duplicates its contents — the messages below print what was READ from it.
+#   Because that second axis is a plain string the restrained actor can write, `git config` WRITES
+#   to user.email / user.name are themselves on the gated surface. Reads are not.
 #
 # FAILS CLOSED, ALWAYS. Anything that cannot be evaluated is a BLOCK, never a pass: no network,
 # `gh` absent, `gh` unauthenticated, empty/malformed/non-login `gh` output, `git` absent,
 # `user.email` unset or empty, allowlist missing/unreadable/unparseable/empty/unknown-key, no
-# usable YAML parser, no python3, an unlexable command string, an unrecognised hook payload.
+# usable YAML parser, no python3, an unlexable command string, an unrecognised hook payload,
+# `--command` with no value, and any exit code from the embedded checker outside its own contract.
 #
 # EXIT CONTRACT (check modes — the firm's three-way gate contract; AC-016)
 #   0  identity resolved AND allow-listed                     -> permitted
@@ -35,6 +46,10 @@
 #   2  CANNOT EVALUATE (any indeterminate path above)          -> refused
 #   Callers MUST treat anything other than 0 as a block. `--hook` does exactly that, and it does
 #   not distinguish 1 from 2 in the block decision (only in the message it prints).
+#   The embedded python checker deliberately exits 3 (not 1) for a refusal, so that a bare 1 —
+#   which is what a python3 that dies of a syntax error, a bad interpreter or a failed exec
+#   returns — can never be MISREAD as the decision "identity resolved and not allow-listed". The
+#   bash wrapper maps 3 -> 1 and maps everything outside {0,2,3} to 2 with a message.
 #
 # WHY --hook ALWAYS EXITS 2 ON A BLOCK, NEVER 1
 #   Measured against Claude Code 2.1.220, not assumed: a PreToolUse hook exiting **2** blocks the
@@ -51,9 +66,18 @@
 # PERFORMANCE (AC-022) — the hook fires on EVERY Bash call, so identity resolution (a network
 # round-trip to `gh`) happens ONLY after the command has matched the gated surface. A command with
 # none of the trigger substrings is decided in bash, with zero subprocesses. Measured on the
-# machine this was written on: 9.8 ms per benign Bash call (no gh, no git, no python3 spawned —
+# machine this was written on: 10.4 ms per benign Bash call (no gh, no git, no python3 spawned —
 # tests/test-merge-guard.sh proves that with stubs that fail loudly if executed), and ~500 ms for a
-# gated command, which is one real `gh` round trip.
+# gated command, which is one real `gh` round trip. The prefilter is quote/escape-normalised in
+# bash (parameter expansion only, still zero subprocesses) so that shell quoting cannot smuggle a
+# trigger word past it — see the comment above _mg_may_match.
+#
+# HOW THE WORST CASE STAYS UNDER THE REGISTERED HOOK TIMEOUT
+#   Both hook registrations set "timeout": 30. The script's own bounded waits are GH_TIMEOUT +
+#   GIT_TIMEOUT + 2 * KILL_GRACE (8 + 4 + 2 = 14 s worst case, both sources hung), leaving room for
+#   python start-up, the allowlist read and the ledger append. tests/test-merge-guard.sh parses
+#   these constants out of THIS file and out of BOTH hook registrations and fails if the inequality
+#   stops holding, because a hook that exceeds its framework timeout is not a block.
 #
 # ON DOUBLE-FIRING, DELIBERATELY NOT CACHED. This repo is simultaneously the plugin source and the
 # project, so BOTH hook registrations resolve and every PreToolUse hook here runs TWICE per Bash
@@ -62,7 +86,7 @@
 # consumer project installing the plugin only sees hooks/hooks.json, a project-scope install only
 # sees .claude/settings.json, so dropping either would silently disable the gate in that mode.
 # The consequence here is two `gh` round trips (~1 s total) and two ledger events on a GATED
-# command; benign commands still cost 2 x 9.8 ms and zero network. That is NOT memoised on
+# command; benign commands still cost 2 x 10.4 ms and zero network. That is NOT memoised on
 # purpose: a cache of a PERMIT decision is a fail-open surface (a stale entry, or a writable cache
 # file, becomes an authorisation) on a control whose entire value is that it fails closed, and the
 # cost it would save falls only on merge/push attempts, which are rare and already network-bound.
@@ -84,10 +108,19 @@ CMD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --hook)    MODE="hook" ;;
-    --command) MODE="command"; CMD="${2:-}"; shift ;;
+    --command)
+      # A flag with no value is caller misuse, not an authorisation. `--command "$UNSET_VAR"`
+      # must not resolve to "nothing gated here, permit" — every other unreadable input in this
+      # script exits 2 and so does this one.
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'firm-merge-guard: CANNOT EVALUATE — --command was given no command string.\n' >&2
+        printf '  Blocking: a gate asked to check nothing must not answer "permitted".\n' >&2
+        exit 2
+      fi
+      MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,60p' "$__src" | sed 's/^# \{0,1\}//'
+      sed -n '2,95p' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
@@ -111,22 +144,41 @@ POLICY  = os.environ.get("FIRM_MG_POLICY", "")
 PAYLOAD = os.environ.get("FIRM_MG_PAYLOAD", "")
 COMMAND = os.environ.get("FIRM_MG_COMMAND", "")
 
+# The DECISION codes (what the ledger records and what the bash wrapper reports as the contract).
 PERMIT, REFUSE, CANNOT = 0, 1, 2
-GH_TIMEOUT, GIT_TIMEOUT = 12, 8
+# What THIS process exits with. REFUSE leaves as 3 so that a bare 1 from a broken interpreter can
+# never be mistaken for a decision; the bash wrapper maps 3 -> 1. (SEC-07)
+PROCESS_EXIT = {PERMIT: 0, REFUSE: 3, CANNOT: 2}
+
+# Bounded waits. tests/test-merge-guard.sh parses this exact line and asserts
+# GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + HOOK_BUDGET_MARGIN <= the registered hook timeout in
+# BOTH .claude/settings.json and hooks/hooks.json. Do not raise these without re-running that test.
+GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = 8, 4, 1
+# Headroom for python start-up, the allowlist read and the ledger append.
+HOOK_BUDGET_MARGIN = 10
 
 def err(*a):
     sys.stderr.write(" ".join(str(x) for x in a) + "\n")
 
 # ---- the gated command surface -------------------------------------------------------------
-# Matching is on the command STRING, because that is all a PreToolUse hook is given. Everything
-# below is structural (tokenise, then look at the actual command word and subcommand) rather than
-# substring matching, because substring matching would block `git merge-base`, `git merge-file`
-# and `git commit -m "...merge..."` — false positives that would make the firm unusable.
+# Matching is STRUCTURAL: tokenise with shlex, split on shell operators, resolve the launcher
+# prefix, then look at the actual command word and subcommand. It is deliberately NOT substring
+# matching, because substring matching would block `git merge-base`, `git merge-file` and
+# `git commit -m "...merge..."` — false positives that would make the firm unusable. There is a
+# cheap substring PREFILTER in bash (see _mg_may_match) but it only ever proves a NEGATIVE.
 
-TRIGGER = re.compile(r"push|merge|pull|gh", re.I)     # cheap prefilter; a strict superset
-SHELLS   = ("bash", "sh", "zsh", "dash", "ksh", "mksh")
+SHELLS   = ("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "busybox")
+# Launcher words: a program whose job is to run ANOTHER program. Recognising one means "keep
+# looking for the real command word", including past the launcher's OWN flags and flag values.
 WRAPPERS = ("sudo", "doas", "env", "command", "builtin", "exec", "nohup",
-            "time", "nice", "ionice", "stdbuf", "setsid", "caffeinate")
+            "time", "nice", "ionice", "stdbuf", "setsid", "caffeinate",
+            "timeout", "gtimeout", "xargs", "flock", "watch", "parallel",
+            "taskset", "chrt", "unbuffer", "script", "proxychains", "proxychains4",
+            "eatmydata", "retry", "chronic", "ts", "arch", "setarch")
+# Shell keywords that can precede a command word inside one operator-delimited segment
+# (`if git diff --quiet; then git push; fi`, `for f in x; do git push; done`).
+KEYWORDS = ("if", "then", "elif", "else", "while", "until", "do", "for", "case", "esac",
+            "fi", "done", "in", "coproc")
 GIT_OPT_WITH_VALUE = ("-C", "-c", "--git-dir", "--work-tree", "--namespace",
                       "--exec-path", "--config-env", "--super-prefix")
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
@@ -135,32 +187,81 @@ WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 GH_API_WRITE_FLAGS = ("-f", "--field", "-F", "--raw-field", "--input")
 GH_API_VALUE_FLAGS = ("-H", "--header", "-q", "--jq", "-t", "--template",
                       "--hostname", "--cache", "-p", "--preview", "--slurp")
+GH_GROUPS = ("pr", "api", "release", "repo")
 GH_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 
+# The identity keys whose WRITE is gated (SEC-04): the guard's own second axis, plus user.name,
+# which is not read for the decision but is the same class of self-authorship.
+GIT_IDENTITY_KEYS = ("user.email", "user.name")
+GIT_CONFIG_VALUE_FLAGS = ("-f", "--file", "--blob", "--type", "-t", "--default",
+                          "--fixed-value", "--comment")
+GIT_CONFIG_READ_FLAGS  = ("--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list",
+                          "-l", "--get-color", "--get-colorbool", "--name-only")
+GIT_CONFIG_READ_VERBS  = ("get", "list")
+GIT_CONFIG_WRITE_FLAGS = ("--add", "--replace-all", "--unset", "--unset-all",
+                          "--rename-section", "--remove-section")
+
 SURFACE_COVERED = [
-    "git push (every form: --force, -f, --force-with-lease, --tags, --mirror, --delete, an",
-    "  explicit refspec, any remote name, `git -C <path> push`, `git -c k=v push`)",
+    "git push — every flag form (--force, -f, --force-with-lease, --tags, --mirror, --delete), an",
+    "  explicit or forced refspec, any remote name or URL, `git -C <path> push`, `git -c k=v push`,",
+    "  `git --git-dir=<d> push`, `git --no-pager push`, and an absolute path to git",
     "git merge (any target, including while the default branch is checked out)",
     "git pull (it merges)",
     "git subtree push",
+    "git config WRITES to user.email / user.name — `git config [--global|--local|--system|-f F]",
+    "  user.email <v>`, `--add`/`--replace-all`/`--unset`/`--unset-all`, and the newer",
+    "  `git config set|unset user.email <v>` verb form. This is the guard's own identity axis, so a",
+    "  blocked agent cannot re-author itself into the allowlist. READS are NOT matched (`git config",
+    "  user.email`, `--get`, `--get-all`, `--get-regexp`, `--list`, `-l`, `git config get ...`),",
+    "  and neither is a non-identity key (`git config --global core.editor vim`).",
     "gh pr merge",
-    "gh api with a write method (-X/--method POST|PUT|PATCH|DELETE) — covers",
-    "  `gh api -X PUT /repos/*/git/refs/heads/<default>` and `gh api -X POST /repos/*/merges`",
+    "gh api with a write method: `-X POST|PUT|PATCH|DELETE`, `--method X`, `--method=X`, and the",
+    "  ATTACHED short form `-XPUT` / `-XPOST` / `-XPATCH` / `-XDELETE` (any case)",
     "gh api with a field/input flag (-f/-F/--field/--raw-field/--input): gh makes that a POST",
     "gh api on a path containing /merges, /git/refs, or /pulls/<n>/merge (any method)",
     "gh release create|delete|edit|upload (creates or moves a remote tag ref)",
     "gh repo sync (moves a branch ref)",
-    "the above behind: `&&`, `||`, `;`, `|`, newlines, `(...)`, backslash continuations,",
-    "  leading VAR=VAL assignments, wrappers (sudo/env/command/exec/time/nohup/nice/xargs-free),",
-    "  an absolute path (/opt/homebrew/bin/gh), `bash -c '<cmd>'`, `$(...)`/backtick substitution,",
-    "  and a shell heredoc body fed to bash/sh/zsh",
+    "any of the above behind ALL of these, in any combination:",
+    "  · operators and grouping: `&&`, `||`, `;`, `|`, `&`, newlines, backslash continuations,",
+    "    `(...)` subshells, `{ ...; }` brace groups, `!` negation, `$(...)` and backtick capture",
+    "  · shell keywords: `if ...; then git push; fi`, `for f in x; do git push; done`",
+    "  · leading VAR=VAL assignments",
+    "  · redirections anywhere, INCLUDING leading and fd-prefixed ones: `>/dev/null git push`,",
+    "    `2>/tmp/e git merge main`, `git push >log 2>&1`",
+    "  · a launcher word AND ITS OWN FLAGS AND FLAG VALUES. The launcher set is printed below;",
+    "    `sudo -u josh`, `sudo --`, `nice -n 10`, `nice -n19`, `env -i`, `env -u FOO`,",
+    "    `command -p`, `stdbuf -o0`, `timeout 60`, `timeout -s KILL 60`, `xargs -n1` all resolve",
+    "    to the command they launch",
+    "  · a shell with an inline command string: any short-option cluster containing `c` (`-c`,",
+    "    `-ec`, `-xc`, `-lc`, `-cl`, `-exc`) and value-taking shell flags before it",
+    "    (`bash -o pipefail -c '<cmd>'`, `bash --rcfile f -c '<cmd>'`)",
+    "  · a shell HERE-STRING: `bash <<< '<cmd>'`",
+    "  · a heredoc body when ANY segment of the introducing line is a shell — so both",
+    "    `bash <<'EOF' ... EOF` and `cat <<'EOF' | bash` are scanned",
+    "  · a command string passed as a whitespace-containing flag VALUE to a launcher",
+    "    (`flock -c 'git push'`, `watch 'git push'`, `xargs -I{} 'git push'`)",
+    "  · shell QUOTING or ESCAPING of the command word or the subcommand: `git pus\\h`,",
+    "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push` — the bash prefilter is",
+    "    quote/escape-normalised and the classifier reads shlex-resolved tokens, not raw text",
+    "the launcher set, in full: " + " ".join(WRAPPERS),
 ]
 SURFACE_GAPS = [
+    "A launcher NOT in the set printed above — a custom wrapper script, `proot`, a new coreutils",
+    "  launcher: `mywrap git push origin main` is NOT matched. The set is a name list and a name",
+    "  list is never complete; the FLAG handling inside it is generic, the names are not.",
+    "A launcher whose command operand follows a non-flag positional operand it consumes:",
+    "  `flock /tmp/lock git push` is NOT matched (`flock -c 'git push'` IS). Skipping a bare",
+    "  positional word would mean treating the next word as a command, which over-blocks.",
     "A git ALIAS: `git ps` where ps=push, or a shell alias/function `gp`. The alias definition is",
     "  not visible in the command string, so the guard cannot see the push. Not closable here.",
     "Any string-level obfuscation: `g=git; $g push`, `eval \"$(printf 'git push')\"`, base64,",
-    "  a push inside a script FILE the agent wrote and then executed. A determined bypass is out",
-    "  of scope by construction — see the CLIENT-SIDE disclosure in this file's header.",
+    "  or a command string assembled at run time (`echo 'git push' | xargs -I{} bash -c '{}'`,",
+    "  `curl ... | bash`). A determined bypass is out of scope by construction — see the",
+    "  CLIENT-SIDE disclosure in this file's header.",
+    "A push inside a script FILE: `bash deploy.sh`, `. deploy.sh`, `bash -s < deploy.sh`. The",
+    "  guard reads the command line, never a file the command line names.",
+    "More than 3 levels of shell nesting (`bash -c \"bash -c 'bash -c ...'\"`) — the recursion is",
+    "  bounded at depth 3 so a pathological string cannot hang the hook.",
     "Non-shell surfaces: a push from Python/Node (subprocess, dulwich, isomorphic-git), or any",
     "  MCP/tool that talks to the GitHub API directly. A PreToolUse(Bash) hook never sees them.",
     "`hub` and `glab`, and `git svn dcommit`.",
@@ -170,6 +271,11 @@ SURFACE_GAPS = [
     "  `git update-ref refs/heads/main`, `git reset --hard` on main. They cannot reach the remote",
     "  without a `git push`, which IS covered.",
     "Read-only `gh api` (a GET with no fields) is deliberately not matched.",
+    "An identity change made as a FILE WRITE rather than as a `git config` command: appending to",
+    "  `.git/config` or `~/.gitconfig` (`printf ... >> .git/config`, `sed -i`, `git config --edit`,",
+    "  or the Edit/Write tools, which this Bash hook never sees). The `git config` COMMAND is now",
+    "  gated; the FILE is not, and cannot be from here. This is the honest residual of SEC-04 and",
+    "  it is why the header still lists 'rewrite the git identity as a file' as a bypass route.",
     "A wrapper script that merges internally is not matched by name: `firm-integrate` is the",
     "  firm's own case, and it is safe by its own positive allowlist (integration/* only), not by",
     "  this guard. A FUTURE wrapper could launder a merge past both.",
@@ -183,6 +289,23 @@ class Cannot(Exception):
 
 def base(tok):
     return tok.rsplit("/", 1)[-1] if "/" in tok else tok
+
+# A program token as the shell would resolve it, minus the decoration shell quoting leaves behind
+# after shlex: `$'git'` lexes to `$git`, `"git"` to `git`, `` `git `` keeps its backtick.
+def prog_name(tok):
+    t = tok.strip("\"'`")
+    while t[:1] in ("$", "{"):
+        t = t[1:]
+    t = t.rstrip("}")
+    return base(t)
+
+ASSIGN_RE  = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+NUMBERISH  = re.compile(r"^[-+]?\d+(?:\.\d+)?[a-zA-Z]?$")
+FD_RE      = re.compile(r"^\d$")
+SEP_WORDS  = ("{", "}", "!")
+SHELL_CFLAG_RE   = re.compile(r"^[-+][A-Za-z]*c[A-Za-z]*$")
+SHELL_VALUE_FLAGS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--wordexp")
+WS_RE = re.compile(r"\s")
 
 def substitutions(text):
     """Yield the inside of every $(...) and `...` span, so `out=$(git push)` is still seen."""
@@ -209,10 +332,15 @@ def substitutions(text):
         i += 1
     return out
 
-HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`, `<<\EOF`
+HEREDOC_RE = re.compile(r"<<-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 def logical_lines(text):
-    """Split into lines, dropping heredoc bodies UNLESS the heredoc feeds a shell."""
+    """Split into lines, dropping heredoc bodies UNLESS the heredoc feeds a shell.
+
+    "Feeds a shell" is decided from EVERY command in the introducing line, not just its first word:
+    `cat <<'EOF' | bash` feeds a shell even though the first word is `cat`. (SEC-01d)
+    """
     lines = text.replace("\\\n", " ").split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
@@ -221,8 +349,7 @@ def logical_lines(text):
         m = HEREDOC_RE.search(line)
         if m:
             word = m.group(2)
-            head = line.strip().split()
-            keep = bool(head) and base(head[0].strip("\"'")) in SHELLS
+            keep = line_feeds_shell(line)
             i += 1
             while i < n and lines[i].strip() != word:
                 if keep:
@@ -233,12 +360,34 @@ def logical_lines(text):
         i += 1
     return out
 
+def line_feeds_shell(line):
+    try:
+        segs = segments(line)
+    except Cannot:
+        head = line.strip().split()
+        return bool(head) and prog_name(head[0]) in SHELLS
+    for toks, _here in segs:
+        argv, _cmdlike = launcher_argv(toks)
+        if argv and prog_name(argv[0]) in SHELLS:
+            return True
+    return False
+
+def is_punct(t):
+    return bool(t) and all(ch in "();<>|&" for ch in t)
+
 def segments(line):
-    """Tokenise one line and split it on shell operators, OUTSIDE quotes.
+    """Tokenise one line and split it into commands, OUTSIDE quotes.
 
     shlex(posix=True, punctuation_chars=True) is the tool for this: it yields `&&`, `||`, `;`, `|`
     as their own tokens and — critically — does NOT split on an operator inside a quoted string.
     A naive split would turn `git commit -m "gate; git push is refused"` into a false positive.
+
+    Returns [(tokens, herestrings)]. Two things are handled here rather than in the classifier:
+      · A REDIRECTION does not start a new command. Its operator, its operand (always a filename,
+        never a command word) and any single-digit fd shlex split off the front of `2>` are all
+        dropped, so `>/dev/null git push` and `2>/tmp/e git merge` keep `git` as the command word.
+      · A HERE-STRING operand (`bash <<< 'git push'`) is a command STRING, so it is kept and handed
+        back for recursion instead of being mistaken for a program name.
     """
     import shlex
     lex = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -248,17 +397,134 @@ def segments(line):
     except ValueError as e:
         # Unbalanced quote: a real shell would fail too, but we must not guess. Fail closed.
         raise Cannot("could not tokenise the command line (%s)" % e)
-    segs, cur = [], []
-    for t in toks:
-        if t and all(ch in "();<>|&" for ch in t):
-            if cur:
-                segs.append(cur)
-                cur = []
-        else:
-            cur.append(t)
-    if cur:
-        segs.append(cur)
+    segs, cur, here = [], [], []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t in SEP_WORDS:                       # `{`, `}`, `!` are command boundaries too
+            if cur or here:
+                segs.append((cur, here)); cur, here = [], []
+            i += 1
+            continue
+        if is_punct(t):
+            if ("<" in t) or (">" in t):
+                if cur and FD_RE.match(cur[-1]):
+                    cur.pop()
+                nxt = toks[i + 1] if i + 1 < n else None
+                if nxt is not None and not is_punct(nxt):
+                    if t == "<<<":
+                        here.append(nxt)
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if cur or here:
+                segs.append((cur, here)); cur, here = [], []
+            i += 1
+            continue
+        cur.append(t)
+        i += 1
+    if cur or here:
+        segs.append((cur, here))
     return segs
+
+def launcher_argv(seg):
+    """Resolve a launcher prefix. -> (argv of the command actually being launched, [cmd strings]).
+
+    The prefix may contain, in any order: leading VAR=VAL assignments, launcher words, shell
+    keywords, and — the whole point of this function — each launcher's OWN flags and flag VALUES.
+    The old version broke on the first flag, which made `sudo -u josh git push`, `nice -n 10 git
+    push`, `env -u FOO git push`, `command -p git push` and `timeout 60 git push` invisible. The
+    handling here is generic (a flag, then optionally one value that is not itself a program we
+    care about), not a per-launcher argument table.
+
+    Second return value: any whitespace-containing token consumed inside the prefix. Those are
+    candidate command STRINGS (`flock -c 'git push'`, `watch 'git push'`) and get classified
+    recursively — structurally, so `sudo -p "prompt about git push"` still resolves to nothing.
+    """
+    i, after_flag, saw_launcher = 0, False, False
+    cmdlike = []
+    while i < len(seg):
+        t = seg[i]
+        if ASSIGN_RE.match(t):
+            i += 1; after_flag = False; continue
+        p = prog_name(t)
+        if p in WRAPPERS or p in KEYWORDS:
+            i += 1; after_flag = False; saw_launcher = True; continue
+        if not saw_launcher:
+            break                       # position 0 decides: nothing to skip past
+        if t == "--":
+            i += 1; after_flag = False; continue
+        if t[:1] in ("-", "+"):
+            i += 1; after_flag = True; continue
+        if p in SHELLS or p in ("git", "gh"):
+            break                       # found the command word
+        if WS_RE.search(t):
+            cmdlike.append(t)           # a command string, wherever it sits in the prefix
+            if not after_flag:
+                return None, cmdlike
+            i += 1; after_flag = False; continue
+        if NUMBERISH.match(t):
+            i += 1; after_flag = False; continue    # `timeout 60`, `nice 10`
+        if after_flag:
+            i += 1; after_flag = False; continue    # this flag's value: `sudo -u josh`
+        return None, cmdlike            # a different program is being launched
+    if i >= len(seg):
+        return None, cmdlike
+    return seg[i:], cmdlike
+
+def shell_inline(argv, depth):
+    """`bash -c '<cmd>'` and every equivalent spelling of it.
+
+    The `-c` is matched as a PATTERN — any single-dash short-option cluster containing a lowercase
+    `c` — not against a fixed list, because `bash -ec`, `bash -xc`, `sh -ec` and `bash -exc` are
+    all `-c` and the fixed list ("-c","-lc","-ic","-cl") missed them. Lowercase `c` is the only
+    bash short option spelled `c`, so a cluster containing it always means -c; `-C` (noclobber)
+    does not match.
+    """
+    j = 1
+    while j < len(argv):
+        t = argv[j]
+        if t in SHELL_VALUE_FLAGS:
+            j += 2
+            continue
+        if SHELL_CFLAG_RE.match(t):
+            return classify(argv[j + 1], depth + 1) if j + 1 < len(argv) else None
+        if t[:1] in ("-", "+"):
+            j += 1
+            continue
+        return None            # a script FILE operand; its contents are a declared gap
+    return None
+
+def classify_git_config(rest):
+    """Gate a WRITE to the guard's own identity axis; never a read. (SEC-04)"""
+    pos, flags = [], []
+    j = 0
+    while j < len(rest):
+        a = rest[j]
+        if a in GIT_CONFIG_VALUE_FLAGS:
+            j += 2
+            continue
+        if a.startswith("-"):
+            flags.append(a.split("=", 1)[0])
+            j += 1
+            continue
+        pos.append(a)
+        j += 1
+    if any(f in GIT_CONFIG_READ_FLAGS for f in flags):
+        return None
+    if pos and pos[0] in GIT_CONFIG_READ_VERBS:
+        return None
+    key, write = None, False
+    if pos and pos[0] in ("set", "unset"):                  # git >= 2.46 verb form
+        key, write = (pos[1] if len(pos) > 1 else ""), True
+    elif any(f in GIT_CONFIG_WRITE_FLAGS for f in flags) and pos:
+        key, write = pos[0], True
+    elif len(pos) >= 2:                                     # `git config user.email <value>`
+        key, write = pos[0], True
+    if write and key and key.lower() in GIT_IDENTITY_KEYS:
+        return "git config (writes %s)" % key.lower()
+    return None
 
 def classify_git(args):
     i = 0
@@ -282,6 +548,8 @@ def classify_git(args):
         return "git pull"
     if sub == "subtree" and rest and rest[0] == "push":
         return "git subtree push"
+    if sub == "config":
+        return classify_git_config(rest)
     return None
 
 def classify_gh_api(rest):
@@ -295,6 +563,11 @@ def classify_gh_api(rest):
             continue
         if a.startswith("--method="):
             method = a.split("=", 1)[1]
+            j += 1
+            continue
+        m = re.match(r"^-X(.+)$", a)                 # attached short form: -XPUT (SEC-05)
+        if m:
+            method = m.group(1)
             j += 1
             continue
         if a in GH_API_WRITE_FLAGS:
@@ -329,9 +602,24 @@ def classify_gh_api(rest):
     return None
 
 def classify_gh(args):
-    i = 0
-    while i < len(args) and args[i].startswith("-"):
-        i += 1
+    """Find the gh command GROUP, skipping global flags AND their values.
+
+    The old loop skipped bare leading flags and then took whatever followed as the group, so a
+    value-taking global flag would have consumed the group word and silently un-gated the whole
+    gh surface. Same generic flag/flag-value handling as launcher_argv.
+    """
+    i, after_flag = 0, False
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1; after_flag = False; continue
+        if a.startswith("-"):
+            i += 1; after_flag = True; continue
+        if a in GH_GROUPS:
+            break
+        if after_flag:
+            i += 1; after_flag = False; continue
+        return None
     if i >= len(args):
         return None
     grp, rest = args[i], args[i + 1:]
@@ -346,43 +634,49 @@ def classify_gh(args):
         return "gh repo sync" if sub == "sync" else None
     return None
 
-def classify_segment(seg, depth):
-    i = 0
-    while i < len(seg):
-        t = seg[i]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):     # leading VAR=VAL
-            i += 1
-            continue
-        if base(t) in WRAPPERS:
-            i += 1
-            continue
-        break
-    if i >= len(seg):
-        return None
-    argv = seg[i:]
-    prog = base(argv[0].strip("\"'"))
-    if prog in SHELLS:
-        for j in range(1, len(argv) - 1):
-            if argv[j] in ("-c", "-lc", "-ic", "-cl"):
-                return classify(argv[j + 1], depth + 1)
-        return None
-    if prog == "git":
-        return classify_git(argv[1:])
-    if prog == "gh":
-        return classify_gh(argv[1:])
+def classify_segment(seg, here, depth):
+    argv, cmdlike = launcher_argv(seg)
+    if argv:
+        prog = prog_name(argv[0])
+        if prog in SHELLS:
+            hit = shell_inline(argv, depth)
+            if hit:
+                return hit
+            for hs in here:                     # `bash <<< 'git push'`
+                hit = classify(hs, depth + 1)
+                if hit:
+                    return hit
+        elif prog == "git":
+            hit = classify_git(argv[1:])
+            if hit:
+                return hit
+        elif prog == "gh":
+            hit = classify_gh(argv[1:])
+            if hit:
+                return hit
+    for c in cmdlike:
+        hit = classify(c, depth + 1)
+        if hit:
+            return hit
     return None
 
 def classify(text, depth=0):
-    """Return a label for the gated surface this command line touches, or None."""
+    """Return a label for the gated surface this command line touches, or None.
+
+    NOTE there is deliberately no raw-substring trigger test here any more. There used to be one
+    (`re.compile("push|merge|pull|gh")` against the RAW string) and it threw away work the shlex
+    classifier would have done correctly: `git pus\\h`, `git 'pu'sh`, `git pu"sh"` and `g\\h api`
+    all lex to the right tokens but do not contain the raw substring in the right place. The cheap
+    negative filter lives in bash (_mg_may_match), operates on a quote/escape-NORMALISED copy of
+    the string, and is the only place a substring test is allowed. (SEC-03)
+    """
     if depth > 3 or not text:
-        return None
-    if not TRIGGER.search(text):
         return None
     for line in logical_lines(text):
         if not line.strip():
             continue
-        for seg in segments(line):
-            hit = classify_segment(seg, depth)
+        for toks, here in segments(line):
+            hit = classify_segment(toks, here, depth)
             if hit:
                 return hit
         for inner in substitutions(line):
@@ -461,7 +755,7 @@ def run(argv, timeout):
     except subprocess.TimeoutExpired:
         try:
             p.kill()
-            p.communicate(timeout=2)
+            p.communicate(timeout=KILL_GRACE)
         except Exception:
             pass
         return 124, "", "", "timeout"
@@ -509,10 +803,16 @@ def ledger(event, fields):
             run_dir = fh.read().strip()
         if not run_dir or not os.path.isdir(run_dir):
             return
+        # CURRENT_RUN is DATA, not an instruction: whatever can write it must not be able to steer
+        # these appends outside the project the hook is running in. (SEC-11)
+        here = os.path.realpath(os.getcwd())
+        target = os.path.realpath(run_dir)
+        if target != here and not target.startswith(here + os.sep):
+            return
         import datetime
         rec = {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "event": event}
         rec.update(fields)
-        with open(os.path.join(run_dir, "run.jsonl"), "a") as fh:
+        with open(os.path.join(target, "run.jsonl"), "a") as fh:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -554,15 +854,16 @@ def command_from_payload():
 # ---- main ----------------------------------------------------------------------------------
 def surface():
     print("firm-merge-guard — gated command surface")
-    print("\nCOVERED (each has its own test assertion in tests/test-merge-guard.sh):")
+    print("\nCOVERED (each line has its own BLOCK assertion in tests/test-merge-guard.sh):")
     for s in SURFACE_COVERED:
         print("  " + s if not s.startswith("  ") else "  " + s)
-    print("\nKNOWN GAPS (honestly enumerated; not closable client-side):")
+    print("\nKNOWN GAPS (each line has its own PERMIT assertion, so this list cannot drift):")
     for s in SURFACE_GAPS:
         print("  " + s if not s.startswith("  ") else "  " + s)
     print("\nNOT MATCHED, deliberately (false positives would make the firm unusable):")
     print("  git merge-base / merge-file / merge-tree / merge-index, git commit -m '...merge...',")
-    print("  git log/diff/status/fetch/show, firm-integrate, firm-qa-checkout, bash tests/run-tests.sh")
+    print("  git log/diff/status/fetch/show, git config READS, git -c user.email=... <subcommand>,")
+    print("  firm-integrate, firm-qa-checkout, bash tests/run-tests.sh")
     return 0
 
 def main():
@@ -625,6 +926,15 @@ def main():
         return PERMIT
 
     # Blocked. Say exactly which axis failed and how to proceed legitimately.
+    #
+    # WHAT THIS MESSAGE DELIBERATELY DOES NOT DO (SEC-04): it does not print a `git config
+    # user.email <value>` command. The previous version did, and that made the guard dictate its
+    # own bypass — a single un-gated Bash call, printed by the control, to the exact actor the
+    # control exists to restrain. The diagnostic (which axis failed, what the allowlist contains,
+    # where it lives) is kept, because the allowlist file path is printed and that file is readable
+    # anyway; redacting its contents would be theatre. What is removed is the IMPERATIVE. The
+    # actionable route for a legitimately mis-configured operator is the human running the repair
+    # themselves — and that write is now gated too, so an agent cannot do it "helpfully".
     code = CANNOT if indeterminate else REFUSE
     label = "CANNOT EVALUATE identity" if indeterminate else "identity NOT authorised"
     err("firm-merge-guard: BLOCKED — %s." % label)
@@ -638,23 +948,20 @@ def main():
     err("  allow-listed    : logins %s ; emails %s" % (", ".join(logins), ", ".join(emails)))
     err("")
     if git_status == "ok" and not git_ok:
-        suggest = ""
-        for e in entries:
-            if str(e.get("gh_login", "")).lower() == gh_login.lower():
-                ems = e.get("git_emails") or []
-                if ems:
-                    suggest = str(ems[0])
-                break
-        if not suggest and emails:
-            suggest = emails[0]
-        err("  Your git identity is not one of the authorised ones. A stale global identity left")
-        err("  behind by CI (`git config --global user.*` in .github/workflows/ci.yml) is the")
-        err("  usual cause on this machine. If you are an authorised operator, set your own:")
+        err("  The git identity configured in this working tree is not an authorised one. A stale")
+        err("  global identity left behind by CI (`git config --global user.*` in")
+        err("  .github/workflows/ci.yml) is the usual cause on this machine.")
         err("")
-        err('      git config --global user.email %s' % suggest)
+        err("  DO NOT re-author your own identity to get past this block. Writing user.email or")
+        err("  user.name is ITSELF on this guard's gated surface, deliberately: a check whose only")
+        err("  input is a value the caller may rewrite is not a check. If the configuration on")
+        err("  this machine is genuinely wrong, that repair belongs to the human operator, in a")
+        err("  terminal, under their own identity — not to the blocked agent.")
         err("")
     if git_status not in ("ok", ):
-        err("  Set a git identity before merging: git config --global user.email <your address>")
+        err("  No usable git identity was found in this working tree. Setting one is itself gated,")
+        err("  so the human operator has to do it — this guard will not authorise an agent to")
+        err("  choose its own identity.")
     if gh_status == "gh-absent":
         err("  Install and authenticate the GitHub CLI: `gh auth login`.")
     elif gh_status in ("gh-failed", "gh-timeout"):
@@ -676,7 +983,7 @@ def main():
     return code
 
 try:
-    sys.exit(main())
+    sys.exit(PROCESS_EXIT[main()])
 except Cannot as e:                      # anything unclassified above still fails closed
     err("firm-merge-guard: CANNOT EVALUATE — %s" % e)
     sys.exit(2)
@@ -688,14 +995,35 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------------------------
-# Cheap bash prefilter (AC-022). A command line with none of these substrings cannot match any
-# entry in SURFACE_COVERED — every covered form literally contains push, merge, pull, or "gh ".
+# Cheap bash prefilter (AC-022). This is a HEURISTIC NEGATIVE FILTER, not a superset of
+# SURFACE_COVERED — do not re-add the claim that it is one. It used to say "a command line with
+# none of these substrings cannot match any entry in SURFACE_COVERED", and that was FALSE: shell
+# quoting splits a trigger word without changing what runs, so `git pus\h`, `git 'pu'sh`,
+# `git pu"sh"` and `g\h api` all reached this filter with no matching substring and were permitted
+# before the real classifier ever saw them. (SEC-03)
+#
+# So the string is NORMALISED first — every backslash, single quote and double quote is deleted
+# with bash parameter expansion, which costs ZERO subprocesses — and the substring test runs
+# against the normalised copy. Deleting quotes can only ADD candidates (a false positive here
+# costs one python3 start and is then resolved structurally); it can never remove one.
+#
+# The `git`+`config` pair is its own condition because a `git config user.email <v>` write — which
+# IS gated (SEC-04) — contains none of push/merge/pull/gh. Requiring BOTH words keeps the common
+# `git status` / `cat config.yml` calls on the zero-subprocess path.
+#
 # Returning 1 here costs ZERO subprocesses: no python3, no gh, no git, no network.
 # ---------------------------------------------------------------------------------------------
 _mg_may_match() {
-  case "$1" in
+  local s
+  s="${1//\\/}"
+  s="${s//\'/}"
+  s="${s//\"/}"
+  case "$s" in
     *push*|*Push*|*PUSH*|*merge*|*Merge*|*MERGE*|*pull*|*Pull*|*PULL*) return 0 ;;
-    *"gh "*|*"gh	"*|*'gh"'*|*"gh'"*)                                  return 0 ;;
+    *"gh "*|*"gh	"*)                                                  return 0 ;;
+  esac
+  case "$s" in
+    *config*)  case "$s" in *git*) return 0 ;; esac ;;
   esac
   return 1
 }
@@ -705,6 +1033,21 @@ if [ "$MODE" = "surface" ]; then
   exit $?
 fi
 
+# _mg_report_rc <rc> <refuse-code> — map the checker's process exit onto the caller contract.
+# 0 permit, 3 refuse, 2 cannot-evaluate; ANYTHING else came from outside the checker's contract
+# (python3 dying of a syntax error or a failed exec both exit 1) and is reported as
+# cannot-evaluate rather than passed through as a decision. (SEC-07)
+_mg_report_rc() {
+  case "$1" in
+    0) exit 0 ;;
+    3) exit "$2" ;;
+    2) exit 2 ;;
+    *) printf 'firm-merge-guard: CANNOT EVALUATE — the checker itself exited %s (no decision was\n' "$1" >&2
+       printf '  reached, so nothing was recorded in the ledger). Blocking.\n' >&2
+       exit 2 ;;
+  esac
+}
+
 if [ "$MODE" = "command" ]; then
   _mg_may_match "$CMD" || exit 0
   if ! command -v python3 >/dev/null 2>&1; then
@@ -712,14 +1055,7 @@ if [ "$MODE" = "command" ]; then
     exit 2
   fi
   FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="$CMD" _mg_py
-  rc=$?
-  # The contract is exactly three-way, so an exit code from OUTSIDE it (python3 itself failing, a
-  # SIGKILL, an exec error) must be reported as cannot-evaluate — not passed through raw. It is
-  # still non-zero either way, but a caller told "99" cannot tell that from a decision.
-  case "$rc" in 0|1|2) exit "$rc" ;; *)
-    printf 'firm-merge-guard: CANNOT EVALUATE — the checker itself exited %s.\n' "$rc" >&2
-    exit 2 ;;
-  esac
+  _mg_report_rc "$?" 1
 fi
 
 # ---- hook mode ------------------------------------------------------------------------------
@@ -728,13 +1064,19 @@ payload="$(cat 2>/dev/null || true)"
 # Fast negative filter. jq is used ONLY to prove a NEGATIVE (a real string command with no trigger
 # word); anything it cannot answer with certainty falls through to python3, which is authoritative.
 # A jq that is missing, old, or wrong can therefore only cost a few milliseconds — never a pass.
+# The same quote/escape normalisation as _mg_may_match is applied before the substring test, for
+# the same reason (SEC-03). The single quote is spelled with jq's own ' escape so that this
+# whole jq program can stay inside a single-quoted shell string.
 if command -v jq >/dev/null 2>&1; then
   verdict="$(printf '%s' "$payload" | jq -r '
     if (.tool_input | type) != "object" then "CHECK"
     elif (.tool_input | has("command")) != true then "CHECK"
     elif (.tool_input.command | type) != "string" then "CHECK"
-    elif (.tool_input.command | test("push|merge|pull|gh"; "i")) then "CHECK"
-    else "SKIP" end' 2>/dev/null || printf 'CHECK')"
+    else (.tool_input.command | gsub("\\\\"; "") | gsub("\u0027"; "") | gsub("\""; "")) as $c
+      | if ($c | test("push|merge|pull|gh"; "i")) then "CHECK"
+        elif ($c | test("git")) and ($c | test("config")) then "CHECK"
+        else "SKIP" end
+    end' 2>/dev/null || printf 'CHECK')"
   [ "$verdict" = "SKIP" ] && exit 0
 else
   # No jq: the whole payload is the haystack. It is a superset of the command, so a negative here
@@ -750,9 +1092,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 FIRM_MG_MODE=hook FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="$payload" FIRM_MG_COMMAND="" _mg_py
-rc=$?
 # THE CALLER CONTRACT (AC-016): anything other than 0 is a block, and a PreToolUse hook only
 # actually blocks on exit 2 in this Claude Code version (measured — exit 1 lets the command run).
-# So 1 and 2 are deliberately NOT distinguished here.
-[ "$rc" -eq 0 ] || exit 2
-exit 0
+# So a refusal (3) and a cannot-evaluate (2) both become 2 here; they are deliberately NOT
+# distinguished, and neither is an out-of-contract code.
+_mg_report_rc "$?" 2
