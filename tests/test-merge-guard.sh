@@ -98,6 +98,34 @@ mg_hook() {
   ( cd "$cwd" && printf '%s' "$p" | PATH="$s:$PATH" "$t/bin/firm-merge-guard" --hook )
 }
 
+# assert_not_output <desc> <needle> <cmd...>  — stdout+stderr must NOT contain <needle>.
+# Deliberately local to this file rather than lib.sh: asserting an ABSENCE is only ever right when
+# the absence IS the contract, and here it is exactly one thing — the block message must not hand
+# the blocked agent a command that re-authorises it (SEC-04).
+assert_not_output() {
+  local desc="$1" needle="$2" out; shift 2
+  out="$("$@" 2>&1)"
+  case "$out" in
+    *"$needle"*) _t_no "$desc" "found forbidden '$needle' in: $(_t_ctx "$out")" ;;
+    *) _t_ok "$desc" ;;
+  esac
+}
+
+# mg_both <desc> <command> — a gated command must be REFUSED by --command (1, the surface matched
+# under a non-allow-listed identity) AND must BLOCK through the hook adapter (2, the tool call is
+# actually stopped). Both axes matter: --command proves the classifier saw it, --hook proves the
+# enforcement surface does. rc=0 in either is the bypass. Callers must set TREE/GH_OK/REPO_BAD.
+mg_both() {
+  assert_rc "$1"                     1 mg      "$TREE" "$GH_OK" "$REPO_BAD" --command "$2"
+  assert_rc "$1 · through the hook"  2 mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$2"
+}
+# mg_gap <desc> <command> — a DECLARED gap: permitted in both modes. Not a win; recorded so the
+# gap list printed by --surface cannot drift away from the behaviour.
+mg_gap() {
+  assert_rc "GAP: $1"                    0 mg      "$TREE" "$GH_OK" "$REPO_BAD" --command "$2"
+  assert_rc "GAP: $1 · through the hook" 0 mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$2"
+}
+
 # A tracked DIRECTORY, not a bare mktemp file: tests/lib.sh's teardown only removes directories, so
 # a registered plain file would be skipped and leaked.
 _hdr_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-header.XXXXXX")"; t_track "$_hdr_dir"
@@ -187,6 +215,89 @@ cd /tmp/r
 git push origin main
 EOF"
 
+# ======================================================== AC-014/SEC-01 · the LAUNCHER class
+# WHAT THIS SECTION PINS. An independent security review found 17 command strings that reach a real
+# merge/push and that this guard PERMITTED with exit 0 — in hook mode, the actual enforcement
+# surface. Every one of them is asserted below, in BOTH modes, because the previous round's tests
+# asserted only the three BARE wrapper forms (`sudo git push`, `env VAR=v git push`,
+# `time git push`) and therefore said nothing about the failure that mattered.
+#
+# NONE of these is an evasion. `bash -ec '<cmd>'`, `timeout 60 <cmd>`, `nice -n 10 <cmd>` and
+# `xargs <cmd>` are how an agent ordinarily writes a command. The defect was structural: the
+# wrapper-skip loop BROKE on the first flag, so argv[0] became `-u` / `-n` / `--`; the shell `-c`
+# check matched only a fixed 4-item list; `{...}` and leading redirections were not handled.
+t_case "AC-014/SEC-01 a launcher's OWN FLAGS and flag VALUES do not hide the command it launches"
+mg_both "sudo -u <user> git push"          'sudo -u josh git push origin main'
+mg_both "sudo -- git push"                 'sudo -- git push origin main'
+mg_both "nice -n 10 git push"              'nice -n 10 git push origin main'
+mg_both "nice -n19 git push (attached)"    'nice -n19 git push origin main'
+mg_both "env -u FOO git push"              'env -u FOO git push origin main'
+mg_both "env -i git push (flag, then git)" 'env -i git push origin main'
+mg_both "stdbuf -o0 git push"              'stdbuf -o0 git push origin main'
+mg_both "command -p git push"              'command -p git push origin main'
+mg_both "ionice -c3 git push"              'ionice -c3 git push origin main'
+mg_both "timeout 60 git push (bare secs)"  'timeout 60 git push origin main'
+mg_both "timeout -s KILL 60 git merge"     'timeout -s KILL 60 git merge feature/x'
+mg_both "xargs git push"                   'echo main | xargs git push origin'
+mg_both "xargs -n1 git push"               'xargs -n1 git push origin main'
+mg_both "a launcher in front of gh"        'timeout 30 gh pr merge 12'
+mg_both "two launchers stacked"            'sudo -u josh nice -n 10 git push origin main'
+
+t_case "AC-014/SEC-01 a shell's inline command flag is matched as a PATTERN, not a fixed list"
+mg_both "bash -ec '<push>'"                "bash -ec 'git push origin main'"
+mg_both "bash -xc '<push>'"                "bash -xc 'git push origin main'"
+mg_both "sh -ec '<merge>'"                 "sh -ec 'git merge main'"
+mg_both "bash -exc '<push>'"               "bash -exc 'git push origin main'"
+mg_both "bash -lc '<push>'"                "bash -lc 'git push origin main'"
+mg_both "bash -o pipefail -c '<push>'"     "bash -o pipefail -c 'git push origin main'"
+mg_both "bash --rcfile <f> -c '<push>'"    "bash --rcfile /tmp/rc -c 'git push origin main'"
+mg_both "zsh -c '<push>'"                  "zsh -c 'git push origin main'"
+# The uppercase -C (noclobber) is NOT -c, so it must not swallow the next token as a command.
+assert_rc "bash -C <script> is not an inline command (no false positive)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'bash -C deploy-and-push.sh'
+
+t_case "AC-014/SEC-01 here-strings, brace groups, keywords, negation and leading redirections"
+mg_both "bash <<< '<push>' (here-STRING)"  "bash <<< 'git push origin main'"
+mg_both "sh <<< '<merge>'"                 "sh <<< 'git merge main'"
+mg_both "{ git push; } (brace group)"      '{ git push origin main; }'
+mg_both "! git push (negation)"            '! git push origin main'
+mg_both "if ...; then git push; fi"        'if git diff --quiet; then git push origin main; fi'
+mg_both "for ...; do git push; done"       'for f in a b; do git push origin main; done'
+mg_both "LEADING redirection"              '>/dev/null git push origin main'
+mg_both "LEADING fd-prefixed redirection"  '2>/tmp/e git merge main'
+mg_both "trailing redirection + 2>&1"      'git push origin main >log 2>&1'
+mg_both "a command string as a flag VALUE" "flock -c 'git push origin main'"
+mg_both "watch '<push>'"                   "watch 'git push origin main'"
+assert_rc "a heredoc PIPED to bash is scanned (keep/drop is per-segment, not head[0])" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "cat <<'EOF' | bash
+cd /tmp/r
+git push origin main
+EOF"
+assert_rc "  the same, through the hook" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "cat <<'EOF' | bash
+cd /tmp/r
+git push origin main
+EOF"
+assert_rc "bash -s <<'EOF' body is scanned" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash -s <<'EOF'
+git push origin main
+EOF"
+
+# ======================================================== AC-014/SEC-03 · the QUOTING class
+# The shlex classifier resolves shell quoting correctly, but a raw-SUBSTRING prefilter ran first and
+# threw these away before the classifier ever saw them. The prefilter now deletes backslashes and
+# quotes (bash parameter expansion, zero subprocesses) before its substring test; `$'git'` was a
+# separate defect in the classifier itself, which read `$git` as the program name.
+t_case "AC-014/SEC-03 shell quoting of the command word or subcommand does not defeat the check"
+mg_both "git pus\\h (escaped letter)"       'git pus\h origin main'
+mg_both "git 'pu'sh (quoted fragment)"      "git 'pu'sh origin main"
+mg_both 'git pu"sh" (dq fragment)'          'git pu"sh" origin main'
+mg_both "\$'git' push (ANSI-C quoting)"     "\$'git' push origin main"
+mg_both '"git" push (fully quoted)'         '"git" push origin main'
+mg_both "g\\h api -X PUT (a remote ref move)" 'g\h api -X PUT /repos/o/r/git/refs/heads/main -f sha=abc'
+mg_both "'gh' pr merge"                     "'gh' pr merge 12"
+mg_both "escaped subcommand: git me\\rge"   'git me\rge feature/x'
+
 t_case "AC-014 gh-based merge paths"
 assert_rc "gh pr merge"                            1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge'
 assert_rc "gh pr merge <n> --squash"               1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge 12 --squash'
@@ -204,6 +315,80 @@ assert_rc "gh repo sync (moves a branch ref)"      1 mg "$TREE" "$GH_OK" "$REPO_
 assert_rc "an absolute path to gh"                 1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command '/opt/homebrew/bin/gh pr merge 3'
 assert_output "the message names WHICH surface matched" "matched surface : gh pr merge" \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge 12'
+
+t_case "AC-014/SEC-05 an ATTACHED gh method flag is a method (-XPUT, not just -X PUT)"
+# `gh` accepts -XPUT. The parser only knew `-X VALUE`, `--method VALUE` and `--method=VALUE`, so
+# -XPUT fell through the generic startswith("-") skip and `method` stayed None — which un-gated
+# `gh api -XPUT /repos/o/r/pulls/1/update-branch` (moves a branch) and `gh api -XDELETE repos/o/r`
+# (deletes the repo), because neither path contains /merges, /git/refs or /pulls/N/merge.
+mg_both "gh api -XPUT (update-branch)"     'gh api -XPUT /repos/o/r/pulls/1/update-branch'
+mg_both "gh api -XDELETE repos/o/r"        'gh api -XDELETE repos/o/r'
+mg_both "gh api -XPOST"                    'gh api -XPOST repos/o/r/issues'
+mg_both "gh api -XPATCH"                   'gh api -XPATCH repos/o/r'
+mg_both "gh api -Xput (lower case)"        'gh api -Xput repos/o/r/pulls/1/update-branch'
+mg_both "gh api --method=DELETE"           'gh api --method=DELETE repos/o/r'
+assert_output "  the matched label names the method" "gh api -X PUT (remote write)" \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh api -XPUT /repos/o/r/pulls/1/update-branch'
+# A value-taking GLOBAL flag must not swallow the command group. Latent before: the leading-flag
+# skip took the flag's VALUE as the group, so the whole gh surface would silently un-gate the day
+# `gh` gained one.
+mg_both "a global flag with a VALUE before the group" 'gh --hostname github.example.com pr merge 3'
+assert_rc "  and an unrelated gh group is still not gated" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh issue comment 5 --body "gh pr merge is gated"'
+
+# ==================================== AC-013/AC-014/SEC-04 · the guard's own identity axis
+# THE BYPASS THIS CLOSES, verified end to end by the reviewer: the block message printed
+# `git config --global user.email <an address read out of the allowlist>`, that command was gated by
+# neither this guard nor .claude/settings.json's ask/deny, and running it flipped block(1) ->
+# permit(0). One un-gated, un-prompted Bash call, dictated by the control, available to the exact
+# actor the control exists to restrain.
+#
+# Two halves are asserted here: the WRITE is now on the gated surface, and the message no longer
+# hands over the command. A check whose only input is a value the caller may rewrite is not a check.
+t_case "AC-013/SEC-04 a git-config WRITE to the guard's own identity axis is gated"
+mg_both "git config --global user.email <v>"     'git config --global user.email a@b.c'
+mg_both "git config user.email <v> (repo-local)" 'git config user.email a@b.c'
+mg_both "git config --local user.name <v>"       'git config --local user.name Somebody'
+mg_both "git config --replace-all user.email"    'git config --replace-all user.email a@b.c'
+mg_both "git config --add user.email"            'git config --global --add user.email a@b.c'
+mg_both "git config --unset user.email"          'git config --unset user.email'
+mg_both "git config --unset-all user.name"       'git config --unset-all user.name'
+mg_both "git config set user.email (verb form)"  'git config set user.email a@b.c'
+mg_both "git config unset user.name (verb form)" 'git config unset user.name'
+mg_both "git -C <path> config user.email"        'git -C /tmp/other config user.email a@b.c'
+mg_both "git config -f <file> user.email"        'git config -f /tmp/other.cfg user.email a@b.c'
+mg_both "git config --system user.email"         'git config --system user.email a@b.c'
+mg_both "USER.EMAIL (git keys are case-insensitive)" 'git config --global USER.EMAIL a@b.c'
+mg_both "behind a launcher"                      'sudo -u josh git config --global user.email a@b.c'
+mg_both "behind bash -ec"                        "bash -ec 'git config --global user.email a@b.c'"
+
+t_case "AC-013/SEC-04 THE EXACT one-command bypass the review executed is now refused"
+# Not a paraphrase: the command is built from the SAME allowlist value the old message printed, so
+# if the guard ever stops gating this the assertion fails with the real string in it.
+assert_rc "\`git config --global user.email <allow-listed>\` is refused, not permitted" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git config --global user.email $ALLOWED_EMAIL"
+assert_rc "  and it BLOCKS the tool call through the hook" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "git config --global user.email $ALLOWED_EMAIL"
+assert_output "  and the block names the identity write as the matched surface" \
+  "matched surface : git config (writes user.email)" \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git config --global user.email $ALLOWED_EMAIL"
+
+t_case "AC-024/SEC-04 git-config READS and non-identity keys are NOT gated (no false positives)"
+# Gating the write must not gate reading your own config, or setting an unrelated key. `git config
+# user.email` with no value is the READ the guard itself performs.
+for c in 'git config user.email' 'git config --get user.email' 'git config --get-all user.email' \
+         'git config --list' 'git config -l' 'git config --get-regexp ^user' \
+         'git config get user.email' 'git config list' \
+         'git config --global core.editor vim' 'git config --global --unset core.pager' \
+         'git config --get remote.origin.url' 'git config --global init.defaultBranch main'; do
+  assert_rc "not gated: $c" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
+done
+assert_rc "git -c user.email=... <subcommand> is NOT gated (it cannot persist an identity)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -c user.email=eval@firm -c user.name=eval commit -qm fixture'
+# ...and that spelling cannot spoof the guard either: identity is resolved by RUNNING
+# `git config user.email`, which ignores a `-c` on some other command line.
+assert_rc "and `git -c user.email=<allow-listed> push` is still refused" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git -c user.email=$ALLOWED_EMAIL push origin main"
 
 t_case "AC-014/AC-024 NO FALSE POSITIVES — these must all be permitted untouched"
 # A false positive here does not merely annoy: `git merge-base` is used by firm-integrate, and a
@@ -343,6 +528,80 @@ printf 'raise ImportError("simulated broken pyyaml install")\n' > "$POISON/yaml/
 mg_poison() { ( cd "$REPO_OK" && PYTHONPATH="$POISON" PATH="$GH_OK:$PATH" "$TREE/bin/firm-merge-guard" "$@" ); }
 assert_rc "pyyaml present but UNIMPORTABLE -> cannot evaluate" 2 mg_poison --command 'git push origin main'
 assert_output "  and distinguishes broken from absent" "unimportable" mg_poison --command 'git push origin main'
+
+t_case "AC-015/SEC-06 the in-script wait budget provably fits under the REGISTERED hook timeout"
+# A hook that exceeds its framework timeout does not block — so the fail-closed property depends on
+# an inequality between two numbers in three different files, and nothing asserted it. Measured
+# worst case with BOTH identity sources hung was 24s against a 30s registered timeout: 6s of
+# headroom, and the evidence file said 20s. The waits are now 8/4/1 (14s worst case) and this test
+# fails if anyone raises them, or lowers a registered timeout, without re-doing the arithmetic.
+assert_ok "GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= the timeout in BOTH registrations" python3 -c "
+import json, re
+src = open('$GUARD').read()
+m = re.search(r'^GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = (\d+), (\d+), (\d+)\$', src, re.M)
+assert m, 'could not parse the wait constants out of the guard'
+gh, gt, grace = (int(x) for x in m.groups())
+mm = re.search(r'^HOOK_BUDGET_MARGIN = (\d+)\$', src, re.M)
+assert mm, 'could not parse HOOK_BUDGET_MARGIN out of the guard'
+budget = gh + gt + 2 * grace + int(mm.group(1))
+found = []
+for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
+    d = json.load(open(path))
+    for entry in d['hooks']['PreToolUse']:
+        for h in entry['hooks']:
+            if 'firm-merge-guard' in h['command']:
+                t = h.get('timeout')
+                assert t is not None, f'{path}: the guard hook registration has no explicit timeout'
+                found.append((path.rsplit('/', 1)[-1], t))
+                assert budget <= t, (f'{path}: worst case {gh}+{gt}+2*{grace}+{mm.group(1)}={budget}s '
+                                     f'does not fit under the registered {t}s hook timeout')
+assert len(found) == 2, f'expected the guard in BOTH registrations, found {found}'
+print('ok', found, 'budget', budget)
+"
+assert_ok "the KILL_GRACE constant is the one actually used to reap a hung child" python3 -c "
+src = open('$GUARD').read()
+assert 'p.communicate(timeout=KILL_GRACE)' in src, 'the kill grace is hard-coded, so the budget test lies'
+"
+assert_ok "and the guard's own header states the arithmetic, with the numbers" python3 -c "
+import re
+head = ''.join(open('$GUARD').readlines()[:95])
+flat = re.sub(r'\s+', ' ', head.replace('#', ' '))
+assert 'GH_TIMEOUT + GIT_TIMEOUT + 2 * KILL_GRACE' in flat, flat[-900:]
+assert re.search(r'\(8 \+ 4 \+ 2 = 14 s worst case', flat), flat[-900:]
+"
+
+t_case "AC-016/SEC-07 an interpreter that dies with status 1 is cannot-evaluate, not a DECISION"
+# The contract says 1 = 'identity resolved and NOT allow-listed'. python3 dying of a syntax error,
+# a bad shebang or a failed exec also exits 1, and 1 used to be INSIDE the pass-through case arm —
+# so a broken interpreter was reported as a decision, with no message and no ledger event. The
+# checker now exits 3 for a refusal, so a bare 1 can only mean 'not from the checker'.
+PYFAIL1="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyfail1.XXXXXX")"; t_track "$PYFAIL1"
+printf '#!/bin/sh\nexit 1\n' > "$PYFAIL1/python3"; chmod +x "$PYFAIL1/python3"
+PYFAIL99="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyfail99.XXXXXX")"; t_track "$PYFAIL99"
+printf '#!/bin/sh\nexit 99\n' > "$PYFAIL99/python3"; chmod +x "$PYFAIL99/python3"
+assert_rc "python3 exits 1 -> 2 (cannot evaluate), NOT 1 (a refusal)" 2 \
+  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
+assert_output "  and it says the checker itself failed" "the checker itself exited 1" \
+  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
+assert_output "  and says no ledger event was reached (so the silence is explained)" \
+  "nothing was recorded in the ledger" \
+  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
+assert_rc "python3 exits 99 -> 2" 2 mg "$TREE" "$PYFAIL99" "$REPO_OK" --command 'git push origin main'
+assert_rc "python3 exits 1, hook mode -> 2 (blocks)" 2 \
+  mg_hook "$TREE" "$PYFAIL1" "$REPO_OK" 'git push origin main'
+# The real refusal path must still report 1 through the wrapper — the 3->1 mapping is load-bearing.
+assert_rc "a REAL refusal is still reported as 1, not 3" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+
+t_case "AC-016/SEC-08 --command with no value is cannot-evaluate, not an authorisation"
+# `firm-merge-guard --command \"\$CMD\"` with an unset variable used to yield exit 0. Every other
+# unreadable input in this script exits 2; this is the same class of input.
+assert_rc "--command with the flag but NO value" 2 mg_env "$TREE" "$PATH" "$REPO_OK" --command
+assert_rc "--command with an EMPTY value" 2 mg_env "$TREE" "$PATH" "$REPO_OK" --command ''
+assert_output "  and says what was missing" "no command string" \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --command
+# The empty-command-inside-a-VALID-hook-payload case is different and stays a permit — there is
+# genuinely nothing to run there. It is asserted in the AC-016 hook-payload section below.
 
 t_case "AC-015 an unparseable COMMAND is cannot-evaluate, not a pass"
 assert_rc "an unbalanced quote around a push" 2 \
@@ -542,9 +801,46 @@ assert_output "the message says WHICH check failed" "NOT allow-listed" mg "$TREE
 assert_output "the message names the refused command" "refused command : git push origin main" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
 assert_output "the message names the allowlist file to edit" "merge-authority.yaml" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
 assert_output "the message gives the legitimate way to proceed" "ask the human operator" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the message offers the exact git config remedy" "git config --global user.email" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the remedy names an email read FROM the allowlist" "$ALLOWED_EMAIL" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
 assert_output "the message repeats the client-side caveat" "CLIENT-SIDE" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+
+t_case "AC-021/SEC-04 the block message names the problem and does NOT dictate the bypass"
+# TEST CHANGE, RECORDED DELIBERATELY. Two assertions used to live here:
+#     "the message offers the exact git config remedy"  -> needle 'git config --global user.email'
+#     "the remedy names an email read FROM the allowlist" -> needle "$ALLOWED_EMAIL"
+# They pinned a DEFECT, not a behaviour: they required the guard to print a runnable
+# self-authorisation command to the actor it had just refused. They are replaced — not deleted — by
+# the inverse assertion plus the assertions that the message is still ACTIONABLE. That combination
+# is strictly stronger: the old pair could not have failed if the guard printed the recipe AND the
+# recipe was un-gated, which is exactly the state the review found.
+#
+# The allowlist CONTENTS are still printed, on purpose. The allowlist PATH is printed too and that
+# file is plainly readable, so redacting the values it contains would be theatre; what mattered was
+# the imperative, and the write itself, both of which are now handled.
+assert_not_output "no runnable \`git config ... user.email\` recipe is printed" \
+  "git config --global user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_not_output "  nor the --local spelling" \
+  "git config --local user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "instead it names the problem" \
+  "The git identity configured in this working tree is not an authorised one" \
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "  and says re-authoring your own identity is itself gated" \
+  "DO NOT re-author your own identity" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "  and it is still actionable for a legitimately mis-configured operator" \
+  "that repair belongs to the human operator" \
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "  the diagnostic still shows WHAT is allow-listed (the file is readable anyway)" \
+  "$ALLOWED_EMAIL" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "  and the file to edit to authorise a NEW identity" "merge-authority.yaml" \
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+# The other half of the fix, asserted from the message side: what the message declines to tell the
+# agent, the surface also refuses to run. Both halves, or neither is worth anything.
+assert_rc "  and the command the old message printed is on the gated surface" 1 \
+  mg "$TREE" "$GH_OK" "$LREPO" --command "git config --global user.email $ALLOWED_EMAIL"
+# An UNSET identity gets the same treatment: no recipe, but a stated route.
+assert_not_output "the unset-identity branch prints no recipe either" \
+  "git config --global user.email" mg_noid --command 'git push origin main'
+assert_output "  and states who has to fix it" "the human operator has to do it" \
+  mg_noid --command 'git push origin main'
 
 t_case "AC-021 an INDETERMINATE block is recorded too, and says which source failed"
 IREPO="$(mk_id_repo "$ALLOWED_EMAIL")"
@@ -572,6 +868,26 @@ g=[r for r in recs if r.get('event')=='merge_guard_permit'][-1]
 assert g['decision']=='permitted' and g['matched']=='git merge', g
 assert g['gh_login']=='$ALLOWED_LOGIN', g
 "
+t_case "AC-021/SEC-11 the ledger append is confined to the project (CURRENT_RUN is data)"
+# ledger() reads a DIRECTORY PATH out of .agent-firm/CURRENT_RUN and appends JSON there. Anything
+# able to write that file could steer the appends into any existing directory. It cannot change the
+# decision, but a gate's own audit trail is not somewhere to accept a steer from a writable file.
+# BOTH axes are varied, because a containment check that simply disabled the ledger would satisfy
+# the negative assertion on its own: outside the project -> no write; inside -> write.
+OUTREPO="$(mk_id_repo nobody@example.com)"
+ELSEWHERE="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-elsewhere.XXXXXX")"; t_track "$ELSEWHERE"
+mkdir -p "$ELSEWHERE/runs/hijacked" "$OUTREPO/.agent-firm"
+printf '%s\n' "$ELSEWHERE/runs/hijacked" > "$OUTREPO/.agent-firm/CURRENT_RUN"
+assert_rc "an out-of-project CURRENT_RUN does not change the decision" 1 \
+  mg "$TREE" "$GH_OK" "$OUTREPO" --command 'git push origin main'
+assert_no_file "  and nothing was appended outside the project" "$ELSEWHERE/runs/hijacked/run.jsonl"
+INREPO="$(mk_id_repo nobody@example.com)"
+mk_run "$INREPO" "20260803T000030Z-contained"
+assert_rc "an in-project CURRENT_RUN still records the block" 1 \
+  mg "$TREE" "$GH_OK" "$INREPO" --command 'git push origin main'
+assert_file "  and the in-project run.jsonl DID receive the event" \
+  "$INREPO/.agent-firm/runs/20260803T000030Z-contained/run.jsonl"
+
 t_case "AC-021 a non-gated command writes NO guard event (the ledger stays readable)"
 NREPO="$(mk_id_repo nobody@example.com)"
 mk_run "$NREPO" "20260803T000003Z-guard-test"
@@ -593,6 +909,21 @@ for c in 'ls -la' 'cat README.md' 'git status' 'echo hello'; do
   assert_eq "benign: $c spawned NO subprocess at all" "" \
     "$(mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c" 2>&1)"
 done
+# QUOTE-BEARING benign commands stay on the zero-subprocess path. This matters because the SEC-03
+# fix could have been implemented as "fall through to python whenever the string contains a quote",
+# which would have moved most real Bash calls onto a python3 start (~35 ms x2 per call). Instead the
+# quotes are DELETED in bash with parameter expansion and the substring test runs on the result, so
+# a quoted command with no trigger word is still decided with zero subprocesses.
+for c in 'echo "hello world"' "printf '%s\\n' done" 'grep -n "TODO" README.md' \
+         'cat "some file.txt"' 'awk -F, "{print \$1}" data.csv'; do
+  assert_rc "benign+quoted: $c exits 0" 0 mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c"
+  assert_eq "benign+quoted: $c spawned NO subprocess" "" \
+    "$(mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c" 2>&1)"
+done
+# And the normalisation is really doing work: the SAME booby-trapped PATH BLOCKS a quote-split
+# trigger word, which proves the string reached python rather than being filtered out in bash.
+assert_rc "a quote-split trigger word reaches the classifier (blocks under a dead PATH)" 2 \
+  mg "$TREE" "$EXPLODE" "$REPO_OK" --command 'git pus\h origin main'
 assert_rc "and the booby-trapped PATH still BLOCKS a gated command (not a silent pass)" 2 \
   mg "$TREE" "$EXPLODE" "$REPO_OK" --command 'git push origin main'
 t_case "AC-022 the same holds through the hook adapter, on a real payload"
@@ -728,18 +1059,102 @@ assert_rc "PERMITTED: the SAME command under an allow-listed identity does not b
   mg_hook "$TREE" "$GH_OK" "$E2E_OK" 'git switch main && git merge feature/x'
 
 t_case "AC-027 the guard documents its own surface, and the docs match the code"
-assert_output "--surface lists the covered forms" "git push (every form" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "--surface lists the covered forms" "git push — every flag form" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface lists the KNOWN GAPS honestly" "KNOWN GAPS" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface names the alias gap" "ALIAS" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface names the non-shell gap" "Non-shell surfaces" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--help prints the exit contract" "EXIT CONTRACT" mg_env "$TREE" "$PATH" "$REPO_OK" --help
+assert_output "--help prints the usage" "USAGE" mg_env "$TREE" "$PATH" "$REPO_OK" --help
 
-t_case "known gaps are asserted as gaps, so a future fix has a test to flip"
-# These are NOT wins. They are recorded so the gap list in the script header cannot drift away from
-# the behaviour: if someone closes one of them, this assertion fails and the docs get updated.
-assert_rc "GAP: a git alias for push is invisible" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git ps origin main'
-assert_rc "GAP: a variable-indirected git is invisible" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'g=git; $g push origin main'
-assert_rc "GAP: hub/glab are not covered" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'hub push origin main'
+# ================================================== AC-019/SEC-02 · the COVERED list is honest
+# THE BLOCKER THIS SECTION EXISTS FOR. The disclosed COVERED/GAPS list is the mechanism the human
+# is asked to trust in place of real branch protection, and it affirmatively claimed three things
+# that were false: "wrappers (sudo/env/command/exec/time/nohup/nice/xargs-free)" (true only for the
+# BARE form), "`bash -c '<cmd>'`" (missed -ec/-xc), and "a shell heredoc body fed to bash/sh/zsh"
+# (missed `cat <<'EOF' | bash`). "git push (every form: ...)" was also literally false once a
+# leading redirect or a brace group was present.
+#
+# Every one of those is now genuinely covered and asserted above. These assertions pin the WORDING
+# so the retracted claims cannot come back, and drive the printed launcher set against the code.
+t_case "AC-019/SEC-02 the retracted overclaims are gone from --surface"
+surface_text() { mg_env "$TREE" "$PATH" "$REPO_OK" --surface; }
+assert_not_output "the 'xargs-free' aside is gone (it was a gap hidden inside a COVERED bullet)" \
+  "xargs-free" surface_text
+assert_not_output "the unqualified 'every form:' claim is gone" "every form:" surface_text
+assert_output "the wrapper bullet now says FLAGS AND FLAG VALUES, not just the bare word" \
+  "AND ITS OWN FLAGS AND FLAG VALUES" surface_text
+assert_output "the shell bullet says 'cluster containing' rather than naming one spelling" \
+  "short-option cluster containing" surface_text
+assert_output "the heredoc bullet says ANY segment of the introducing line" \
+  "ANY segment of the introducing line is a shell" surface_text
+assert_output "the quoting/escaping coverage is stated" "shell QUOTING or ESCAPING" surface_text
+assert_output "the git-config write coverage is stated, with reads excluded" \
+  "READS are NOT matched" surface_text
+assert_output "the launcher set is printed in full, and labelled a name list" \
+  "the launcher set, in full (a NAME LIST, not a rule)" surface_text
+assert_output "GAPS says every gap line has its own PERMIT assertion" \
+  "each line has its own PERMIT assertion" surface_text
+
+t_case "AC-019/SEC-02 every launcher --surface NAMES is really treated as a launcher"
+# Drives the PRINTED list against the BEHAVIOUR, name by name. What it catches: a name added to the
+# doc text but not to the code (and vice versa, since the doc is generated from the code — so a
+# hand-edited doc line fails here). What it does NOT catch: a name deleted from both, which is what
+# the per-form assertions in the SEC-01 sections above are for.
+LAUNCHERS="$(surface_text | python3 -c "
+import sys
+lines = sys.stdin.read().splitlines()
+i = [k for k, l in enumerate(lines) if 'the launcher set, in full' in l]
+assert i, 'the launcher set is not printed by --surface'
+out = []
+for l in lines[i[0] + 1:]:
+    if l.strip() and l.startswith('      '):
+        out.append(l.strip())
+    else:
+        break
+assert out, 'the launcher set marker is printed but the set itself is not'
+print(' '.join(' '.join(out).split()))
+")"
+assert_ne "the printed launcher set is non-empty" "" "$LAUNCHERS"
+for _w in $LAUNCHERS; do
+  assert_rc "launcher '$_w' resolves to the command it launches" 1 \
+    mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$_w git push origin main"
+done
+
+t_case "AC-019/SEC-02 known gaps are asserted as gaps, so this list cannot drift either"
+# These are NOT wins. Each line printed under KNOWN GAPS by --surface has an assertion here, in
+# both modes, so closing one FAILS this file and forces the printed list to be updated. An honest
+# gap beats a fragile block; an UNDISCLOSED gap is the thing that made the previous round a blocker.
+mg_gap "an unlisted launcher name"           'mywrap git push origin main'
+mg_gap "a launcher whose cmd follows a positional it consumes (flock <file> cmd)" \
+                                             'flock /tmp/lock git push origin main'
+mg_gap "a git alias for push is invisible"   'git ps origin main'
+mg_gap "a variable-indirected git"           'g=git; $g push origin main'
+mg_gap "eval of an assembled string"         'eval "$(printf "%s" "git push origin main")"'
+mg_gap "a command string arriving on stdin"  'echo "git push origin main" | xargs -I{} bash -c "{}"'
+mg_gap "a push inside a script FILE"         'bash deploy-and-push.sh'
+mg_gap "a sourced script file"               '. deploy-and-push.sh'
+mg_gap "a shell reading its program from stdin redirection" 'bash -s < deploy-and-push.sh'
+mg_gap "shell nesting deeper than 3"         "bash -c \"bash -c \\\"bash -c 'bash -c \\\\\\\"git push\\\\\\\"'\\\"\""
+# ...and the bound really is at 3, not "nesting is broken": the same shape one level shallower
+# BLOCKS. Without this, the gap assertion above would also pass if recursion never worked at all.
+assert_rc "nesting UP TO 3 levels is covered (so the gap above is a bound, not a hole)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash -c \"bash -c 'bash -c \\\"git push\\\"'\""
+mg_gap "hub is not covered"                  'hub push origin main'
+mg_gap "glab is not covered"                 'glab mr merge 3'
+mg_gap "git svn dcommit is not covered"      'git svn dcommit'
+mg_gap "gh workflow run (one indirection)"   'gh workflow run deploy.yml'
+mg_gap "a local ref move: git branch -f"     'git branch -f main abc1234'
+mg_gap "a local ref move: git update-ref"    'git update-ref refs/heads/main abc1234'
+mg_gap "a read-only gh api GET"              'gh api repos/o/r/branches/main --jq .protected'
+mg_gap "an identity change as a FILE append" 'printf "[user]\n\temail = x@y.z\n" >> .git/config'
+mg_gap "an identity change via sed -i"       'sed -i "" "s/ci@/x@/" ~/.gitconfig'
+mg_gap "git config --edit (an editor, not a value)" 'git config --global --edit'
+mg_gap "firm-integrate merges internally, by its own allowlist" \
+                                             'firm-integrate 20260803T120043Z-slug wo-a wo-b'
+assert_rc "GAP: a heredoc body fed to a NON-shell is skipped" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "python3 - <<'PY'
+print('git push origin main')
+PY"
 assert_rc "GAP: a push from python is not covered" 0 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'python3 -c "import subprocess;subprocess.run([chr(103)+chr(105)+chr(116)])"'
 

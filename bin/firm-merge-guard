@@ -243,8 +243,22 @@ SURFACE_COVERED = [
     "  · shell QUOTING or ESCAPING of the command word or the subcommand: `git pus\\h`,",
     "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push` — the bash prefilter is",
     "    quote/escape-normalised and the classifier reads shlex-resolved tokens, not raw text",
-    "the launcher set, in full: " + " ".join(WRAPPERS),
 ]
+
+def _wrap_words(words, width=92, indent="    "):
+    lines, cur = [], indent
+    for w in words:
+        if len(cur) + len(w) > width and cur.strip():
+            lines.append(cur.rstrip())
+            cur = indent
+        cur += w + " "
+    if cur.strip():
+        lines.append(cur.rstrip())
+    return lines
+
+# Printed, and then driven name-by-name by tests/test-merge-guard.sh, so the set the doc CLAIMS
+# and the set the code USES cannot come apart. An unlisted launcher is a declared GAP, below.
+SURFACE_COVERED += ["the launcher set, in full (a NAME LIST, not a rule):"] + _wrap_words(WRAPPERS)
 SURFACE_GAPS = [
     "A launcher NOT in the set printed above — a custom wrapper script, `proot`, a new coreutils",
     "  launcher: `mywrap git push origin main` is NOT matched. The set is a name list and a name",
