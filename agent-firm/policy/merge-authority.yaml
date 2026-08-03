@@ -1,0 +1,73 @@
+# agent-firm/policy/merge-authority.yaml
+#
+# THE allowlist for bin/firm-merge-guard — the ONLY place an identity is declared.
+# Adding or removing an operator is a one-file edit here. It is deliberately NOT duplicated in the
+# script, in the hook wiring, in .claude/settings.json, or in any document. If you find a second
+# copy of these values anywhere, the second copy is the bug.
+#
+# WHAT READS THIS FILE, AND WHAT IT ACTUALLY CHECKS
+#   bin/firm-merge-guard resolves TWO identity sources and requires BOTH to appear in this file:
+#     1. `gh api user --jq .login`   compared (case-insensitively) against `gh_login`
+#     2. `git config user.email`     compared (case-insensitively) against `git_emails`
+#   Those two commands are the whole of the identity evidence. No other source is read — not
+#   `user.name`, not the SSH key, not the commit signature, not $USER, not the OS account.
+#   `user.name` is deliberately NOT checked: it is exactly as spoofable as the email and adding it
+#   as a third required axis only creates false blocks. Any field below that the script does not
+#   read is rejected rather than ignored (see STRICTNESS).
+#
+# THE TWO SOURCES FAIL DIFFERENTLY, WHICH IS WHY BOTH ARE REQUIRED
+#   · `gh` proves control of a GitHub token. It is NOT the identity an SSH `git push` authenticates
+#     as, and it needs the network.
+#   · `git config user.email` is offline and is what lands in the commit, but it is a plain string
+#     any user can set to anything.
+#   Neither is a credential check. Together they are a consistency check on the operator's own
+#   configuration — see THE CEILING below.
+#
+# THE CEILING (read this before trusting it)
+#   This is a CLIENT-SIDE control and it is BYPASSABLE by anyone with repo write access: edit the
+#   script, delete the hook entry from .claude/settings.json, set `git config user.email` to a
+#   listed value, or just run git in a terminal outside the AI tool. It is NOT a security boundary,
+#   NOT branch protection, and it CANNOT provide a "required PR review" — only GitHub can do that
+#   (see docs/BRANCH-PROTECTION-RUNBOOK.md). Its actual, narrower scope: preventing an AI agent
+#   from performing an unauthorised merge or push. Rated honestly in docs/ENFORCEMENT.md.
+#
+# STRICTNESS — this file fails CLOSED
+#   Missing, unreadable, unparseable, empty, or carrying a key the script does not read  =>
+#   firm-merge-guard exits 2 (CANNOT EVALUATE) and the caller BLOCKS. There is no
+#   empty-allowlist pass and no allow-everything pass. A `*` or a blank value anywhere in an
+#   identity field is rejected, not treated as a wildcard. Unknown keys are rejected specifically
+#   so this file can never describe an identity source the code does not actually read.
+#
+# WHAT IS DELIBERATELY NOT LISTED (and why — do not "fix" these by adding them)
+#   · ci@agent-firm.local / "agent-firm CI" — the CI identity that .github/workflows/ci.yml sets
+#     with `git config --global`, which leaked into this machine's ~/.gitconfig. Not a human.
+#   · noreply@heightslabs.com ("agent-firm"), implementer@agent-firm.local ("firm implementer"),
+#     eval@firm, test@agent-firm.local — bot/fixture identities used by the firm's own agents,
+#     tests and evals. Allow-listing ANY of them would hand the control's authority to the very
+#     agent it exists to restrain, which defeats it entirely.
+#   · matanmkamhi@gmail.com — a real contributor in this repo's history, but not one of the two
+#     accounts the human authorised. Add an entry here if that changes; do not widen an existing one.
+#   · josh@heightslabs.com — the operator's mail address, but never observed as a git identity in
+#     this repo's history, so it is not asserted here. If you commit under it, add it to the
+#     `joshualblau` entry's `git_emails` (one line) rather than working around the block.
+#
+# PROVENANCE of the values below: the git identities are the ones actually observed in this repo's
+# commit history for the two authorised accounts (`git log --format='%an <%ae>'`), and the logins
+# are the two accounts the human named at the Requirements gate.
+
+schema_version: 1
+
+allowed:
+  - gh_login: joshualblau
+    git_emails:
+      - joshualblau@gmail.com
+    note: >-
+      Repository owner (github.com/joshualblau/agent-firm). Observed in history as
+      "josh <joshualblau@gmail.com>".
+
+  - gh_login: younglionsolutions
+    git_emails:
+      - younglionsolutions@youngs-mbp.lan
+    note: >-
+      Collaborator with push access; the account `gh` is currently authenticated as. Observed in
+      history as "Young Lion Solutions <younglionsolutions@youngs-mbp.lan>".
