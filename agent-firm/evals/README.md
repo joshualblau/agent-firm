@@ -82,6 +82,13 @@ parses-to-nothing `assertions.yaml` used to print `0/0 assertions passed` and ex
   and separate risks. A **YAML syntax error is never a fallback trigger** — it is a hard failure, so a
   typo that moves an assertion out of the `assertions:` list reads as "this file is broken", not "that
   assertion simply isn't there".
+- **"pyyaml is missing" and "pyyaml is BROKEN" are different conditions.** Absence is the legitimate
+  degraded path (the line parser runs). An installed-but-unimportable pyyaml — a partial or corrupted
+  install — means no parser could be *chosen*, so it is **exit 2**, naming the real exception:
+  never a quiet downgrade to the weaker parser, and never an escaping exception (which python would
+  turn into exit **1**, the code that means "an assertion failed"). The two are told apart with
+  `importlib.util.find_spec("yaml")`; a probe that cannot tell is also exit 2, because guessing
+  "absent" would downgrade the parser on no evidence.
 - **The fallback accounts for every list item it sees.** Anything under `assertions:` it can't turn
   into a `- key: value` mapping is reported with its line number and fails the file, because a dropped
   assertion is an unrun check. It reads only the `assertions:` block, so a `- key: value` line under
