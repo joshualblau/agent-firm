@@ -50,7 +50,23 @@
 #
 # PERFORMANCE (AC-022) — the hook fires on EVERY Bash call, so identity resolution (a network
 # round-trip to `gh`) happens ONLY after the command has matched the gated surface. A command with
-# none of the trigger substrings is decided in bash, with zero subprocesses.
+# none of the trigger substrings is decided in bash, with zero subprocesses. Measured on the
+# machine this was written on: 9.8 ms per benign Bash call (no gh, no git, no python3 spawned —
+# tests/test-merge-guard.sh proves that with stubs that fail loudly if executed), and ~500 ms for a
+# gated command, which is one real `gh` round trip.
+#
+# ON DOUBLE-FIRING, DELIBERATELY NOT CACHED. This repo is simultaneously the plugin source and the
+# project, so BOTH hook registrations resolve and every PreToolUse hook here runs TWICE per Bash
+# call (measurable in run.jsonl: ~50% of the existing ledger lines are exact duplicates — a
+# pre-existing registration defect, not this guard's). Both registrations are load-bearing: a
+# consumer project installing the plugin only sees hooks/hooks.json, a project-scope install only
+# sees .claude/settings.json, so dropping either would silently disable the gate in that mode.
+# The consequence here is two `gh` round trips (~1 s total) and two ledger events on a GATED
+# command; benign commands still cost 2 x 9.8 ms and zero network. That is NOT memoised on
+# purpose: a cache of a PERMIT decision is a fail-open surface (a stale entry, or a writable cache
+# file, becomes an authorisation) on a control whose entire value is that it fails closed, and the
+# cost it would save falls only on merge/push attempts, which are rare and already network-bound.
+# Blocking twice is still blocking; the check is idempotent.
 set -uo pipefail
 
 # Resolve symlinks so ~/.local/bin/firm-merge-guard still finds the repo (firm-link installs it).
