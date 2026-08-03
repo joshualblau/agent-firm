@@ -66,11 +66,14 @@
 # PERFORMANCE (AC-022) — the hook fires on EVERY Bash call, so identity resolution (a network
 # round-trip to `gh`) happens ONLY after the command has matched the gated surface. A command with
 # none of the trigger substrings is decided in bash, with zero subprocesses. Measured on the
-# machine this was written on: 10.4 ms per benign Bash call (no gh, no git, no python3 spawned —
-# tests/test-merge-guard.sh proves that with stubs that fail loudly if executed), and ~500 ms for a
-# gated command, which is one real `gh` round trip. The prefilter is quote/escape-normalised in
-# bash (parameter expansion only, still zero subprocesses) so that shell quoting cannot smuggle a
-# trigger word past it — see the comment above _mg_may_match.
+# machine this was written on, 200 iterations under /bin/bash 3.2.57: 11.08 ms per benign Bash call
+# through the hook adapter (jq included), 5.61 ms via --command. The pre-SEC-03 guard measured
+# 11.41 ms / 5.43 ms on the same runs, so quote-normalising the prefilter cost nothing measurable —
+# and no gh, git or python3 is spawned either way (tests/test-merge-guard.sh proves that with stubs
+# that fail loudly if executed, including for QUOTED benign commands). A gated command costs
+# ~500 ms, which is one real `gh` round trip. The prefilter deletes backslashes and quotes with
+# bash parameter expansion — still zero subprocesses — so shell quoting cannot smuggle a trigger
+# word past it, which it previously could. See the comment above _mg_may_match.
 #
 # HOW THE WORST CASE STAYS UNDER THE REGISTERED HOOK TIMEOUT
 #   Both hook registrations set "timeout": 30. The script's own bounded waits are GH_TIMEOUT +
@@ -86,7 +89,7 @@
 # consumer project installing the plugin only sees hooks/hooks.json, a project-scope install only
 # sees .claude/settings.json, so dropping either would silently disable the gate in that mode.
 # The consequence here is two `gh` round trips (~1 s total) and two ledger events on a GATED
-# command; benign commands still cost 2 x 10.4 ms and zero network. That is NOT memoised on
+# command; benign commands still cost 2 x 11.08 ms and zero network. That is NOT memoised on
 # purpose: a cache of a PERMIT decision is a fail-open surface (a stale entry, or a writable cache
 # file, becomes an authorisation) on a control whose entire value is that it fails closed, and the
 # cost it would save falls only on merge/push attempts, which are rare and already network-bound.

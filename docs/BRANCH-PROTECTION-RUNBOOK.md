@@ -126,6 +126,47 @@ Three things about that payload, stated plainly because getting them wrong waste
 3. `--input -` with a heredoc is used rather than a pile of `-f` flags because this payload has
    nested objects, which `-f` cannot express.
 
+### Read this before you run Step 2: who can actually approve your PRs?
+
+`required_approving_review_count: 1` **plus** `enforce_admins: true` on a two-collaborator repo has
+a consequence the payload does not advertise, and it decides whether the "required PR review" ask is
+really met or only met on paper.
+
+Measured facts about this repo, not assumptions:
+
+```bash
+gh api "repos/$OWNER/$REPO/collaborators" --jq '.[] | {login, push: .permissions.push}'
+gh api user --jq .login          # -> the account the AI's `gh` is authenticated as
+```
+
+At the time of writing the collaborators are **`joshualblau`** (owner) and
+**`younglionsolutions`** (`permissions.push: true`), and `younglionsolutions` is *the identity the
+AI operates as*. GitHub does not let a PR author approve their own PR. So with `count: 1` and
+`enforce_admins: true`:
+
+- the owner cannot merge his own PR without an approving review, and
+- the **only** account available to give that review is the AI's.
+
+That satisfies the ask in form while making the AI's own account the sole possible approver, and it
+simultaneously locks the human out of merging solo. Three real options, pick deliberately:
+
+| Option | Payload | What you get | What it costs |
+|---|---|---|---|
+| **(a) Add a second HUMAN reviewer** | keep `count: 1`, `enforce_admins: true`; invite a human collaborator and keep the AI's account out of the review path | The ask as intended: a human reviews, admins included | Needs a second human who will actually review |
+| **(b) No review count, PR still required** | `"required_pull_request_reviews": {"required_approving_review_count": 0, "dismiss_stale_reviews": true, "require_code_owner_reviews": false}`, `enforce_admins: true` | Direct pushes to `main` are blocked for everyone including admins; changes must go through a PR. **No fake review is invented** | You can self-merge your own PR, so this is "no direct push", not "reviewed" |
+| **(c) Keep `count: 1`, drop admin enforcement** | `count: 1`, `enforce_admins: false` | Owner keeps a solo path | Re-opens the hole: an admin can push straight to `main`, so the control no longer binds the account most able to break things |
+
+**Recommended: (b) now, (a) when a second human exists.** (b) is the honest version of the ask that
+one person can operate today; (c) is the only one that quietly gives back what you just bought.
+
+One more lever, worth naming because it is the *actual* answer to "restrict who may push": the AI's
+`gh` identity has write access to this repo **today**. Removing that collaborator removes the push
+capability entirely, which no branch-protection setting on a personal-account repo can do:
+
+```bash
+gh api -X DELETE "repos/$OWNER/$REPO/collaborators/younglionsolutions"
+```
+
 ## Step 3 — or a ruleset (the newer API; org repos get per-actor bypass)
 
 Rulesets are the modern equivalent and are configured per repository. Same plan gate.
@@ -167,14 +208,27 @@ JSON
 
 ## Step 4 — verify. This is the step that distinguishes success from the ambiguous 404
 
+**Which verification belongs to which route.** `.protected` is documented by GitHub against
+*classic branch protection*. It is **not documented to reflect rulesets**, so if you took the Step 3
+ruleset route, do not treat `.protected: false` as failure — check the ruleset endpoints instead
+(1b/3 below). Using the wrong check here produces a false alarm on a correct configuration, which is
+worse than no check at all.
+
 ```bash
 OWNER=joshualblau REPO=agent-firm
 
-# 1. The unambiguous boolean — works even without admin.
+# 1. CLASSIC route (Step 2) — the unambiguous boolean, works even without admin.
 gh api "repos/$OWNER/$REPO/branches/main" --jq '.protected'
-#    false = nothing is in force   |   true = protection or a ruleset is active
+#    false = no classic protection in force   |   true = classic protection is active
+#    Verified on this repo: currently `false`. Do NOT use this to verify a RULESET.
 
-# 2. If (and only if) you are an admin, read the detail back:
+# 1b. RULESET route (Step 3) — ask what rules apply to the branch. Needs no admin, and unlike
+#     `.protected` this endpoint is documented to answer for rulesets.
+gh api "repos/$OWNER/$REPO/rules/branches/main" --jq '[.[] | .type]'
+#    expect a non-empty list containing "pull_request", "deletion", "non_fast_forward"
+#    []  = no ruleset applies to main (whatever `.protected` says)
+
+# 2. If (and only if) you are an admin, read the classic detail back:
 gh api "repos/$OWNER/$REPO/branches/main/protection" \
   --jq '{reviews: .required_pull_request_reviews.required_approving_review_count,
          admins: .enforce_admins.enabled,
@@ -190,9 +244,15 @@ gh api "repos/$OWNER/$REPO/rulesets" --jq '.[] | {name, enforcement, target}'
 #    Expect: "protected branch hook declined" / "Changes must be made through a pull request".
 ```
 
-If step 1 still says `false` after step 2 or 3 appeared to succeed, the call did not do what you
-think — re-read its response body rather than assuming, and check you were authenticated as an
-admin of the repo.
+If you took the **classic** route (Step 2) and step 1 still says `false` after the PUT appeared to
+succeed, the call did not do what you think — re-read its response body rather than assuming, and
+check you were authenticated as an admin of the repo.
+
+If you took the **ruleset** route (Step 3), judge it by **1b** and **3**, not by step 1: `.protected`
+is not documented to reflect rulesets, so a `false` there alongside a non-empty `rules/branches/main`
+means your ruleset is active and the boolean simply does not speak to it. Note that `rulesets` and
+`rules/branches/main` are both behind the same plan gate as Step 3 itself — a 403 there means the
+ruleset route was never available, not that it failed.
 
 ## Rollback
 
