@@ -98,6 +98,11 @@ mg_hook() {
   ( cd "$cwd" && printf '%s' "$p" | PATH="$s:$PATH" "$t/bin/firm-merge-guard" --hook )
 }
 
+# A tracked DIRECTORY, not a bare mktemp file: tests/lib.sh's teardown only removes directories, so
+# a registered plain file would be skipped and leaked.
+_hdr_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-header.XXXXXX")"; t_track "$_hdr_dir"
+SCRATCH_HEADER="$_hdr_dir/header.txt"
+
 TREE="$(mk_guard_tree)"
 GH_OK="$(mk_stub_gh login "$ALLOWED_LOGIN")"
 GH_BAD="$(mk_stub_gh login some-other-account)"
@@ -280,8 +285,33 @@ printf 'allowed: []\n' > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "allowlist an EMPTY list (no vacuous pass)" 2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and says so explicitly" "never a vacuous pass" \
   mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
-printf 'allowed:\n  - gh_login: "*"\n    git_emails: ["*"]\n' > "$BROKEN/agent-firm/policy/merge-authority.yaml"
-assert_rc "a WILDCARD is rejected, not honoured as allow-everything" 2 \
+# ONE AXIS AT A TIME. A single fixture with a wildcard in BOTH fields passes for either reason, so
+# it cannot tell which check is doing the work — and mutation testing proved exactly that: deleting
+# the gh_login wildcard guard left the combined fixture GREEN, because the git_emails guard was
+# still catching it. Each field therefore gets its own fixture, with the OTHER field valid.
+printf 'allowed:\n  - gh_login: "*"\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
+  > "$BROKEN/agent-firm/policy/merge-authority.yaml"
+assert_rc "a WILDCARD gh_login is rejected (with a valid email alongside)" 2 \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_output "  and says which field" "gh_login" \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+printf 'allowed:\n  - gh_login: %s\n    git_emails: ["*"]\n' "$ALLOWED_LOGIN" \
+  > "$BROKEN/agent-firm/policy/merge-authority.yaml"
+assert_rc "a WILDCARD git_emails is rejected (with a valid login alongside)" 2 \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_output "  and says which field" "git_emails" \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+printf 'allowed:\n  - gh_login: "?ny"\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
+  > "$BROKEN/agent-firm/policy/merge-authority.yaml"
+assert_rc "a single-character glob in gh_login is rejected too" 2 \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+printf 'allowed:\n  - gh_login: %s\n    git_emails: [""]\n' "$ALLOWED_LOGIN" \
+  > "$BROKEN/agent-firm/policy/merge-authority.yaml"
+assert_rc "a BLANK email is rejected, not treated as matching everything" 2 \
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+printf 'allowed:\n  - gh_login: ""\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
+  > "$BROKEN/agent-firm/policy/merge-authority.yaml"
+assert_rc "a BLANK gh_login is rejected"                     2 \
   mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 printf 'allowed:\n  - gh_login: %s\n    git_names: [josh]\n    git_emails: [%s]\n' \
   "$ALLOWED_LOGIN" "$ALLOWED_EMAIL" > "$BROKEN/agent-firm/policy/merge-authority.yaml"
@@ -448,8 +478,21 @@ for f in "$GUARD" "$POLICY" "$ENFORCEMENT" "$RUNBOOK"; do
   assert_ok "$b denies being a security boundary"         disclosure_check "$f" "not a security boundary"
   assert_ok "$b names who can bypass it (repo write access)" disclosure_check "$f" "repo write access"
 done
-assert_output "the guard header denies being branch protection" "NOT branch protection" cat "$GUARD"
-assert_output "the guard header denies providing a required PR review" "required PR review" cat "$GUARD"
+# The SCRIPT HEADER specifically must carry the disclosure — not merely the file somewhere. Mutation
+# testing caught this: stripping the disclosure from the header left the whole-file assertion green,
+# because the same phrase also appears in the runtime block message 300 lines lower. AC-019 names
+# the header, so the header is what gets asserted.
+head -60 "$GUARD" > "$SCRATCH_HEADER"
+assert_ok "the HEADER (first 60 lines) says client-side"        disclosure_check "$SCRATCH_HEADER" "client-side"
+assert_ok "the HEADER says bypassable"                          disclosure_check "$SCRATCH_HEADER" "bypassable"
+assert_ok "the HEADER denies being a security boundary"         disclosure_check "$SCRATCH_HEADER" "not a security boundary"
+assert_ok "the HEADER denies being branch protection"           disclosure_check "$SCRATCH_HEADER" "not branch protection"
+assert_ok "the HEADER denies providing a required PR review"    disclosure_check "$SCRATCH_HEADER" "cannot provide a \"required pr review\""
+assert_ok "the HEADER names the four bypass routes"             disclosure_check "$SCRATCH_HEADER" "repo write access"
+# And the RUNTIME message must carry it too, independently of the header — an agent that is blocked
+# reads the message, not the source.
+assert_output "the runtime block message repeats it" "not a security boundary" \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
 assert_output "the runbook says only GitHub can require a review" "only GitHub" cat "$RUNBOOK"
 assert_ok "no artifact claims the control IS branch protection or a security boundary" python3 -c "
 import re
