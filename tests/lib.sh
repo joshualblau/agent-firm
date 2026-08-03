@@ -198,12 +198,24 @@ sha_of() { git -C "$1" rev-parse "$2" 2>/dev/null; }
 # checked when a space-split FRAGMENT of a real fixture path sailed through every one of them.) The
 # two kinds overlap on relative paths, so that case is guarded twice; tests/test-lib.sh says so, and
 # 09-test-evidence records which single deletions the redundancy masks.
+#
+# IDENTITY IS A QUESTION ABOUT DIRECTORIES, NOT ABOUT STRINGS (SEC-R9). The identity check used to
+# compare the target to the temp root as normalized TEXT, and the symlink check tests only the FINAL
+# component — so an INTERMEDIATE symlink was never considered. "$TMPDIR/link/fixture", where
+# "$TMPDIR/link" points anywhere at all, is a perfect textual match for "under the temp root" while
+# `rm -rf` follows the link and deletes outside it. Both sides are therefore resolved to their
+# physical paths (_t_realdir) before they are compared, and the delete targets the RESOLVED path —
+# the one that was actually validated. Resolving also fixes the mirror-image bug: on macOS $TMPDIR is
+# reached through a symlink ("/var" -> "/private/var", and "/tmp" -> "/private/tmp"), so a fixture
+# spelled the other way textually "escaped" the root and leaked instead of being cleaned up.
 
 # _t_norm <path> — set _t_normed to <path> with runs of "/" collapsed. "$TMPDIR/x" is routinely
 # spelled "/a/T//x" (TMPDIR usually ends in a slash) while the same directory reached through $PWD is
-# spelled "/a/T/x", and the identity check below compares strings. Without this, two spellings of one
-# path fail to match: the fixture leaks, and — worse for a test suite — a case meant to exercise some
-# other guard passes for this reason instead, which is how a guard test goes quietly decorative.
+# spelled "/a/T/x". Without this, two spellings of one path fail to match: the fixture leaks, and —
+# worse for a test suite — a case meant to exercise some other guard passes for this reason instead,
+# which is how a guard test goes quietly decorative. _t_realdir now subsumes this for both sides of
+# the identity check (`pwd -P` emits a collapsed path); this remains the cheap textual tidy applied to
+# the raw $TMPDIR before its shape is judged, which is what keeps an unusable root from widening.
 _t_norm() {
   _t_normed="$1"
   while :; do
@@ -220,6 +232,34 @@ _t_norm() {
   done
 }
 
+# _t_realdir <dir> — set _t_realdir_out to the physical path of <dir>, every component resolved, or
+# to "" (rc 1) if it cannot be resolved. `( cd -P -- "$d" && pwd -P )` is the resolver because it is
+# the only one that is actually portable here: BSD/macOS `readlink` has no `-f`, and `realpath` is not
+# guaranteed installed — while `cd -P` + `pwd -P` are bash builtins present in 3.2.57 and resolve
+# EVERY component, which is precisely the intermediate-symlink case. Notes on the details:
+#   · CDPATH is cleared: with CDPATH set, `cd` can print the directory it chose and pick a different
+#     one. (Absolute operands already bypass CDPATH, but this must not depend on that.)
+#   · The `printf 'x'` sentinel is stripped back off because command substitution eats TRAILING
+#     newlines — without it a directory whose name ends in a newline would resolve to a truncated
+#     path, and truncating a path is how a delete lands somewhere it was never meant to.
+#   · Callers must treat rc 1 as "delete nothing". Failing safe is the whole contract: an
+#     unresolvable path is never a licence to fall back to the unresolved string.
+_t_nl="$(printf '\nx')"; _t_nl="${_t_nl%x}"
+_t_realdir() {
+  _t_realdir_out=""
+  [ -n "${1:-}" ] || return 1
+  _t_realdir_out="$( CDPATH=''; cd -P -- "$1" 2>/dev/null && pwd -P && printf 'x' )" \
+    || { _t_realdir_out=""; return 1; }
+  case "$_t_realdir_out" in
+    *x) _t_realdir_out="${_t_realdir_out%x}"; _t_realdir_out="${_t_realdir_out%$_t_nl}" ;;
+    *)  _t_realdir_out=""; return 1 ;;      # no sentinel: `pwd -P` itself failed
+  esac
+  case "$_t_realdir_out" in
+    /?*) return 0 ;;                        # absolute and not "/" — "/" is never a temp root or fixture
+    *)   _t_realdir_out=""; return 1 ;;
+  esac
+}
+
 _t_rm_fixture() {
   _t_target="${1:-}"
   [ -n "$_t_target" ] || return 0
@@ -227,23 +267,33 @@ _t_rm_fixture() {
     /*) ;;
     *)  return 0 ;;          # relative entry — would delete relative to $PWD
   esac
+  # Both string-shape checks below run BEFORE resolution, and must stay there: `cd -P` resolves ".."
+  # away, so a `<dir>/sub/../keepme` entry would arrive at the identity check looking innocent.
   case "$_t_target" in
     */..|*/../*) return 0 ;; # no traversal components: `<dir>/sub/../keepme` IS a delete rm performs
   esac
   [ "$_t_target" = "/" ] && return 0
-  # Identity: strictly inside this shell's temp root. Both sides are slash-normalized and the root's
-  # trailing slashes stripped; an unusable root refuses everything rather than widening to "/".
+  [ -d "$_t_target" ] || return 0   # already gone, or never a directory
+  [ -L "$_t_target" ] && return 0   # a symlink: delete nothing rather than chase it somewhere else
+  # Identity: strictly inside this shell's temp root, as DIRECTORIES rather than as text (SEC-R9).
+  # The raw root is slash-normalized and its trailing slashes stripped first, so an unusable root
+  # refuses everything rather than widening to "/"; then both sides are resolved to physical paths, so
+  # an intermediate symlink cannot carry a textually-inside target outside the root. If either side
+  # fails to resolve, nothing is deleted.
   _t_norm "${TMPDIR:-/tmp}"; _t_root="$_t_normed"
   while :; do case "$_t_root" in */) _t_root="${_t_root%/}" ;; *) break ;; esac; done
   case "$_t_root" in /?*) ;; *) return 0 ;; esac
-  _t_norm "$_t_target"
-  case "$_t_normed" in
-    "$_t_root"/?*) ;;        # quoted pattern: a glob character in $TMPDIR matches itself, literally
+  _t_realdir "$_t_root"   || return 0
+  _t_rroot="$_t_realdir_out"
+  _t_realdir "$_t_target" || return 0
+  _t_rtarget="$_t_realdir_out"
+  case "$_t_rtarget" in
+    "$_t_rroot"/?*) ;;       # quoted pattern: a glob character in $TMPDIR matches itself, literally
     *) return 0 ;;
   esac
-  [ -d "$_t_target" ] || return 0   # already gone, or never a directory
-  [ -L "$_t_target" ] && return 0   # a symlink: delete nothing rather than chase it somewhere else
-  rm -rf "$_t_target"
+  # Delete the path that was validated, not the spelling that arrived: they name the same directory,
+  # and the resolved one is the one every check above was actually applied to.
+  rm -rf "$_t_rtarget"
 }
 
 t_cleanup() {

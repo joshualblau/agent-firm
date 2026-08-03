@@ -28,8 +28,8 @@
 #     literal `/`, no `$HOME`, no repo path, nothing this file did not just create. `/` itself is
 #     deliberately NOT tested: the only way to test it is to hand `/` to a live `rm -rf` and hope the
 #     guard holds. That trade is not worth one assertion; the `/` guard is one line, reviewed by eye.
-#   · _t_rm_fixture applies FIVE guards and two of them (absolute-path, and "under this shell's temp
-#     root") overlap. A case that means to exercise one specific guard therefore has to be arranged
+#   · _t_rm_fixture applies a stack of guards and two of them (absolute-path, and "under this shell's
+#     temp root") overlap. A case that means to exercise one specific guard therefore has to be arranged
 #     so the OTHERS cannot be what saves the canary — hence the `control` directory most cases
 #     register and then assert was deleted: it proves teardown ran AND that deleting at that exact
 #     location was permitted, so the canary's survival can only be the guard under test.
@@ -184,6 +184,77 @@ child "$ov" "$ov/tmp/" \
 assert_no_file "the control fixture inside the temp root WAS deleted" "$ov/tmp/control"
 assert_file "the directory outside the temp root survived" "$ov/outsider"
 assert_file "…with its contents"                           "$ov/outsider/keep.txt"
+
+# ---------------------------------------------------------------------------
+# SEC-R9 · IDENTITY IS RESOLVED, NOT SPELLED. The case above asks whether a target is under this
+# shell's temp root; these four ask what "under the temp root" MEANS for a path that reaches it
+# through a symlink. Answering textually is wrong in both directions — an intermediate symlink
+# smuggles a target OUT of the root while still matching the prefix, and a legitimate fixture spelled
+# through a symlink fails to match and leaks — so both directions are pinned, along with the ordinary
+# case in between (the one that catches a "fix" that just refuses everything) and the final-component
+# symlink guard, which resolution must not swallow. Every path below lives inside a fresh `sandbox`
+# mktemp -d: no literal `/`, no `$HOME`, no repo path, nothing this file did not just create.
+# ---------------------------------------------------------------------------
+t_case "SEC-R9 · an INTERMEDIATE symlink cannot carry a fixture path outside the temp root"
+# `${TMPDIR}link/victim`: the final component is a real directory, so the symlink guard — which only
+# ever looks at the LAST component — does not see this, and the entry is textually under $TMPDIR, so
+# a string comparison waves it straight through into `rm -rf`, which follows the link. Resolving
+# every component of both sides is the only thing standing in front of the delete.
+esc="$(sandbox)"
+mkdir -p "$esc/outside/victim"; printf 'precious\n' > "$esc/outside/victim/PRECIOUS.txt"
+esc_entry="$(child "$esc" "$esc/tmp/" \
+  'mkdir -p "${TMPDIR}control"; t_track "${TMPDIR}control"; ln -s "$PWD/outside" "${TMPDIR}link"; t_track "${TMPDIR}link/victim"; printf "%s" "${TMPDIR}link/victim"' \
+  2>/dev/null)"
+# Both halves of the trap have to be real for this case to mean anything: the entry must LOOK inside
+# the root (or a string check would have refused it for the wrong reason) and RESOLVE outside it.
+case "$esc_entry" in "$esc/tmp/"*) esc_inside=yes ;; *) esc_inside=no ;; esac
+assert_eq "the registered entry was textually inside the child's \$TMPDIR" "yes" "$esc_inside"
+assert_no_file "the control fixture WAS deleted, so teardown ran and could delete here" "$esc/tmp/control"
+assert_file "the directory reached through the intermediate symlink survived" "$esc/outside/victim"
+assert_file "…with its contents"                             "$esc/outside/victim/PRECIOUS.txt"
+assert_file "and so did the directory the symlink points at" "$esc/outside"
+
+t_case "SEC-R9 · an ordinary fixture — no symlink between the temp root and it — is still deleted"
+# The counterweight. Closing the escape must not turn the guard into a universal refusal: that would
+# be "safe" and would silently leak every fixture the whole suite creates. If the identity check ever
+# stops matching for the common case, this is what goes red.
+ord="$(sandbox)"
+made_ord="$(child "$ord" "$ord/tmp/" \
+  'd="$(mktemp -d "${TMPDIR}plain.XXXXXX")"; printf "x\n" > "$d/f.txt"; t_track "$d"; printf "%s" "$d"')"
+assert_ne      "the child really created a fixture" "" "$made_ord"
+assert_no_file "the ordinary fixture was removed"      "$made_ord"
+assert_eq      "and nothing was left behind in the child's TMPDIR" "" "$(ls -A "$ord/tmp" 2>/dev/null)"
+
+t_case "SEC-R9 · a fixture spelled differently from \$TMPDIR is cleaned up rather than leaked"
+# macOS ships this shape by default: $TMPDIR is /var/folders/… while that same directory's physical
+# path is /private/var/folders/… ("/var" is a symlink), and "/tmp" is a symlink to "/private/tmp". Two
+# spellings of one directory never matched as text, so teardown refused and real fixtures piled up in
+# $TMPDIR. Reproduced with an explicit symlink so the case behaves the same on Linux.
+spell="$(sandbox)"
+mkdir -p "$spell/real"; ln -s "$spell/real" "$spell/alias"
+made_sp="$(child "$spell" "$spell/alias/" \
+  'd="$(mktemp -d "$PWD/real/fix.XXXXXX")"; printf "x\n" > "$d/f.txt"; t_track "$d"; printf "%s" "$d"')"
+assert_ne "the child really created a fixture" "" "$made_sp"
+assert_output "…spelled through the real directory, not through the \$TMPDIR symlink" \
+  "/real/fix." printf '%s' "$made_sp"
+case "$made_sp" in "$spell/alias/"*) sp_textual=yes ;; *) sp_textual=no ;; esac
+assert_eq "…so it is NOT textually under the \$TMPDIR the child was given (the leak's cause)" \
+  "no" "$sp_textual"
+assert_no_file "the differently-spelled fixture was cleaned up" "$made_sp"
+assert_eq "and the directory \$TMPDIR actually points at is empty again" \
+  "" "$(ls -A "$spell/real" 2>/dev/null)"
+
+t_case "SEC-R9 · a registered path whose FINAL component is a symlink is refused, not followed"
+# Resolution must not swallow the pre-existing symlink guard. The link points INSIDE the temp root on
+# purpose, so the identity check cannot be what saves the canary — it resolves to a perfectly
+# legitimate in-root directory. Only the `-L` refusal stands in front of this one.
+fsl="$(sandbox)"
+child "$fsl" "$fsl/tmp/" \
+  'mkdir -p "${TMPDIR}control" "${TMPDIR}canary"; printf "precious\n" > "${TMPDIR}canary/keep.txt"; t_track "${TMPDIR}control"; ln -s "${TMPDIR}canary" "${TMPDIR}ln-canary"; t_track "${TMPDIR}ln-canary"' \
+  >/dev/null 2>&1
+assert_no_file "the control fixture WAS deleted, so teardown ran and could delete here" "$fsl/tmp/control"
+assert_file "the directory the symlink pointed at survived" "$fsl/tmp/canary"
+assert_file "…with its contents"                            "$fsl/tmp/canary/keep.txt"
 
 # ---------------------------------------------------------------------------
 t_case "no test file registers fixtures through the retired T_TMPDIRS channel"
