@@ -611,12 +611,13 @@ def logical_lines(text):
     `cat <<'EOF' | bash` feeds a shell even though the first word is `cat`. (SEC-01d)
 
     A LINE CONTINUATION IS REMOVED, NOT REPLACED WITH A SPACE. bash deletes the backslash-newline
-    pair outright, so `gi\<newline>t push` is `git push` and `gi\<newline>t co\<newline>nfig --global
-    user.email <v>` is an identity write. Substituting a space instead produced `gi t push` and
-    permitted both, which is the same class of defect as a mid-token `$'...'` — a quoting construct
-    that splits a trigger word without changing what runs. (SEC-18) Removal is also right for the
-    ordinary use: `git push \<newline>origin main` keeps the space that was already before the
-    backslash, so the words do not run together.
+    pair outright, so a `git` split across a continuation is still `git` and a `config` split across
+    one is still an identity write. Substituting a space instead produced `gi t push` and permitted
+    both, which is the same class of defect as a mid-token ANSI-C span: a quoting construct that
+    splits a trigger word without changing what runs. (SEC-18) Removal is also right for the
+    ordinary use, where the space is already there BEFORE the backslash, so the words do not run
+    together. (Backslashes are spelled BS in this file's comments; a literal one in a docstring is
+    an invalid escape sequence, which is a warning today and a SyntaxError in a future python.)
     """
     lines = text.replace("\\\n", "").split("\n")
     out, i, n = [], 0, len(lines)

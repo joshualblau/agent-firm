@@ -1661,6 +1661,28 @@ done
 assert_eq "and none of them spawned gh/git/python3" "" \
   "$(mg "$TREE" "$EXPLODE" "$SCRATCH" --command 'git -c user.email=eval@firm commit -qm fixture' 2>&1)"
 
+# ================================================== the embedded checker is real, LINTED python
+# The classifier lives inside a `python3 - <<'PYEOF'` heredoc, so no linter, no import and no
+# `py_compile` in this repo ever sees it — a syntax-level defect can only show up as a runtime exit
+# 1, which the wrapper (correctly) reports as cannot-evaluate. That means a latent break looks like a
+# BLOCK and could sit there unnoticed. Compiling it with warnings-as-errors is the cheap guard, and it
+# is not hypothetical: this wave added a docstring containing a literal backslash-angle-bracket, which
+# is an invalid escape sequence — a DeprecationWarning on python 3.9 (silent in normal runs) and a
+# SyntaxError in a future python, i.e. the whole gate turning into exit 2 on a version bump.
+t_case "the embedded python checker compiles cleanly, with warnings as errors"
+assert_ok "extractable, syntactically valid, and warning-free" python3 -c "
+import re, sys, warnings
+src = open('$GUARD').read()
+m = re.search(r\"python3 - <<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)
+assert m, 'the embedded checker could not be extracted from the guard'
+prog = m.group(1)
+assert 'def classify(' in prog and 'FIRM_MG_DECISION' in prog, prog[:200]
+with warnings.catch_warnings():
+    warnings.simplefilter('error')
+    compile(prog, 'firm-merge-guard(embedded)', 'exec')
+print('ok')
+"
+
 # ============================================================ AC-025 · no permission weakened
 t_case "AC-025 no permission rule is weakened"
 assert_ok "Bash(git push:*) is STILL in deny" python3 -c "
