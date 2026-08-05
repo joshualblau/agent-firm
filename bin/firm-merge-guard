@@ -76,9 +76,18 @@
 # through the hook adapter (jq included), 6.3 ms via --command. No gh, git, python3 or jq is spawned
 # on that path (tests/test-merge-guard.sh proves it with stubs that fail loudly if executed,
 # including for QUOTED benign commands). A gated command costs ~500 ms, which is one real `gh`
-# round trip. The prefilter deletes backslashes and quotes with bash parameter expansion — still
-# zero subprocesses — so shell quoting cannot smuggle a trigger word past it, which it previously
-# could. See the comment above _mg_may_match.
+# round trip. The prefilter deletes backslashes, quotes, the `$` of a `$'…'`/`$"…"` quote introducer
+# and a backslash-newline continuation PAIR, all with bash parameter expansion — still zero
+# subprocesses — so shell quoting cannot smuggle a trigger word past it, which it previously could.
+# See the comment above _mg_may_match.
+#   RE-MEASURED after that last addition (SEC-18), same method, 200 iterations: 5.5 ms via --command
+#   and 9.7 ms through the hook for a benign call, i.e. unchanged within run-to-run noise — the extra
+#   parameter expansions and the extra `case` cost nothing measurable. `grep 'TODO$' README.md` — a
+#   `$` immediately before a quote, the everyday end-of-line regex anchor — stays on the
+#   zero-subprocess path at 5.6 ms, and `sed $'s/x/y/' f` (an ANSI-C span with no escape in it) at
+#   5.5 ms. What DOES now reach python3 is a `$'…'` span containing a backslash, because hex/octal/\u
+#   escapes cannot be decoded in bash without a subprocess; that is a deliberate trade of ~30 ms on a
+#   rare spelling against a whole bypass class.
 #   MEASURED, same runs, for the `git`-then-`config` clause once it was ORDERED: a command with both
 #   words in the WRONG order — `grep -rn config .github/` is the everyday one — went from 34.3 ms to
 #   6.3 ms via --command and 38.7 ms to 11.5 ms through the hook, i.e. back onto the zero-subprocess
@@ -136,7 +145,7 @@ while [ "$#" -gt 0 ]; do
       MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,109p' "$__src" | sed 's/^# \{0,1\}//'
+      sed -n '2,118p' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
@@ -297,11 +306,29 @@ SURFACE_COVERED = [
     "    there the gated text is the OUTPUT of the inside, not the inside.",
     "  · a command string passed as a whitespace-containing flag VALUE to a launcher",
     "    (`flock -c 'git push'`, `watch 'git push'`, `xargs -I{} 'git push'`, `su -c 'git push'`)",
-    "  · shell QUOTING or ESCAPING of the command word or the subcommand: `git pus\\h`,",
-    "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push`, `git $'push'`, `gh $'pr' merge`,",
-    "    `git $'config' user.email <v>` — the bash prefilter is quote/escape-normalised, and the",
-    "    classifier normalises the same decoration off the SUBCOMMAND and the flags, not only off",
-    "    the command word",
+    "  · shell QUOTING or ESCAPING of the command word, the subcommand or a flag, AT ANY POSITION",
+    "    IN THE TOKEN — not only at its start: `git pus\\h`, `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`,",
+    "    `$'git' push`, `git $'push'`, `gh $'pr' merge`, `git $'config' user.email <v>`, AND the",
+    "    MID-TOKEN forms `git pu$'s'h`, `git pus$'h'`, `g$'i't push`, `g$'h' pr merge`,",
+    "    `git co$'n'fig --global user.email <v>`, `git pu$\"s\"h`. `$'...'` and `$\"...\"` are quote",
+    "    INTRODUCERS: bash collapses them into the surrounding word, so the prefilter deletes the",
+    "    `$` together with the quote it introduces and the classifier models the same rule on the",
+    "    RAW line, before shlex. Nothing here can affect `$VAR` — a `$` is only special when a QUOTE",
+    "    is the very next character, which is bash's own rule.",
+    "  · the ESCAPE SEQUENCES inside `$'...'`, DECODED the way bash decodes them, so a trigger word",
+    "    spelled in hex, octal or \\u is still matched: `$'\\x67it' push`, `git $'\\x70ush'`,",
+    "    `git $'\\160ush'`, `git co$'\\x6e'fig --global user.email <v>`, `$'\\x67h' pr merge`. These",
+    "    are real commands, not theory (`to$'\\x75'ch f` creates `f` under /bin/bash 3.2.57), and no",
+    "    substring test can see them, so the prefilters send any `$'` span containing a backslash to",
+    "    the classifier instead of guessing.",
+    "  · a LINE CONTINUATION inside a word — bash deletes the backslash-newline PAIR, so the halves",
+    "    join: `git pu\\<newline>sh origin main`, `gi\\<newline>t co\\<newline>nfig --global",
+    "    user.email <v>` (and an ordinary `git push \\<newline>origin main` still matches too)",
+    "  · all of the above nested one shell deeper, INCLUDING where bash drops a backslash that shlex",
+    "    keeps: `bash -c \"git pu\\$'s'h origin main\"` and `bash -ec \"git co\\$'n'fig --global",
+    "    user.email <v>\"` are matched. The cost of reading `\\$'` both ways is that a TOP-LEVEL",
+    "    `git pu\\$'s'h` — which bash reads as the literal `pu$sh` — is over-blocked. Ambiguity",
+    "    resolves toward blocking.",
 ]
 
 def _wrap_words(words, width=92, indent="    "):
@@ -341,7 +368,9 @@ SURFACE_GAPS = [
     "  `curl ... | bash`, `bash <(echo 'git push')`, `bash <(curl ...)`). In all of these the gated",
     "  text is the OUTPUT of something the guard would have to RUN to see, not text on the command",
     "  line. A determined bypass is out of scope by construction — see the CLIENT-SIDE disclosure",
-    "  in this file's header.",
+    "  in this file's header. NOT in this category, and NOT a gap: an ANSI-C escape such as",
+    "  `$'\\x67it' push` or `git $'\\160ush'`. That is text on the command line, and it is decoded",
+    "  and MATCHED (see COVERED above) — a shell quoting construct is not run-time assembly.",
     "A push inside a script FILE: `bash deploy.sh`, `. deploy.sh`, `bash -s < deploy.sh`. The",
     "  guard reads the command line, never a file the command line names.",
     "More than 3 levels of shell nesting (`bash -c \"bash -c 'bash -c ...'\"`) — the recursion is",
@@ -436,6 +465,142 @@ def substitutions(text):
         i += 1
     return out
 
+# ---- bash's own quote INTRODUCERS, modelled on the RAW line, before shlex (SEC-18) -------------
+# `$'...'` (ANSI-C quoting) and `$"..."` (locale quoting) are QUOTE INTRODUCERS, not expansions, so
+# bash collapses them into the surrounding word exactly the way it collapses `'...'`: `pu$'s'h` IS
+# `push`. shlex does not know that — it lexes `pu$'s'h` to the token `pu$sh` — and unquote() only
+# ever stripped a `$` at POSITION 0 of a token, so every mid-token spelling was PERMITTED while
+# SURFACE_COVERED claimed the whole class "shell QUOTING or ESCAPING of the command word or the
+# subcommand":  git pu$'s'h · git pus$'h' · g$'i't push · g$'h' pr merge · git co$'n'fig user.email.
+# Repairing tokens AFTER shlex cannot fix that (the damage is that the word was split at all), so the
+# modelling happens here, on the raw line:
+#   · $'...'  ->  its DECODED content, re-emitted as ONE POSIX single-quoted literal, so shlex
+#                 rebuilds precisely the word bash would build. Re-quoting is load-bearing:
+#                 `git $'push origin main'` is ONE argument to bash and must stay one token, not
+#                 become a push. Decoding is what closes the escape spellings — `$'\x67it' push`,
+#                 `git $'\x70ush'`, `git $'\160ush'` really do run git (verified with a non-git
+#                 marker, `to$'\x75'ch f`, under /bin/bash 3.2.57), and no substring or token test
+#                 can see a trigger word spelled in hex, octal or \u.
+#   · $"..."  ->  the same span with the `$` dropped. bash does not decode escapes there, so
+#                 neither does this.
+# This CANNOT touch `$VAR`: a `$` is special here only when a QUOTE is the very next character,
+# which is bash's own rule. `$HOME`, `$PWD`, `"$v"` and `${push}` are passed through untouched.
+# And it is never the ONLY reading of a line — classify() drives the raw line as well — so the
+# normalisation can only ever ADD a candidate, never remove one.
+BS = chr(92)          # a literal backslash, spelled once so that nothing below has to escape it
+ANSI_C_SIMPLE = {"a": chr(7), "b": chr(8), "e": chr(27), "E": chr(27), "f": chr(12),
+                 "n": chr(10), "r": chr(13), "t": chr(9), "v": chr(11),
+                 BS: BS, "'": "'", '"': '"', "?": "?"}
+HEXDIGITS, OCTDIGITS = "0123456789abcdefABCDEF", "01234567"
+
+def _ansi_c_decode(body):
+    """Decode the inside of one ANSI-C span the way bash does; unknown escapes are kept verbatim."""
+    out, i, n = [], 0, len(body)
+    while i < n:
+        if body[i] != BS:
+            out.append(body[i]); i += 1; continue
+        i += 1
+        if i >= n:
+            out.append(BS); break
+        c = body[i]
+        if c in ANSI_C_SIMPLE:
+            out.append(ANSI_C_SIMPLE[c]); i += 1; continue
+        if c in ("x", "u", "U"):                       # \xHH, \uHHHH, \UHHHHHHHH
+            width = {"x": 2, "u": 4, "U": 8}[c]
+            j = i + 1
+            while j < min(i + 1 + width, n) and body[j] in HEXDIGITS:
+                j += 1
+            if j > i + 1:
+                # \u / \U are bash >= 4.2. Decoding them on a bash that would NOT is over-blocking,
+                # which is the safe direction; the reverse would be a hole.
+                try:
+                    out.append(chr(int(body[i + 1:j], 16)))
+                except (ValueError, OverflowError):
+                    pass
+                i = j
+                continue
+            out.append(c); i += 1; continue
+        if c in OCTDIGITS:                             # \nnn, up to three octal digits
+            j = i
+            while j < min(i + 3, n) and body[j] in OCTDIGITS:
+                j += 1
+            out.append(chr(int(body[i:j], 8) & 0xFF)); i = j; continue
+        if c == "c" and i + 1 < n:                     # \cX -> a control character, never a letter
+            out.append(chr(ord(body[i + 1].upper()) ^ 0x40)); i += 2; continue
+        out.append(BS); out.append(c); i += 1          # not an escape bash knows: keep both chars
+    return "".join(out)
+
+def _single_quoted(s):
+    """<s> as one POSIX single-quoted word, so shlex hands back exactly these characters."""
+    return "'" + s.replace("'", "'" + BS + "'" + "'") + "'"
+
+def _dq_span_end(line, i):
+    """Index just past the closing double quote of a span whose BODY starts at i."""
+    n = len(line)
+    while i < n and line[i] != '"':
+        i += 2 if line[i] == BS else 1
+    return min(i + 1, n)
+
+def _sq_span(line, i):
+    """(raw body, index just past the closing single quote) for a span whose BODY starts at i."""
+    body, n = [], len(line)
+    while i < n and line[i] != "'":
+        if line[i] == BS and i + 1 < n:
+            body.append(line[i:i + 2]); i += 2; continue
+        body.append(line[i]); i += 1
+    return "".join(body), min(i + 1, n)
+
+def resolve_quote_introducers(line):
+    """-> the line with every $'...' / $"..." resolved the way bash resolves it.
+
+    Quote CONTEXT is tracked, because a `$'` inside an ordinary quoted span is not an introducer.
+    Imprecision here can only add a reading, never remove one, so this errs toward normalising.
+    """
+    out, i, n = [], 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == BS and i + 1 < n:                     # an escaped character: copy both, verbatim
+            out.append(line[i:i + 2]); i += 2; continue
+        if ch == "'":                                  # a plain single-quoted span is verbatim
+            j = line.find("'", i + 1)
+            if j < 0:
+                out.append(line[i:]); break
+            out.append(line[i:j + 1]); i = j + 1; continue
+        if ch == '"':                                  # ...and so is a double-quoted one
+            j = _dq_span_end(line, i + 1)
+            out.append(line[i:j]); i = j; continue
+        if ch == "$" and line[i + 1:i + 2] == '"':      # $"..."  ->  "..."
+            j = _dq_span_end(line, i + 2)
+            out.append(line[i + 1:j]); i = j; continue
+        if ch == "$" and line[i + 1:i + 2] == "'":      # $'...'  ->  '<decoded>'
+            body, j = _sq_span(line, i + 2)
+            out.append(_single_quoted(_ansi_c_decode(body))); i = j; continue
+        out.append(ch); i += 1
+    return "".join(out)
+
+def line_readings(line):
+    """Every defensible reading of one logical line. classify() drives ALL of them; any hit gates.
+
+    Same rule as the ambiguous launcher prefix (see launcher_argvs): when a string has more than one
+    defensible reading, classify all of them rather than picking one. Ambiguity resolves toward
+    blocking. A line with no quote introducer in it yields exactly one reading and costs nothing.
+
+    The second candidate exists because SHLEX IS NOT BASH INSIDE DOUBLE QUOTES: bash drops the
+    backslash of `\\$`, shlex keeps it. So the inner string of `bash -c "git pu\\$'s'h origin main"`
+    — which bash hands the inner shell as `git pu$'s'h`, i.e. a real push (verified with a non-git
+    marker, `bash -c "to\\$'u'ch f"`, which creates f) — arrives here as `git pu\\$'s'h` and resolves
+    to nothing. A shlex token no longer knows whether it was double-quoted, so both readings are
+    taken. ONLY the two-character sequences `\\$'` and `\\$"` are affected, so `\\$HOME` and `\\$1`
+    are untouched; the cost is deliberate over-blocking of a TOP-LEVEL `\\$'x'`, which bash reads as
+    the literal `$x`. That is an evasion-shaped string and this is the fail-closed direction.
+    """
+    out = []
+    for cand in (line, line.replace(BS + "$'", "$'").replace(BS + '$"', '$"')):
+        for reading in (cand, resolve_quote_introducers(cand)):
+            if reading not in out:
+                out.append(reading)
+    return out
+
 # `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`, `<<\EOF`
 HEREDOC_RE = re.compile(r"<<-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
@@ -444,8 +609,17 @@ def logical_lines(text):
 
     "Feeds a shell" is decided from EVERY command in the introducing line, not just its first word:
     `cat <<'EOF' | bash` feeds a shell even though the first word is `cat`. (SEC-01d)
+
+    A LINE CONTINUATION IS REMOVED, NOT REPLACED WITH A SPACE. bash deletes the backslash-newline
+    pair outright, so a `git` split across a continuation is still `git` and a `config` split across
+    one is still an identity write. Substituting a space instead produced `gi t push` and permitted
+    both, which is the same class of defect as a mid-token ANSI-C span: a quoting construct that
+    splits a trigger word without changing what runs. (SEC-18) Removal is also right for the
+    ordinary use, where the space is already there BEFORE the backslash, so the words do not run
+    together. (Backslashes are spelled BS in this file's comments; a literal one in a docstring is
+    an invalid escape sequence, which is a warning today and a SyntaxError in a future python.)
     """
-    lines = text.replace("\\\n", " ").split("\n")
+    lines = text.replace("\\\n", "").split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
         line = lines[i]
@@ -474,12 +648,20 @@ def segs_feed_shell(segs):
     return False
 
 def line_feeds_shell(line):
-    try:
-        segs = segments(line)
-    except Cannot:
-        head = line.strip().split()
-        return bool(head) and prog_name(head[0]) in SHELLS
-    return segs_feed_shell(segs)
+    # EVERY reading of the line, so that `ba$'s'h <<'EOF'` is recognised as a shell and its heredoc
+    # body is scanned. Without this the SEC-18 normalisation would close the introducing COMMAND but
+    # not the heredoc-keep decision that runs before classify() ever sees the body.
+    for reading in line_readings(line):
+        try:
+            segs = segments(reading)
+        except Cannot:
+            head = reading.strip().split()
+            if head and prog_name(head[0]) in SHELLS:
+                return True
+            continue
+        if segs_feed_shell(segs):
+            return True
+    return False
 
 def is_punct(t):
     return bool(t) and all(ch in "();<>|&" for ch in t)
@@ -814,6 +996,30 @@ def classify_segment(seg, here, depth):
             return hit
     return None
 
+def classify_line(line, depth):
+    """One reading of one logical line: its segments, its here-strings, its substitutions."""
+    segs = segments(line)
+    for toks, here in segs:
+        hit = classify_segment(toks, here, depth)
+        if hit:
+            return hit
+    # A HERE-STRING belongs to the LINE, not to the segment that spells it: in
+    # `cat <<< '<cmd>' | bash` the text is a command string even though the segment that owns
+    # the `<<<` runs `cat`. That is the same rule logical_lines already applies to a heredoc
+    # body (`cat <<'EOF' | bash` is scanned), and the asymmetry between the two — heredoc
+    # scanned, here-string not — was a bypass. (SEC-15)
+    heres = [h for _toks, here in segs for h in here]
+    if heres and segs_feed_shell(segs):
+        for h in heres:
+            hit = classify(h, depth + 1)
+            if hit:
+                return hit
+    for inner in substitutions(line):
+        hit = classify(inner, depth + 1)
+        if hit:
+            return hit
+    return None
+
 def classify(text, depth=0):
     """Return a label for the gated surface this command line touches, or None.
 
@@ -823,30 +1029,19 @@ def classify(text, depth=0):
     all lex to the right tokens but do not contain the raw substring in the right place. The cheap
     negative filter lives in bash (_mg_may_match), operates on a quote/escape-NORMALISED copy of
     the string, and is the only place a substring test is allowed. (SEC-03)
+
+    EVERY READING of each line is classified (see line_readings): the line as written, and — when
+    the line uses a `$'...'` / `$"..."` quote introducer — the line with that introducer resolved
+    the way bash resolves it. shlex cannot do that itself, and mid-token introducers were a bypass
+    of the whole quoting/escaping class. (SEC-18)
     """
     if depth > 3 or not text:
         return None
     for line in logical_lines(text):
         if not line.strip():
             continue
-        segs = segments(line)
-        for toks, here in segs:
-            hit = classify_segment(toks, here, depth)
-            if hit:
-                return hit
-        # A HERE-STRING belongs to the LINE, not to the segment that spells it: in
-        # `cat <<< '<cmd>' | bash` the text is a command string even though the segment that owns
-        # the `<<<` runs `cat`. That is the same rule logical_lines already applies to a heredoc
-        # body (`cat <<'EOF' | bash` is scanned), and the asymmetry between the two — heredoc
-        # scanned, here-string not — was a bypass. (SEC-15)
-        heres = [h for _toks, here in segs for h in here]
-        if heres and segs_feed_shell(segs):
-            for h in heres:
-                hit = classify(h, depth + 1)
-                if hit:
-                    return hit
-        for inner in substitutions(line):
-            hit = classify(inner, depth + 1)
+        for reading in line_readings(line):
+            hit = classify_line(reading, depth)
             if hit:
                 return hit
     return None
@@ -1029,7 +1224,9 @@ def surface():
     print("\nNOT MATCHED, deliberately (false positives would make the firm unusable):")
     print("  git merge-base / merge-file / merge-tree / merge-index, git commit -m '...merge...',")
     print("  git log/diff/status/fetch/show, git config READS, git -c user.email=... <subcommand>,")
-    print("  firm-integrate, firm-qa-checkout, bash tests/run-tests.sh")
+    print("  firm-integrate, firm-qa-checkout, bash tests/run-tests.sh, and — because a decoded")
+    print("  ANSI-C span is re-quoted as ONE word, exactly as bash builds it — `git $'push origin")
+    print("  main'`, which is a single argument to git and cannot push.")
     return 0
 
 def main():
@@ -1185,6 +1382,30 @@ PYEOF
 # against the normalised copy. Deleting quotes can only ADD candidates (a false positive here
 # costs one python3 start and is then resolved structurally); it can never remove one.
 #
+# THE `$` OF A QUOTE INTRODUCER IS DELETED WITH THE QUOTE (SEC-18). `$'…'` (ANSI-C) and `$"…"`
+# (locale) are QUOTE INTRODUCERS, so bash collapses them into the surrounding word exactly the way
+# it collapses `'…'`: `pu$'s'h` IS `push`. Deleting only the quotes left `pu$sh`, which contains no
+# trigger word, so `git pu$'s'h`, `git pus$'h'` and — worst — `git co$'n'fig --global user.email`
+# were SKIPped here, before python3 ever started. A `$` is only deleted when a quote character
+# comes IMMEDIATELY after it, which is precisely bash's own rule and is why this cannot touch
+# `$VAR`: `$HOME`, `$PWD`, `"$var"` and `${push}` have no quote in that position and are untouched.
+# Deleting characters can only ever ADD candidates (no trigger word contains `$` or a quote), so
+# this direction is safe by construction.
+#
+# AND THE ESCAPE SEQUENCES INSIDE `$'…'` CANNOT BE SEEN BY ANY SUBSTRING TEST. `$'\x67it' push` and
+# `git $'\x70ush'` really do run git (verified with a non-git marker: `to$'\x75'ch f` creates `f`
+# under /bin/bash 3.2.57), but after normalisation they read `git x70ush` — decoding hex, octal and
+# \u escapes in bash would cost a subprocess, which is the one thing this filter exists to avoid.
+# So the PRESENCE of `$'` followed anywhere by a backslash is itself a CHECK: the classifier decodes
+# the span exactly. That is tested on the RAW string, before the backslash deletion below (which
+# would otherwise remove the very evidence). `grep 'TODO$' README.md` — a `$` before a quote with no
+# backslash after it — stays on the zero-subprocess path.
+#
+# A LINE CONTINUATION IS DELETED AS A PAIR, for the same reason. Deleting only the backslash left the
+# NEWLINE between the halves of the split word, so `git pu\<newline>sh origin main` — which bash runs
+# as `git push` — normalised to `git pu<newline>sh` and SKIPped here. Same construct class as the
+# mid-token `$'...'`, same fix shape, and the classifier's logical_lines() removes the pair too.
+#
 # The `git`-then-`config` clause is its own condition because a `git config user.email <v>` write —
 # which IS gated (SEC-04) — contains none of push/merge/pull/gh.
 #
@@ -1212,7 +1433,18 @@ PYEOF
 # ---------------------------------------------------------------------------------------------
 _mg_may_match() {
   local s
-  s="${1//\\/}"
+  # An ANSI-C quoted span carrying a BACKSLASH ESCAPE is decoded only by the classifier (SEC-18).
+  # Tested on the RAW argument: the normalisation below deletes backslashes.
+  case "$1" in *"\$'"*"\\"*) return 0 ;; esac
+  # A line continuation is a PAIR: bash deletes the backslash AND the newline, so the halves of a
+  # split word join up (`git pu\<newline>sh` is `git push`).
+  s="${1//\\$'\n'/}"
+  s="${s//\\/}"
+  # `$'` and `$"` are quote INTRODUCERS: delete the `$` along with the quote it introduces (the two
+  # lines below would delete that quote anyway), so `pu$'s'h` normalises to `push`. Only a `$`
+  # IMMEDIATELY followed by a quote is touched, so `$VAR` / `${VAR}` / `"$v"` are untouched.
+  s="${s//\$\'/}"
+  s="${s//\$\"/}"
   s="${s//\'/}"
   s="${s//\"/}"
   case "$s" in
@@ -1281,14 +1513,21 @@ payload="$(cat 2>/dev/null || true)"
 # word); anything it cannot answer with certainty falls through to python3, which is authoritative.
 # A jq that is missing, old, or wrong can therefore only cost a few milliseconds — never a pass.
 # The same quote/escape normalisation as _mg_may_match is applied before the substring test, for
-# the same reason (SEC-03). The single quote is spelled with jq's own ' escape so that this
-# whole jq program can stay inside a single-quoted shell string.
+# the same reason (SEC-03) — INCLUDING the `$` of a `$'…'` / `$"…"` quote introducer, and the
+# RAW-string test for a backslash escape inside an ANSI-C span, which must run BEFORE the backslash
+# deletion that would remove its evidence (SEC-18). Whatever changes in one of these two prefilters
+# has to change in the other: tests/test-merge-guard.sh drives BOTH over one corpus and fails if
+# they disagree — and the jq side is the one that runs whenever jq exists.
+# The single quote is spelled with jq's own escape so that this whole jq program can stay inside a
+# single-quoted shell string.
 if command -v jq >/dev/null 2>&1; then
   verdict="$(printf '%s' "$payload" | jq -r '
     if (.tool_input | type) != "object" then "CHECK"
     elif (.tool_input | has("command")) != true then "CHECK"
     elif (.tool_input.command | type) != "string" then "CHECK"
-    else (.tool_input.command | gsub("\\\\"; "") | gsub("\u0027"; "") | gsub("\""; "")) as $c
+    elif (.tool_input.command | test("\\$\u0027[\\s\\S]*\\\\")) then "CHECK"
+    else (.tool_input.command | gsub("\\\\\n"; "") | gsub("\\\\"; "") | gsub("\\$\u0027"; "") | gsub("\\$\""; "")
+          | gsub("\u0027"; "") | gsub("\""; "")) as $c
       | if ($c | test("push|merge|pull|gh"; "i")) then "CHECK"
         elif ($c | test("git[\\s\\S]*config")) then "CHECK"
         else "SKIP" end
