@@ -76,9 +76,18 @@
 # through the hook adapter (jq included), 6.3 ms via --command. No gh, git, python3 or jq is spawned
 # on that path (tests/test-merge-guard.sh proves it with stubs that fail loudly if executed,
 # including for QUOTED benign commands). A gated command costs ~500 ms, which is one real `gh`
-# round trip. The prefilter deletes backslashes and quotes with bash parameter expansion — still
-# zero subprocesses — so shell quoting cannot smuggle a trigger word past it, which it previously
-# could. See the comment above _mg_may_match.
+# round trip. The prefilter deletes backslashes, quotes, the `$` of a `$'…'`/`$"…"` quote introducer
+# and a backslash-newline continuation PAIR, all with bash parameter expansion — still zero
+# subprocesses — so shell quoting cannot smuggle a trigger word past it, which it previously could.
+# See the comment above _mg_may_match.
+#   RE-MEASURED after that last addition (SEC-18), same method, 200 iterations: 5.5 ms via --command
+#   and 9.7 ms through the hook for a benign call, i.e. unchanged within run-to-run noise — the extra
+#   parameter expansions and the extra `case` cost nothing measurable. `grep 'TODO$' README.md` — a
+#   `$` immediately before a quote, the everyday end-of-line regex anchor — stays on the
+#   zero-subprocess path at 5.6 ms, and `sed $'s/x/y/' f` (an ANSI-C span with no escape in it) at
+#   5.5 ms. What DOES now reach python3 is a `$'…'` span containing a backslash, because hex/octal/\u
+#   escapes cannot be decoded in bash without a subprocess; that is a deliberate trade of ~30 ms on a
+#   rare spelling against a whole bypass class.
 #   MEASURED, same runs, for the `git`-then-`config` clause once it was ORDERED: a command with both
 #   words in the WRONG order — `grep -rn config .github/` is the everyday one — went from 34.3 ms to
 #   6.3 ms via --command and 38.7 ms to 11.5 ms through the hook, i.e. back onto the zero-subprocess
@@ -136,7 +145,7 @@ while [ "$#" -gt 0 ]; do
       MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,109p' "$__src" | sed 's/^# \{0,1\}//'
+      sed -n '2,118p' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
