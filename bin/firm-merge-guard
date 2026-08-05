@@ -297,11 +297,29 @@ SURFACE_COVERED = [
     "    there the gated text is the OUTPUT of the inside, not the inside.",
     "  · a command string passed as a whitespace-containing flag VALUE to a launcher",
     "    (`flock -c 'git push'`, `watch 'git push'`, `xargs -I{} 'git push'`, `su -c 'git push'`)",
-    "  · shell QUOTING or ESCAPING of the command word or the subcommand: `git pus\\h`,",
-    "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push`, `git $'push'`, `gh $'pr' merge`,",
-    "    `git $'config' user.email <v>` — the bash prefilter is quote/escape-normalised, and the",
-    "    classifier normalises the same decoration off the SUBCOMMAND and the flags, not only off",
-    "    the command word",
+    "  · shell QUOTING or ESCAPING of the command word, the subcommand or a flag, AT ANY POSITION",
+    "    IN THE TOKEN — not only at its start: `git pus\\h`, `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`,",
+    "    `$'git' push`, `git $'push'`, `gh $'pr' merge`, `git $'config' user.email <v>`, AND the",
+    "    MID-TOKEN forms `git pu$'s'h`, `git pus$'h'`, `g$'i't push`, `g$'h' pr merge`,",
+    "    `git co$'n'fig --global user.email <v>`, `git pu$\"s\"h`. `$'...'` and `$\"...\"` are quote",
+    "    INTRODUCERS: bash collapses them into the surrounding word, so the prefilter deletes the",
+    "    `$` together with the quote it introduces and the classifier models the same rule on the",
+    "    RAW line, before shlex. Nothing here can affect `$VAR` — a `$` is only special when a QUOTE",
+    "    is the very next character, which is bash's own rule.",
+    "  · the ESCAPE SEQUENCES inside `$'...'`, DECODED the way bash decodes them, so a trigger word",
+    "    spelled in hex, octal or \\u is still matched: `$'\\x67it' push`, `git $'\\x70ush'`,",
+    "    `git $'\\160ush'`, `git co$'\\x6e'fig --global user.email <v>`, `$'\\x67h' pr merge`. These",
+    "    are real commands, not theory (`to$'\\x75'ch f` creates `f` under /bin/bash 3.2.57), and no",
+    "    substring test can see them, so the prefilters send any `$'` span containing a backslash to",
+    "    the classifier instead of guessing.",
+    "  · a LINE CONTINUATION inside a word — bash deletes the backslash-newline PAIR, so the halves",
+    "    join: `git pu\\<newline>sh origin main`, `gi\\<newline>t co\\<newline>nfig --global",
+    "    user.email <v>` (and an ordinary `git push \\<newline>origin main` still matches too)",
+    "  · all of the above nested one shell deeper, INCLUDING where bash drops a backslash that shlex",
+    "    keeps: `bash -c \"git pu\\$'s'h origin main\"` and `bash -ec \"git co\\$'n'fig --global",
+    "    user.email <v>\"` are matched. The cost of reading `\\$'` both ways is that a TOP-LEVEL",
+    "    `git pu\\$'s'h` — which bash reads as the literal `pu$sh` — is over-blocked. Ambiguity",
+    "    resolves toward blocking.",
 ]
 
 def _wrap_words(words, width=92, indent="    "):
@@ -341,7 +359,9 @@ SURFACE_GAPS = [
     "  `curl ... | bash`, `bash <(echo 'git push')`, `bash <(curl ...)`). In all of these the gated",
     "  text is the OUTPUT of something the guard would have to RUN to see, not text on the command",
     "  line. A determined bypass is out of scope by construction — see the CLIENT-SIDE disclosure",
-    "  in this file's header.",
+    "  in this file's header. NOT in this category, and NOT a gap: an ANSI-C escape such as",
+    "  `$'\\x67it' push` or `git $'\\160ush'`. That is text on the command line, and it is decoded",
+    "  and MATCHED (see COVERED above) — a shell quoting construct is not run-time assembly.",
     "A push inside a script FILE: `bash deploy.sh`, `. deploy.sh`, `bash -s < deploy.sh`. The",
     "  guard reads the command line, never a file the command line names.",
     "More than 3 levels of shell nesting (`bash -c \"bash -c 'bash -c ...'\"`) — the recursion is",
@@ -1194,7 +1214,9 @@ def surface():
     print("\nNOT MATCHED, deliberately (false positives would make the firm unusable):")
     print("  git merge-base / merge-file / merge-tree / merge-index, git commit -m '...merge...',")
     print("  git log/diff/status/fetch/show, git config READS, git -c user.email=... <subcommand>,")
-    print("  firm-integrate, firm-qa-checkout, bash tests/run-tests.sh")
+    print("  firm-integrate, firm-qa-checkout, bash tests/run-tests.sh, and — because a decoded")
+    print("  ANSI-C span is re-quoted as ONE word, exactly as bash builds it — `git $'push origin")
+    print("  main'`, which is a single argument to git and cannot push.")
     return 0
 
 def main():

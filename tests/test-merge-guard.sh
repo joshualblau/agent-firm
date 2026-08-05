@@ -126,6 +126,14 @@ mg_gap() {
   assert_rc "GAP: $1 · through the hook" 0 mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$2"
 }
 
+# A literal newline, and a bash LINE CONTINUATION (backslash + newline). Both are needed as data:
+# the continuation is a quoting construct that splits a word, so several assertions below have to
+# build a command string containing one. `"\\$NL"` is a backslash followed by a newline, NOT an
+# escaped newline — the difference is the whole point of the SEC-18 continuation rows.
+NL='
+'
+CONT="\\$NL"
+
 # A tracked DIRECTORY, not a bare mktemp file: tests/lib.sh's teardown only removes directories, so
 # a registered plain file would be skipped and leaked.
 _hdr_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-header.XXXXXX")"; t_track "$_hdr_dir"
@@ -157,7 +165,12 @@ DEF_REPO="$(mk_id_repo nobody@example.com)"
 ( cd "$DEF_REPO" && git checkout -q main && git checkout -q -b feature/x && printf 'x\n' > f.txt \
     && git add -A && git commit -qm f && git checkout -q main ) >/dev/null 2>&1
 assert_eq "fixture really is on main" "main" "$(git -C "$DEF_REPO" rev-parse --abbrev-ref HEAD)"
-assert_rc "on main, `git merge feature/x` is refused for a non-allowed identity" 1 \
+# NOTE the backticks below are ESCAPED. Unescaped, bash command-substitutes an assertion
+# DESCRIPTION, and this file's descriptions quote the very commands under test — so the suite
+# really did run `git merge feature/x` (and, at the `git -c user.email=... push` row further down,
+# attempt a push) in whatever directory it was invoked from, every single run. It failed only
+# because no such branch existed here. No assertion changed; the strings are now inert data.
+assert_rc "on main, \`git merge feature/x\` is refused for a non-allowed identity" 1 \
   mg "$TREE" "$GH_OK" "$DEF_REPO" --command 'git merge feature/x'
 assert_rc "on main, the same merge is permitted for an allowed identity" 0 \
   mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
@@ -510,6 +523,119 @@ for c in "git \$'merge-base' main HEAD" "git \$'status'" "git \$'commit' -qm x" 
   assert_rc "not gated: $c" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
 done
 
+# ============================================ AC-014/SEC-18 · the quote INTRODUCER, MID-TOKEN
+# THE DEFECT SHAPE, FOUND FOR THE THIRD TIME. Every example the COVERED bullet printed happened to
+# put the `$` at position 0 of a token (`$'git' push`, `git $'push'`), and all of them blocked — so
+# the examples were honest and the CLASS CLAIM ("shell QUOTING or ESCAPING of the command word or the
+# subcommand") was not. `$'...'` and `$"..."` are quote INTRODUCERS: bash collapses them into the
+# surrounding word exactly as it collapses `'...'`, so `pu$'s'h` IS `push`. unquote() stripped a `$`
+# only while it was the FIRST character of a token, and both prefilters deleted quotes without the
+# `$` that introduced them.
+#
+# WHY EVERY ONE OF THESE IS ASSERTED ON BOTH SURFACES (mg_both), and why that is not redundant here:
+# the review measured that `git pu$'s'h`, `git pus$'h'` and `git co$'n'fig ...` were SKIP at the
+# PREFILTER (python3 never started, so fixing the classifier alone could not close them) while
+# `g$'i't push` was CHECK and permitted anyway (so fixing the prefilter alone could not close that
+# one). The fix is in three layers — the bash prefilter, the jq prefilter, the classifier — and a
+# regression in any ONE of them re-opens a different subset of these rows.
+t_case "AC-014/SEC-18 a quote introducer MID-TOKEN does not defeat the check"
+mg_both "git pu\$'s'h (mid-token ANSI-C)"    "git pu\$'s'h origin main"
+mg_both "git pus\$'h' (last letter)"         "git pus\$'h' origin main"
+mg_both "g\$'i't push (mid command word)"    "g\$'i't push origin main"
+mg_both "g\$'h' pr merge"                    "g\$'h' pr merge 1"
+mg_both "git co\$'n'fig user.email <v>"      "git co\$'n'fig --global user.email a@b.c"
+mg_both "git pu\$\"s\"h (LOCALE quoting)"    "git pu\$\"s\"h origin main"
+mg_both "git me\$'r'ge"                      "git me\$'r'ge feature/x"
+mg_both "git pu\$'l'l"                       "git pu\$'l'l origin main"
+mg_both "gh pr me\$'r'ge (gh subcommand)"    "gh pr me\$'r'ge 12"
+mg_both "git su\$'b'tree push"               "git su\$'b'tree push --prefix=d origin main"
+mg_both "the config KEY, mid-token"          "git config user.\$'e'mail a@b.c"
+mg_both "behind a launcher"                  "sudo -u josh git pu\$'s'h origin main"
+mg_both "inside a \$( ) capture"             "x=\$(git pu\$'s'h origin main)"
+mg_both "behind a shell keyword"             "if true; then git pu\$'s'h origin main; fi"
+mg_both "with redirections attached"         "git pu\$'s'h origin main >/dev/null 2>&1"
+# The SEC-04 identity axis, re-opened by this shape and closed again. Built from the SAME allowlist
+# value as the original one-command bypass, so the string in the failure output is the real one.
+assert_rc "\`git co\$'n'fig --global user.email <allow-listed>\` is refused" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git co\$'n'fig --global user.email $ALLOWED_EMAIL"
+assert_rc "  and it BLOCKS the tool call through the hook" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "git co\$'n'fig --global user.email $ALLOWED_EMAIL"
+assert_output "  and the matched surface is still named exactly" \
+  "matched surface : git config (writes user.email)" \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git co\$'n'fig --global user.email $ALLOWED_EMAIL"
+
+t_case "AC-014/SEC-18 the ESCAPE SEQUENCES inside \$'...' are decoded, not stared at"
+# These are not theoretical strings: bash decodes \xHH and \nnn inside $'...', which was confirmed
+# WITHOUT touching git — `to$'\x75'ch <name>` creates the file under /bin/bash 3.2.57. No substring
+# test can see a trigger word spelled this way, which is why the prefilters send any `$'` span
+# containing a backslash to the classifier rather than guessing.
+mg_both "\$'\\x67it' push (hex command word)" "\$'\\x67it' push origin main"
+mg_both "git \$'\\x70ush' (hex subcommand)"   "git \$'\\x70ush' origin main"
+mg_both "git \$'\\160ush' (OCTAL)"            "git \$'\\160ush' origin main"
+mg_both "git pu\$'\\x73'h (hex, mid-token)"   "git pu\$'\\x73'h origin main"
+mg_both "git co\$'\\x6e'fig user.email <v>"   "git co\$'\\x6e'fig --global user.email a@b.c"
+mg_both "\$'\\x67h' pr merge"                 "\$'\\x67h' pr merge 1"
+mg_both "git \$'\\x6d\\x65rge'"               "git \$'\\x6d\\x65rge' feature/x"
+# \u is bash >= 4.2. Decoding it on a bash that would NOT is deliberate OVER-blocking — the same
+# recorded fail-closed choice as `git ${push}` below. The reverse (not decoding it on a bash that
+# does) would be a hole, and this suite runs on /bin/bash 3.2.57.
+mg_both "git \$'\\u0070ush' — over-blocks on purpose" "git \$'\\u0070ush' origin main"
+
+t_case "AC-014/SEC-18 a LINE CONTINUATION inside a word joins the halves, as bash joins them"
+# bash deletes the backslash-newline PAIR. logical_lines() replaced it with a SPACE, which turned
+# `gi\<newline>t push` into `gi t push` and permitted it; the prefilters deleted the backslash and
+# left the newline, so these were SKIP there too. Same construct class as the mid-token `$'...'`.
+# $CONT is the backslash-newline pair; see the fixtures at the top of this file.
+mg_both "gi\\<newline>t push"             "gi${CONT}t push origin main"
+mg_both "git pu\\<newline>sh"             "git pu${CONT}sh origin main"
+mg_both "gi\\<nl>t co\\<nl>nfig user.email <v>" "gi${CONT}t co${CONT}nfig --global user.email a@b.c"
+mg_both "gh pr me\\<newline>rge"          "gh pr me${CONT}rge 12"
+# ...and the ORDINARY use of a continuation still matches, so the pair-deletion did not break it:
+# the space that was already there before the backslash keeps the words apart.
+mg_both "git push \\<newline>origin main"  "git push ${CONT}origin main"
+assert_rc "and a continuation in a BENIGN command is still not gated" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "echo hello ${CONT}world"
+
+t_case "AC-014/SEC-18 the same shape one shell deeper, where shlex is not bash"
+# shlex keeps the backslash of `\$` inside double quotes; bash drops it. So the inner string of
+# `bash -c \"git pu\$'s'h origin main\"` reaches the classifier as `git pu\$'s'h` and used to resolve
+# to nothing — while bash hands the inner shell `git pu$'s'h`, a real push (verified with a non-git
+# marker: `bash -c \"to\$'u'ch f\"` creates f). Both readings are now classified.
+mg_both "bash -c with a mid-token introducer"  "bash -c \"git pu\$'s'h origin main\""
+mg_both "  and with the backslash bash drops"  "bash -c \"git pu\\\$'s'h origin main\""
+mg_both "  the identity write, nested"         "bash -ec \"git co\\\$'n'fig --global user.email a@b.c\""
+mg_both "  gh, nested"                         "sh -c \"g\\\$'h' pr merge 1\""
+# The SHELL'S OWN NAME, spelled with a mid-token introducer: without this the heredoc/-c body would
+# not even be scanned, because "does this line feed a shell?" is decided before classify() runs.
+mg_both "ba\$'s'h -c '<cmd>'"                  "ba\$'s'h -c 'git push origin main'"
+mg_both "ba\$'s'h <<< '<cmd>'"                 "ba\$'s'h <<< 'git push origin main'"
+assert_rc "ba\$'s'h heredoc body is scanned (the introducer resolves to a shell)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "ba\$'s'h <<'EOF'
+git push origin main
+EOF"
+assert_rc "  ...and through the hook" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "ba\$'s'h <<'EOF'
+git push origin main
+EOF"
+assert_rc "cat <<'EOF' | ba\$'s'h is scanned too" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "cat <<'EOF' | ba\$'s'h
+git push origin main
+EOF"
+
+t_case "AC-024/SEC-18 the introducer normalisation does not invent matches"
+# The decoded span is re-emitted as ONE single-quoted word, exactly as bash builds it. That is
+# load-bearing in both directions: `git $'push origin main'` is a SINGLE argument to git and cannot
+# push, so it must NOT be gated — a naive textual substitution would have read three words and
+# blocked it.
+for c in "git \$'push origin main'" "git \$'merge-base' main HEAD" "git st\$'a'tus --porcelain" \
+         "git config --get user.\$'e'mail" "git config lis\$'t'" \
+         "git comm\$'i't -qm x" "git \$'commit' -m \$'docs: git push is refused'" \
+         "echo \$'hello\\tworld'" "printf \$'%s\\n' done" "sed \$'s/\\t/,/g' data.tsv" \
+         "grep -c 'x\$' file.txt" "echo \"cost is 5\\\$\"" "gh \$'issue' comment 5" \
+         "git log --format=\$'%h %s'" "git di\$'f'f --stat"; do
+  assert_rc "not gated: $c" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
+done
+
 t_case "AC-014 gh-based merge paths"
 assert_rc "gh pr merge"                            1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge'
 assert_rc "gh pr merge <n> --squash"               1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge 12 --squash'
@@ -599,7 +725,7 @@ assert_rc "git -c user.email=... <subcommand> is NOT gated (it cannot persist an
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -c user.email=eval@firm -c user.name=eval commit -qm fixture'
 # ...and that spelling cannot spoof the guard either: identity is resolved by RUNNING
 # `git config user.email`, which ignores a `-c` on some other command line.
-assert_rc "and `git -c user.email=<allow-listed> push` is still refused" 1 \
+assert_rc "and \`git -c user.email=<allow-listed> push\` is still refused" 1 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git -c user.email=$ALLOWED_EMAIL push origin main"
 
 t_case "AC-014/AC-024 NO FALSE POSITIVES — these must all be permitted untouched"
@@ -1197,12 +1323,35 @@ for c in 'echo "hello world"' "printf '%s\\n' done" 'grep -n "TODO" README.md' \
   assert_eq "benign+quoted: $c spawned NO subprocess" "" \
     "$(mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c" 2>&1)"
 done
+# THE `$VAR` NON-REGRESSION, AND IT IS A PERFORMANCE PROPERTY, NOT JUST A CORRECTNESS ONE (SEC-18).
+# Closing the mid-token `$'...'` class meant teaching the prefilter about a `$`. The rule is "a `$`
+# that a QUOTE immediately follows", which is bash's own rule — so ordinary variable expansion must
+# not start spawning python3. These run under the booby-trapped PATH: exit 0 AND no output is
+# positive proof that no gh, git or python3 was executed. `grep 'TODO$' README.md` is the one that
+# matters most — it is a `$` directly before a quote (the everyday end-of-line regex anchor) with no
+# backslash after it, and it stays on the zero-subprocess path.
+for c in 'echo $HOME' 'cd $PWD && ls' 'echo "$var"' 'printf "%s\n" "$PATH"' \
+         'grep "TODO$" README.md' "grep 'TODO\$' README.md" 'awk "{print \$1}" data.csv' \
+         'echo ${HOME}' 'test -n "$TMPDIR"' 'echo "5$"' "echo 'cost 5\$'"; do
+  assert_rc "\$VAR benign: $c exits 0" 0 mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c"
+  assert_eq "\$VAR benign: $c spawned NO subprocess" "" \
+    "$(mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c" 2>&1)"
+done
 # And the normalisation is really doing work: the SAME booby-trapped PATH BLOCKS a quote-split
 # trigger word, which proves the string reached python rather than being filtered out in bash.
 assert_rc "a quote-split trigger word reaches the classifier (blocks under a dead PATH)" 2 \
   mg "$TREE" "$EXPLODE" "$REPO_OK" --command 'git pus\h origin main'
 assert_rc "and the booby-trapped PATH still BLOCKS a gated command (not a silent pass)" 2 \
   mg "$TREE" "$EXPLODE" "$REPO_OK" --command 'git push origin main'
+# Same proof for the SEC-18 forms: each one reaches the classifier, so none of them was decided in
+# bash. A prefilter that SKIPped any of these would return 0 here instead of 2.
+for c in "git pu\$'s'h origin main" "git pus\$'h' origin main" "g\$'i't push origin main" \
+         "g\$'h' pr merge 1" "git co\$'n'fig --global user.email a@b.c" \
+         "git \$'\\x70ush' origin main" "\$'\\x67it' push origin main" \
+         "git pu\$\"s\"h origin main"; do
+  assert_rc "SEC-18 form reaches the classifier under a dead PATH: $c" 2 \
+    mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$c"
+done
 t_case "AC-022 the same holds through the hook adapter, on a real payload"
 hook_explode() { ( cd "$REPO_OK" && printf '%s' "$(mk_payload "$1")" | PATH="$EXPLODE:$PATH" "$TREE/bin/firm-merge-guard" --hook ); }
 assert_rc "hook + benign command -> 0" 0 hook_explode 'ls -la'
@@ -1255,18 +1404,19 @@ open('$PFDIR/pre.jq', 'w').write(prog)
 PF_BAD_DIRECTION=0
 # pf_row <kind> <expect-bash> <expect-jq> <string>
 pf_row() {
-  local kind="$1" eb="$2" ej="$3" s="$4" ab aj
+  local kind="$1" eb="$2" ej="$3" s="$4" ab aj shown
   ab="$(bash "$PFDIR/may.sh" "$s" 2>/dev/null)"
   aj="$(printf '%s' "$(mk_payload "$s")" | jq -r -f "$PFDIR/pre.jq" 2>/dev/null || printf 'CHECK')"
-  assert_eq "prefilter[bash] wants $eb · $kind · $s" "$eb" "$ab"
-  assert_eq "prefilter[jq]   wants $ej · $kind · $s" "$ej" "$aj"
+  shown="${s//$NL/<nl>}"     # a row may legitimately contain a newline (the continuation rows)
+  assert_eq "prefilter[bash] wants $eb · $kind · $shown" "$eb" "$ab"
+  assert_eq "prefilter[jq]   wants $ej · $kind · $shown" "$ej" "$aj"
   if [ "$ab" = "CHECK" ] && [ "$aj" = "SKIP" ]; then
     PF_BAD_DIRECTION=$((PF_BAD_DIRECTION+1))
-    _t_no "jq is WEAKER than the bash fallback for: $s" \
+    _t_no "jq is WEAKER than the bash fallback for: $shown" \
           "jq runs whenever jq exists, so it must never SKIP what bash would CHECK"
   fi
   if [ "$kind" = "gated" ]; then
-    assert_eq "  gated rows must be CHECK in BOTH (neither may drop a gated command) · $s" \
+    assert_eq "  gated rows must be CHECK in BOTH (neither may drop a gated command) · $shown" \
       "CHECK CHECK" "$eb $ej"
     assert_rc "  ...and the guard really gates it, so the row above cannot be edited to hide it" 1 \
       mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$s"
@@ -1294,6 +1444,27 @@ pf_row gated  CHECK CHECK 'gh api -XPUT repos/o/r/git/refs/heads/main'
 pf_row gated  CHECK CHECK 'git subtree push --prefix=d origin main'
 pf_row gated  CHECK CHECK 'cat <(git push origin main)'
 pf_row gated  CHECK CHECK "busybox sh -c 'git push origin main'"
+# ---- SEC-18. The review DROVE the extracted `_mg_may_match` and found rows 1, 2 and 5 SKIPping in
+# bash while the classifier would have gated them: python3 never started, so no classifier fix could
+# reach them. Every one is a `gated` row, so each also asserts that the guard really refuses it.
+pf_row gated  CHECK CHECK "git pu\$'s'h origin main"
+pf_row gated  CHECK CHECK "git pus\$'h' origin main"
+pf_row gated  CHECK CHECK "g\$'i't push origin main"
+pf_row gated  CHECK CHECK "g\$'h' pr merge 1"
+pf_row gated  CHECK CHECK "git co\$'n'fig --global user.email a@b.c"
+pf_row gated  CHECK CHECK "git pu\$\"s\"h origin main"
+pf_row gated  CHECK CHECK "git config user.\$'e'mail a@b.c"
+# ...and the ESCAPE forms, which no substring test can see at all: these are CHECK because the
+# prefilters test for a `$'` span containing a backslash, not because a trigger word is visible.
+pf_row gated  CHECK CHECK "\$'\\x67it' push origin main"
+pf_row gated  CHECK CHECK "git \$'\\x70ush' origin main"
+pf_row gated  CHECK CHECK "git \$'\\160ush' origin main"
+pf_row gated  CHECK CHECK "git co\$'\\x6e'fig --global user.email a@b.c"
+pf_row gated  CHECK CHECK "\$'\\x67h' pr merge 1"
+# ...and the line CONTINUATION, where deleting the backslash but not the newline left `pu<nl>sh`.
+pf_row gated  CHECK CHECK "gi${CONT}t push origin main"
+pf_row gated  CHECK CHECK "git pu${CONT}sh origin main"
+pf_row gated  CHECK CHECK "gi${CONT}t co${CONT}nfig --global user.email a@b.c"
 # ---- BENIGN, and on the zero-subprocess path in BOTH. These are the AC-022 win: the ordered
 # `git`-then-`config` clause returns them here. Before it, every one containing both words in ANY
 # order cost a python3 start (~40 ms, doubled by the two hook registrations).
@@ -1313,6 +1484,16 @@ pf_row benign SKIP  SKIP  'ls config git'
 pf_row benign SKIP  SKIP  'echo GitHub'
 pf_row benign SKIP  SKIP  'sed -i "" s/a/b/ file.txt'
 pf_row benign SKIP  SKIP  'awk -F, "{print \$1}" data.csv'
+# ---- `$VAR` MUST NOT START SPAWNING PYTHON (SEC-18). The new rule is "a `$` that a QUOTE
+# immediately follows", so these are all untouched — including the end-of-line regex anchor
+# `'TODO$'`, where a `$` really is immediately before a quote but no backslash follows it.
+pf_row benign SKIP  SKIP  'echo $HOME'
+pf_row benign SKIP  SKIP  'cd $PWD && ls'
+pf_row benign SKIP  SKIP  'echo "$var"'
+pf_row benign SKIP  SKIP  "grep 'TODO\$' README.md"
+pf_row benign SKIP  SKIP  'echo ${HOME}'
+pf_row benign SKIP  SKIP  "echo 'cost 5\$'"
+pf_row benign SKIP  SKIP  "sed \$'s/x/y/' file.txt"
 # ---- STILL CHECK, and honestly so. `git` DOES precede `config` here, so the ordered clause cannot
 # tell these from a real `git ... config` write without a parse. They cost one python3 start and are
 # then resolved to PERMIT structurally. Narrowing further — e.g. demanding whitespace before
@@ -1344,6 +1525,43 @@ assert '*config*' not in bash_fn.replace('*git*config*', ''), (
 jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
 assert re.search(r'test\(\"git\[.*?\]\*config\"\)', jq), 'the jq clause is not the ordered form: ' + jq
 assert 'test(\"config\")' not in jq, 'an unordered config test is back in the jq program'
+print('ok')
+"
+# And the SEC-18 clauses exist in BOTH copies, asserted on the SOURCE as well as on behaviour. The
+# behaviour rows above would also go red if a clause vanished, but only on the machine that runs
+# them: this is the assertion that says the jq-less host and the jq host normalise the SAME way.
+assert_ok "both prefilters delete the \$ of a quote INTRODUCER, and the continuation PAIR" python3 -c "
+import re
+src = open('$GUARD').read()
+bash_fn = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M).group(1)
+for want, why in [
+    (chr(92) + chr(36) + chr(92) + chr(39), 'the \$-before-single-quote deletion'),
+    (chr(92) + chr(36) + chr(92) + chr(34), 'the \$-before-double-quote deletion'),
+    ('\$' + chr(39) + chr(92) + 'n' + chr(39), 'the backslash-newline PAIR deletion'),
+]:
+    assert want in bash_fn, why + ' is missing from _mg_may_match: ' + bash_fn
+jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+B = chr(92)
+for want, why in [
+    (B * 2 + '\$' + B + 'u0027', 'the \$-before-single-quote gsub'),
+    (B * 2 + '\$' + B + '\"',    'the \$-before-double-quote gsub'),
+    (B * 4 + B + 'n',            'the backslash-newline PAIR gsub'),
+]:
+    assert want in jq, why + ' is missing from the jq program: ' + jq
+print('ok')
+"
+assert_ok "the ANSI-C escape span reaches the classifier from BOTH prefilters" python3 -c "
+import re
+src = open('$GUARD').read()
+bash_fn = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M).group(1)
+B, Q = chr(92), chr(39)
+# case \"\$1\" in *\"\\\$'\"*\"\\\\\"*) return 0 — tested on the RAW argument, before any deletion
+assert '\$1' in bash_fn.split('return 0')[0], (
+    'the escape clause must test the RAW argument, not the normalised copy: ' + bash_fn)
+assert B + '\$' + Q in bash_fn, 'no \$-quote escape clause in _mg_may_match: ' + bash_fn
+jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+assert re.search(r'test\(\"' + re.escape(B * 2 + '\$' + B + 'u0027') + r'.*?' + re.escape(B * 4) + r'\"\)', jq), (
+    'no raw-string ANSI-C-escape test in the jq program: ' + jq)
 print('ok')
 "
 
@@ -1549,6 +1767,33 @@ assert_output "GAPS names the two positional-consuming launchers, and no others"
   "chroot /newroot git push" surface_text
 assert_output "  and says the flag-operand launchers are covered, not gapped" \
   "are covered, not gapped" surface_text
+# ---- SEC-18. The CLASS claim, not just the examples. The bullet used to say "shell QUOTING or
+# ESCAPING of the command word or the subcommand" while every example it printed put the `$` at
+# position 0 — honest examples, false class. It now states the position rule, and each spelling it
+# names has its own BLOCK assertion above.
+assert_output "COVERED says the quoting rule holds AT ANY POSITION in the token" \
+  "AT ANY POSITION" surface_text
+assert_output "  and prints the mid-token forms it now blocks" "git pu\$'s'h" surface_text
+assert_output "  including the one that re-opened the identity axis" \
+  "git co\$'n'fig --global user.email <v>" surface_text
+assert_output "  and the LOCALE-quoting spelling" "git pu\$\"s\"h" surface_text
+assert_output "  and says why \$VAR is untouched" \
+  "is only special when a QUOTE" surface_text
+assert_output "COVERED states that ANSI-C ESCAPE SEQUENCES are decoded" \
+  "DECODED the way bash decodes them" surface_text
+assert_output "  and prints the hex and octal spellings" "git \$'\\160ush'" surface_text
+assert_output "COVERED states the line-continuation case" "a LINE CONTINUATION inside a word" surface_text
+assert_output "COVERED states the nested shlex-is-not-bash case" \
+  "bash -c \"git pu\\\$'s'h origin main\"" surface_text
+assert_output "  and DISCLOSES the over-block that reading costs" "is over-blocked" surface_text
+assert_output "GAPS says an ANSI-C escape is NOT in the obfuscation category" \
+  "NOT in this category, and NOT a gap" surface_text
+assert_output "NOT MATCHED explains why a decoded span is ONE word" \
+  "cannot push" surface_text
+# The retracted wording must not creep back: the old bullet claimed the class with only position-0
+# examples, and that phrasing is what made the claim false.
+assert_not_output "the position-0-only phrasing is gone" \
+  "of the command word or the subcommand: " surface_text
 
 t_case "AC-019/SEC-02 every launcher --surface NAMES is really treated as a launcher"
 # Drives the PRINTED list against the BEHAVIOUR, name by name. What it catches: a name added to the
