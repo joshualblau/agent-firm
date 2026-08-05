@@ -50,6 +50,12 @@
 #   which is what a python3 that dies of a syntax error, a bad interpreter or a failed exec
 #   returns — can never be MISREAD as the decision "identity resolved and not allow-listed". The
 #   bash wrapper maps 3 -> 1 and maps everything outside {0,2,3} to 2 with a message.
+#   AND the code alone is not trusted: the checker prints a PROOF-OF-EXECUTION sentinel line on
+#   stdout naming its decision, and the wrapper honours 0 (permit) or 3 (refuse) ONLY if the
+#   sentinel agrees. An exit status is a number any `python3` on PATH can return without running a
+#   line of the checker — a stub exiting 3 was reported as a refusal, and a stub exiting 0 was
+#   reported as a PERMIT, which is a fail-open. Both are now cannot-evaluate. stderr is never
+#   captured, so the human-readable block message still reaches the caller verbatim.
 #
 # WHY --hook ALWAYS EXITS 2 ON A BLOCK, NEVER 1
 #   Measured against Claude Code 2.1.220, not assumed: a PreToolUse hook exiting **2** blocks the
@@ -123,7 +129,7 @@ while [ "$#" -gt 0 ]; do
       MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,95p' "$__src" | sed 's/^# \{0,1\}//'
+      sed -n '2,102p' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
@@ -152,6 +158,17 @@ PERMIT, REFUSE, CANNOT = 0, 1, 2
 # What THIS process exits with. REFUSE leaves as 3 so that a bare 1 from a broken interpreter can
 # never be mistaken for a decision; the bash wrapper maps 3 -> 1. (SEC-07)
 PROCESS_EXIT = {PERMIT: 0, REFUSE: 3, CANNOT: 2}
+# PROOF OF EXECUTION. An exit code alone cannot prove this program ran, and the wrapper reads that
+# code AS the decision, so a `python3` that never executed a line of it could still author one:
+#   · a python3 exiting 3 was read as "identity resolved and NOT allow-listed" (SEC-17), and
+#   · a python3 exiting 0 was read as PERMIT — the same defect pointing the wrong way, and a
+#     fail-OPEN. `python3` shims, wrappers and a stub that ignores stdin all exit 0.
+# So every decision also writes this sentinel to STDOUT (stderr is left strictly alone: it carries
+# the human-readable block message and must reach the agent verbatim). The wrapper honours 0 and 3
+# ONLY when the sentinel names the same decision, and reports anything else as cannot-evaluate.
+SENTINEL = {PERMIT: "FIRM_MG_DECISION=permit",
+            REFUSE: "FIRM_MG_DECISION=refuse",
+            CANNOT: "FIRM_MG_DECISION=cannot"}
 
 # Bounded waits. tests/test-merge-guard.sh parses this exact line and asserts
 # GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + HOOK_BUDGET_MARGIN <= the registered hook timeout in
@@ -170,14 +187,29 @@ def err(*a):
 # `git commit -m "...merge..."` — false positives that would make the firm unusable. There is a
 # cheap substring PREFILTER in bash (see _mg_may_match) but it only ever proves a NEGATIVE.
 
-SHELLS   = ("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "busybox")
+# Names that ARE a shell: argv[1:] are the shell's OWN flags, so `-c <string>` is an inline command.
+# `busybox` and `toybox` are deliberately NOT here even though `busybox sh` is a shell: they are
+# multi-call DISPATCHERS whose first operand is an applet NAME, not a flag. Listing one here made
+# shell_inline read the applet name `sh` as a script FILE and return None, so `busybox sh -c
+# '<cmd>'` was permitted — being in SHELLS was strictly worse than being absent. They belong in
+# WRAPPERS, which skips the applet name and resolves the real shell. (SEC-14)
+# tests/test-merge-guard.sh asserts SHELLS and WRAPPERS stay disjoint, and asserts every
+# dispatcher name is on the WRAPPERS side, so this cannot silently regress.
+SHELLS   = ("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash")
+MULTICALL = ("busybox", "toybox")
 # Launcher words: a program whose job is to run ANOTHER program. Recognising one means "keep
 # looking for the real command word", including past the launcher's OWN flags and flag values.
-WRAPPERS = ("sudo", "doas", "env", "command", "builtin", "exec", "nohup",
+# `su`/`runuser`/`setpriv`/`unshare`/`systemd-run`/`nsenter`/`chroot` sit here beside `sudo` and
+# `doas` because they are the same kind of word (SEC-16); the ones that take a POSITIONAL operand
+# before the command (`chroot <dir> cmd`, `nsenter -t <pid> cmd`) are still limited by declared
+# gap #2, which names them.
+WRAPPERS = ("sudo", "doas", "su", "runuser", "setpriv", "unshare", "systemd-run",
+            "nsenter", "chroot",
+            "env", "command", "builtin", "exec", "nohup",
             "time", "nice", "ionice", "stdbuf", "setsid", "caffeinate",
             "timeout", "gtimeout", "xargs", "flock", "watch", "parallel",
             "taskset", "chrt", "unbuffer", "script", "proxychains", "proxychains4",
-            "eatmydata", "retry", "chronic", "ts", "arch", "setarch")
+            "eatmydata", "retry", "chronic", "ts", "arch", "setarch") + MULTICALL
 # Shell keywords that can precede a command word inside one operator-delimited segment
 # (`if git diff --quiet; then git push; fi`, `for f in x; do git push; done`).
 KEYWORDS = ("if", "then", "elif", "else", "while", "until", "do", "for", "case", "esac",
@@ -235,17 +267,34 @@ SURFACE_COVERED = [
     "    `sudo -u josh`, `sudo --`, `nice -n 10`, `nice -n19`, `env -i`, `env -u FOO`,",
     "    `command -p`, `stdbuf -o0`, `timeout 60`, `timeout -s KILL 60`, `xargs -n1` all resolve",
     "    to the command they launch",
+    "  · a launcher flag VALUE that is itself spelled like a command word, in EITHER reading:",
+    "    `sudo -u git git push` (`git` is the -u value; `git` is the conventional service-account",
+    "    name) is matched, and so is `env -i git push` / `command -p git push` / `sudo -n git push`",
+    "    (where the flag takes NO value, so the same token IS the command word). There is no",
+    "    per-launcher table of which flags take a value, so BOTH readings are classified and either",
+    "    one matching is a block. Ambiguity resolves toward blocking.",
     "  · a shell with an inline command string: any short-option cluster containing `c` (`-c`,",
     "    `-ec`, `-xc`, `-lc`, `-cl`, `-exc`) and value-taking shell flags before it",
     "    (`bash -o pipefail -c '<cmd>'`, `bash --rcfile f -c '<cmd>'`)",
-    "  · a shell HERE-STRING: `bash <<< '<cmd>'`",
+    "  · a multi-call shell dispatcher in front of the shell: `busybox sh -c '<cmd>'`,",
+    "    `busybox ash -c '<cmd>'`, `toybox sh -c '<cmd>'` (the applet NAME is skipped, not read as",
+    "    a script file)",
+    "  · a shell HERE-STRING, whether the shell owns it or a LATER segment does: `bash <<< '<cmd>'`",
+    "    and `cat <<< '<cmd>' | bash` are both scanned, by the same any-segment-is-a-shell rule the",
+    "    heredoc uses",
     "  · a heredoc body when ANY segment of the introducing line is a shell — so both",
     "    `bash <<'EOF' ... EOF` and `cat <<'EOF' | bash` are scanned",
+    "  · a PROCESS SUBSTITUTION whose inside is the gated command: `cat <(git push origin main)`,",
+    "    `diff <(git log) <(git push origin main)` (`<(`/`>(` is a command boundary, not a",
+    "    redirection). NOTE the reverse shape, `bash <(echo 'git push')`, is a declared GAP below:",
+    "    there the gated text is the OUTPUT of the inside, not the inside.",
     "  · a command string passed as a whitespace-containing flag VALUE to a launcher",
-    "    (`flock -c 'git push'`, `watch 'git push'`, `xargs -I{} 'git push'`)",
+    "    (`flock -c 'git push'`, `watch 'git push'`, `xargs -I{} 'git push'`, `su -c 'git push'`)",
     "  · shell QUOTING or ESCAPING of the command word or the subcommand: `git pus\\h`,",
-    "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push` — the bash prefilter is",
-    "    quote/escape-normalised and the classifier reads shlex-resolved tokens, not raw text",
+    "    `git 'pu'sh`, `git pu\"sh\"`, `g\\h api`, `$'git' push`, `git $'push'`, `gh $'pr' merge`,",
+    "    `git $'config' user.email <v>` — the bash prefilter is quote/escape-normalised, and the",
+    "    classifier normalises the same decoration off the SUBCOMMAND and the flags, not only off",
+    "    the command word",
 ]
 
 def _wrap_words(words, width=92, indent="    "):
@@ -266,22 +315,36 @@ SURFACE_GAPS = [
     "A launcher NOT in the set printed above — a custom wrapper script, `proot`, a new coreutils",
     "  launcher: `mywrap git push origin main` is NOT matched. The set is a name list and a name",
     "  list is never complete; the FLAG handling inside it is generic, the names are not.",
-    "A launcher whose command operand follows a non-flag positional operand it consumes:",
-    "  `flock /tmp/lock git push` is NOT matched (`flock -c 'git push'` IS). Skipping a bare",
-    "  positional word would mean treating the next word as a command, which over-blocks.",
+    "A launcher whose command operand follows a non-flag POSITIONAL operand it consumes:",
+    "  `flock /tmp/lock git push`, `chroot /newroot git push`, `nsenter -t 1 -m /bin/git push` and",
+    "  `systemd-run --unit=x /usr/bin/git push` are NOT matched (`flock -c 'git push'` and",
+    "  `su -c 'git push'` ARE). Skipping a bare positional word would mean treating the next word",
+    "  as a command, which over-blocks. These names are in the launcher set for their flag forms.",
+    "Container / VM / remote launchers, deliberately out of scope: `docker run ... git push`,",
+    "  `podman run`, `ssh host 'git push'`, `kubectl exec`. The command runs in a different",
+    "  filesystem and identity context, so the identity THIS guard resolves (the gh login and",
+    "  user.email in the hook's own working directory) is not the identity that would push. Gating",
+    "  on a check that does not describe the actor would be worse than declaring the gap.",
     "A git ALIAS: `git ps` where ps=push, or a shell alias/function `gp`. The alias definition is",
     "  not visible in the command string, so the guard cannot see the push. Not closable here.",
     "Any string-level obfuscation: `g=git; $g push`, `eval \"$(printf 'git push')\"`, base64,",
     "  or a command string assembled at run time (`echo 'git push' | xargs -I{} bash -c '{}'`,",
-    "  `curl ... | bash`). A determined bypass is out of scope by construction — see the",
-    "  CLIENT-SIDE disclosure in this file's header.",
+    "  `curl ... | bash`, `bash <(echo 'git push')`, `bash <(curl ...)`). In all of these the gated",
+    "  text is the OUTPUT of something the guard would have to RUN to see, not text on the command",
+    "  line. A determined bypass is out of scope by construction — see the CLIENT-SIDE disclosure",
+    "  in this file's header.",
     "A push inside a script FILE: `bash deploy.sh`, `. deploy.sh`, `bash -s < deploy.sh`. The",
     "  guard reads the command line, never a file the command line names.",
     "More than 3 levels of shell nesting (`bash -c \"bash -c 'bash -c ...'\"`) — the recursion is",
     "  bounded at depth 3 so a pathological string cannot hang the hook.",
     "Non-shell surfaces: a push from Python/Node (subprocess, dulwich, isomorphic-git), or any",
     "  MCP/tool that talks to the GitHub API directly. A PreToolUse(Bash) hook never sees them.",
-    "`hub` and `glab`, and `git svn dcommit`.",
+    "`hub` and `glab`, and `git svn dcommit`. Also the DASHED builtin form (`git-push origin main`,",
+    "  `git-merge x`, `git-config --global user.email <v>`) and third-party `git-*` porcelain",
+    "  (`git-lfs push`, `git-town sync`): the command word is `git-push`, not `git`, so the",
+    "  subcommand classifier never runs. Modern git ships the dashed forms in libexec and NOT on",
+    "  PATH, so `git-push` is normally 'command not found'; matching the prefix by name would also",
+    "  catch unrelated `git-*` tools, so this is left as a named gap rather than a guess.",
     "`gh workflow run` / `gh workflow enable`: can trigger a workflow that itself pushes. One",
     "  indirection past what the guard reads.",
     "Local-ref moves that are not merges and not pushes: `git branch -f main <sha>`,",
@@ -307,14 +370,24 @@ class Cannot(Exception):
 def base(tok):
     return tok.rsplit("/", 1)[-1] if "/" in tok else tok
 
-# A program token as the shell would resolve it, minus the decoration shell quoting leaves behind
-# after shlex: `$'git'` lexes to `$git`, `"git"` to `git`, `` `git `` keeps its backtick.
-def prog_name(tok):
+# A token as the shell would resolve it, minus the decoration shell quoting leaves behind after
+# shlex: `$'push'` lexes to `$push`, `"push"` to `push`, `` `push` `` keeps its backtick,
+# `${push}` to `{push}`.
+#
+# THIS IS APPLIED TO SUBCOMMANDS AND FLAGS, NOT ONLY TO THE PROGRAM WORD. It used to live inside
+# prog_name only, so `$'git' push` blocked (the PROGRAM was normalised) while `git $'push'` and
+# `gh $'pr' merge` were PERMITTED — and SURFACE_COVERED claims "shell QUOTING or ESCAPING of the
+# command word OR THE SUBCOMMAND". A COVERED claim the code does not provide is the defect the
+# blocker was raised for, so the normalisation now runs wherever a token is compared against a
+# fixed name (subcommand, git/gh global flag, git-config key, gh group, gh api path).
+def unquote(tok):
     t = tok.strip("\"'`")
     while t[:1] in ("$", "{"):
         t = t[1:]
-    t = t.rstrip("}")
-    return base(t)
+    return t.rstrip("}")
+
+def prog_name(tok):
+    return base(unquote(tok))
 
 ASSIGN_RE  = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 NUMBERISH  = re.compile(r"^[-+]?\d+(?:\.\d+)?[a-zA-Z]?$")
@@ -323,6 +396,11 @@ SEP_WORDS  = ("{", "}", "!")
 SHELL_CFLAG_RE   = re.compile(r"^[-+][A-Za-z]*c[A-Za-z]*$")
 SHELL_VALUE_FLAGS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--wordexp")
 WS_RE = re.compile(r"\s")
+# See launcher_argvs. A cap on AMBIGUITY, not on coverage: it exists so a pathological string
+# cannot make the classifier quadratic, and exceeding it raises Cannot (a BLOCK) rather than
+# discarding a reading, because a discarded reading is a fail-open. No real command line has more
+# than one flag value spelled `git`/`gh`/`sh`/`bash`.
+MAX_LAUNCHER_READINGS = 16
 
 def substitutions(text):
     """Yield the inside of every $(...) and `...` span, so `out=$(git push)` is still seen."""
@@ -377,17 +455,22 @@ def logical_lines(text):
         i += 1
     return out
 
+def segs_feed_shell(segs):
+    """Does ANY command on this line run a shell? (Every candidate reading of every segment.)"""
+    for toks, _here in segs:
+        argvs, _cmdlike = launcher_argvs(toks)
+        for argv in argvs:
+            if prog_name(argv[0]) in SHELLS:
+                return True
+    return False
+
 def line_feeds_shell(line):
     try:
         segs = segments(line)
     except Cannot:
         head = line.strip().split()
         return bool(head) and prog_name(head[0]) in SHELLS
-    for toks, _here in segs:
-        argv, _cmdlike = launcher_argv(toks)
-        if argv and prog_name(argv[0]) in SHELLS:
-            return True
-    return False
+    return segs_feed_shell(segs)
 
 def is_punct(t):
     return bool(t) and all(ch in "();<>|&" for ch in t)
@@ -403,6 +486,11 @@ def segments(line):
       · A REDIRECTION does not start a new command. Its operator, its operand (always a filename,
         never a command word) and any single-digit fd shlex split off the front of `2>` are all
         dropped, so `>/dev/null git push` and `2>/tmp/e git merge` keep `git` as the command word.
+      · A PROCESS SUBSTITUTION is not a redirection, even though shlex lexes `<(` as one
+        punctuation run containing `<`. What follows `<(` / `>(` is a COMMAND, not a filename, so
+        the run is a BOUNDARY. Reading it as a redirection made `cat <(git push origin main)` drop
+        the `git` as the "filename" and leave `push origin main` as the segment, which permitted a
+        real push with the command text fully inline. (SEC-15)
       · A HERE-STRING operand (`bash <<< 'git push'`) is a command STRING, so it is kept and handed
         back for recursion instead of being mistaken for a program name.
     """
@@ -424,6 +512,13 @@ def segments(line):
             i += 1
             continue
         if is_punct(t):
+            if ("(" in t) or (")" in t):
+                # `(`, `)`, and the process-substitution runs `<(` / `>(` / `<()` are BOUNDARIES.
+                # This test comes FIRST so that `<(` is never mistaken for a redirection. (SEC-15)
+                if cur or here:
+                    segs.append((cur, here)); cur, here = [], []
+                i += 1
+                continue
             if ("<" in t) or (">" in t):
                 if cur and FD_RE.match(cur[-1]):
                     cur.pop()
@@ -445,8 +540,8 @@ def segments(line):
         segs.append((cur, here))
     return segs
 
-def launcher_argv(seg):
-    """Resolve a launcher prefix. -> (argv of the command actually being launched, [cmd strings]).
+def launcher_argvs(seg):
+    """Resolve a launcher prefix. -> ([candidate argvs of the launched command], [cmd strings]).
 
     The prefix may contain, in any order: leading VAR=VAL assignments, launcher words, shell
     keywords, and — the whole point of this function — each launcher's OWN flags and flag VALUES.
@@ -455,12 +550,40 @@ def launcher_argv(seg):
     handling here is generic (a flag, then optionally one value that is not itself a program we
     care about), not a per-launcher argument table.
 
+    WHY THIS RETURNS A LIST, NOT ONE argv (SEC-13). Without a per-launcher table of which flags
+    take a value, one token can be BOTH readings at once, and the two readings disagree:
+
+        sudo -u git git push origin main     `git` is the VALUE of -u; the command word is the next
+                                             `git`.  (`git` is the conventional service-account
+                                             name: gitolite, gitea, forgejo, git-daemon.)
+        env -i git push origin main          `-i` takes NO value, so `git` IS the command word.
+        command -p git push / sudo -n git push / nice -19 git push   likewise.
+
+    Testing the command word first (the old code) permits the whole `sudo -u git ...` family —
+    argv became ["git","git","push"], so `sub` read as "git" and nothing matched. Testing the
+    flag value first would permit the `env -i` family instead. There is no ordering that gets both
+    right, so ORDERING IS THE WRONG TOOL: when a token is a command-word candidate AND a flag is
+    pending, BOTH readings are emitted and the caller gates if EITHER of them classifies.
+    Ambiguity resolves toward blocking. The cost is one extra classify call on a rare shape.
+
+    The readings are collected in a single left-to-right pass — reading A terminates the walk,
+    reading B continues it — so the count is LINEAR in the prefix length, not exponential.
+
     Second return value: any whitespace-containing token consumed inside the prefix. Those are
-    candidate command STRINGS (`flock -c 'git push'`, `watch 'git push'`) and get classified
-    recursively — structurally, so `sudo -p "prompt about git push"` still resolves to nothing.
+    candidate command STRINGS (`flock -c 'git push'`, `watch 'git push'`, `su -c '<cmd>'`) and get
+    classified recursively — structurally, so `sudo -p "prompt about git push"` resolves to nothing.
     """
     i, after_flag, saw_launcher = 0, False, False
-    cmdlike = []
+    cmdlike, argvs = [], []
+
+    def reading(idx):
+        # A cap only so a pathological string cannot make this quadratic. It must never DROP a
+        # reading — a dropped reading is a fail-open — so exceeding it blocks instead.
+        if len(argvs) >= MAX_LAUNCHER_READINGS:
+            raise Cannot("the launcher prefix is ambiguous in more than %d places, so the command "
+                         "word cannot be resolved" % MAX_LAUNCHER_READINGS)
+        argvs.append(seg[idx:])
+
     while i < len(seg):
         t = seg[i]
         if ASSIGN_RE.match(t):
@@ -469,26 +592,28 @@ def launcher_argv(seg):
         if p in WRAPPERS or p in KEYWORDS:
             i += 1; after_flag = False; saw_launcher = True; continue
         if not saw_launcher:
-            break                       # position 0 decides: nothing to skip past
+            reading(i)                  # position 0 decides: nothing to skip past
+            break
         if t == "--":
             i += 1; after_flag = False; continue
         if t[:1] in ("-", "+"):
             i += 1; after_flag = True; continue
         if p in SHELLS or p in ("git", "gh"):
-            break                       # found the command word
+            reading(i)                  # reading A: this IS the command word
+            if not after_flag:
+                break
+            i += 1; after_flag = False; continue    # reading B: it was the pending flag's value
         if WS_RE.search(t):
             cmdlike.append(t)           # a command string, wherever it sits in the prefix
             if not after_flag:
-                return None, cmdlike
+                break
             i += 1; after_flag = False; continue
         if NUMBERISH.match(t):
             i += 1; after_flag = False; continue    # `timeout 60`, `nice 10`
         if after_flag:
             i += 1; after_flag = False; continue    # this flag's value: `sudo -u josh`
-        return None, cmdlike            # a different program is being launched
-    if i >= len(seg):
-        return None, cmdlike
-    return seg[i:], cmdlike
+        break                           # a different program is being launched
+    return argvs, cmdlike
 
 def shell_inline(argv, depth):
     """`bash -c '<cmd>'` and every equivalent spelling of it.
@@ -518,7 +643,7 @@ def classify_git_config(rest):
     pos, flags = [], []
     j = 0
     while j < len(rest):
-        a = rest[j]
+        a = unquote(rest[j])
         if a in GIT_CONFIG_VALUE_FLAGS:
             j += 2
             continue
@@ -546,7 +671,7 @@ def classify_git_config(rest):
 def classify_git(args):
     i = 0
     while i < len(args):
-        a = args[i]
+        a = unquote(args[i])
         if a in GIT_OPT_WITH_VALUE:
             i += 2
             continue
@@ -556,14 +681,14 @@ def classify_git(args):
         break
     if i >= len(args):
         return None
-    sub, rest = args[i], args[i + 1:]
+    sub, rest = unquote(args[i]), args[i + 1:]
     if sub == "push":
         return "git push"
     if sub == "merge":                 # exact: `merge-base`/`merge-file`/`merge-tree` are NOT this
         return "git merge"
     if sub == "pull":
         return "git pull"
-    if sub == "subtree" and rest and rest[0] == "push":
+    if sub == "subtree" and rest and unquote(rest[0]) == "push":
         return "git subtree push"
     if sub == "config":
         return classify_git_config(rest)
@@ -573,9 +698,9 @@ def classify_gh_api(rest):
     method, path, write_flag = None, None, False
     j = 0
     while j < len(rest):
-        a = rest[j]
+        a = unquote(rest[j])
         if a in ("-X", "--method"):
-            method = rest[j + 1] if j + 1 < len(rest) else ""
+            method = unquote(rest[j + 1]) if j + 1 < len(rest) else ""
             j += 2
             continue
         if a.startswith("--method="):
@@ -627,7 +752,7 @@ def classify_gh(args):
     """
     i, after_flag = 0, False
     while i < len(args):
-        a = args[i]
+        a = unquote(args[i])
         if a == "--":
             i += 1; after_flag = False; continue
         if a.startswith("-"):
@@ -639,8 +764,8 @@ def classify_gh(args):
         return None
     if i >= len(args):
         return None
-    grp, rest = args[i], args[i + 1:]
-    sub = rest[0] if rest else ""
+    grp, rest = unquote(args[i]), args[i + 1:]
+    sub = unquote(rest[0]) if rest else ""
     if grp == "pr":
         return "gh pr merge" if sub == "merge" else None
     if grp == "api":
@@ -652,8 +777,11 @@ def classify_gh(args):
     return None
 
 def classify_segment(seg, here, depth):
-    argv, cmdlike = launcher_argv(seg)
-    if argv:
+    argvs, cmdlike = launcher_argvs(seg)
+    # EVERY candidate reading of the launcher prefix is classified, and the FIRST one that hits
+    # gates the segment. See launcher_argvs: readings are ambiguous by construction, so "any hit
+    # is a hit" is the only fail-closed way to combine them. (SEC-13)
+    for argv in argvs:
         prog = prog_name(argv[0])
         if prog in SHELLS:
             hit = shell_inline(argv, depth)
@@ -692,10 +820,22 @@ def classify(text, depth=0):
     for line in logical_lines(text):
         if not line.strip():
             continue
-        for toks, here in segments(line):
+        segs = segments(line)
+        for toks, here in segs:
             hit = classify_segment(toks, here, depth)
             if hit:
                 return hit
+        # A HERE-STRING belongs to the LINE, not to the segment that spells it: in
+        # `cat <<< '<cmd>' | bash` the text is a command string even though the segment that owns
+        # the `<<<` runs `cat`. That is the same rule logical_lines already applies to a heredoc
+        # body (`cat <<'EOF' | bash` is scanned), and the asymmetry between the two — heredoc
+        # scanned, here-string not — was a bypass. (SEC-15)
+        heres = [h for _toks, here in segs for h in here]
+        if heres and segs_feed_shell(segs):
+            for h in heres:
+                hit = classify(h, depth + 1)
+                if hit:
+                    return hit
         for inner in substitutions(line):
             hit = classify(inner, depth + 1)
             if hit:
@@ -999,15 +1139,27 @@ def main():
         "exit": code})
     return code
 
+def finish(code):
+    """-> the process exit status, after emitting the proof-of-execution sentinel."""
+    if MODE == "surface":
+        return code                      # --surface writes its report on stdout; no sentinel there
+    try:
+        sys.stdout.write(SENTINEL[code] + "\n")
+        sys.stdout.flush()
+    except Exception:
+        # We ran, but cannot prove it. The wrapper must not read this exit AS a decision.
+        return PROCESS_EXIT[CANNOT]
+    return PROCESS_EXIT[code]
+
 try:
-    sys.exit(PROCESS_EXIT[main()])
+    sys.exit(finish(main()))
 except Cannot as e:                      # anything unclassified above still fails closed
     err("firm-merge-guard: CANNOT EVALUATE — %s" % e)
-    sys.exit(2)
+    sys.exit(finish(CANNOT))
 except Exception as e:                   # an internal error is not a permit
     err("firm-merge-guard: internal error (%s: %s) — blocking, not permitting."
         % (type(e).__name__, e))
-    sys.exit(2)
+    sys.exit(finish(CANNOT))
 PYEOF
 }
 
@@ -1024,9 +1176,28 @@ PYEOF
 # against the normalised copy. Deleting quotes can only ADD candidates (a false positive here
 # costs one python3 start and is then resolved structurally); it can never remove one.
 #
-# The `git`+`config` pair is its own condition because a `git config user.email <v>` write — which
-# IS gated (SEC-04) — contains none of push/merge/pull/gh. Requiring BOTH words keeps the common
-# `git status` / `cat config.yml` calls on the zero-subprocess path.
+# The `git`-then-`config` clause is its own condition because a `git config user.email <v>` write —
+# which IS gated (SEC-04) — contains none of push/merge/pull/gh.
+#
+# THE PAIR IS ORDERED, AND THE ORDER IS THE WHOLE POINT. It used to be "`config` anywhere AND `git`
+# anywhere", which fired on every string containing both words in either order — `grep -rn config
+# .github/`, `ls docs/config.md` next to a `.git` path — and each one cost a python3 start
+# (measured 40.5 ms versus 6.8 ms on the zero-subprocess path, doubled by the two hook
+# registrations). Requiring `git` BEFORE `config` returns those to the zero-subprocess path while
+# keeping every gated spelling: the `config` SUBCOMMAND always follows the `git` command word, and
+# quote/escape normalisation runs first, so `git 'con'fig`, `git conf\ig` and `/usr/bin/git -C /p
+# config` all still match. (Strings like `cat .git/config` do still match — narrowing further, e.g.
+# by requiring whitespace before `config`, would drop `git $'config' user.email`, which IS gated.
+# The clause errs toward CHECK, which costs milliseconds; erring the other way costs the gate.)
+#
+# DO NOT DELETE THIS CLAUSE. An uncommitted attempt to do so removed it from HERE only and left the
+# jq program's copy intact — and this function is exactly what hook mode falls back to when jq is
+# ABSENT (a supported configuration; see below). That would have deleted the whole SEC-04 identity
+# gate from the ENFORCEMENT surface on any jq-less host: a fail-open, not a perf tweak. The diff is
+# kept as 09-test-evidence/wo-c-discarded-wip-config-prefilter-revert.diff. The two prefilters are
+# now pinned to each other by a test that runs a fixed corpus through BOTH and requires them to
+# agree (tests/test-merge-guard.sh, "the bash and jq prefilters agree"), so this class of
+# divergence fails the suite instead of shipping.
 #
 # Returning 1 here costs ZERO subprocesses: no python3, no gh, no git, no network.
 # ---------------------------------------------------------------------------------------------
@@ -1038,9 +1209,7 @@ _mg_may_match() {
   case "$s" in
     *push*|*Push*|*PUSH*|*merge*|*Merge*|*MERGE*|*pull*|*Pull*|*PULL*) return 0 ;;
     *"gh "*|*"gh	"*)                                                  return 0 ;;
-  esac
-  case "$s" in
-    *config*)  case "$s" in *git*) return 0 ;; esac ;;
+    *git*config*)                                                      return 0 ;;
   esac
   return 1
 }
@@ -1050,19 +1219,37 @@ if [ "$MODE" = "surface" ]; then
   exit $?
 fi
 
-# _mg_report_rc <rc> <refuse-code> — map the checker's process exit onto the caller contract.
-# 0 permit, 3 refuse, 2 cannot-evaluate; ANYTHING else came from outside the checker's contract
-# (python3 dying of a syntax error or a failed exec both exit 1) and is reported as
-# cannot-evaluate rather than passed through as a decision. (SEC-07)
+# _mg_report_rc <rc> <checker-stdout> <refuse-code> — map the checker's process exit onto the
+# caller contract. 0 permit, 3 refuse, 2 cannot-evaluate; ANYTHING else came from outside the
+# checker's contract (python3 dying of a syntax error or a failed exec both exit 1) and is reported
+# as cannot-evaluate rather than passed through as a decision. (SEC-07)
+#
+# AND THE CODE ALONE IS NOT ENOUGH. An exit status is a number any `python3` on PATH can return
+# without running a line of the checker, and this function reads that number AS a decision. So 0
+# and 3 are honoured only when the checker's own stdout sentinel names the SAME decision. Without
+# it, a python3 stub exiting 3 was reported as "identity resolved and not allow-listed" (SEC-17)
+# and — far worse — a python3 stub exiting 0 was reported as PERMITTED, which is a fail-open on a
+# control whose entire value is that it fails closed. 2 needs no sentinel: it blocks either way.
 _mg_report_rc() {
   case "$1" in
-    0) exit 0 ;;
-    3) exit "$2" ;;
+    0) if [ "$2" = "FIRM_MG_DECISION=permit" ]; then exit 0; fi
+       _mg_unproven "$1" "permit" ;;
+    3) if [ "$2" = "FIRM_MG_DECISION=refuse" ]; then exit "$3"; fi
+       _mg_unproven "$1" "refuse" ;;
     2) exit 2 ;;
     *) printf 'firm-merge-guard: CANNOT EVALUATE — the checker itself exited %s (no decision was\n' "$1" >&2
        printf '  reached, so nothing was recorded in the ledger). Blocking.\n' >&2
        exit 2 ;;
   esac
+}
+
+_mg_unproven() {
+  printf 'firm-merge-guard: CANNOT EVALUATE — the checker exited %s (which would mean "%s") but\n' "$1" "$2" >&2
+  printf '  did not emit its proof-of-execution sentinel, so that exit status cannot be read as a\n' >&2
+  printf '  decision. A `python3` on PATH that is a stub, a shim, or the wrong interpreter can\n' >&2
+  printf '  return any status without running the check. Blocking, and nothing was recorded in the\n' >&2
+  printf '  ledger. Verify python3 (a declared firm prerequisite, see docs/INSTALL.md).\n' >&2
+  exit 2
 }
 
 if [ "$MODE" = "command" ]; then
@@ -1071,8 +1258,11 @@ if [ "$MODE" = "command" ]; then
     printf 'firm-merge-guard: CANNOT EVALUATE — python3 is required to inspect this command.\n' >&2
     exit 2
   fi
-  FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="$CMD" _mg_py
-  _mg_report_rc "$?" 1
+  # stdout is captured because it carries the decision SENTINEL and nothing else; stderr is NOT
+  # captured, so the human-readable block message still reaches the caller verbatim.
+  _mg_out="$(FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" \
+             FIRM_MG_COMMAND="$CMD" _mg_py)"
+  _mg_report_rc "$?" "$_mg_out" 1
 fi
 
 # ---- hook mode ------------------------------------------------------------------------------
@@ -1091,7 +1281,7 @@ if command -v jq >/dev/null 2>&1; then
     elif (.tool_input.command | type) != "string" then "CHECK"
     else (.tool_input.command | gsub("\\\\"; "") | gsub("\u0027"; "") | gsub("\""; "")) as $c
       | if ($c | test("push|merge|pull|gh"; "i")) then "CHECK"
-        elif ($c | test("git")) and ($c | test("config")) then "CHECK"
+        elif ($c | test("git[\\s\\S]*config")) then "CHECK"
         else "SKIP" end
     end' 2>/dev/null || printf 'CHECK')"
   [ "$verdict" = "SKIP" ] && exit 0
@@ -1108,9 +1298,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-FIRM_MG_MODE=hook FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="$payload" FIRM_MG_COMMAND="" _mg_py
+_mg_out="$(FIRM_MG_MODE=hook FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="$payload" \
+           FIRM_MG_COMMAND="" _mg_py)"
 # THE CALLER CONTRACT (AC-016): anything other than 0 is a block, and a PreToolUse hook only
 # actually blocks on exit 2 in this Claude Code version (measured — exit 1 lets the command run).
 # So a refusal (3) and a cannot-evaluate (2) both become 2 here; they are deliberately NOT
 # distinguished, and neither is an out-of-contract code.
-_mg_report_rc "$?" 2
+_mg_report_rc "$?" "$_mg_out" 2
