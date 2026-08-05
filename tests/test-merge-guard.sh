@@ -1156,6 +1156,27 @@ assert_ok "the HEADER names the four bypass routes"             disclosure_check
 assert_output "the runtime block message repeats it" "not a security boundary" \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
 assert_output "the runbook says only GitHub can require a review" "only GitHub" cat "$RUNBOOK"
+# docs/ENFORCEMENT.md is a CLAIM SURFACE, not just prose: it is the row a human reads when deciding
+# how much to trust this control. Its quoting/escaping clause names specific commands, so each one is
+# driven here — both the ones it claims are MATCHED and the one it claims is deliberately NOT. A doc
+# that names an example the code does not deliver is the same defect as an overclaiming --surface.
+t_case "AC-019/SEC-18 the ENFORCEMENT.md coverage row is driven, example by example"
+assert_output "the row states the position-independence claim" "at any position inside a token" \
+  cat "$ENFORCEMENT"
+assert_output "  and that the ANSI-C escapes are decoded" "ANSI-C escapes decoded" cat "$ENFORCEMENT"
+assert_output "  and that each layer is mutation-tested independently" \
+  "mutation-tested independently" cat "$ENFORCEMENT"
+for c in "git pu\$'s'h origin main" "g\$'i't push origin main" \
+         "git co\$'n'fig --global user.email a@b.c" "git pu\$\"s\"h origin main" \
+         "\$'\\x67it' push origin main" "git \$'\\160ush' origin main" \
+         "bash -c \"git pu\\\$'s'h origin main\""; do
+  assert_rc "ENFORCEMENT.md claims this is matched, and it is: $c" 1 \
+    mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
+done
+assert_rc "ENFORCEMENT.md claims this is NOT matched, and it is not: git \$'push origin main'" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git \$'push origin main'"
+assert_rc "  and the continuation example it names IS matched" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "gi${CONT}t co${CONT}nfig --global user.email a@b.c"
 assert_ok "no artifact claims the control IS branch protection or a security boundary" python3 -c "
 import re
 forbidden = [
