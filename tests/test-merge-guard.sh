@@ -776,8 +776,12 @@ assert 'p.communicate(timeout=KILL_GRACE)' in src, 'the kill grace is hard-coded
 "
 assert_ok "and the guard's own header states the arithmetic, with the numbers" python3 -c "
 import re
-head = ''.join(open('$GUARD').readlines()[:95])
-flat = re.sub(r'\s+', ' ', head.replace('#', ' '))
+# Slice to the END OF THE HEADER (the first line of real code) rather than to a fixed line number:
+# a magic number turns 'somebody added a paragraph' into a failure about wait budgets, which is a
+# test failing for the wrong reason. Still excludes the runtime block message 900 lines lower.
+lines = open('$GUARD').readlines()
+end = next(i for i, l in enumerate(lines) if l.startswith('set -uo pipefail'))
+flat = re.sub(r'\s+', ' ', ''.join(lines[:end]).replace('#', ' '))
 assert 'GH_TIMEOUT + GIT_TIMEOUT + 2 * KILL_GRACE' in flat, flat[-900:]
 assert re.search(r'\(8 \+ 4 \+ 2 = 14 s worst case', flat), flat[-900:]
 "
@@ -1010,7 +1014,11 @@ done
 # testing caught this: stripping the disclosure from the header left the whole-file assertion green,
 # because the same phrase also appears in the runtime block message 300 lines lower. AC-019 names
 # the header, so the header is what gets asserted.
-head -60 "$GUARD" > "$SCRATCH_HEADER"
+python3 -c "
+lines = open('$GUARD').readlines()
+end = next(i for i, l in enumerate(lines) if l.startswith('set -uo pipefail'))
+open('$SCRATCH_HEADER', 'w').write(''.join(lines[:end]))
+"
 assert_ok "the HEADER (first 60 lines) says client-side"        disclosure_check "$SCRATCH_HEADER" "client-side"
 assert_ok "the HEADER says bypassable"                          disclosure_check "$SCRATCH_HEADER" "bypassable"
 assert_ok "the HEADER denies being a security boundary"         disclosure_check "$SCRATCH_HEADER" "not a security boundary"
@@ -1473,6 +1481,24 @@ assert_output "--surface names the alias gap" "ALIAS" mg_env "$TREE" "$PATH" "$R
 assert_output "--surface names the non-shell gap" "Non-shell surfaces" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--help prints the exit contract" "EXIT CONTRACT" mg_env "$TREE" "$PATH" "$REPO_OK" --help
 assert_output "--help prints the usage" "USAGE" mg_env "$TREE" "$PATH" "$REPO_OK" --help
+# --help prints a fixed LINE RANGE of the source, so it silently truncates whenever the header
+# grows. Assert it reaches the END of the header, not just the start: without this, a paragraph
+# added anywhere above the last one disappears from --help and nothing notices.
+assert_ok "--help prints the header through to its LAST line (the sed range has not drifted)" \
+  python3 -c "
+import subprocess
+lines = open('$GUARD').readlines()
+end = next(i for i, l in enumerate(lines) if l.startswith('set -uo pipefail'))
+last = lines[end - 1].lstrip('#').strip()
+assert last, 'the line above set -uo pipefail is blank; pick a different anchor'
+out = subprocess.run(['$TREE/bin/firm-merge-guard', '--help'], capture_output=True, text=True).stdout
+assert last in out, (
+    'the last header line is missing from --help, so the sed range in the --help branch is stale.\n'
+    '  wanted: %r' % last)
+first = lines[1].lstrip('#').strip()
+assert first in out, 'the FIRST header line is missing from --help too'
+print('ok')
+"
 
 # ================================================== AC-019/SEC-02 · the COVERED list is honest
 # THE BLOCKER THIS SECTION EXISTS FOR. The disclosed COVERED/GAPS list is the mechanism the human

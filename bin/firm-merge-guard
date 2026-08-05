@@ -72,14 +72,21 @@
 # PERFORMANCE (AC-022) — the hook fires on EVERY Bash call, so identity resolution (a network
 # round-trip to `gh`) happens ONLY after the command has matched the gated surface. A command with
 # none of the trigger substrings is decided in bash, with zero subprocesses. Measured on the
-# machine this was written on, 200 iterations under /bin/bash 3.2.57: 11.08 ms per benign Bash call
-# through the hook adapter (jq included), 5.61 ms via --command. The pre-SEC-03 guard measured
-# 11.41 ms / 5.43 ms on the same runs, so quote-normalising the prefilter cost nothing measurable —
-# and no gh, git or python3 is spawned either way (tests/test-merge-guard.sh proves that with stubs
-# that fail loudly if executed, including for QUOTED benign commands). A gated command costs
-# ~500 ms, which is one real `gh` round trip. The prefilter deletes backslashes and quotes with
-# bash parameter expansion — still zero subprocesses — so shell quoting cannot smuggle a trigger
-# word past it, which it previously could. See the comment above _mg_may_match.
+# machine this was written on, 200 iterations under /bin/bash 3.2.57: 11.0 ms per benign Bash call
+# through the hook adapter (jq included), 6.3 ms via --command. No gh, git, python3 or jq is spawned
+# on that path (tests/test-merge-guard.sh proves it with stubs that fail loudly if executed,
+# including for QUOTED benign commands). A gated command costs ~500 ms, which is one real `gh`
+# round trip. The prefilter deletes backslashes and quotes with bash parameter expansion — still
+# zero subprocesses — so shell quoting cannot smuggle a trigger word past it, which it previously
+# could. See the comment above _mg_may_match.
+#   MEASURED, same runs, for the `git`-then-`config` clause once it was ORDERED: a command with both
+#   words in the WRONG order — `grep -rn config .github/` is the everyday one — went from 34.3 ms to
+#   6.3 ms via --command and 38.7 ms to 11.5 ms through the hook, i.e. back onto the zero-subprocess
+#   path. And what did NOT improve, stated because a performance claim is a claim: `cat .git/config`
+#   and `ls ~/.gitconfig` still cost ~34 ms, because `git` genuinely does precede `config` there and
+#   no substring test can tell them from a real `git ... config` write without parsing.
+#   `cat docs/config.md` and `python3 -c "import configparser"` were never on the CHECK path at all
+#   — neither contains `git` — so the ordering did not change them either.
 #
 # HOW THE WORST CASE STAYS UNDER THE REGISTERED HOOK TIMEOUT
 #   Both hook registrations set "timeout": 30. The script's own bounded waits are GH_TIMEOUT +
@@ -129,7 +136,7 @@ while [ "$#" -gt 0 ]; do
       MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,102p' "$__src" | sed 's/^# \{0,1\}//'
+      sed -n '2,109p' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
