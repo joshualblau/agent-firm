@@ -50,7 +50,22 @@ to a round-2 blocker. Crediting round 2 with the blocker is fair; crediting it w
 
 The five rounds were re-extracted by parsing every balanced JSON object containing a `verdict` key out of
 both `gpt-qa.log` files, discarding schema echoes and prompt echoes, de-duplicating by content hash, and
-ordering by byte offset:
+ordering by character offset into the UTF-8-decoded text.
+
+**Read the `md5`s in this document as object hashes, not file hashes (F-DOC-03).** Every `md5` here and in
+the table above is `md5(json.dumps(obj, sort_keys=True))` — the canonical form the de-duplication used.
+Running `md5 <file>` against the two persisted verdicts therefore gives *different* digests, and a reader
+who tries that first will conclude the block is fabricated. It is not; both readings reproduce exactly:
+
+```
+                                          object md5   raw byte-slice md5 == md5 of the persisted file
+round 3  evaluate-remote-changes  offset 3278637   c51fe25c     c406f541  == 08-qa-verdict.gpt.json (12,942 B)
+round 5  remediate-wave2          offset 2625273   7005ad60     3fc09a51  == 08-qa-verdict.gpt.json  (9,796 B)
+```
+
+That second column is the stronger claim and is why it is printed: the surviving files are not merely
+*consistent with* rounds 3 and 5, they are **byte-identical** to the slices at those offsets. The
+commit-the-ledger PR quotes the `c406f541`/`3fc09a51` form, because its block is labelled by filename.
 
 ```
 20260801T203648Z-evaluate-remote-changes/09-test-evidence/gpt-qa.log   (3,304,543 chars)
@@ -69,8 +84,9 @@ Five substantive rounds plus one stub. "Five" is confirmed. Two things follow th
 could not have known:
 
 - **`firm-gpt-qa` overwrites `08-qa-verdict.gpt.json` on each invocation, so only the LAST round of each
-  run survives as a decision artifact.** The two persisted files are `md5 c51fe25c` (round 3) and
-  `md5 7005ad60` (round 5). **Rounds 1, 2 and 4 — including this PR's own corrected row 2, and round 4's
+  run survives as a decision artifact.** The two persisted files hold round 3 (object `md5 c51fe25c`, file
+  `md5 c406f541`) and round 5 (object `md5 7005ad60`, file `md5 3fc09a51`) — see the note above on the two
+  hashings. **Rounds 1, 2 and 4 — including this PR's own corrected row 2, and round 4's
   id-reconciliation finding — exist nowhere but inside a 2.6–3.3 MB transcript under
   `09-test-evidence/`.** Three fifths of the evidence for this PR's central table is in the tier that is
   not committed and not curated. This is the single most concrete instance in the batch of the problem the
@@ -81,7 +97,9 @@ could not have known:
   #3, offset 2314645** — while raw object 8 (offset 1660995) is a *re-emission of round 1*. The blocker
   text the reviewer quoted matches round 2 exactly, so the finding was right; the locator was not
   reproducible. Two correct parses of one file disagree on numbering, so an index is not a citation. Every
-  row above therefore carries an md5 and a byte offset. **A fourth wrong version of row 2 was the most
+  row above therefore carries an md5 and a **character** offset into the UTF-8-decoded text — not a byte
+  offset; neither log is pure ASCII (3,312,028 bytes to 3,304,543 characters), and seeking to these numbers
+  as byte positions lands mid-string. **A fourth wrong version of row 2 was the most
   likely outcome of this edit, and quoting content instead of counting objects is what prevented it.**
 
 **Correction to this PR's first draft.** It credited the judge with catching the Lead's stale test
@@ -158,8 +176,20 @@ Cited: `20260803T051454Z-remediate-wave4/11-retrospective.md` (SC-12) and `12-ow
      policy.
    - **This stop rule therefore binds only in the REQUIRED case**, because that is the only case where a
      BLOCK actually blocks. In the advisory case there is nothing to override and no artifact is owed.
-     That materially narrows this PR, and the narrowing is the point: two of the five judge rounds
-     tabulated above were on runs that would have been advisory-only.
+     That materially narrows this PR, and the narrowing is the point — **but it does not narrow anything
+     on this engagement's own history.** The five rounds sit on exactly two runs (1–3 on
+     `evaluate-remote-changes`, 4–5 on `remediate-wave2`), and both touch permissions on their face:
+     run 1's `01-acceptance-criteria.yaml` names `settings.json` 7 times, `auth` 3 and `permission` 2,
+     and the run shipped a `settings-reconciliation.proposed.json`; wave 2's names `settings.json` 4
+     times, requires a newly-created `settings.json` to be mode 0600 (`:41`), and puts owner ratification
+     of the `settings.json` permissive-policy change explicitly out of scope (`:110`). Under the adopted
+     rule the second voice would have been **REQUIRED on all five rounds**. The narrowing bites on future
+     runs, not on these.
+     *(Corrected on fourth review (F-DOC-05): this read "two of the five judge rounds tabulated above
+     were on runs that would have been advisory-only" — an unnamed quantity, not derivable from any
+     artifact, and contradicted by both runs' criteria files. It was the sentence quantifying the only
+     "decided, not deferred" resolution in the batch, which is the worst place in the document for a
+     number nobody can check.)*
    - **An override under this rule waives no other Final-gate precondition.** Verdict validation,
      acceptance-coverage traceability and ledger validation must still have been run and passed — see the
      criteria-before-Build and validate-run-artifacts PRs. An override answers the second voice, not the
@@ -196,8 +226,15 @@ Cited: `20260803T051454Z-remediate-wave4/11-retrospective.md` (SC-12) and `12-ow
   verbatim in `12-owner-override.md`. It is **false as a statement about the engagement**: running the
   proposed guard over all eight run dirs (see the guard section) shows
   `20260801T203648Z-evaluate-remote-changes` also holds a BLOCK verdict with five blockers, and **none of
-  them is dispositioned anywhere — 0 of 5 appear in any override document.** Two BLOCK verdicts exist in
-  the firm's history; one was answered in writing and one was not. The honest version of this risk bullet
+  the five is dispositioned in writing: 0 of 5 appear verbatim in any override document, and the only one
+  the override mentions at all — the negative eval that scored 8/8 with QA never invoked — is cited under
+  *"Why the override was reasonable"* as a credit to the judge, not answered.** Two persisted
+  second-voice BLOCK verdicts existed when this was measured; one was answered in writing and one was not.
+  *(Corrected on fourth review (F-DOC-04): "none of them is dispositioned anywhere" outran its own
+  measurement by one step — the measurement is verbatim-match, and the override does touch blocker 4's
+  substance. The gap it illustrates is sharper stated exactly, not stated absolutely. Also pinned: the
+  "two BLOCK verdicts" count is as of 2026-08-03; a third second-voice BLOCK has since been persisted by
+  this batch's own `cleanup-and-identity-gate` run.)* The honest version of this risk bullet
   is therefore: *the hazard is not hypothetical — it has already happened once, silently, and nobody
   noticed until a proposed guard was run against the ledgers.* That strengthens the case for proposal 2
   and for the guard, and it is a better argument than the reassurance it replaces.
@@ -276,9 +313,14 @@ blockers verbatim.
 
   So the corrected check yields **one genuine pass and one genuine fail on real data** — exactly the two
   cases the review asked to see, and both drawn from ledgers rather than constructed. The FAIL is not a
-  false positive: `evaluate-remote-changes` carries a BLOCK with five blockers that were **never
-  dispositioned in writing anywhere**. That is a real gap in the record, surfaced by executing the guard,
-  and it is the first thing this PR has produced that the firm did not already know.
+  false positive: `evaluate-remote-changes` carries a BLOCK whose five blockers are **not dispositioned in
+  writing** — 0 of 5 verbatim, and the single one the override touches at all appears there as a credit to
+  the judge rather than an answer (F-DOC-04). That is a real gap in the record, surfaced by executing the
+  guard, and it is the first thing this PR has produced that the firm did not already know.
+  *(Matching note, so the numbers are re-runnable: both figures are whitespace-normalised substring
+  matches. Wave 2's override line-wraps its five quotes, so a raw substring match scores it 1 of 5 and the
+  guard would report a false FAIL on the one case that should pass. Any implementation of this check must
+  normalise whitespace before comparing.)*
 - **A defect in the existing artifact that only execution reveals, and it is why the pointer must be
   explicit.** `12-owner-override.md:16` says the objections are *"verbatim from `08-qa-verdict.gpt.json`"* —
   an unqualified filename, resolved relative to the document, and **there is no such file in wave 4's run
@@ -360,8 +402,8 @@ was rejected for three times.)*
   template, which belongs to round 4), and had dropped round 2's genuine second item
   (`03-decision-log.md` empty) to make room for it. Third consecutive draft in which this row was wrong.
   Rather than patch the row a fourth time, **every row was re-derived** by parsing both `gpt-qa.log` files
-  for balanced verdict objects, de-duplicating by content hash and ordering by byte offset. Each row now
-  carries an md5 and an offset, because two correct parses of the same file assign different *indices* to
+  for balanced verdict objects, de-duplicating by content hash and ordering by character offset. Each row
+  now carries an md5 and an offset, because two correct parses of the same file assign different *indices* to
   the same object — an index is not a citation. Also restored: `covered: partial` was first raised as a
   round-1 warning and escalated to a round-2 blocker.
 - **T-05** — the proposed guard was executed against all eight real run dirs and was wrong in both
@@ -394,8 +436,8 @@ section changed, this PR's **Generalizability** and **Risk & rollback** sections
   from artifacts the overriding party did not author.
 - *Risk* is where it paid. The section claimed "in this engagement the rule was applied only after the
   judge's substantive findings were all fixed, not to dodge them." Running the guard showed that is true of
-  wave 2 and **false of the engagement**: `evaluate-remote-changes` holds a BLOCK with five blockers
-  dispositioned nowhere. The reassurance is **withdrawn** and replaced with the measured fact. A sentence
+  wave 2 and **false of the engagement**: `evaluate-remote-changes` holds a BLOCK with five blockers, none
+  of them dispositioned in writing. The reassurance is **withdrawn** and replaced with the measured fact. A sentence
   that comforts the reader and does not survive execution is worse than no sentence.
 - Batch grep for the changed claims: "PR1 was rewritten" (this file only); `12-owner-override.md` as
   "the template" (this file and PR7 — PR7's reference is to the *correction note* in it, not to template
@@ -410,6 +452,34 @@ pasted in the guard section.** That is what produced T-05's real resolution, the
 **Standing recommendation, unchanged:** this PR still has no mechanism behind its substance and should be
 gated alone. It is no longer the weakest of the six on *accuracy* — every row is now content-addressed and
 the guard is executable — but it remains the weakest on *enforceability*.
+
+## Fourth-review edit record (2026-08-06)
+
+Three findings from an independent document review (LENS-DOC), all re-derived here from the artifacts
+rather than accepted from the finding text.
+
+- **F-DOC-03 — the `md5`s are object hashes and the document never said so.** Every digest in the table
+  and the rebuild block is `md5(json.dumps(obj, sort_keys=True))`; `md5 <file>` on the two persisted
+  verdicts returns `c406f541` and `3fc09a51` instead. Nothing was fabricated — all six object digests
+  reproduce exactly — but a reviewer's first check disagrees with the page, and in a batch about checkable
+  evidence a hash that looks wrong is worse than no hash. The normalisation is now stated once, up front,
+  together with the **stronger** fact it was hiding: the raw slices at offsets 3278637 and 2625273 are
+  byte-identical to the two persisted files, so "these files ARE rounds 3 and 5" is provable by a better
+  method than the one printed. Also corrected: the offsets are **character** offsets into the decoded
+  text, not byte offsets — neither log is pure ASCII, so the distinction is load-bearing for anyone
+  re-running the parse.
+- **F-DOC-04 — "none of them is dispositioned anywhere" outran its own measurement.** The measurement is
+  a verbatim match (0 of 5, reproduced). The override *does* touch blocker 4's substance, crediting "the
+  negative eval that scored 8/8 with QA never invoked" under *Why the override was reasonable*. Restated
+  exactly, which is a sharper illustration of the gap than the absolute was. The "two BLOCK verdicts"
+  count is now dated, since a third has been persisted since.
+- **F-DOC-05 — "two of the five judge rounds … would have been advisory-only" is not derivable.** The five
+  rounds sit on two runs and both touch permissions on their face (counts quoted inline from their
+  criteria files), so under proposal 4's adopted rule the second voice would have been REQUIRED on all
+  five. Replaced with the checkable version, which is also stronger for the PR: the narrowing costs this
+  engagement nothing and bites only on future runs. An unnamed quantity in the sentence that quantifies
+  the batch's only "decided, not deferred" resolution is the same shape as the round-2 row that was wrong
+  three times.
 
 ## Human decision
 - [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
