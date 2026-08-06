@@ -867,13 +867,24 @@ mg_poison() { ( cd "$REPO_OK" && PYTHONPATH="$POISON" PATH="$GH_OK:$PATH" "$TREE
 assert_rc "pyyaml present but UNIMPORTABLE -> cannot evaluate" 2 mg_poison --command 'git push origin main'
 assert_output "  and distinguishes broken from absent" "unimportable" mg_poison --command 'git push origin main'
 
-t_case "AC-015/SEC-06 the in-script wait budget provably fits under the REGISTERED hook timeout"
-# A hook that exceeds its framework timeout does not block — so the fail-closed property depends on
-# an inequality between two numbers in three different files, and nothing asserted it. Measured
-# worst case with BOTH identity sources hung was 24s against a 30s registered timeout: 6s of
-# headroom, and the evidence file said 20s. The waits are now 8/4/1 (14s worst case) and this test
-# fails if anyone raises them, or lowers a registered timeout, without re-doing the arithmetic.
-assert_ok "GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= the timeout in BOTH registrations" python3 -c "
+t_case "AC-015/SEC-06/SEC-19 the WHOLE hook budget — PARSE and waits — fits under the REGISTERED timeout"
+# A hook that exceeds its framework timeout does not block. That is MEASURED now, not assumed
+# (SEC-19): headless `claude -p` probes against Claude Code 2.1.221 showed a hook registered
+# "timeout": 5 that sleeps 20 s and would then exit 2 letting `touch ran.txt` through with
+# permission_denials: 0 — 3/3, including the exact 48 s-work-under-a-30 s-registration shape — while
+# the same hook exiting 2 immediately BLOCKED and exiting 0 immediately RAN. See
+# 09-test-evidence/SEC-19-hook-timeout-failure-mode-measured.txt. So the fail-closed property
+# depends on an inequality between numbers living in three different files.
+#
+# WHAT THIS CASE USED TO OMIT, AND WHY THAT MATTERED. It bounded only the gh/git WAITS. Classification
+# runs BEFORE identity resolution, so the inequality proved the cheap half fit while the expensive
+# half was unbounded: a 16 KB command string spent 48 s in the bash prefilter, and a REAL 74 KB
+# command out of this repo's ledger spent 99.8 s, both reaching a correct BLOCK long after the hook
+# had already failed open. PARSE_BUDGET is now a term in the inequality — and because a declared
+# budget nobody drives is just a number, the two assertions after the arithmetic MEASURE it: one
+# runs a worst-case-shaped fixture AT MAX_COMMAND_BYTES through the real script, the other runs the
+# original SEC-19 reproducer, and both must finish inside PARSE_BUDGET.
+assert_ok "PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= the timeout in BOTH registrations" python3 -c "
 import json, re
 src = open('$GUARD').read()
 m = re.search(r'^GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = (\d+), (\d+), (\d+)\$', src, re.M)
@@ -881,7 +892,13 @@ assert m, 'could not parse the wait constants out of the guard'
 gh, gt, grace = (int(x) for x in m.groups())
 mm = re.search(r'^HOOK_BUDGET_MARGIN = (\d+)\$', src, re.M)
 assert mm, 'could not parse HOOK_BUDGET_MARGIN out of the guard'
-budget = gh + gt + 2 * grace + int(mm.group(1))
+mp = re.search(r'^PARSE_BUDGET = (\d+)\$', src, re.M)
+assert mp, ('could not parse PARSE_BUDGET out of the guard. Without it this inequality covers only '
+            'the identity waits and says nothing about the classification phase that precedes them '
+            '— which is exactly the omission SEC-19 was filed for.')
+parse = int(mp.group(1))
+assert parse > 0, 'PARSE_BUDGET is zero, so the parse phase is not really in the budget'
+budget = parse + gh + gt + 2 * grace + int(mm.group(1))
 found = []
 for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
     d = json.load(open(path))
@@ -891,8 +908,8 @@ for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
                 t = h.get('timeout')
                 assert t is not None, f'{path}: the guard hook registration has no explicit timeout'
                 found.append((path.rsplit('/', 1)[-1], t))
-                assert budget <= t, (f'{path}: worst case {gh}+{gt}+2*{grace}+{mm.group(1)}={budget}s '
-                                     f'does not fit under the registered {t}s hook timeout')
+                assert budget <= t, (f'{path}: worst case {parse}+{gh}+{gt}+2*{grace}+{mm.group(1)}'
+                                     f'={budget}s does not fit under the registered {t}s hook timeout')
 assert len(found) == 2, f'expected the guard in BOTH registrations, found {found}'
 print('ok', found, 'budget', budget)
 "
@@ -910,6 +927,133 @@ end = next(i for i, l in enumerate(lines) if l.startswith('set -uo pipefail'))
 flat = re.sub(r'\s+', ' ', ''.join(lines[:end]).replace('#', ' '))
 assert 'GH_TIMEOUT + GIT_TIMEOUT + 2 * KILL_GRACE' in flat, flat[-900:]
 assert re.search(r'\(8 \+ 4 \+ 2 = 14 s worst case', flat), flat[-900:]
+"
+assert_ok "  and states the CLASSIFICATION phase and the measured fail-open premise, not just the waits" python3 -c "
+import re
+lines = open('$GUARD').readlines()
+end = next(i for i, l in enumerate(lines) if l.startswith('set -uo pipefail'))
+flat = re.sub(r'\s+', ' ', ''.join(lines[:end]).replace('#', ' '))
+for want, why in [
+    ('PARSE_BUDGET',          'the header does not name the parse-phase budget'),
+    ('MAX_COMMAND_BYTES',     'the header does not name the input-size cap'),
+    ('MG_MAX_PREFILTER_BYTES','the header does not name the prefilter normalisation bound'),
+    ('FAILS OPEN',            'the header still leaves the framework-timeout premise unstated'),
+    ('2.1.221',               'the header does not say which version the premise was measured against'),
+]:
+    assert want in flat, why + ': ' + flat[-1200:]
+assert 'CLASSIFICATION' in flat, 'the header does not present classification as its own budgeted phase'
+print('ok')
+"
+
+# ---- THE DECLARED PARSE BUDGET IS DRIVEN, NOT JUST DECLARED --------------------------------------
+# Read every constant out of the guard so nothing below can drift from the code, and fail loudly if
+# one is missing rather than silently asserting against an empty string.
+MG_PARSE_BUDGET="$(python3 -c "
+import re, sys
+m = re.search(r'^PARSE_BUDGET = (\d+)\$', open('$GUARD').read(), re.M)
+sys.stdout.write(m.group(1) if m else '')")"
+MG_MAX_CMD="$(python3 -c "
+import re, sys
+m = re.search(r'^MAX_COMMAND_BYTES = (\d+)\$', open('$GUARD').read(), re.M)
+sys.stdout.write(m.group(1) if m else '')")"
+assert_ne "PARSE_BUDGET is declared (an absent one would make every timing bound below vacuous)" \
+  "" "$MG_PARSE_BUDGET"
+assert_ne "MAX_COMMAND_BYTES is declared (ditto for every cap assertion below)" "" "$MG_MAX_CMD"
+
+# mg_ms <cmd...> — run it and print "<rc> <elapsed-ms>". python3 is the clock: bash 3.2 has no
+# sub-second $SECONDS and `date +%s%N` is a GNU extension macOS does not ship. The two python3
+# starts are INSIDE the measured span, so this over-reports by ~60 ms — the conservative direction
+# for an upper-bound assertion.
+mg_ms() {
+  local t0 t1 rc
+  t0="$(python3 -c 'import time; print(repr(time.time()))')"
+  "$@" >/dev/null 2>&1; rc=$?
+  t1="$(python3 -c 'import time; print(repr(time.time()))')"
+  printf '%s %s' "$rc" "$(python3 -c "print(int(($t1 - $t0) * 1000))")"
+}
+
+# The slowest classifier shape measured (nested `$(`), sized to exactly MAX_COMMAND_BYTES. It is
+# BENIGN on purpose: this assertion bounds the CLASSIFICATION phase alone, which is the term that
+# was missing from the inequality. The identity waits are the separate term above, and a command
+# that matched nothing never reaches them.
+WORST_AT_CAP="$(python3 -c "
+import sys
+n = int('$MG_MAX_CMD')
+k = (n - 8) // 4
+s = 'echo ' + '\$(' * k + 'x' + ')' * k
+sys.stdout.write(s + 'y' * (n - len(s)))")"
+assert_eq "the worst-case fixture really is AT the cap, not near it" "$MG_MAX_CMD" "${#WORST_AT_CAP}"
+read _mgb_rc _mgb_ms <<< "$(mg_ms mg "$TREE" "$GH_OK" "$REPO_OK" --command "$WORST_AT_CAP")"
+assert_eq "a worst-case-shaped command AT MAX_COMMAND_BYTES is still DECIDED (permit), not refused" \
+  "0" "$_mgb_rc"
+assert_ok "  ...and classification finishes inside PARSE_BUDGET (${_mgb_ms}ms <= ${MG_PARSE_BUDGET}000ms)" \
+  sh -c "[ $_mgb_ms -le $((MG_PARSE_BUDGET * 1000)) ]"
+
+# THE ORIGINAL SEC-19 REPRODUCER, at the size the reviewer measured at 48 097 ms. It must still reach
+# the CORRECT decision (refuse / block) and it must reach it inside the budget. Asserting only the
+# decision is what let this defect through the first time: the decision was already right.
+SEC19_PAD="$(python3 -c "
+import sys
+sys.stdout.write((chr(36) + chr(39) + 'x' + chr(39)) * 4000)")"
+SEC19_CMD=": $SEC19_PAD ; git push origin main"
+read _mgs_rc _mgs_ms <<< "$(mg_ms mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$SEC19_CMD")"
+assert_eq "the SEC-19 reproducer (16 KB of \$'x' spans + a real push) is still REFUSED" "1" "$_mgs_rc"
+assert_ok "  ...and now decides inside PARSE_BUDGET (${_mgs_ms}ms <= ${MG_PARSE_BUDGET}000ms; it was 48 097ms)" \
+  sh -c "[ $_mgs_ms -le $((MG_PARSE_BUDGET * 1000)) ]"
+read _mgh_rc _mgh_ms <<< "$(mg_ms mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$SEC19_CMD")"
+assert_eq "  and through the HOOK adapter — the actual enforcement surface — it BLOCKS" "2" "$_mgh_rc"
+assert_ok "  ...inside PARSE_BUDGET there too (${_mgh_ms}ms <= ${MG_PARSE_BUDGET}000ms)" \
+  sh -c "[ $_mgh_ms -le $((MG_PARSE_BUDGET * 1000)) ]"
+
+t_case "AC-015/SEC-19 the input-size cap REFUSES to decide — it never truncates and never skips"
+# The cap is the MAX_LAUNCHER_READINGS idiom applied to input size: over it, Cannot (a BLOCK).
+# THE DISCRIMINATOR IS THE BENIGN ROW. A cap that TRUNCATED to MAX_COMMAND_BYTES and classified the
+# prefix would permit a benign over-cap command (rc 0); a cap that SKIPPED the check would permit it
+# too. Only a cap that refuses to decide answers 2. So `over-cap + benign -> 2` is the assertion that
+# tells the three implementations apart, and it is why it is not enough to assert that a gated
+# over-cap command blocks.
+OVER_CAP_BENIGN="$(python3 -c "
+import sys
+sys.stdout.write('echo ' + 'a' * (int('$MG_MAX_CMD') - 4))")"
+assert_ok "the over-cap fixture really is over the cap" \
+  sh -c "[ ${#OVER_CAP_BENIGN} -gt $MG_MAX_CMD ]"
+assert_rc "over MAX_COMMAND_BYTES and BENIGN -> 2 (refused), not 0 (truncated or skipped)" 2 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN"
+assert_rc "  and the same through the hook adapter" 2 \
+  mg_hook "$TREE" "$GH_OK" "$REPO_OK" "$OVER_CAP_BENIGN"
+assert_output "  and the message names the constant and the actual size" "MAX_COMMAND_BYTES" \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN"
+assert_output "  and says it is blocking because it cannot classify in time" "cannot be classified in time" \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN"
+# A gated command hidden PAST the cap blocks too — and would have blocked under a truncating cap as
+# well, which is precisely why the benign row above is the one that proves the shape.
+assert_rc "over the cap with a real push in the TAIL -> 2" 2 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$OVER_CAP_BENIGN && git push origin main"
+# ...and it is a CAP, not "block everything long": one byte under it, both directions still work.
+UNDER_CAP_BENIGN="$(python3 -c "
+import sys
+sys.stdout.write('echo ' + 'a' * (int('$MG_MAX_CMD') - 6))")"
+assert_ok "the under-cap fixture really is under the cap" \
+  sh -c "[ ${#UNDER_CAP_BENIGN} -le $MG_MAX_CMD ]"
+assert_rc "just UNDER the cap, a benign command is still PERMITTED" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command "$UNDER_CAP_BENIGN"
+assert_rc "just under the cap, a GATED command is still classified and refused" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$(python3 -c "
+import sys
+sys.stdout.write('git push origin main # ' + 'a' * (int('$MG_MAX_CMD') - 30))")"
+# Refusing must also be FAST: a cap that took 30 s to say 'too long' would not have fixed anything.
+read _mgc_rc _mgc_ms <<< "$(mg_ms mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN")"
+assert_ok "the refusal itself lands inside PARSE_BUDGET (${_mgc_ms}ms <= ${MG_PARSE_BUDGET}000ms)" \
+  sh -c "[ $_mgc_ms -le $((MG_PARSE_BUDGET * 1000)) ]"
+assert_ok "the cap constant is real and is the one the message names (not a hard-coded number)" python3 -c "
+import re
+src = open('$GUARD').read()
+m = re.search(r'^MAX_COMMAND_BYTES = (\d+)\$', src, re.M)
+assert m, 'MAX_COMMAND_BYTES is not defined, so the cap assertions above prove nothing'
+tail = src.split('raise Cannot(\"the command string is')[1][:300]
+assert 'MAX_COMMAND_BYTES' in tail, 'the cap is hard-coded in the message rather than read from the constant'
+assert 'len(cmd) > MAX_COMMAND_BYTES' in src, 'nothing actually compares the command length to the cap'
+print('ok', m.group(1))
 "
 
 t_case "AC-016/SEC-07 an interpreter that dies with status 1 is cannot-evaluate, not a DECISION"
@@ -1407,27 +1551,40 @@ t_case "AC-022/SEC-02 the bash and jq prefilters agree on a fixed corpus"
 assert_ok "precondition: jq IS on PATH (without it this whole case would prove only half)" \
   sh -c 'command -v jq'
 PFDIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-prefilter.XXXXXX")"; t_track "$PFDIR"
+# The SEC-19 length bound lives in a constant OUTSIDE _mg_may_match and is handed to the jq program
+# with --argjson, so the extraction has to carry it to both sides or it would silently prove nothing.
+# It is written to a file so the shell below and the jq invocation use the SAME parsed value.
 assert_ok "both prefilters can be extracted from the SHIPPED script (not re-implemented here)" \
   python3 -c "
 import re
 src = open('$GUARD').read()
 m = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M)
 assert m, 'could not extract _mg_may_match from the guard'
+c = re.search(r'^MG_MAX_PREFILTER_BYTES=(\d+)\$', src, re.M)
+assert c, 'MG_MAX_PREFILTER_BYTES is not defined in the guard, so the length bound proves nothing'
+open('$PFDIR/cap', 'w').write(c.group(1))
 open('$PFDIR/may.sh', 'w').write(
-    '#!/usr/bin/env bash\n_mg_may_match() {\n' + m.group(1) + '}\n'
+    '#!/usr/bin/env bash\n' + c.group(0) + '\n_mg_may_match() {\n' + m.group(1) + '}\n'
     'if _mg_may_match \"\$1\"; then echo CHECK; else echo SKIP; fi\n')
-j = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S)
+j = re.search(r\"\| jq -r [^']*'\n(.*?)'\s*2>/dev/null\", src, re.S)
 assert j, 'could not extract the jq prefilter program from the guard'
 prog = j.group(1)
 assert 'tool_input' in prog and 'SKIP' in prog and 'CHECK' in prog, prog[:200]
 open('$PFDIR/pre.jq', 'w').write(prog)
 "
+PF_CAP="$(cat "$PFDIR/cap" 2>/dev/null || printf '')"
+assert_ne "the extracted prefilter bound is a real number, not an empty string" "" "$PF_CAP"
 PF_BAD_DIRECTION=0
+# pf_jq <string> — drive the EXTRACTED jq program exactly as the guard drives it, cap and all.
+pf_jq() {
+  printf '%s' "$(mk_payload "$1")" \
+    | jq -r --argjson cap "$PF_CAP" -f "$PFDIR/pre.jq" 2>/dev/null || printf 'CHECK'
+}
 # pf_row <kind> <expect-bash> <expect-jq> <string>
 pf_row() {
   local kind="$1" eb="$2" ej="$3" s="$4" ab aj shown
   ab="$(bash "$PFDIR/may.sh" "$s" 2>/dev/null)"
-  aj="$(printf '%s' "$(mk_payload "$s")" | jq -r -f "$PFDIR/pre.jq" 2>/dev/null || printf 'CHECK')"
+  aj="$(pf_jq "$s")"
   shown="${s//$NL/<nl>}"     # a row may legitimately contain a newline (the continuation rows)
   assert_eq "prefilter[bash] wants $eb · $kind · $shown" "$eb" "$ab"
   assert_eq "prefilter[jq]   wants $ej · $kind · $shown" "$ej" "$aj"
@@ -1534,6 +1691,51 @@ pf_row divergent SKIP CHECK 'echo pUsh'
 pf_row divergent SKIP CHECK 'echo MeRgE'
 assert_eq "NO corpus row has jq weaker than the bash fallback (checked on every row above)" \
   "0" "$PF_BAD_DIRECTION"
+
+# ---- SEC-19 · THE LENGTH BOUND, IN BOTH PREFILTERS, FROM ONE CONSTANT.
+# These rows are driven directly rather than through pf_row because the strings are kilobytes long
+# and would make an unreadable assertion description. The property is the same, and the DIRECTION is
+# the whole point: over the bound the answer must be CHECK. A bound that answered SKIP would be a
+# fail-open on every command an attacker can pad, which is every command.
+PF_UNDER="$(python3 -c "
+import sys
+sys.stdout.write('echo ' + 'a' * (int('$PF_CAP') - 5))")"
+PF_OVER="$(python3 -c "
+import sys
+sys.stdout.write('echo ' + 'a' * (int('$PF_CAP') - 4))")"
+assert_eq "the two length-bound fixtures straddle the bound by exactly one byte" \
+  "$PF_CAP $((PF_CAP + 1))" "${#PF_UNDER} ${#PF_OVER}"
+assert_eq "prefilter[bash] a benign string AT the bound is still normalised, and SKIPs" \
+  "SKIP" "$(bash "$PFDIR/may.sh" "$PF_UNDER" 2>/dev/null)"
+assert_eq "prefilter[jq]   a benign string AT the bound is still normalised, and SKIPs" \
+  "SKIP" "$(pf_jq "$PF_UNDER")"
+assert_eq "prefilter[bash] ONE byte OVER the bound is CHECK — never SKIP" \
+  "CHECK" "$(bash "$PFDIR/may.sh" "$PF_OVER" 2>/dev/null)"
+assert_eq "prefilter[jq]   ONE byte OVER the bound is CHECK — never SKIP" \
+  "CHECK" "$(pf_jq "$PF_OVER")"
+# ...and the bound cannot be evaded by padding a GATED command past it either.
+assert_eq "prefilter[bash] a gated command padded past the bound is still CHECK" \
+  "CHECK" "$(bash "$PFDIR/may.sh" "$PF_OVER && git push origin main" 2>/dev/null)"
+assert_eq "prefilter[jq]   a gated command padded past the bound is still CHECK" \
+  "CHECK" "$(pf_jq "$PF_OVER && git push origin main")"
+# The END-TO-END consequence, on the real script rather than the extracted filters: an over-bound
+# benign command still PERMITS (so the bound did not become a blanket block), and it demonstrably
+# reached python3 to get there — the booby-trapped PATH turns "reached python3" into a visible 2,
+# the same positive proof the $VAR rows use.
+assert_rc "over the bound, a benign command is still permitted (the bound is not a blanket block)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command "$PF_OVER"
+assert_rc "  and it got there by REACHING the classifier (blocks under a booby-trapped PATH)" 2 \
+  mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_OVER"
+assert_rc "  while the same string one byte SHORTER is still decided in bash, zero subprocesses" 0 \
+  mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_UNDER"
+assert_eq "  ...and really spawned nothing to do it" "" \
+  "$(mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_UNDER" 2>&1)"
+# And the bound exists in BOTH copies, asserted on the SOURCE — same reason as the clauses below:
+# the behaviour rows only speak for the host that runs them, this speaks for the jq-less host too.
+# It also asserts POSITION: a bound that ran after the work it bounds would pass every behaviour row
+# above (same verdicts) while costing the same 99.8 s it exists to prevent.
+assert_ok "both prefilters carry the length bound, read it from ONE constant, and apply it FIRST" \
+  python3 "$TESTS_DIR/fixtures/mg-prefilter-bound-check.py" "$GUARD"
 # And the ordered clause is really ordered, in BOTH copies — asserted on the source as well as on
 # behaviour, because "config before git" is the property the tightening turns on.
 assert_ok "both copies of the git/config clause require git BEFORE config" python3 -c "
@@ -1543,7 +1745,7 @@ bash_fn = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M).grou
 assert '*git*config*' in bash_fn, 'the bash clause is not the ordered form: ' + bash_fn
 assert '*config*' not in bash_fn.replace('*git*config*', ''), (
     'an unordered *config* clause is back in _mg_may_match: ' + bash_fn)
-jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+jq = re.search(r\"\| jq -r [^']*'\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
 assert re.search(r'test\(\"git\[.*?\]\*config\"\)', jq), 'the jq clause is not the ordered form: ' + jq
 assert 'test(\"config\")' not in jq, 'an unordered config test is back in the jq program'
 print('ok')
@@ -1561,7 +1763,7 @@ for want, why in [
     ('\$' + chr(39) + chr(92) + 'n' + chr(39), 'the backslash-newline PAIR deletion'),
 ]:
     assert want in bash_fn, why + ' is missing from _mg_may_match: ' + bash_fn
-jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+jq = re.search(r\"\| jq -r [^']*'\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
 B = chr(92)
 for want, why in [
     (B * 2 + '\$' + B + 'u0027', 'the \$-before-single-quote gsub'),
@@ -1575,12 +1777,22 @@ assert_ok "the ANSI-C escape span reaches the classifier from BOTH prefilters" p
 import re
 src = open('$GUARD').read()
 bash_fn = re.search(r'^_mg_may_match\(\) \{\n(.*?)^\}\$', src, re.S | re.M).group(1)
-B, Q = chr(92), chr(39)
-# case \"\$1\" in *\"\\\$'\"*\"\\\\\"*) return 0 — tested on the RAW argument, before any deletion
-assert '\$1' in bash_fn.split('return 0')[0], (
-    'the escape clause must test the RAW argument, not the normalised copy: ' + bash_fn)
-assert B + '\$' + Q in bash_fn, 'no \$-quote escape clause in _mg_may_match: ' + bash_fn
-jq = re.search(r\"\| jq -r '\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
+B, Q, D, DQ = chr(92), chr(39), chr(36), chr(34)
+# The clause is:  case \"<dollar>1\" in *\"\\<dollar>'\"*\"\\\\\"*) return 0 ;; esac
+# It must test the RAW argument (positional 1), and it must run BEFORE the deletions that would
+# remove the backslash it looks for. Both are asserted on the clause's OWN line: splitting the
+# function on the first 'return 0' used to stand in for the position check, and stopped working the
+# moment another early return (the SEC-19 length bound) was added above it.
+lines = bash_fn.splitlines()
+esc = [i for i, l in enumerate(lines) if (B + D + Q) in l and 'case' in l]
+assert esc, 'no <dollar>-quote escape clause in _mg_may_match: ' + bash_fn
+assert (DQ + D + '1' + DQ) in lines[esc[0]], (
+    'the escape clause must test the RAW argument, not the normalised copy: ' + lines[esc[0]])
+dele = [i for i, l in enumerate(lines) if l.strip().startswith('s=' + DQ + D + '{')]
+assert dele, 'no parameter-expansion deletions found in _mg_may_match: ' + bash_fn
+assert esc[0] < dele[0], (
+    'the escape clause runs AFTER the deletions that erase the backslash it tests for: ' + bash_fn)
+jq = re.search(r\"\| jq -r [^']*'\n(.*?)'\s*2>/dev/null\", src, re.S).group(1)
 assert re.search(r'test\(\"' + re.escape(B * 2 + '\$' + B + 'u0027') + r'.*?' + re.escape(B * 4) + r'\"\)', jq), (
     'no raw-string ANSI-C-escape test in the jq program: ' + jq)
 print('ok')
@@ -1829,6 +2041,22 @@ assert_output "COVERED states the line-continuation case" "a LINE CONTINUATION i
 assert_output "COVERED states the nested shlex-is-not-bash case" \
   "bash -c \"git pu\\\$'s'h origin main\"" surface_text
 assert_output "  and DISCLOSES the over-block that reading costs" "is over-blocked" surface_text
+# ---- SEC-19. The COVERED list must say that the quoting coverage holds AT ANY LENGTH — a reader who
+# knows the prefilter is a substring test would otherwise reasonably assume padding buys a SKIP — and
+# it must disclose the over-block that the length bound costs, with the measured size of it. The
+# `DISCLOSED OVER-BLOCK` line is a COVERED line, so it has its own BLOCK assertion (the over-cap and
+# over-bound rows in the SEC-19 cases above).
+assert_output "COVERED says the quoting coverage holds AT ANY LENGTH" "AT ANY LENGTH" surface_text
+assert_output "  and names both caps by their constant names" "MG_MAX_PREFILTER_BYTES" surface_text
+assert_output "  and says over the size cap the answer is refuse, not truncate or skip" \
+  "never truncated and never skipped" surface_text
+assert_output "  and states the measured premise that makes a late decision a permit" \
+  "MEASURED to fail OPEN" surface_text
+assert_output "  and DISCLOSES the over-block the length bound costs" "DISCLOSED OVER-BLOCK" surface_text
+assert_output "  ...priced by replaying the real ledger corpus at two candidate bounds" \
+  "a 2048-byte bound flips SIX of them from permit to block" surface_text
+assert_output "  ...and does not launder 'zero observed' into 'zero'" \
+  "Zero OBSERVED is not zero in general" surface_text
 assert_output "GAPS says an ANSI-C escape is NOT in the obfuscation category" \
   "NOT in this category, and NOT a gap" surface_text
 assert_output "NOT MATCHED explains why a decoded span is ONE word" \
