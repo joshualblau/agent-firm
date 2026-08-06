@@ -42,6 +42,27 @@ provisional answer is now **superseded**: the owner's rule is neither "always bi
 It is **binding unless QA dissents**, with a bounded escalation. PR3 has been annotated to record that
 its open question is answered and by whom; it is **not** approved by this PR and remains `proposed`.
 
+### How the contradiction arose — and why this change overturns nothing that was approved
+
+Worth pinning, because it justifies the two-axis split rather than merely asserting it. The phrase
+"advisory by default" entered the firm through
+`system-changes/20260727T191117Z-fix-gpt-second-voice-judge.md` (`Status: approved`, signed
+2026-07-27), whose proposal 3 asked a **narrower question than the phrase later carried**:
+
+> "**Set the policy explicitly** in the gate matrix: is the GPT second voice **advisory** (skip →
+> documented warning, human accepts) or **required** for high-risk/security-sensitive runs (skip → the
+> Lead must get explicit human waiver at the Final gate)? Recommend: advisory by default, REQUIRED for
+> runs touching auth/permissions/crypto/PII"
+
+Every branch of that question is about a **skip** — what happens when the judge does not run. It never
+asked what happens when the judge *does* run and blocks. The phrase then landed in `gate-matrix.md:64`
+unqualified, where it read as an answer to both questions, and `CLAUDE.md:106` answered the second one
+the opposite way. That is the whole contradiction.
+
+So the fix is a split, not a reversal: **§1 keeps the 2026-07-27 decision intact** (advisory-on-skip,
+REQUIRED-for-auth/permissions/crypto/PII, human waiver otherwise) and **§2 answers the question that was
+never actually asked**. No approved decision is overturned by this PR.
+
 Why the contradiction was not academic: the run
 `20260803T120043Z-cleanup-and-identity-gate` ended with **six live Claude-vs-GPT disagreements**
 (AC-001, AC-008, AC-012, AC-026, AC-027, AC-028, enumerated in that run's `traceability.yaml` under

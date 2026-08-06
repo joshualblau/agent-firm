@@ -476,6 +476,9 @@ was rejected for three times.)*
 - **S-16** — proposal 4 no longer says "pick one". It decides: `gate-matrix.md` is authoritative, the second
   voice is advisory by default and REQUIRED for auth/permissions/crypto/PII, `CLAUDE.md:106` is amended to
   match, and **this stop rule binds only in the REQUIRED case**. That narrows the PR, which is correct.
+  **(Accurate as a record of what the third review decided. SUPERSEDED as policy on 2026-08-07 by the
+  owner — see the boxed note under proposal 4. The "advisory by default" half and the narrowing that
+  followed from it no longer hold.)**
 
 **AC-005 cross-section propagation — performed, and it forced a withdrawal.** After the table and the guard
 section changed, this PR's **Generalizability** and **Risk & rollback** sections were re-read:
