@@ -110,6 +110,11 @@
 #   over the bound fell from 268.6 s to 6.0 s and the per-call maximum from 99 721 ms to 155 ms;
 #   98.73% of all 3 296 calls stay on the zero-subprocess path and the 1.27% above the bound pay one
 #   python3 start (~30 ms). The bound's one real cost is a disclosed OVER-block; see SURFACE_COVERED.
+#   RE-MEASURED after that bound, same method, 200 iterations x 2 rounds, old script vs new:
+#   `ls -la` 5.44/5.45 -> 5.53/5.55 ms, `echo "hello world"` 5.39/5.44 -> 5.56/5.56,
+#   `grep 'TODO$' README.md` 5.44/5.47 -> 5.61/5.58, `sed $'s/x/y/' f` 5.45/5.44 -> 5.54/5.58.
+#   +0.11 ms, reproducible across rounds and almost certainly the extra header bash parses, not
+#   the one `${#1}` test. Stated because a performance claim is a claim.
 #
 # HOW THE WORST CASE STAYS UNDER THE REGISTERED HOOK TIMEOUT
 #   THE PREMISE, NOW MEASURED RATHER THAN ASSUMED. A PreToolUse hook that exceeds its registered
