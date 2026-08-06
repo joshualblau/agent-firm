@@ -73,8 +73,9 @@ tenth instance, in the same script as three of the nine, and it was live at `e92
 first draft asserted "all nine known instances are now fixed".
 
 **It is now fixed, at `76814ad`** *("fix(traceability): a coverage entry naming no criterion is
-cannot-evaluate")* — `bin/firm-traceability-check` +142/-11 and 16 new `t_case` blocks / 110 new
-assertions in `tests/test-traceability-check.sh`. Same fixture, same gate, re-executed at that commit:
+cannot-evaluate")* — `bin/firm-traceability-check` **+132/-10** and 16 new `t_case` blocks / 110 new
+`assert_*` call sites in `tests/test-traceability-check.sh` (+382; that commit totals 515 insertions and
+11 deletions across three files). Same fixture, same gate, re-executed at that commit:
 
 ```
 acceptance criteria: 2  verdict coverage entries: 4  -- MISMATCH: 2 of these entries name NO criterion

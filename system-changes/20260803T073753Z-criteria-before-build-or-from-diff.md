@@ -145,9 +145,10 @@ assertion verb behind it.
   direction — coverage entries naming ids that exist in no criterion — was a **live fail-open at HEAD**
   when this section was written, found by *executing* the gate during review of this PR set rather than
   by reading it. It was closed on `main` at **`76814ad`** *("fix(traceability): a coverage entry naming
-  no criterion is cannot-evaluate")* — `bin/firm-traceability-check` +142/-11,
-  `tests/test-traceability-check.sh` +382 (**16** new `t_case` blocks, **110** new assertions; that file
-  now holds 75 cases / 442 assertions), and one line of `docs/ENFORCEMENT.md`. Nothing here remains to
+  no criterion is cannot-evaluate")* — `bin/firm-traceability-check` **+132/-10**,
+  `tests/test-traceability-check.sh` +382 (**16** new `t_case` blocks, **110** new `assert_*` call sites;
+  that file now holds 75 cases and executes 442 assertions, up from 59 / 317), and one line of
+  `docs/ENFORCEMENT.md` — 515 insertions / 11 deletions across the three files. Nothing here remains to
   build. It is kept in the document, not deleted, because the *provenance* is the point: the guard this
   PR argued for found a real defect in the firm's own coverage gate within an hour of being proposed.
 - **The fixture to pin is the SUPERSET, not wave 2's disjoint ledger — and this correction is why the
