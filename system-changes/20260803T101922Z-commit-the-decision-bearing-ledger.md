@@ -125,8 +125,8 @@ made after an independent document review, and they are kept as corrections rath
   files, not 80, and tier A is **112**, not 108. The four new files are the
   `12-defect-note-template-criteria.md` siblings this batch's own review produced (all four created
   2026-08-03T13:06:54Z, ~1 minute after this table was committed at `3999631`, 13:05:45Z). Tier A is
-  3.14 MB at that later reading rather than
-  3.12 — a 0.6% move, not a re-scope. The delta is left visible rather than conformed to: a stale count in
+  3.14 MB at that later reading rather than 3.12 — a 0.6% move, not a re-scope. Tier B is unchanged at
+  118 files. The delta is left visible rather than conformed to: a stale count in
   the document arguing that ledgers must be checkable is the failure this batch keeps having, and the
   reason the 2026-08-03 row is retained is that it is the measurement the human's decision was taken
   against.

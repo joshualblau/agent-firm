@@ -58,9 +58,13 @@ Running `md5 <file>` against the two persisted verdicts therefore gives *differe
 who tries that first will conclude the block is fabricated. It is not; both readings reproduce exactly:
 
 ```
-                                          object md5   raw byte-slice md5 == md5 of the persisted file
-round 3  evaluate-remote-changes  offset 3278637   c51fe25c     c406f541  == 08-qa-verdict.gpt.json (12,942 B)
-round 5  remediate-wave2          offset 2625273   7005ad60     3fc09a51  == 08-qa-verdict.gpt.json  (9,796 B)
+                                   CHAR offset   object md5   slice bytes md5 == md5 of the persisted file
+round 3  evaluate-remote-changes      3278637     c51fe25c        c406f541    == 08-qa-verdict.gpt.json (12,942 B)
+round 5  remediate-wave2              2625273     7005ad60        3fc09a51    == 08-qa-verdict.gpt.json  (9,796 B)
+
+  object md5 = md5(json.dumps(obj, sort_keys=True));  slice bytes md5 = md5 of the balanced object
+  taken at that CHARACTER offset and re-encoded UTF-8. Offsets are character positions in the decoded
+  text, not byte positions — the logs are not pure ASCII.
 ```
 
 That second column is the stronger claim and is why it is printed: the surviving files are not merely
