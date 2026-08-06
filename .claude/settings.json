@@ -17,7 +17,6 @@
       "Bash(git clean:*)",
       "Bash(git filter-branch:*)",
       "Bash(git filter-repo:*)",
-      "Bash(git push:*)",
       "Bash(rm:*)",
       "Bash(dropdb:*)",
       "Bash(brew:*)",
@@ -76,6 +75,12 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR/bin/firm-ledger-hook\""
+          },
+          {
+            "//": "Merge/push authority gate. Fail-closed, CLIENT-SIDE, bypassable by anyone with repo write access — not a security boundary and not branch protection (docs/ENFORCEMENT.md). Runs AFTER the ledger hook so a refused command is still recorded. Remove this one object to remove the control entirely; nothing in allow/ask/deny is touched by it. `timeout` is only a backstop — the script's own gh/git waits are bounded at 8s/4s with a 1s kill grace (14s worst case, both sources hung). tests/test-merge-guard.sh parses THIS timeout value and asserts the script's waits plus a margin fit under it; do not raise the waits or lower this number without re-running it.",
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/bin/firm-merge-guard\" --hook",
+            "timeout": 30
           }
         ]
       }
