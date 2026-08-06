@@ -213,7 +213,14 @@ Cited: `20260803T051454Z-remediate-wave4/11-retrospective.md` (SC-12) and `12-ow
   is REQUIRED (auth / permissions / crypto / PII). So its portability claim is narrower than the previous
   drafts implied: what generalises is the *shape* — a termination rule for an adversarial gate, plus a
   written, pointer-carrying disposition artifact — not the frequency. On this engagement's own history the
-  rule would have bound on a minority of runs.
+  rule would have bound on a minority of **runs** — 3 of the 8 run dirs' `01-acceptance-criteria.yaml`
+  files mention `settings.json` / `auth` / `permission` at all — **but on all five of the judge
+  rounds**, because every round landed on one of those three runs. Both halves matter and they point
+  opposite ways: the narrowing is real going forward and cost this engagement nothing.
+  *(Corrected on fourth review alongside F-DOC-05, which is where the round-level half was wrong.
+  Caveat on the run-level half, stated because it weakens it: 4 of those 8 criteria files are still
+  byte-identical to the template, so "does not mention permissions" is partly an artefact of a criteria
+  file nobody filled in — a run with no criteria cannot be shown to touch anything.)*
 
 ## Risk & rollback
 
