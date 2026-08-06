@@ -150,15 +150,24 @@ Proposal 2 asserts a list of exit codes. Rather than assert it, here it is run: 
 input it cannot evaluate (no arguments, and an empty directory standing in for an artifact-less run dir).
 
 ```
-SCRIPT                     no-args  empty-dir  headline on empty-dir
-firm-traceability-check       2         2       TRACEABILITY: CANNOT VERIFY -- MISSING <dir>/...
-firm-check-assertions         2         2       usage: firm-check-assertions <assertions.yaml> <repo>
-firm-qa-clean-check           2         2       firm-qa-clean-check: CANNOT VERIFY — 'git status' failed
+SCRIPT                     no-args  empty-dir  headline on empty-dir (verbatim; '...' = truncated here)
+firm-traceability-check      2 †        2       TRACEABILITY: CANNOT VERIFY -- MISSING <dir>/01-acceptance-criteria.yaml
+firm-check-assertions         2         2       usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]
+firm-qa-clean-check           2         2       firm-qa-clean-check: CANNOT VERIFY — 'git status' failed (rc=128) in '<dir>' ...
 firm-validate-verdict         2         1       INVALID: not valid JSON: [Errno 21] Is a directory: ...
+
+† PRECONDITION, and it changes the answer. Run from a cwd with NO `.agent-firm/CURRENT_RUN`.
+  firm-traceability-check defaults its argument to the active run, so in the primary checkout
+  during a live engagement "no arguments" is NOT an input it cannot evaluate: it evaluates that
+  run and returns an earned 0 or 1. Re-measured 2026-08-06 in the primary checkout: rc=1, a real
+  FAIL on the active run. That is correct behaviour, not a fail-open — but a reader who runs the
+  command where they are standing will see 1, not the 2 printed above. The unconditionally
+  unevaluable input for this script is the empty-dir column, which is 2 either way.
 ```
 
-The first three confirm proposal 2's claim exactly. The last two rows are findings, and **they are not
-part of the count of ten above** — they were found now, by executing this proposal, and they are live:
+The first three rows confirm proposal 2's claim — row 1 only under the stated precondition, which is why
+it is stated. The last two rows are findings, and **they are not part of the count of ten above** — they
+were found now, by executing this proposal, and they are live:
 
 - **`firm-validate-verdict` reports an I/O error as a syntax error, at its evaluated-failure code.**
   `[Errno 21] Is a directory` is a `IsADirectoryError`, not a JSON parse failure; the tool prints it as
@@ -246,10 +255,14 @@ in `tests/`.
 - Feasibility: high. Every condition is constructible with a `mktemp -d` fixture, the suite already has
   the `PYTHONPATH`/`sitecustomize` techniques for simulating a broken or absent parser, and all ten fixed
   instances above were reproduced this way during the engagement. The tenth's fix at `76814ad` is the
-  worked example: 16 `t_case` blocks and 110 assertions, all file-in / exit-code-out.
+  worked example: 16 `t_case` blocks and 110 `assert_*` call sites, all file-in / exit-code-out.
 - **Registry contents, and the two rows that would fail on day one.** The registry premise was executed
   (see the proposed-change section): `firm-traceability-check`, `firm-check-assertions` and
-  `firm-qa-clean-check` already return 2 on unevaluable input and would pass immediately.
+  `firm-qa-clean-check` already return 2 on unevaluable input and would pass immediately. **Each registry
+  entry must name the input, not just the script** — for `firm-traceability-check` the unevaluable input
+  is a missing or artifact-less run dir, *not* bare no-args, which resolves to the active run and returns
+  an earned verdict (the `†` precondition above). A registry row that feeds no-args from a checkout with a
+  live `CURRENT_RUN` asserts nothing about fail-closed behaviour.
   `firm-validate-verdict` returns 1 and `firm-run-evals` returns 0 — so a registry-driven test written
   honestly is **red the moment it is written**, on two entries. That is the correct outcome and it should
   be stated up front, because the alternative is an implementer quietly omitting those two rows from the
@@ -311,11 +324,28 @@ was rejected for three times.)*
   file and the criteria PR, consistent).
 
 **AC-006, and it found things.** Proposal 2's exit-code registry was executed rather than asserted. Three
-of four rows confirmed the claim; two new live instances surfaced (`firm-validate-verdict` reporting an I/O
-error at its evaluated-failure code, and `firm-run-evals` exiting 0 having selected no evals on a
-one-character typo). Both are recorded as **found now and not fixed here**, explicitly outside the count of
-ten. Neither is folded into the headline, because inflating a count to strengthen an argument is the defect
-this PR is about.
+of four rows confirmed the claim — row 1 only under a precondition that is now printed with it (see the
+correction note below); two new live instances surfaced (`firm-validate-verdict` reporting an I/O error at its
+evaluated-failure code, and `firm-run-evals` exiting 0 having selected no evals on a one-character typo).
+Both are recorded as **found now and not fixed here**, explicitly outside the count of ten. Neither is
+folded into the headline, because inflating a count to strengthen an argument is the defect this PR is
+about.
+
+**Corrected on fourth review (F-DOC-01, F-DOC-02, F-DOC-08), re-measured 2026-08-06:**
+- `bin/firm-traceability-check` **+142/-11 → +132/-10**. The `-11` was the *commit's* total deletions
+  (10 in the script + 1 in `docs/ENFORCEMENT.md`) mislabelled as the script's; `+142` matched nothing in
+  the commit. The same wrong pair sat in `criteria-before-build-or-from-diff.md:148`; both are fixed.
+  `git diff --numstat 76814ad^ 76814ad -- bin/firm-traceability-check` → `132  10`.
+- The registry table's `firm-traceability-check` no-args cell is **environment-dependent** and now says
+  so. From the primary checkout with a live `CURRENT_RUN` it returns 1, not the 2 printed. Presenting an
+  unstated precondition as executed output is the same defect class this document argues against, one
+  level down.
+- The `firm-check-assertions` headline was a paraphrase (`<repo>`), not the output
+  (`<scratch-repo> [result.json]`). Real line pasted; the column is now labelled as truncated where it
+  is truncated.
+- Propagated: the guard section's registry spec now requires each entry to name its *input*, because
+  "feed it no arguments" is not a fail-closed probe for this script. That is the F-DOC-02 defect
+  reaching the test it would otherwise have produced.
 
 ## Human decision
 - [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
