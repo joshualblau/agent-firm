@@ -47,9 +47,15 @@ document and is the sharpest.
    that has been wrong in three consecutive drafts — have no durable artifact at all. Verified:
 
    ```
-   08-qa-verdict.gpt.json present in : evaluate-remote-changes (md5 c51fe25c = round 3)
-                                       remediate-wave2         (md5 7005ad60 = round 5)
+   08-qa-verdict.gpt.json present in : evaluate-remote-changes (md5 c406f541 = round 3)
+                                       remediate-wave2         (md5 3fc09a51 = round 5)
    rounds 1, 2, 4          live in   : 09-test-evidence/gpt-qa.log only
+
+   These are md5 of the FILE, so `md5 -q <path>` reproduces them directly (12,942 and 9,796 bytes).
+   The stop-rule PR's five-round table cites the same two verdicts as c51fe25c and 7005ad60: those
+   are md5 of the verdict OBJECT canonicalised as json.dumps(obj, sort_keys=True), which is how the
+   rounds were de-duplicated inside the transcripts. Same two verdicts, two digests of two different
+   byte strings. Both reproduce; neither reproduces under the other's method.
    ```
 
    This is the strongest available argument for the *curation* clause specifically (proposal 3), rather than
@@ -65,19 +71,24 @@ wall-clock PR adopted after S-08, applied here because this table is the one a r
 | Tier | Total (7 runs) | Files | Per run | At 100 runs |
 |---|---|---|---|---|
 | **A** · decision artifacts `00`–`12` (incl. `05-work-orders/`) | 1.08 MB | 80 | 158 KB | ~16 MB |
-| **A** · `traceability.yaml`, `run-baseline.json`, `integration-summary.md`, `system-change-pr.md` | 0.05 MB | 19 | 7 KB | ~1 MB |
+| **A** · `traceability.yaml`, `run-baseline.json`, `integration-summary.md`, `system-change-pr.md`, `wo-*` | 0.05 MB | 21 | 7 KB | ~1 MB |
 | **A** · `run.jsonl` (machine event log) | 1.99 MB | 7 | 291 KB | ~28 MB |
-| **A — total** | **3.11 MB** | **106** | **456 KB (0.44 MB)** | **~44 MB** |
+| **A — total** | **3.12 MB** | **108** | **456 KB (0.44 MB)** | **~44 MB** |
 | **B** · `09-test-evidence/` (bulk) | 7.43 MB | 118 | 1,087 KB | ~106 MB |
 | **excluded** · `settings*.json`, `*.bak` | 0.02 MB | 3 | 2 KB | — |
 | Everything | 10.56 MB | 229 | 1.51 MB | ~151 MB |
 
-For scale, `.git` is currently **1.5 MB**. Committing everything would grow the repository roughly 7× from a
-single engagement and reach ~151 MB at 100 runs — untenable for a plugin repo people install. **Tier A costs
-~0.44 MB per run and ~44 MB at 100 runs**, which is ordinary for a decision record and is the tier this PR
-proposes.
+For scale, `.git` was **3.0 MB** when last measured (`du -sh .git`, 2026-08-06, at `3999631`). **Treat the
+multiple as the perishable number and the absolutes as the durable ones**: this figure is the only one on
+this page pinned to nothing — it grows with every ordinary commit and with every worktree created, and it
+has already moved twice under this document (1.5 MB in the sentence this replaces; 1.8 MB when an
+independent reviewer re-measured on 2026-08-03). Committing everything would grow the repository roughly
+**3.5× at today's `.git`** — it was 7× at 1.5 MB — and reach ~151 MB at 100 runs, untenable for a plugin
+repo people install. **Tier A costs ~0.44 MB per run and ~44 MB at 100 runs**, which is ordinary for a
+decision record and is the tier this PR proposes.
 
-Three notes on the numbers, because a reviewer should be able to attack them:
+Five notes on the numbers, because a reviewer should be able to attack them — the last two are corrections
+made after an independent document review, and they are kept as corrections rather than folded in silently:
 
 - **The human settled this shape on a ~0.47 MB/run figure; it now measures 0.44.** Nothing was re-scoped —
   two smaller runs closed in between and pulled the mean down. The difference is not decision-relevant and
@@ -94,7 +105,31 @@ Three notes on the numbers, because a reviewer should be able to attack them:
   `.agent-firm/runs/*/[01]*` pattern misses both. It also **sweeps in** three files that must not be
   committed: `settings.json.pre-merge.bak`, `settings.json.pre-permissive.bak` and
   `settings-reconciliation.proposed.json` — verbatim copies of `.claude/settings.json` permission postures
-  left in run dirs as backups. The tier must be an explicit allow-list, never a prefix glob.
+  left in run dirs as backups. The tier must be defined by an explicit **deny-list**, never a prefix glob —
+  see the correction below for why an *allow*-list is the wrong polarity for a completeness requirement.
+- **This document fell into its own trap, one level down (F-DOC-06, corrected 2026-08-06).** The `A other`
+  row above originally read **19 files** and enumerated four names. A complete walk of the same seven run
+  dirs finds two further non-prefixed, decision-bearing artifacts it omitted:
+  `20260801T203648Z-evaluate-remote-changes/wo-0-roster.tsv` and `.../wo-0b-commit-group-matrix.yaml` — the
+  second being a commit-group matrix, precisely the artifact one judge round blocked a run for not
+  producing. The explicit list this note demands *instead of* a glob was itself incomplete against the run
+  dirs it was measured from, which is the argument for stating the tier as a deny-list ("every top-level
+  file in the run dir except `09-test-evidence/`, `settings*`, `*.bak`") rather than as an enumeration
+  anyone has to keep complete. Row and total corrected to **21** and **108**. The two files total 5,805
+  bytes across the seven runs (829 B/run): per run that is 467,386 B with them and 466,557 B without, so
+  the `456 KB` column is unchanged; the `0.44 MB` shorthand is the same 456 KB and is left as written,
+  because 0.8 KB/run is not decision-relevant and 0.44 is the figure the human's decision was taken
+  against.
+- **The file counts are a 2026-08-03 snapshot and have since drifted; the byte figures are the decision
+  record.** Re-measured 2026-08-06 across the *same* seven closed dirs: the `00`–`12` row is now **84**
+  files, not 80, and tier A is **112**, not 108. The four new files are the
+  `12-defect-note-template-criteria.md` siblings this batch's own review produced (all four created
+  2026-08-03T13:06:54Z, ~1 minute after this table was committed at `3999631`, 13:05:45Z). Tier A is
+  3.14 MB at that later reading rather than
+  3.12 — a 0.6% move, not a re-scope. The delta is left visible rather than conformed to: a stale count in
+  the document arguing that ledgers must be checkable is the failure this batch keeps having, and the
+  reason the 2026-08-03 row is retained is that it is the measurement the human's decision was taken
+  against.
 
 ### Why `run.jsonl` is in tier A, against v1
 
@@ -160,12 +195,20 @@ be narrowed**, and they fail differently:
 1. **Narrow the worktree exclude.** `bin/firm-new-worktree:33` must append `.agent-firm/worktrees/`, not
    `.agent-firm/`. That is the directory it actually needs hidden. **Ship a one-line migration note**,
    because existing machines carry the broad pattern and a commit cannot remove it.
-2. **Commit tier A, by explicit allow-list.** `.gitignore` keeps `.agent-firm/worktrees/` and
-   `.agent-firm/runs/*/09-test-evidence/` excluded, adds `.agent-firm/runs/*/settings*` and
-   `.agent-firm/runs/**/*.bak`, and stops excluding the rest. Net addition: **~0.44 MB and ~15 files per
-   run** — intake, criteria, decision log, staffing, architecture, work-orders, implementation summaries,
-   review findings, verdicts, traceability matrix, handoff, retrospective, override, run baseline, and
-   `run.jsonl`. Enumerate the set; do not use a prefix glob (see the third note under *Measured cost*).
+2. **Commit tier A by explicit deny-list — the polarity matters (revised for F-DOC-06).** `.gitignore`
+   keeps `.agent-firm/worktrees/` and `.agent-firm/runs/*/09-test-evidence/` excluded, adds
+   `.agent-firm/runs/*/settings*` and `.agent-firm/runs/**/*.bak`, and **stops excluding everything else**
+   — that is, every top-level file in a run dir is committed unless it is on that short exclusion list.
+   Net addition: **~0.44 MB and ~15–16 files per run**, which today means intake, criteria, decision log,
+   staffing, architecture, work-orders, implementation summaries, review findings, verdicts, traceability
+   matrix, handoff, retrospective, override, defect notes, run baseline, `wo-*` work-order artifacts
+   (roster, commit-group matrix), and `run.jsonl`. **That list is illustrative, not the mechanism.** v1 of
+   this proposal said "enumerate the set; do not use a prefix glob" and its own enumeration was already
+   missing two real artifacts (F-DOC-06) — an allow-list is the wrong polarity for a completeness
+   requirement, because it fails silently and closed against artifacts nobody thought of, and new
+   artifact names appear in this ledger every engagement. A deny-list fails loudly and open: the worst
+   case is one unwanted file in a diff, which review catches, rather than one missing decision record,
+   which nothing catches. `bin/firm-ledger-scan` (proposal 4) is what makes the open polarity safe.
 3. **Curate cited evidence — this replaces v1's "inline the excerpt" rule.** Bulk `09-test-evidence/` stays
    local. But when a System Change PR (or a handoff) cites a path under it, the specific artifact is
    **copied into `system-changes/evidence/<pr-slug>/`** as part of approving that PR, and the citation
@@ -218,7 +261,7 @@ be narrowed**, and they fail differently:
   file-size distribution, which is a tooling-repo profile. A project generating large visual-regression
   artefacts would want a different cut — and note that `09-test-evidence/` is already 1,087 KB/run here with
   **no** visual baselines in play. The tiering *mechanism* and the curation rule generalise; the specific
-  allow-list should be configurable, not hardcoded.
+  cut — i.e. proposal 2's exclusion list — should be configurable, not hardcoded.
 - **What does not generalise, and cuts against this PR:** in a *client* project, tier A is the tier most
   likely to contain material that must not be in a shared repo — intake notes, decision logs and
   retrospectives are where names, commercial terms and candid assessments live. The size argument says
@@ -238,17 +281,23 @@ be narrowed**, and they fail differently:
   This is the single strongest argument *against* this revision, and it is not answered by asserting that
   `run.jsonl` is valuable — both are true. It is why proposal 4 is a hard prerequisite rather than a
   companion, and why the scanner's absolute-home-path rule is not optional.
-- **Churn.** Every run adds ~15 files. `git log` becomes dominated by ledger commits unless they are batched
+- **Churn.** Every run adds ~15–16 files. `git log` becomes dominated by ledger commits unless they are batched
   (one commit per closed run) — worth specifying.
 - **Half-measures are worse than either extreme.** Committing decision artifacts while leaving the evidence
   they cite unreachable leaves citations broken *and* adds weight. Proposal 3 is what prevents that, so 2
   and 3 must land together or neither should.
 - **Second-order:** once the ledger is in git, `firm-new-run` writing template artifacts creates committed
-  placeholders. Measured, and worse than v1 assumed: **63 artifacts across the eight run dirs are
-  byte-identical to their templates**, including four `01-acceptance-criteria.yaml` and six
-  `06-implementation-summary.md`. Under proposal 2 those become committed decision records that are in fact
-  blank forms. The `validate-run-artifacts-at-write-time` PR is therefore a **hard prerequisite**, not a
-  companion — a template committed as a decision record is a false record, and there are 63 of them waiting.
+  placeholders. Measured, and worse than v1 assumed: **63 artifacts across the eight run dirs were
+  byte-identical to their templates** when measured (2026-08-03, at `3999631` — see the AC-006 note on why
+  this is not `b1868eb`), including four
+  `01-acceptance-criteria.yaml` and six `06-implementation-summary.md`. Under proposal 2 those become
+  committed decision records that are in fact blank forms. The `validate-run-artifacts-at-write-time` PR is
+  therefore a **hard prerequisite**, not a companion — a template committed as a decision record is a false
+  record. *(Re-measured 2026-08-06 over the same eight dirs: **58**. The count is a snapshot, not an
+  invariant — it falls as runs are remediated, and the five that fell are `cleanup-and-identity-gate`'s own
+  `03-decision-log.md`, `06-implementation-summary.md`, `08-qa-verdict.json`, `10-handoff.md` and
+  `traceability.yaml`, filled after the measurement. The argument is unaffected: 58 blank forms would still
+  be committed as decision records.)*
 - **Rollback:** revert this PR; re-add the `.gitignore` entries. Already-committed ledgers stay in history —
   **this decision is not cleanly reversible**, which is itself an argument for the narrow tier. Note also
   that reverting the `.gitignore` change does **not** restore `.git/info/exclude:8` on a machine where
@@ -262,9 +311,13 @@ be narrowed**, and they fail differently:
      the regression that would silently re-hide the ledger on a fresh machine. This is the highest-value
      assertion here and it directly pins the blocker described above. Pure string check on a script.
   2. A run dir's tier-A artifacts are **not** ignored (`git check-ignore` returns non-zero for each,
-     including the two that carry no numeric prefix, `traceability.yaml` and `run-baseline.json`), while
-     `09-test-evidence/`, `settings*.json` and `*.bak` **are**. Both directions, and specifically the files
-     a prefix glob would get wrong.
+     including **all four** kinds that carry no numeric prefix — `traceability.yaml`, `run-baseline.json`,
+     `integration-summary.md`/`system-change-pr.md`, and the `wo-*` work-order artifacts
+     (`wo-0-roster.tsv`, `wo-0b-commit-group-matrix.yaml`) — while `09-test-evidence/`, `settings*.json`
+     and `*.bak` **are**. Both directions, and specifically the files a prefix glob would get wrong.
+     *(The `wo-*` pair was added for F-DOC-06: v1 of this assertion named only the first two, which is the
+     same omission the cost table carried, reaching the test that was supposed to pin against it. A
+     fixture built from v1's list would have gone green while proposal 2 dropped a commit-group matrix.)*
   3. `firm-ledger-scan` fails closed on a fixture containing a planted credential pattern, and passes on a
      clean fixture — **and returns its cannot-evaluate code, not a pass, on a run dir it cannot read.**
      (Per the sibling never-rule PR: a new gate script shipping without a cannot-evaluate outcome would be
@@ -336,10 +389,11 @@ were re-read and all three changed:
 - *Risk* gained the consequence of moving `run.jsonl` into tier A: 93.2% of ledger events are `bash` events
   carrying verbatim `cmd` fields with absolute home paths. That is the strongest argument against this
   revision and it is stated as such rather than answered.
-- *Golden eval* gained a third direction for assertion 2 (the two tier-A files that carry no numeric prefix,
-  which a prefix glob would silently drop), the note that assertion 3 is **not constructible** because the
-  binary does not exist, and the executed `git check-ignore` premise showing the assertion currently fails
-  on every tier-A file — the correct starting state for a pin.
+- *Golden eval* gained a third direction for assertion 2 (the tier-A files that carry no numeric prefix,
+  which a prefix glob would silently drop — **four** kinds, corrected from two for F-DOC-06), the note that
+  assertion 3 is **not constructible** because the binary does not exist, and the executed
+  `git check-ignore` premise showing the assertion currently fails on every tier-A file — the correct
+  starting state for a pin.
 - Batch grep: the shared evidence-availability footer named a narrower tier without `run.jsonl` in **six**
   files; all six were corrected in the same pass with a visible note, including the already-committed
   `validate-run-artifacts-at-write-time.md`. Leaving a superseded enumeration in five siblings is the exact
@@ -348,8 +402,37 @@ were re-read and all three changed:
 **AC-006 — every figure and every premise in this document was executed, not estimated.** The tier table,
 the 50% duplicate-line rate, the 63 template-identical artifacts, the `git check-ignore` attribution, the
 `firm-new-worktree:33` quote, the missing `firm-ledger-scan`, and the three stray `settings*`/`*.bak` files a
-prefix glob would sweep in — all measured against the real run dirs at `b1868eb`. The three
-`settings*`/`*.bak` files and the 63 templates were both found this way and neither appeared in v1.
+prefix glob would sweep in — all measured against the real run dirs at **`3999631`**, i.e. inside the window
+2026-08-03 **12:01Z–13:07Z**. The three `settings*`/`*.bak` files and the 63 templates were both found this
+way and neither appeared in v1.
+
+*(Corrected 2026-08-06, found by the F-DOC-01 sweep rather than by a named finding: this paragraph
+previously attributed the measurements to **`b1868eb`**. It cannot be. `b1868eb` was committed
+2026-08-03T11:54:16Z and the **eighth** run dir — the one the 63 figure counts over — was created
+2026-08-03T12:00:43Z, six and a half minutes later; at `b1868eb` there were seven. The window's other edge
+is fixed by the tier table's `00`–`12` row of 80 files, which requires a reading before the four
+`12-defect-note-*` files appeared at 13:06:54Z. Same defect class as F-DOC-01: a figure attributed to a
+commit it does not belong to, where the attribution reads as provenance.)*
+
+## Fourth-review edit record (2026-08-06)
+
+Applied from an independent document review (LENS-DOC, findings F-DOC-03, F-DOC-06, F-DOC-11) plus one
+item found by sweeping for the same defect class. Every figure below was re-derived from the repository,
+not copied from the finding text.
+
+| # | Finding | Was | Is | How verified |
+|---|---|---|---|---|
+| 1 | F-DOC-06 | `A other` row = 19 files, four names; tier A = 106 | 21 files incl. `wo-*`; tier A = 108 | Complete walk of the seven closed run dirs: `wo-0-roster.tsv` and `wo-0b-commit-group-matrix.yaml` in `evaluate-remote-changes` are non-prefixed and decision-bearing |
+| 2 | F-DOC-06 | proposal 2 framed as an **allow**-list with an enumeration | deny-list, enumeration marked illustrative; `wo-*` named | the enumeration this document demanded *instead of* a glob was itself incomplete — the trap it warns about, one level down |
+| 3 | F-DOC-06 | golden-eval assertion 2 pinned **two** non-prefixed files | **four** kinds, `wo-*` included | a fixture built from the old list would have gone green while proposal 2 dropped a commit-group matrix |
+| 4 | F-DOC-03 | `md5 c51fe25c` / `7005ad60` against filenames | `c406f541` / `3fc09a51`, with the two hashing methods distinguished | `md5 -q` on both files; the stop-rule PR's digests reproduce only under `json.dumps(obj, sort_keys=True)` — both were re-derived here |
+| 5 | F-DOC-11 | "`.git` is currently **1.5 MB** … roughly 7×" | 3.0 MB at `3999631`, ~3.5×, with the multiple marked perishable | `du -sh .git`; the figure has moved three times (1.5 → 1.8 → 3.0) and is the only number here pinned to nothing |
+| 6 | sweep | 63 templates *are* … "measured at `b1868eb`" | *were*, at `3999631`; re-measured 58 | `b1868eb` (11:54:16Z) predates the eighth run dir (12:00:43Z), so no eight-dir figure can come from it |
+
+**Not changed, deliberately:** the `0.44 MB/run` figure in this table and in all six sibling footers. The
+two `wo-*` files add 829 B/run, which does not move `456 KB`, and 0.44 is the figure the human's decision
+was taken against. Re-deriving it would ripple through six documents for a 0.2% correction — the exact
+trade that has introduced fresh errors in each of the last three correction rounds.
 
 ## Human decision
 - [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
