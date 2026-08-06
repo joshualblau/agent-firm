@@ -78,6 +78,16 @@ checkout at the integration HEAD) then `firm-validate-verdict` + `firm-traceabil
   enforcement picture.
 - Gate on **acceptance coverage**: `firm-traceability-check` must pass (every criterion covered or
   justified) before the final gate. Reject malformed verdicts.
+- **The two-voice rule — the judge's BLOCK binds unless QA dissents.** Owner decision, 2026-08-07;
+  `policy/gate-matrix.md` §"Second-voice (GPT) QA judge policy" §2 is authoritative and has the full
+  procedure. Applied **per disputed point**: (1) judge BLOCKs and QA does **not** dissent — agrees, or
+  is silent on that point — **the block stands**; (2a) QA dissents and the point is **high-risk**
+  (never-rule, gated scope, permissions/hooks/sandbox/credentials, a security control or its proof, or
+  anything irreversible/outward-facing) — the disagreement **must be resolved**, blocking; (2b) QA
+  dissents and it is not high-risk — **attempt** resolution once, and if it doesn't resolve easily,
+  **record the judge's dissent and proceed on QA's decision** (in `two_voice_diff`, the handoff, and the
+  Final-gate payload — never silently). Ambiguity fails toward blocking: unclear dissent ⇒ no dissent;
+  unclear risk ⇒ high-risk. A **QA BLOCK is blocking regardless** of what the judge says.
 - The team never self-approves and never auto-merges.
 
 ## Hard rules (always)
@@ -103,8 +113,10 @@ deliverable** — for the human to approve and version. Accepted changes are gua
 Phase 0–5 done. Core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff;
 worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, the
 retrospective → System-Change-PR + golden-eval loop; the `recruiter` + generic `specialist` +
-`firm-hire` staffing mechanism; the independent Codex/GPT QA judge (`firm-gpt-qa`, two-voice — both must
-APPROVE); portability — a versioned plugin + per-project subscription profiles + `op`/direnv secrets
+`firm-hire` staffing mechanism; the independent Codex/GPT QA judge (`firm-gpt-qa`, two-voice — the
+judge's BLOCK **binds unless QA dissents**; see the two-voice rule above and `gate-matrix.md` §2, which
+is authoritative. This line previously read "both must APPROVE", contradicting `gate-matrix.md`'s then
+"advisory by default"; the owner settled it on 2026-08-07); portability — a versioned plugin + per-project subscription profiles + `op`/direnv secrets
 guarded by a fail-closed `firm-doctor`; and hardening (Phase 5): an opt-in default-deny **egress
 firewall**, a **visual-regression** suite (`firm-visual-check`, wired into the QA `visual` verdict —
 project-gated, read-only, baselines never auto-updated), provider-agnostic **remote approval
