@@ -96,13 +96,47 @@
 #   no substring test can tell them from a real `git ... config` write without parsing.
 #   `cat docs/config.md` and `python3 -c "import configparser"` were never on the CHECK path at all
 #   — neither contains `git` — so the ordering did not change them either.
+#   AND THE CHEAP PREFILTER IS ONLY CHEAP ON SHORT STRINGS (SEC-19). bash 3.2's `${v//pat/repl}` is
+#   roughly O(n^2.9) in the number of MATCHES, and the six deletions below are all high-match on
+#   quote-dense text. Measured, /bin/bash 3.2.57, worst-case density: 1 KB 50 ms · 2 KB 354 ms ·
+#   3 KB 1.1 s · 4 KB 2.7 s · 8 KB ~20 s · 16 KB 48 s. That is not a synthetic worry: replaying the
+#   3 296 real Bash commands in this repo's own run ledgers, the nine over 4 KB cost 0.1–99.8 s here,
+#   the 74 187-byte one taking 99.8 s against a 30 s registered timeout that is MEASURED to fail
+#   OPEN when overrun. So `_mg_may_match` and the jq program both refuse to NORMALISE a string longer
+#   than MG_MAX_PREFILTER_BYTES and answer CHECK instead — the prefilter's only power is to prove a
+#   NEGATIVE, so declining to prove one adds work and can never remove a check. The python classifier
+#   is linear on every shape measured (16 KB 11 ms, 256 KB 1.3 s worst case) and is where a long
+#   command is then decided. Same corpus, before vs after: total prefilter time across the 120 calls
+#   over the bound fell from 268.6 s to 6.0 s and the per-call maximum from 99 721 ms to 155 ms;
+#   98.73% of all 3 296 calls stay on the zero-subprocess path and the 1.27% above the bound pay one
+#   python3 start (~30 ms). The bound's one real cost is a disclosed OVER-block; see SURFACE_COVERED.
 #
 # HOW THE WORST CASE STAYS UNDER THE REGISTERED HOOK TIMEOUT
-#   Both hook registrations set "timeout": 30. The script's own bounded waits are GH_TIMEOUT +
-#   GIT_TIMEOUT + 2 * KILL_GRACE (8 + 4 + 2 = 14 s worst case, both sources hung), leaving room for
-#   python start-up, the allowlist read and the ledger append. tests/test-merge-guard.sh parses
-#   these constants out of THIS file and out of BOTH hook registrations and fails if the inequality
-#   stops holding, because a hook that exceeds its framework timeout is not a block.
+#   THE PREMISE, NOW MEASURED RATHER THAN ASSUMED. A PreToolUse hook that exceeds its registered
+#   `timeout` FAILS OPEN: the framework kills the hook and RUNS THE TOOL CALL ANYWAY, recording no
+#   permission denial. Measured against Claude Code 2.1.221 with real headless `claude -p` probes —
+#   a hook registered `"timeout": 5` that sleeps 20 s and would then exit 2 let `touch ran.txt`
+#   through, with `permission_denials: 0`, three times out of three; so did the exact shape of the
+#   defect this bound exists for, 48 s of work under a `"timeout": 30` registration. Controls in the
+#   same harness: the same hook exiting 2 immediately BLOCKED, exiting 0 immediately RAN. Evidence:
+#   09-test-evidence/SEC-19-hook-timeout-failure-mode-measured.txt. This is the same fail-open shape
+#   as exit 1 (see WHY --hook ALWAYS EXITS 2), and it is why every phase below is bounded IN THIS
+#   SCRIPT rather than left to the framework: overrunning the timeout is indistinguishable from
+#   permitting.
+#
+#   Both hook registrations set "timeout": 30, and the worst case is the sum of TWO phases:
+#     1. CLASSIFICATION (bounded by PARSE_BUDGET). Bounded by two caps, because it is not free:
+#        MG_MAX_PREFILTER_BYTES bounds the quote/escape NORMALISATION in the cheap bash and jq
+#        prefilters, and MAX_COMMAND_BYTES bounds the command string the python classifier will
+#        parse at all. Over the second cap the answer is CANNOT EVALUATE (exit 2), never a permit.
+#     2. IDENTITY RESOLUTION (bounded waits): GH_TIMEOUT + GIT_TIMEOUT + 2 * KILL_GRACE
+#        (8 + 4 + 2 = 14 s worst case, both sources hung).
+#   Plus HOOK_BUDGET_MARGIN for python start-up, the allowlist read and the ledger append.
+#   tests/test-merge-guard.sh parses these constants out of THIS file and out of BOTH hook
+#   registrations, asserts the whole inequality, and — because a declared budget nobody drives is
+#   just a number — MEASURES the real wall clock of a worst-case fixture AT the cap and fails if it
+#   exceeds PARSE_BUDGET. Classification runs BEFORE identity resolution, so an inequality that
+#   omitted phase 1 would bound the cheap half and leave the expensive half unbounded. (SEC-19)
 #
 # ON DOUBLE-FIRING, DELIBERATELY NOT CACHED. This repo is simultaneously the plugin source and the
 # project, so BOTH hook registrations resolve and every PreToolUse hook here runs TWICE per Bash
@@ -145,7 +179,11 @@ while [ "$#" -gt 0 ]; do
       MODE="command"; CMD="$2"; shift ;;
     --surface) MODE="surface" ;;
     -h|--help)
-      sed -n '2,118p' "$__src" | sed 's/^# \{0,1\}//'
+      # The header, addressed by its END MARKER rather than by a magic last line number. A fixed
+      # range silently truncates every time the header grows (it did, twice); the range now stops at
+      # the first line of real code and prints everything above it. tests/test-merge-guard.sh still
+      # asserts the last header line reaches --help, so this cannot regress unnoticed either way.
+      sed -n '2,/^set -uo pipefail/{/^set -uo pipefail/!p;}' "$__src" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       printf 'firm-merge-guard: unknown argument: %s (try --help)\n' "$1" >&2
@@ -187,11 +225,41 @@ SENTINEL = {PERMIT: "FIRM_MG_DECISION=permit",
             CANNOT: "FIRM_MG_DECISION=cannot"}
 
 # Bounded waits. tests/test-merge-guard.sh parses this exact line and asserts
-# GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + HOOK_BUDGET_MARGIN <= the registered hook timeout in
-# BOTH .claude/settings.json and hooks/hooks.json. Do not raise these without re-running that test.
+# PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + HOOK_BUDGET_MARGIN <= the registered hook
+# timeout in BOTH .claude/settings.json and hooks/hooks.json. Do not raise these without re-running
+# that test.
 GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = 8, 4, 1
 # Headroom for python start-up, the allowlist read and the ledger append.
 HOOK_BUDGET_MARGIN = 10
+
+# ---- THE CLASSIFICATION PHASE IS BOUNDED TOO (SEC-19) ----------------------------------------
+# Classification runs BEFORE identity resolution, so bounding only the gh/git waits bounds the cheap
+# half of the hook and leaves the expensive half unbounded. It was: a 16 KB command string spent 48 s
+# in the bash prefilter under a "timeout": 30 registration, and a hook that overruns its registered
+# timeout is MEASURED to fail OPEN (see the header) — a correct BLOCK decision arriving too late is
+# a permit.
+#
+# MAX_COMMAND_BYTES is a cap on what this checker will parse AT ALL, in exactly the idiom
+# MAX_LAUNCHER_READINGS already uses: exceeding it raises Cannot, which is a BLOCK. It does NOT
+# truncate the string and it does NOT skip the check — a truncated parse is a fail-open (the gated
+# word may be past the cut) and a skipped parse is a permit. Refusing to decide is neither.
+#
+# WHERE THE NUMBER COMES FROM, measured rather than chosen: across 3 296 real Bash command strings in
+# this repo's own run ledgers the median is 291 bytes, p99 is 3 429 and the largest ever observed is
+# 74 187 (a heredoc writing a run artifact). 262 144 is 3.5x that largest real command, so no real
+# command in this project's history comes near it. At the cap the slowest classifier shape measured
+# (nested `$(`) costs 1.3 s, which is what PARSE_BUDGET is sized against.
+#
+# Counted in characters — `${#s}` in bash and len() here agree. On a non-ASCII command line that
+# under-counts BYTES, which only means the classifier sees a string whose byte length exceeds the
+# constant's name; the classifier is linear in characters, so that is harmless.
+MAX_COMMAND_BYTES = 262144
+# The whole classification phase's share of the hook timeout: the bash/jq prefilter (bounded by
+# MG_MAX_PREFILTER_BYTES, worst case 353 ms), python start-up (~30 ms) and classify() at the cap
+# (worst measured shape 1.3 s) — about 1.7 s, declared at 4 s so a slower machine has ~2.3x headroom.
+# tests/test-merge-guard.sh both puts this in the budget inequality AND drives a worst-case fixture
+# at the cap through the real script, so the number cannot quietly become a fiction.
+PARSE_BUDGET = 4
 
 def err(*a):
     sys.stderr.write(" ".join(str(x) for x in a) + "\n")
@@ -329,6 +397,22 @@ SURFACE_COVERED = [
     "    user.email <v>\"` are matched. The cost of reading `\\$'` both ways is that a TOP-LEVEL",
     "    `git pu\\$'s'h` — which bash reads as the literal `pu$sh` — is over-blocked. Ambiguity",
     "    resolves toward blocking.",
+    "  · ...AT ANY LENGTH. The cheap prefilter refuses to NORMALISE a command longer than its bound",
+    "    (MG_MAX_PREFILTER_BYTES in this script) and sends it to the classifier unconditionally, so",
+    "    padding a command past the bound cannot get it a cheaper answer. Over MAX_COMMAND_BYTES the",
+    "    answer is CANNOT EVALUATE (exit 2) — refused, never truncated and never skipped. Both caps",
+    "    exist because a hook that overruns its registered timeout is MEASURED to fail OPEN, and the",
+    "    bash prefilter's quote normalisation is O(n^2.9): a real 74 KB command from this repo's own",
+    "    ledger took 99.8 s under a 30 s registration. (SEC-19)",
+    "    DISCLOSED OVER-BLOCK, and the bound was chosen to price it. Past the prefilter bound a",
+    "    command the CLASSIFIER cannot lex blocks even when it holds no trigger word — below the",
+    "    bound the prefilter would have proved that negative and permitted it. Measured by replaying",
+    "    every real Bash command in this repo's own run ledgers through the guard before and after:",
+    "    a 2048-byte bound flips SIX of them from permit to block (all six in the 2210-2783 byte",
+    "    band), and the shipped bound flips ZERO. Zero OBSERVED is not zero in general — the class is",
+    "    real. It is fail-closed, it is loud, the message quotes the lexer's own reason, and the same",
+    "    shape (`git commit -m \"$(cat <<'EOF' ... EOF)\"`) already blocks at ANY length once its",
+    "    message happens to contain push/merge/pull/gh, so the class is not new either.",
 ]
 
 def _wrap_words(words, width=92, indent="    "):
@@ -437,7 +521,8 @@ WS_RE = re.compile(r"\s")
 # See launcher_argvs. A cap on AMBIGUITY, not on coverage: it exists so a pathological string
 # cannot make the classifier quadratic, and exceeding it raises Cannot (a BLOCK) rather than
 # discarding a reading, because a discarded reading is a fail-open. No real command line has more
-# than one flag value spelled `git`/`gh`/`sh`/`bash`.
+# than one flag value spelled `git`/`gh`/`sh`/`bash`. (MAX_COMMAND_BYTES, above, is the same idiom
+# applied to input SIZE — it bounds parse TIME, which this one does not. SEC-19)
 MAX_LAUNCHER_READINGS = 16
 
 def substitutions(text):
@@ -1244,11 +1329,18 @@ def main():
         return PERMIT
 
     try:
+        # The size cap comes FIRST, before a single character is parsed: over it there is no
+        # decision to be had, only a decision that would arrive after the hook's registered
+        # timeout, and an overrunning hook is measured to fail OPEN. Cannot, never truncate. (SEC-19)
+        if len(cmd) > MAX_COMMAND_BYTES:
+            raise Cannot("the command string is %d bytes, over the %d-byte MAX_COMMAND_BYTES this "
+                         "checker will parse, so it cannot be classified in time"
+                         % (len(cmd), MAX_COMMAND_BYTES))
         hit = classify(cmd)
     except Cannot as e:
         err("firm-merge-guard: CANNOT EVALUATE — %s" % e)
         err("  command: %s" % cmd[:400])
-        err("  Blocking: the command contains a merge/push trigger word but could not be parsed.")
+        err("  Blocking: the command reached the classifier but could not be parsed to a decision.")
         ledger("merge_guard_block", {"decision": "cannot_evaluate", "reason": str(e),
                                      "cmd": cmd[:2000]})
         return CANNOT
@@ -1430,9 +1522,47 @@ PYEOF
 # divergence fails the suite instead of shipping.
 #
 # Returning 1 here costs ZERO subprocesses: no python3, no gh, no git, no network.
+#
+# AND THE NORMALISATION IS BOUNDED BY LENGTH (SEC-19). Cheap is a property of SHORT strings here:
+# bash 3.2's `${v//pat/repl}` is roughly O(n^2.9) in the number of matches, and every deletion below
+# is high-match on quote-dense text. Measured worst-case density on /bin/bash 3.2.57: 1 KB 50 ms,
+# 2 KB 353 ms, 4 KB 2.7 s, 16 KB 48 s — and on the REAL 74 187-byte Bash command in this repo's own
+# run ledger, 99.8 s, against a 30 s registered hook timeout that is measured to fail OPEN when
+# overrun. Over MG_MAX_PREFILTER_BYTES this function therefore returns CHECK WITHOUT NORMALISING.
+# That is not "skipping the check" and it is not a truncated parse: this filter's only power is to
+# prove a NEGATIVE, so declining to prove one hands the string to the python classifier, which is
+# linear (256 KB worst case 1.3 s) and authoritative. The direction is add-work-only, by
+# construction — there is no input for which the bound turns a CHECK into a SKIP.
 # ---------------------------------------------------------------------------------------------
+# ONE source of truth for both prefilters: the jq program below is invoked with
+# `--argjson cap "$MG_MAX_PREFILTER_BYTES"` and applies the same bound to the command it extracts.
+# tests/test-merge-guard.sh drives both over a corpus that straddles the bound.
+#
+# WHERE 3072 COMES FROM — two measurements, not a preference.
+#   1. THE COST CURVE, worst-case density (a string of nothing but quotes), /bin/bash 3.2.57:
+#        2048 -> 354 ms · 2560 -> 674 ms · 3072 -> 1 147 ms · 3584 -> 1 801 ms · 4096 -> 2 662 ms.
+#      3072 is the largest bound whose worst case stays around a second — specifically, under the
+#      python classifier's own worst case at MAX_COMMAND_BYTES (1.3 s), so this bound is never the
+#      dominant term in PARSE_BUDGET. One step further (4096) is 2.3x that and 5.3 s across the two
+#      hook registrations, which is a visibly hung agent for an input that is not even gated.
+#   2. THE REAL-COMMAND CORPUS, 3 296 Bash calls out of this repo's own run ledgers, each replayed
+#      through the guard BEFORE and AFTER this bound. Over the bound the prefilter can no longer
+#      prove a negative, so an UNLEXABLE benign command now blocks where it used to be filtered out
+#      in bash and permitted (see the DISCLOSED OVER-BLOCK in SURFACE_COVERED). At 2048 that flipped
+#      SIX distinct real commands from permit to block; every one of them sits in the 2210-2783 byte
+#      band, and at 3072 the count is ZERO. Choosing 2048 for its prettier worst case would have
+#      bought 0.8 s of adversarial latency with six real false blocks.
+# Cost of the bound at 3072: 42 of 3 296 real calls (1.27%) leave the zero-subprocess path and pay
+# one python3 start (~30 ms) instead of up to 99.8 s. 98.73% are untouched.
+MG_MAX_PREFILTER_BYTES=3072
+
 _mg_may_match() {
   local s
+  # The length bound runs BEFORE every pattern operation below, including the glob on the raw
+  # argument. `:-0` is deliberate: if this constant ever goes missing the bound becomes "normalise
+  # nothing", i.e. CHECK everything — loud (the benign corpus rows and the zero-subprocess
+  # assertions all go red) and fail-closed, rather than silently unbounded.
+  if [ "${#1}" -gt "${MG_MAX_PREFILTER_BYTES:-0}" ]; then return 0; fi
   # An ANSI-C quoted span carrying a BACKSLASH ESCAPE is decoded only by the classifier (SEC-18).
   # Tested on the RAW argument: the normalisation below deletes backslashes.
   case "$1" in *"\$'"*"\\"*) return 0 ;; esac
@@ -1520,11 +1650,22 @@ payload="$(cat 2>/dev/null || true)"
 # they disagree — and the jq side is the one that runs whenever jq exists.
 # The single quote is spelled with jq's own escape so that this whole jq program can stay inside a
 # single-quoted shell string.
+#
+# THE SAME LENGTH BOUND AS _mg_may_match, from the same constant (SEC-19). jq's gsub is ~300x faster
+# than bash 3.2's parameter expansion but it is super-linear too (measured: 4 KB 41 ms, 16 KB 323 ms,
+# 64 KB 3.9 s), so the bound applies here as well and applies FIRST, before any gsub or test runs.
+# jq is handed the cap with `--argjson` so there is one number, not two that can drift; a jq too old
+# for --argjson errors out and the `|| printf 'CHECK'` below turns that into CHECK, which is the safe
+# direction. Note the two prefilters bound different strings by necessity: jq can extract and bound
+# the COMMAND, the jq-less fallback bounds the whole PAYLOAD, which is a superset — so the fallback
+# reaches CHECK marginally sooner. That asymmetry is in the add-work direction, like the existing
+# superset-haystack one.
 if command -v jq >/dev/null 2>&1; then
-  verdict="$(printf '%s' "$payload" | jq -r '
+  verdict="$(printf '%s' "$payload" | jq -r --argjson cap "$MG_MAX_PREFILTER_BYTES" '
     if (.tool_input | type) != "object" then "CHECK"
     elif (.tool_input | has("command")) != true then "CHECK"
     elif (.tool_input.command | type) != "string" then "CHECK"
+    elif (.tool_input.command | length) > $cap then "CHECK"
     elif (.tool_input.command | test("\\$\u0027[\\s\\S]*\\\\")) then "CHECK"
     else (.tool_input.command | gsub("\\\\\n"; "") | gsub("\\\\"; "") | gsub("\\$\u0027"; "") | gsub("\\$\""; "")
           | gsub("\u0027"; "") | gsub("\""; "")) as $c
