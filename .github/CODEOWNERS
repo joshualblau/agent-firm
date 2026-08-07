@@ -1,0 +1,3 @@
+# Approvals on `main` only count from these accounts.
+# Enforced by the "main protection" ruleset (require_code_owner_review).
+* @joshualblau @younglionsolutions
