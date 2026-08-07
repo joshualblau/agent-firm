@@ -199,6 +199,39 @@ Cited: `20260803T051454Z-remediate-wave4/11-retrospective.md` (SC-12) and `12-ow
      criteria-before-Build and validate-run-artifacts PRs. An override answers the second voice, not the
      gate matrix.
 
+   > ### PROPOSAL 4 IS ANSWERED — by the repository owner, 2026-08-07. This PR is still `proposed`.
+   >
+   > The contradiction proposal 4 raised (`CLAUDE.md:106` "both must APPROVE" vs
+   > `agent-firm/policy/gate-matrix.md:64` "advisory by default", both verified at `ad817a9` as well as
+   > at the `b1868eb` cited above) has been **settled by the repository owner**, not by a reviewer, and
+   > is now canon in `agent-firm/policy/gate-matrix.md` §2 with the owner's instruction quoted verbatim
+   > in `system-changes/20260807T000000Z-two-voice-rule-judge-binds-unless-qa-dissents.md` (`Status:
+   > approved`). **The question is closed; this PR is not approved by that closure** — the stop rule
+   > below and everything else here remains `Status: proposed`.
+   >
+   > **The owner's answer is not the one this section reached.** Proposal 4 decided "advisory by
+   > default". The owner decided the judge's BLOCK **binds unless QA dissents**, with a bounded
+   > escalation: high-risk dissent must be resolved (blocking); otherwise attempt resolution and, failing
+   > that, record the judge's dissent and proceed on QA's decision. Neither "always binding" nor
+   > "advisory".
+   >
+   > **Two claims in this PR are therefore stale and must be re-derived before it is approved.** Named
+   > rather than silently rewritten, because they are this PR's own reasoning and its author owns the
+   > repair:
+   > - *This section's third bullet* — "**This stop rule therefore binds only in the REQUIRED case**,
+   >   because that is the only case where a BLOCK actually blocks." Its premise is gone. Under the
+   >   owner's rule a BLOCK blocks on **every** run absent QA dissent, so the stop rule's scope is
+   >   **wider**, not narrower. The rest of that bullet — that the second voice would have been required
+   >   on all five tabulated judge rounds — is unaffected; it was a claim about those runs' criteria
+   >   files, not about the default.
+   > - *The **Generalizability** section's third bullet* ("Narrowed on third review, following proposal
+   >   4's decision"), which is downstream of the same premise.
+   >
+   > Also worth the author's attention: the owner's rule creates a case the stop rule does not cover —
+   > case 2b, where a non-high-risk judge dissent is **recorded and carried** rather than overridden.
+   > That is a third disposition alongside "fix it" and "override it", and it needs no
+   > `12-owner-override.md`, because nothing is overridden.
+
 ## Generalizability check (reviewer)
 
 - **Applies beyond this project?** Yes, and it is arguably the most portable lesson here. Any firm
@@ -213,7 +246,11 @@ Cited: `20260803T051454Z-remediate-wave4/11-retrospective.md` (SC-12) and `12-ow
   was the exact claim the first review refuted — the body was tightened and this sentence was left
   standing. Leaving a rebutted claim in the section that grades the proposal is the failure mode this
   whole PR is about.)*
-- **Narrowed on third review, following proposal 4's decision.** The rule binds only where the second voice
+- **Narrowed on third review, following proposal 4's decision.** **STALE as of 2026-08-07 — see the boxed
+  note under proposal 4.** The owner's ruling replaced "advisory by default" with "binds unless QA
+  dissents", so this bullet's premise no longer holds and the narrowing it describes does not follow.
+  Left in place, marked, for the author to re-derive; not rewritten here. The text as written:
+  The rule binds only where the second voice
   is REQUIRED (auth / permissions / crypto / PII). So its portability claim is narrower than the previous
   drafts implied: what generalises is the *shape* — a termination rule for an adversarial gate, plus a
   written, pointer-carrying disposition artifact — not the frequency. On this engagement's own history the
@@ -439,6 +476,9 @@ was rejected for three times.)*
 - **S-16** — proposal 4 no longer says "pick one". It decides: `gate-matrix.md` is authoritative, the second
   voice is advisory by default and REQUIRED for auth/permissions/crypto/PII, `CLAUDE.md:106` is amended to
   match, and **this stop rule binds only in the REQUIRED case**. That narrows the PR, which is correct.
+  **(Accurate as a record of what the third review decided. SUPERSEDED as policy on 2026-08-07 by the
+  owner — see the boxed note under proposal 4. The "advisory by default" half and the narrowing that
+  followed from it no longer hold.)**
 
 **AC-005 cross-section propagation — performed, and it forced a withdrawal.** After the table and the guard
 section changed, this PR's **Generalizability** and **Risk & rollback** sections were re-read:
