@@ -28,6 +28,18 @@
 # per-account Codex config dirs
 .codex-*/
 
+# The Codex plugin manifest is the one distributable exception to the per-account pattern above.
+# Keep the directory closed by default so adding another file cannot expose local auth/cache state.
+!.codex-plugin/
+.codex-plugin/*
+!.codex-plugin/plugin.json
+
+# Project-local Codex hook prototypes are configuration, not package inputs. The plugin owns hooks.
+.codex/
+
+# firm-install migration backups are recoverable local state, never package inputs.
+.claude/settings.json.*.bak
+
 # Per-run ledgers live in the WORK project, not in the firm repo; ignore if generated here
 .agent-firm/runs/
 

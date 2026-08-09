@@ -23,10 +23,9 @@ comment for the reasoning.
 ## Running
 - **`firm-run-evals --structural`** validates every eval's **structure** (files present, assertion
   count) and lists the suite. No `claude` login, no spend. This is what CI runs on every push/PR.
-- **`firm-run-evals [eval-name]`** (no `--structural`) actually **drives the firm** headlessly against
-  the fixture under a bounded permission posture, then checks `assertions.yaml` against the result.
-  Needs a `claude` login and real budget (`--max-budget-usd`, default $5) — this does not run in CI,
-  and is a deliberate, manual, budget-spending act.
+- **`firm-run-evals --provider claude|codex [eval-name]`** actually **drives the selected primary
+  provider** headlessly, then checks `assertions.yaml`. Claude remains the default for compatibility.
+  The selected provider needs subscription login; behavioral runs are deliberate and never run in CI.
 
 ## Assertion vocabulary (assertions.yaml)
 - `artifact_exists: <ledger file>` / `artifact_absent: <ledger file>` — presence/absence relative to
@@ -65,7 +64,8 @@ comment for the reasoning.
   whose ledger predates this mechanism, or whose baseline can't be resolved, FAILs this assertion
   rather than passing on an unverifiable claim.
 - `final_gate_pending: true` — requires BOTH an *explicit* `final_gate_pending` event actually logged
-  to `run.jsonl` (via `firm-ledger-log final_gate_pending` — see `CLAUDE.md` / `commands/start.md`'s
+  to `run.jsonl` (via `firm-ledger-log final_gate_pending` — see the shared lifecycle contract and
+  `commands/start.md`'s
   Final-gate instruction to the Lead) AND the default-branch-unchanged check above. This is **not**
   inferred from the outer `claude -p` result envelope's `subtype`/`is_error` fields — an earlier version
   was, and a run that crashed or did nothing at all could satisfy that inference just as easily as a

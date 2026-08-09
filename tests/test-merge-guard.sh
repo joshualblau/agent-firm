@@ -26,7 +26,8 @@ set -uo pipefail
 GUARD="$BIN/firm-merge-guard"
 POLICY="$FIRM_ROOT/agent-firm/policy/merge-authority.yaml"
 SETTINGS="$FIRM_ROOT/.claude/settings.json"
-PLUGIN_HOOKS="$FIRM_ROOT/hooks/hooks.json"
+CODEX_HOOKS="$FIRM_ROOT/hooks/hooks.json"
+CLAUDE_HOOKS="$FIRM_ROOT/hooks/claude.json"
 
 # A PATH with a real python3 (WITH its site-packages, so pyyaml imports) and a real git, but NO gh.
 # Note: symlinking python3 into a scratch dir would break its site-packages and silently turn a
@@ -900,7 +901,7 @@ parse = int(mp.group(1))
 assert parse > 0, 'PARSE_BUDGET is zero, so the parse phase is not really in the budget'
 budget = parse + gh + gt + 2 * grace + int(mm.group(1))
 found = []
-for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
+for path in ('$SETTINGS', '$CLAUDE_HOOKS', '$CODEX_HOOKS'):
     d = json.load(open(path))
     for entry in d['hooks']['PreToolUse']:
         for h in entry['hooks']:
@@ -910,7 +911,7 @@ for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
                 found.append((path.rsplit('/', 1)[-1], t))
                 assert budget <= t, (f'{path}: worst case {parse}+{gh}+{gt}+2*{grace}+{mm.group(1)}'
                                      f'={budget}s does not fit under the registered {t}s hook timeout')
-assert len(found) == 2, f'expected the guard in BOTH registrations, found {found}'
+assert len(found) == 3, f'expected the guard in project, Claude-plugin, and Codex-plugin registrations, found {found}'
 print('ok', found, 'budget', budget)
 "
 assert_ok "the KILL_GRACE constant is the one actually used to reap a hung child" python3 -c "
@@ -1236,7 +1237,7 @@ assert_ok "settings.json and hooks.json contain no allowlist data" python3 -c "
 import yaml
 d = yaml.safe_load(open('$POLICY'))
 vals = [v for a in d['allowed'] for v in ([a['gh_login']] + list(a['git_emails']))]
-for f in ('$SETTINGS', '$PLUGIN_HOOKS'):
+for f in ('$SETTINGS', '$CLAUDE_HOOKS', '$CODEX_HOOKS'):
     text = open(f).read()
     bad = [v for v in vals if v in text]
     assert not bad, f'{f} duplicates allowlist data: {bad}'
@@ -1822,7 +1823,7 @@ assert_ok "a failure in the LEDGER path cannot fail a tool call (garbage stdin)"
 assert_ok "  (no active run at all)" \
   sh -c "cd '$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-norun.XXXXXX")' && printf '{}' | '$BIN/firm-ledger-hook'"
 
-t_case "AC-023 BOTH hook surfaces are wired, ledger FIRST, guard added not substituted"
+t_case "AC-023 project plus BOTH provider hook surfaces are wired, ledger FIRST"
 assert_ok "settings.json (project mode) keeps the ledger hook and adds the guard" python3 -c "
 import json
 d = json.load(open('$SETTINGS'))
@@ -1835,9 +1836,9 @@ assert 'firm-ledger-hook' in cmds[0], cmds
 assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
 assert 'CLAUDE_PROJECT_DIR' in cmds[1], cmds
 "
-assert_ok "hooks.json (plugin mode) keeps the ledger hook and adds the guard" python3 -c "
+assert_ok "Claude plugin hook keeps the ledger hook and adds the guard" python3 -c "
 import json
-d = json.load(open('$PLUGIN_HOOKS'))
+d = json.load(open('$CLAUDE_HOOKS'))
 bash = [e for e in d['hooks']['PreToolUse'] if e.get('matcher') == 'Bash']
 assert len(bash) == 1, d
 cmds = [h['command'] for h in bash[0]['hooks']]
@@ -1846,10 +1847,23 @@ assert 'firm-ledger-hook' in cmds[0], cmds
 assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
 assert 'CLAUDE_PLUGIN_ROOT' in cmds[1], cmds
 "
-assert_ok "the Notification hook is untouched" python3 -c "
+assert_ok "the Claude Notification hook is preserved" python3 -c "
 import json
-d = json.load(open('$PLUGIN_HOOKS'))
+d = json.load(open('$CLAUDE_HOOKS'))
 n = d['hooks']['Notification'][0]['hooks'][0]['command']
+assert 'firm-notify' in n, n
+"
+assert_ok "Codex default hook keeps ledger then guard and uses PermissionRequest notify" python3 -c "
+import json
+d = json.load(open('$CODEX_HOOKS'))
+bash = [e for e in d['hooks']['PreToolUse'] if e.get('matcher') == 'Bash']
+assert len(bash) == 1, d
+cmds = [h['command'] for h in bash[0]['hooks']]
+assert len(cmds) == 2, cmds
+assert 'firm-ledger-hook' in cmds[0], cmds
+assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
+assert 'CLAUDE_PLUGIN_ROOT' in cmds[1], cmds
+n = d['hooks']['PermissionRequest'][0]['hooks'][0]['command']
 assert 'firm-notify' in n, n
 "
 

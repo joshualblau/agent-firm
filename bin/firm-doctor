@@ -15,12 +15,12 @@
 #   5. op:// references in .env.op actually resolve  (with --probe, or when op is authed)
 #   6. Claude profile: CLAUDE_CONFIG_DIR isolated + CLAUDE_CODE_OAUTH_TOKEN present (macOS account switch)
 #   7. Codex profile: CODEX_HOME isolated + has its own auth.json (switches the ChatGPT account)
-#   8. codex present (the Phase-3 GPT QA judge), chezmoi bootstrap sanity (informational)
+#   8. both provider CLIs present and subscription login/model configuration ready
 #   9. retired permission rules (fail-closed): the retirement policy is present AND readable, and no
 #      settings.json still grants a rule it withdrew. "Could not check" counts as a FAIL, not a WARN.
 #
 # Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
-#   --probe   also run live account probes (op run resolve, codex login status) — needs network.
+#   --probe   also run live account/model probes — needs network and a small subscription turn.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -262,11 +262,7 @@ else
 fi
 # Python prerequisites. jsonschema is GATE-CRITICAL: without it firm-validate-verdict exits 4
 # (DEGRADED) and a QA verdict cannot clear the Final gate.
-# pyyaml is NOT "advisory" any more — that wording predates the regression suite. It is REQUIRED to
-# run the firm's own tests (tests/test-policy-yaml-valid.sh) and CI installs it. In a work project it
-# is still non-fatal at runtime, hence WARN and not FAIL here, but "non-fatal" is not "no effect":
-# without it the traceability/assertion parsers drop to a looser regex, which fails CLOSED (CANNOT
-# VERIFY) on criteria files pyyaml would have parsed exactly.
+# pyyaml is gate-critical in 0.8.0 because firm-final-qa-check parses structured two-voice state.
 if python3 -c 'import jsonschema' >/dev/null 2>&1; then
   pass "python jsonschema present — QA verdicts can be schema-validated"
 else
@@ -274,9 +270,9 @@ else
   info "fix: python3 -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)"
 fi
 if python3 -c 'import yaml' >/dev/null 2>&1; then
-  pass "python pyyaml present — acceptance-criteria/assertion parsing is exact"
+  pass "python pyyaml present — traceability, eval assertions, and final QA can parse exactly"
 else
-  warn "python pyyaml missing — traceability + eval assertion parsing falls back to a looser regex that can fail closed (CANNOT VERIFY), and the agent-firm repo's own test suite cannot pass; install with 'python3 -m pip install --user pyyaml'."
+  fail "python pyyaml missing — firm-final-qa-check cannot evaluate two-voice state; install with 'python3 -m pip install --user pyyaml'."
 fi
 
 # Retired permission rules. firm-install only unions rules, so a project installed before a rule was
@@ -416,8 +412,55 @@ PY
   done
 fi
 
-if command -v codex >/dev/null 2>&1; then pass "codex present — the Phase-3 GPT QA judge (firm-gpt-qa) can run"
-else warn "codex not found — firm-gpt-qa degrades gracefully to Claude-only QA (never treated as a pass)."; fi
+section "9. Provider CLIs and reviewer readiness"
+if [ -x "$SELF/firm-version" ]; then
+  if "$SELF/firm-version" --check >/dev/null 2>&1; then pass "Claude and Codex plugin manifest base versions match"
+  else fail "plugin manifest versions drifted — run 'firm-version --check' for details"; fi
+fi
+if command -v claude >/dev/null 2>&1; then
+  pass "claude present — Claude-primary orchestration and firm-claude-qa are available"
+  if run_capped 10 claude auth status >/dev/null 2>&1; then
+    pass "Claude subscription authentication is ready"
+    if [ "$PROBE" = 1 ]; then
+      if run_capped 45 claude -p "Reply with exactly: ok" --model "${FIRM_CLAUDE_QA_MODEL:-opus}" \
+        --effort xhigh --output-format text --permission-mode dontAsk --tools "" \
+        --no-session-persistence >/dev/null 2>&1; then
+        pass "Claude reviewer model ${FIRM_CLAUDE_QA_MODEL:-opus} completed a bounded no-tools probe"
+      else
+        warn "Claude reviewer model ${FIRM_CLAUDE_QA_MODEL:-opus} failed its bounded probe — check model compatibility, quota, and login."
+      fi
+    else
+      info "configured Claude reviewer model: ${FIRM_CLAUDE_QA_MODEL:-opus} (run firm-doctor --probe to verify it live)"
+    fi
+  else warn "Claude authentication is not ready — run 'claude auth' or the provider's login flow before using Claude staff/reviewer."; fi
+else
+  fail "claude not found — dual-provider Agent Firm installation is incomplete"
+fi
+if command -v codex >/dev/null 2>&1; then
+  pass "codex present — Codex-primary orchestration and firm-gpt-qa are available"
+  if run_capped 10 codex login status >/dev/null 2>&1; then
+    pass "Codex ChatGPT subscription authentication is ready"
+    if [ "$PROBE" = 1 ]; then
+      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
+        -m "${FIRM_GPT_QA_MODEL:-gpt-5.6-sol}" "Reply with exactly: ok" >/dev/null 2>&1; then
+        pass "GPT reviewer model ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} completed a bounded read-only probe"
+      else
+        warn "GPT reviewer model ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} failed its bounded probe — check model compatibility, quota, and login."
+      fi
+    else
+      info "configured GPT reviewer model: ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} (run firm-doctor --probe to verify it live)"
+    fi
+  else warn "Codex authentication is not ready — run 'codex login' before using GPT staff/reviewer."; fi
+else
+  fail "codex not found — dual-provider Agent Firm installation is incomplete"
+fi
+info "reviewer models: GPT=${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} · Claude=${FIRM_CLAUDE_QA_MODEL:-opus}"
+
+# Codex loads hooks from every matching source. The old project prototype duplicates the plugin's
+# ledger hook and must be removed manually; bootstrap never overwrites project config.
+if [ -f .codex/hooks.json ] && grep -q 'firm-ledger-hook' .codex/hooks.json 2>/dev/null; then
+  warn "obsolete duplicate .codex/hooks.json ledger hook detected — remove that file manually after confirming it contains no project-specific hooks; the plugin now provides hooks/hooks.json."
+fi
 if command -v chezmoi >/dev/null 2>&1; then
   cfg="$HOME/.config/chezmoi/chezmoi.toml"
   if [ -f "$cfg" ] && grep -q 'mode *= *"service"' "$cfg" 2>/dev/null; then pass "chezmoi present + [onepassword] mode=\"service\" (reproducible second-machine bootstrap)"

@@ -3,9 +3,8 @@
 # Puts the firm's `firm-*` tools on your SHELL's PATH by symlinking them into a bin directory
 # (default: ~/.local/bin, override with --dir or $FIRM_BIN_DIR).
 #
-# Why this exists: a Claude Code plugin's bin/ joins PATH only INSIDE a claude session. The docs
-# tell you to run `firm-install` from your terminal in a project dir — that only works if the tools
-# are on your shell PATH too. This is the missing link (pun intended).
+# Why this exists: plugin bins are runtime-scoped, while setup and gate tools also run from a normal
+# terminal. Symlinking the shared tools keeps Claude and Codex on the same checkout.
 #
 # The symlinks point at THIS repo, so `git pull` propagates instantly — no re-linking needed.
 # Every firm-* script resolves its own symlink, so they still find the repo root correctly.

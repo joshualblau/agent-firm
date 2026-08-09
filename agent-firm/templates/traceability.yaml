@@ -10,3 +10,25 @@ matrix:
     status: uncovered            # covered | partial | uncovered
 # Rule: an `uncovered` criterion fails the traceability gate UNLESS it carries an explicit
 # justification (e.g. waived at the Requirements gate, or out of scope).
+
+# Cross-provider review state. `firm-final-qa-check` validates this section. The helper validates
+# recorded state; it cannot determine whether a claimed dissent or risk classification is truthful.
+two_voice:
+  secondary_provider: ""       # gpt | claude
+  status: available            # available | unavailable
+  required: false              # true for auth / permissions / crypto / PII
+  human_waiver:
+    granted: false
+    record: ""                 # required when an unavailable second voice was required
+two_voice_diff: []              # one entry for every blocker in the secondary verdict
+# Example entry:
+# - secondary_blocker: "exact blocker text from the secondary verdict"
+#   primary_position: "positive dissent with the evidence read differently"
+#   positive_dissent: true
+#   risk: low                   # low | high; ambiguity is high
+#   bounded_resolution:
+#     attempted: true
+#     rerun: block              # approve | block | not_run | not_required
+#     evidence: "09-test-evidence/two-voice-resolution.md"
+#   evidence: "Primary evidence and rationale"
+#   disposition: proceed_with_primary  # unresolved | fixed | secondary_withdrew | human_decision | proceed_with_primary

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# firm-run-evals [--structural] [eval-name]
+# firm-run-evals [--structural] [--provider claude|codex] [eval-name]
 # Golden evals: DRIVE the firm headlessly against each fixture under a BOUNDED permission posture, then
 # check assertions.yaml. `--structural` is the OFFLINE mode (no model run) — see below.
 #
 # --------------------------------------------------------------------------------------------------
 # WHAT `--structural` CLAIMS, AND WHAT IT DOES NOT (read before changing it — SEC-R15)
 #
-# It is the mode CI runs, because it is hermetic: no `claude`, no `codex`, no `firm-gpt-qa`, no network,
+# It is the mode CI runs, because it is hermetic: no `claude`, no `codex`, no reviewer wrapper, no network,
 # no credentials, no spend, ~1s for the whole suite. It answers exactly one question per eval:
 #
 #     is this eval WELL-FORMED, and can bin/firm-check-assertions actually EVALUATE its assertions?
@@ -51,13 +51,33 @@ while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 EVALS="$ROOT/agent-firm/evals"
-MANUAL="$ROOT/CLAUDE.md"                 # firm operating manual — injected as an appended system prompt
+MANUAL="$ROOT/agent-firm/contracts/lifecycle.md"  # shared provider-neutral lifecycle contract
 SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
 CHECKER="$SELF/firm-check-assertions"
 
-mode=run
-[ "${1:-}" = "--structural" ] && { mode=structural; shift; }
-want="${1:-}"
+mode=run; provider=claude; want=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --structural) mode=structural; shift ;;
+    --provider)
+      provider="${2:-}"; shift 2 || true
+      case "$provider" in claude|codex) ;; *) echo "firm-run-evals: --provider must be claude or codex" >&2; exit 2 ;; esac ;;
+    -*) echo "firm-run-evals: unknown option '$1'" >&2; exit 2 ;;
+    *) [ -z "$want" ] || { echo "firm-run-evals: only one eval name may be selected" >&2; exit 2; }; want="$1"; shift ;;
+  esac
+done
+
+# Behavioral mode has one provider invocation per selected eval and no retry path. Wall-clock and
+# case limits prevent an expanding eval tree or stalled provider from consuming unbounded subscription
+# turns; the result envelope is also checked against the declared top-level turn cap.
+if [ "$mode" = run ]; then
+  eval_timeout="${FIRM_EVAL_TIMEOUT_SECONDS:-900}"
+  eval_max_turns="${FIRM_EVAL_MAX_TURNS:-60}"
+  eval_max_cases="${FIRM_EVAL_MAX_CASES:-8}"
+  for bound in "$eval_timeout" "$eval_max_turns" "$eval_max_cases"; do
+    case "$bound" in ''|*[!0-9]*|0) echo "firm-run-evals: behavioral bounds must be positive integers" >&2; exit 2 ;; esac
+  done
+fi
 
 structural_check() { # $1 = eval dir -> 0 ok, 1 bad
   local d="$1" ok=1
@@ -79,7 +99,7 @@ structural_check() { # $1 = eval dir -> 0 ok, 1 bad
 #   * PATH is REPLACED by a directory of symlinks to an ALLOW-LIST of boring POSIX utilities — the ones
 #     firm-check-assertions and the two sibling scripts it delegates to (firm-traceability-check,
 #     firm-qa-clean-check) need in order to run correctly. It is an allow-list, not a deny-list, so
-#     `claude`, `codex`, `firm-gpt-qa`, `node`, `npm`, `pytest` and anything else are unreachable BY
+  #     `claude`, `codex`, `firm-gpt-qa`, `firm-claude-qa`, `node`, `npm`, `pytest` and anything else are unreachable BY
 #     CONSTRUCTION rather than by enumeration. (Residual, documented: a `test_passes` naming an
 #     ABSOLUTE path still resolves. Nothing in-tree does, and the alternative — not invoking the
 #     checker — is the defect being fixed.)
@@ -212,8 +232,8 @@ PY
 }
 
 run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
-  local d="$1" name="$2"
-  command -v claude >/dev/null 2>&1 || { echo "SKIP $name: 'claude' not found"; return 4; }
+  local d="$1" name="$2" provider_rc turns
+  command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
 
   local scratch; scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-${name}.XXXXXX")"
   cp -R "$d/fixture/." "$scratch/" 2>/dev/null || true
@@ -222,21 +242,80 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   local out="$scratch/.eval-out"; mkdir -p "$out"
   make_eval_settings "$out/settings.json"
 
-  echo "==> $name: driving the firm headlessly (bounded posture) in $scratch"
+  echo "==> $name: driving the $provider-primary firm headlessly (bounded posture) in $scratch"
+  echo "    bounds: wall=${eval_timeout}s top-level-turns=$eval_max_turns cases=$eval_max_cases attempts=1 retries=0"
   # AskUserQuestion / merge / push are deliberately NOT allow-listed, so the firm cannot autonomously
   # pass the final human gate in -p mode — that's how final_gate_pending is provable.
-  ( cd "$scratch" && claude -p "$(cat "$d/task.md")" \
-      --append-system-prompt "$(cat "$MANUAL")" \
-      --settings "$out/settings.json" \
-      --permission-mode default \
-      --allowedTools "Read,Edit,Write,Grep,Glob,Bash(firm-new-run:*),Bash(firm-ledger-log:*),Bash(firm-validate-verdict:*),Bash(firm-traceability-check:*),Bash(firm-qa-checkout:*),Bash(firm-qa-clean-check:*),Bash(firm-integrate:*),Bash(firm-new-worktree:*),Bash(firm-gpt-qa:*),Bash(firm-bench-record:*),Bash(git add:*),Bash(git commit:*),Bash(git worktree:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(node --test),Bash(node --test:*),Bash(npm test:*),Bash(npm run test:*),Bash(pytest:*),Bash(sh test/run-tests.sh)" \
-      --disallowedTools "Bash(git push:*),Bash(git merge:*)" \
-      --max-budget-usd "${FIRM_EVAL_BUDGET_USD:-5.00}" \
-      --output-format json ) > "$out/result.json" 2>"$out/stderr.log" \
-      || echo "  (claude exited non-zero — see $out/stderr.log)" >&2
+  if [ "$provider" = claude ]; then
+    ( cd "$scratch" || exit
+      [ "$name" != gpt-judge-availability ] || export FIRM_GPT_QA_FORCE_INCOMPAT=1
+      perl -e 'alarm shift @ARGV; exec @ARGV' "$eval_timeout" claude -p "$(cat "$d/task.md")" \
+        --append-system-prompt "$(cat "$MANUAL")
+
+Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns." \
+        --settings "$out/settings.json" \
+        --permission-mode default \
+        --allowedTools "Read,Edit,Write,Grep,Glob,Bash(firm-new-run:*),Bash(firm-ledger-log:*),Bash(firm-validate-verdict:*),Bash(firm-traceability-check:*),Bash(firm-final-qa-check:*),Bash(firm-qa-checkout:*),Bash(firm-qa-clean-check:*),Bash(firm-integrate:*),Bash(firm-new-worktree:*),Bash(firm-gpt-qa:*),Bash(firm-claude-qa:*),Bash(firm-bench-record:*),Bash(git add:*),Bash(git commit:*),Bash(git worktree:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(git checkout:*),Bash(git switch:*),Bash(git branch:*),Bash(node --test),Bash(node --test:*),Bash(npm test:*),Bash(npm run test:*),Bash(pytest:*),Bash(sh test/run-tests.sh)" \
+        --disallowedTools "Bash(git push:*),Bash(git merge:*)" \
+        --max-budget-usd "${FIRM_EVAL_BUDGET_USD:-5.00}" \
+        --output-format json ) > "$out/result.json" 2>"$out/stderr.log"
+    provider_rc=$?
+  else
+    prompt="\$agent-firm:start $(cat "$d/task.md")
+
+Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns."
+    ( cd "$scratch" || exit
+      [ "$name" != gpt-judge-availability ] || export FIRM_CLAUDE_QA_FORCE_INCOMPAT=1
+      FIRM_PRIMARY_PROVIDER=codex perl -e 'alarm shift @ARGV; exec @ARGV' "$eval_timeout" codex exec --ephemeral \
+        -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
+        -s workspace-write -a never --json "$prompt" ) > "$out/result.json" 2>"$out/stderr.log"
+    provider_rc=$?
+  fi
+
+  if [ "$provider_rc" -ne 0 ]; then
+    echo "  ($provider exited non-zero or exceeded ${eval_timeout}s; rc=$provider_rc — see $out/stderr.log; no retry attempted)" >&2
+    return 1
+  fi
+
+  if [ "$provider" = claude ]; then
+    turns="$(python3 - "$out/result.json" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("num_turns")
+    if not isinstance(value, int) or value < 0:
+        raise ValueError("num_turns is absent or invalid")
+    print(value)
+except Exception as e:
+    print(f"cannot account Claude turns: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
+PY
+)" || return 1
+  else
+    turns="$(python3 - "$out/result.json" <<'PY'
+import json, sys
+count = 0
+try:
+    for raw in open(sys.argv[1], encoding="utf-8"):
+        event = json.loads(raw)
+        if event.get("type") in ("turn.started", "turn_start"):
+            count += 1
+    if count < 1:
+        raise ValueError("no turn-start event was recorded")
+    print(count)
+except Exception as e:
+    print(f"cannot account Codex turns: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
+PY
+)" || return 1
+  fi
+  if [ "$turns" -gt "$eval_max_turns" ]; then
+    echo "  ($provider reported $turns top-level turns, exceeding cap $eval_max_turns — BLOCK; no retry attempted)" >&2
+    return 1
+  fi
+  echo "    accounted top-level turns: $turns/$eval_max_turns"
 
   # Show the run envelope summary for observability.
-  python3 - "$out/result.json" <<'PY' 2>/dev/null || true
+  [ "$provider" = claude ] && python3 - "$out/result.json" <<'PY' 2>/dev/null || true
 import json,sys
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)
@@ -244,7 +323,7 @@ print("    envelope:", {k:d.get(k) for k in ("subtype","is_error","num_turns","s
 print("    permission_denials:", len(d.get("permission_denials") or []))
 PY
 
-  "$SELF/firm-check-assertions" "$d/assertions.yaml" "$scratch" "$out/result.json"
+  FIRM_EVAL_PROVIDER="$provider" "$SELF/firm-check-assertions" "$d/assertions.yaml" "$scratch" "$out/result.json"
   local rc=$?
   echo "    (scratch: $scratch — inspect .eval-out/ and .agent-firm/ on failure)"
   return $rc
@@ -253,7 +332,7 @@ PY
 if [ "$mode" = "structural" ]; then
   echo "structural mode: OFFLINE shape + assertion-PARSE check (no model run, no network, no spend)."
   echo "  Proves: each eval is well-FORMED and firm-check-assertions can EVALUATE its assertions."
-  echo "  Does NOT prove: that the firm SATISFIES them — that needs a real 'firm-run-evals <name>'."
+  echo "  Does NOT prove: that the firm SATISFIES them — that needs a real 'firm-run-evals --provider <provider> <name>'."
 fi
 
 rc=0; n=0
@@ -261,6 +340,11 @@ for d in "$EVALS"/*/; do
   [ -d "$d" ] || continue
   name="$(basename "$d")"; [ "$name" = "README.md" ] && continue
   [ -n "$want" ] && [ "$want" != "$name" ] && continue
+  if [ "$mode" = run ] && [ "$n" -ge "$eval_max_cases" ]; then
+    echo "behavioral eval case cap reached ($eval_max_cases); refusing additional subscription work" >&2
+    rc=1
+    break
+  fi
   n=$((n+1))
   if ! structural_check "$d"; then echo "BAD  $name (structure)"; rc=1; continue; fi
   if [ "$mode" = "structural" ]; then

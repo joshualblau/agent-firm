@@ -267,8 +267,8 @@ def default_branch_status():
 
 def final_gate_event_logged():
     """Was a `final_gate_pending` event actually written to run.jsonl? This is a POSITIVE, checkable
-    signal the Lead logs immediately before pausing for human sign-off (see CLAUDE.md / commands/
-    start.md) -- not an inference from the outer claude -p envelope's subtype/is_error, which a run
+    signal the Lead logs immediately before pausing for human sign-off (see
+    agent-firm/contracts/lifecycle.md) -- not an inference from the outer provider envelope, which a run
     that crashed or did nothing at all could also satisfy."""
     led = find_ledger()
     if not led:

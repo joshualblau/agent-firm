@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/test-run-evals-structural.sh — firm-run-evals --structural: the one mode CI actually runs (no
-# claude login, no spend). Model-driven `run_one` is exercised manually only, per the plan.
+# claude login, no spend). Behavioral envelope mechanics are exercised below with provider stubs;
+# no live provider is invoked by this suite.
 #
 # firm-run-evals hardcodes its evals directory to THIS repo's agent-firm/evals/ (resolved from the
 # script's own location, not parametrized by CWD or an env var), so the cases in the first half of
@@ -349,10 +350,10 @@ assert_output "names exit 2 as the reason" "exited 2" \
 # stay hermetic, so it replaces PATH with an allow-list that cannot reach any of those. Tripwires prove
 # it: shadow the dangerous names on PATH, run --structural over the REAL evals, and require that not
 # one of them was executed.
-t_case "--structural stays hermetic: claude/codex/firm-gpt-qa/node are never invoked"
+t_case "--structural stays hermetic: both provider CLIs and reviewer wrappers are never invoked"
 trip="$(mktemp -d "${TMPDIR:-/tmp}/firm-trip.XXXXXX")"; t_track "$trip"
 mkdir -p "$trip/bin" "$trip/marks"
-for b in claude codex firm-gpt-qa node npm npx pytest; do
+for b in claude codex firm-gpt-qa firm-claude-qa node npm npx pytest; do
   printf '#!/bin/sh\n: > "%s/%s"\nexit 0\n' "$trip/marks" "$b" > "$trip/bin/$b"
   chmod +x "$trip/bin/$b"
 done
@@ -362,6 +363,8 @@ assert_ok "precondition: a SHIPPED eval's test_passes really does name node" \
   sh -c "grep -q 'node --test' $EVALS_DIR/*/assertions.yaml"
 assert_output "precondition: the tripwires shadow the real binaries on PATH" \
   "$trip/bin/firm-gpt-qa" sh -c "PATH='$trip/bin:\$PATH' command -v firm-gpt-qa"
+assert_output "precondition: the Claude-reviewer tripwire is also active" \
+  "$trip/bin/firm-claude-qa" sh -c "PATH='$trip/bin:\$PATH' command -v firm-claude-qa"
 out_trip="$(PATH="$trip/bin:$PATH" "$RUN_EVALS" --structural 2>&1)"; rc_trip=$?
 assert_eq "--structural still exits 0 over the real evals" 0 "$rc_trip"
 fired="$(ls -A "$trip/marks" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
@@ -380,5 +383,96 @@ for name in $(real_eval_names); do
   esac
 done
 assert_eq "all $n_real shipped evals report ok, parsed count == independent grep count" 0 "$mismatch"
+
+# ===========================================================================================
+# Behavioral envelope mechanics. These use a copied runner, synthetic evals, and local provider
+# stubs. They prove provider routing and limits without authentication, network, or subscription use.
+# ===========================================================================================
+broot="$(mk_eval_root)"
+mkdir -p "$broot/.claude" "$broot/agent-firm/contracts"
+cp "$FIRM_ROOT/.claude/settings.json" "$broot/.claude/settings.json"
+cp "$FIRM_ROOT/agent-firm/contracts/lifecycle.md" "$broot/agent-firm/contracts/lifecycle.md"
+mk_eval "$broot" bounded-one <<'YAML'
+name: bounded-one
+assertions:
+  - file_exists: seed.txt
+YAML
+printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via bounded stub"\necho "--- 1/1 assertions passed"\nexit 0\n' \
+  > "$broot/bin/firm-check-assertions"
+chmod +x "$broot/bin/firm-check-assertions"
+bstub="$broot/provider-stubs"; mkdir -p "$bstub"
+bcalls="$broot/provider-calls.log"; : > "$bcalls"
+cat > "$bstub/claude" <<'SH'
+#!/bin/sh
+printf 'claude %s\n' "$*" >> "$FIRM_EVAL_STUB_CALLS"
+case "${FIRM_EVAL_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 2 ;;
+  excess) printf '{"num_turns":3,"is_error":false}\n' ;;
+  *) printf '{"num_turns":1,"is_error":false}\n' ;;
+esac
+SH
+cat > "$bstub/codex" <<'SH'
+#!/bin/sh
+printf 'codex %s\n' "$*" >> "$FIRM_EVAL_STUB_CALLS"
+case "${FIRM_EVAL_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 2 ;;
+  excess) printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.started"}' '{"type":"turn.started"}' ;;
+  *) printf '%s\n' '{"type":"turn.started"}' ;;
+esac
+SH
+chmod +x "$bstub/claude" "$bstub/codex"
+BRUN="$broot/bin/firm-run-evals"
+benv() {
+  env PATH="$bstub:/usr/bin:/bin" FIRM_EVAL_STUB_CALLS="$bcalls" \
+    FIRM_EVAL_STUB_MODE="${1:-ok}" FIRM_EVAL_TIMEOUT_SECONDS="${2:-3}" \
+    FIRM_EVAL_MAX_TURNS="${3:-2}" FIRM_EVAL_MAX_CASES="${4:-2}" \
+    "$BRUN" --provider "$5" bounded-one
+}
+
+t_case "behavioral provider selection and envelope are explicit"
+: > "$bcalls"
+assert_ok "Claude provider path succeeds under its stub" benv ok 3 2 2 claude
+assert_output "only Claude was invoked" "claude -p" cat "$bcalls"
+assert_ok "Codex was not invoked by Claude selection" sh -c "! grep -q '^codex ' '$bcalls'"
+assert_output "Claude retains a subscription dollar cap" "--max-budget-usd" cat "$bcalls"
+assert_output "Claude run reports zero retries" "attempts=1 retries=0" benv ok 3 2 2 claude
+
+: > "$bcalls"
+assert_ok "Codex provider path succeeds under its stub" benv ok 3 2 2 codex
+assert_output "only Codex was invoked" "codex exec --ephemeral" cat "$bcalls"
+assert_ok "Claude was not invoked by Codex selection" sh -c "! grep -q '^claude ' '$bcalls'"
+assert_output "Codex run accounts its turn-start events" "accounted top-level turns: 1/2" benv ok 3 2 2 codex
+
+t_case "behavioral provider attempts have wall-clock and turn caps with no retry"
+: > "$bcalls"
+assert_rc "Codex timeout blocks" 1 benv timeout 1 2 2 codex
+assert_eq "timeout attempted the provider exactly once" "1" "$(grep -c '^codex ' "$bcalls" | tr -d ' ')"
+: > "$bcalls"
+assert_rc "Claude turn overage blocks" 1 benv excess 3 2 2 claude
+assert_eq "Claude overage attempted exactly once" "1" "$(grep -c '^claude ' "$bcalls" | tr -d ' ')"
+: > "$bcalls"
+assert_rc "Codex turn overage blocks" 1 benv excess 3 2 2 codex
+assert_eq "Codex overage attempted exactly once" "1" "$(grep -c '^codex ' "$bcalls" | tr -d ' ')"
+
+t_case "behavioral total-case cap and bound validation fail before extra subscription work"
+mk_eval "$broot" bounded-two <<'YAML'
+name: bounded-two
+assertions:
+  - file_exists: seed.txt
+YAML
+: > "$bcalls"
+assert_rc "a one-case cap refuses the second eval" 1 env PATH="$bstub:/usr/bin:/bin" \
+  FIRM_EVAL_STUB_CALLS="$bcalls" FIRM_EVAL_STUB_MODE=ok FIRM_EVAL_TIMEOUT_SECONDS=3 \
+  FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=1 "$BRUN" --provider claude
+assert_eq "only one provider invocation occurred at the case cap" "1" \
+  "$(grep -c '^claude ' "$bcalls" | tr -d ' ')"
+: > "$bcalls"
+assert_rc "zero wall-clock cap is a usage error" 2 env PATH="$bstub:/usr/bin:/bin" \
+  FIRM_EVAL_STUB_CALLS="$bcalls" FIRM_EVAL_TIMEOUT_SECONDS=0 "$BRUN" --provider claude bounded-one
+assert_eq "invalid bounds invoke no provider" "" "$(cat "$bcalls")"
+assert_rc "structural mode ignores behavioral bound variables and remains offline" 0 env \
+  PATH="$bstub:/usr/bin:/bin" FIRM_EVAL_STUB_CALLS="$bcalls" FIRM_EVAL_TIMEOUT_SECONDS=0 \
+  "$BRUN" --structural bounded-one
+assert_eq "structural mode still invokes no provider" "" "$(cat "$bcalls")"
 
 t_summary

@@ -58,31 +58,31 @@ The Lead decides the track at intake and records it in `00-intake.md`.
 The same rule binds `firm-integrate`: integration runs on `integration/*` branches only, and refuses
 any other target. Merging to the default branch is a **human gate**, never a script's decision.
 
-## Second-voice (GPT) QA judge policy
+## Cross-provider second-voice QA policy
 
-The firm's independent cross-provider QA judge (`bin/firm-gpt-qa`, run via the Codex CLI) raises two
-separate questions. Keep them separate — conflating them is what produced the contradiction this
-section now resolves.
+The independent judge is always the provider opposite the primary staff: `firm-gpt-qa` for a
+Claude-primary run and `firm-claude-qa` for a Codex-primary run. Both wrappers use subscription auth,
+write provider-suffixed verdicts, and share the exit contract below. The judge raises two separate
+questions. Keep them separate.
 
 ### 1 · Must the judge run? (availability)
 
 The judge runs whenever it is available, and it is **REQUIRED for any run touching auth / permissions /
 crypto / PII**.
 
-- When the judge is **UNAVAILABLE** (`firm-gpt-qa` exits **3** — codex absent, or codex present but
-  incompatible with the configured model), QA degrades to Claude-only and records it as a **skipped**
-  second voice. This MUST be surfaced by the Lead as a **Final-gate warning** — never a silent pass.
-  (Exit **3** = unavailable → Claude-only, logged; exit **1** = the judge RAN and **BLOCKED** — a real
-  judgement to act on. Do not conflate the two.)
+- When the judge is **UNAVAILABLE** (the selected wrapper exits **3** because its CLI, subscription
+  authentication, or configured model is unavailable), QA degrades to the primary voice and records
+  a **skipped** second voice. This MUST be surfaced by the Lead as a Final-gate warning—never a silent
+  pass. Exit 3 is unavailable; exit 1 means a valid BLOCK or a judge failure/timeout and is blocking.
 - On a **required** run (auth/permissions/crypto/PII), a skipped/unavailable judge does **not** pass
   by default: the Lead must obtain an **explicit, logged human waiver at the Final gate** to proceed
   without the second voice. No waiver ⇒ the run is not done.
-- The judge model is env-configurable (`FIRM_GPT_QA_MODEL`); pinning/upgrading the Codex CLI to a
-  compatible version is the **human's environment action**, prompted by the exit-3 message.
+- Judge models are env-configurable (`FIRM_GPT_QA_MODEL`, `FIRM_CLAUDE_QA_MODEL`). Installing,
+  authenticating, or upgrading a provider CLI is the human's environment action.
 
 ### 2 · The judge RAN and BLOCKED — does the block bind? (the two-voice rule)
 
-**Canon.** The judge's BLOCK **binds** unless the Claude QA voice **dissents** on that same point.
+**Canon.** The cross-provider judge's BLOCK **binds** unless primary QA **dissents** on that same point.
 This is the repository owner's decision of 2026-08-07; it is recorded, with the owner's instruction
 quoted verbatim as the authority, in
 `system-changes/20260807T000000Z-two-voice-rule-judge-binds-unless-qa-dissents.md`.
@@ -97,29 +97,28 @@ they can land in different branches.
 
 | # | Situation | Outcome |
 |---|---|---|
-| 1 | Judge BLOCKs · **QA does not dissent** (QA agrees, or is silent on that point) | **The block stands.** The gate does not clear until the objection is fixed and the judge re-run to APPROVE. |
-| 2a | Judge BLOCKs · QA dissents · **high-risk** issue (defined below) | **Blocking.** The disagreement must be **RESOLVED** before the gate clears. Recording it is not resolving it. |
-| 2b | Judge BLOCKs · QA dissents · **not** high-risk | **Attempt** resolution (one bounded round). If it does not resolve easily, **record the judge's dissent and proceed on QA's decision.** |
+| 1 | Judge BLOCKs · **primary QA does not dissent** (agrees, or is silent on that point) | **The block stands.** The gate does not clear until the objection is fixed and the judge re-run to APPROVE. |
+| 2a | Judge BLOCKs · primary QA dissents · **high-risk** issue (defined below) | **Blocking.** The disagreement must be **RESOLVED** before the gate clears. Recording it is not resolving it. |
+| 2b | Judge BLOCKs · primary QA dissents · **not** high-risk | **Attempt** resolution (one bounded round). If it does not resolve easily, record the judge's dissent and proceed on primary QA's decision. |
 
 - **Resolved** (case 2a) means one of exactly three things, each of them an artifact: one voice
   **withdraws** its reading on the record; the underlying defect is **fixed** so the dispute is moot; or
   the **human decides it at the Final gate** and the decision is written down. Fatigue is not resolution.
 - **One bounded round** (case 2b) is the attempt budget: re-read the disputed evidence, and where the
-  artifact actually changed, re-run `firm-gpt-qa` against it once. This deliberately adds no new key to
+  artifact actually changed, re-run the selected provider wrapper against it once. This deliberately adds no new key to
   `execution-budget.yaml`; if a second round is wanted, that is a human call at the Final gate.
 - **Case 2b is never a silent pass.** The dissent is enumerated in the run's `traceability.yaml` under
   `two_voice_diff` (and as a per-criterion `disagreement_note`), restated in `10-handoff.md`, and listed
-  in the Final-gate payload. QA's decision stands; the judge's objection travels with it.
-- **The reverse direction is unchanged:** a **QA BLOCK is blocking** whatever the judge says. The judge
-  cannot clear a Claude-voice BLOCK — `definition-of-done.yaml` requires a schema-valid **APPROVE** from
-  QA, and no second voice substitutes for it.
+  in the Final-gate payload. Primary QA's decision stands; the judge's objection travels with it.
+- **The reverse direction is unchanged:** a **primary QA BLOCK is blocking** whatever the judge says.
+  No second voice substitutes for the schema-valid primary `08-qa-verdict.json`.
 - **The human always retains the override** at the Final gate, in every branch above, and an override
   must be written down (the run id and verdict file it answers, plus each objection it disposes of). The
   conditions under which the *Lead* may propose one are the subject of
   `system-changes/20260803T073753Z-stop-rule-for-adversarial-review.md`, which is still `Status:
   proposed` and is not canon.
 
-**What counts as QA dissent.** Only a *positive, contrary* position by the Claude QA voice on the
+**What counts as primary QA dissent.** Only a *positive, contrary* position by primary QA on the
 disputed point, visible in its own artifact: a differing `acceptance_criteria_coverage` score, a
 `disagreement_note`, or an explicit rebuttal in `08-qa-verdict.json`. **Silence, absence, "not assessed",
 or a shrug is not dissent** — it is case 1, and the block stands. A dissent recorded *after* the judge
@@ -149,5 +148,5 @@ That is a statement about which branch applies, not about whether the issue matt
 
 **Ambiguity resolves toward blocking**, as everywhere else in this policy set:
 
-- Unclear whether **QA dissents** → treat as **no dissent** → case 1, the block stands.
+- Unclear whether **primary QA dissents** → treat as **no dissent** → case 1, the block stands.
 - Unclear whether the issue is **high-risk** → treat as **high-risk** → case 2a, resolve it.

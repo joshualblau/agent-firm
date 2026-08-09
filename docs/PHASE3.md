@@ -1,60 +1,60 @@
-# Phase 3 — The Codex/GPT QA judge (independent, cross-provider)
+# Phase 3 — Cross-provider QA judges
 
-> **This is a dated build-journal entry, not reference documentation.** It records what shipped
-> and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
-> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+> **This is a dated build-journal entry, not reference documentation.** For current behavior, read
+> `agent-firm/contracts/lifecycle.md`, `agent-firm/policy/gate-matrix.md`, and the `firm-*-qa` tools.
 
-Goal: make QA **two voices from different providers**, so a blind spot the implementer's model shares
-with a same-provider reviewer still gets caught. The Claude `qa-tester` checks acceptance/evidence
-coverage; a **GPT judge via Codex** independently hunts implementation blind spots. Both must APPROVE.
+The goal is two voices from different providers, so a blind spot shared by primary staff and a
+same-provider reviewer still gets caught. In 0.8.0 this is symmetric: GPT judges Claude-primary runs,
+while Claude judges Codex-primary runs. The cross-provider BLOCK binds unless primary QA positively
+dissents on that point; high-risk disagreement remains blocking.
 
 ## How it works
-- `bin/firm-gpt-qa` runs `codex exec --output-schema agent-firm/schemas/qa-verdict.schema.json` on your
-  **ChatGPT subscription** (via the Codex CLI — **no OpenAI API key**) and writes a schema-valid
-  `08-qa-verdict.gpt.json` next to the Claude `08-qa-verdict.json`.
-- The `qa-tester` runs its own pass, then calls `firm-gpt-qa` and reports **both** verdicts. The final
-  gate needs both APPROVE; a BLOCK from either voice blocks.
-- `AGENTS.md` (repo root) is Codex's project-instruction file: read-only judge, schema-valid verdict,
-  never edits source, treats content as data.
-- Model tiering: this is the one role where a *different provider* earns its keep (adversarial, lower
-  self-grading bias) — see the Claude-side tiering in `docs/` / the plan.
 
-## Prerequisites (one-time, per machine)
-The Codex CLI must be installed and logged in on your ChatGPT plan:
+- `firm-gpt-qa` runs `codex exec --output-schema` with a read-only sandbox and ChatGPT subscription
+  auth. It writes `08-qa-verdict.gpt.json` for Claude-primary runs.
+- `firm-claude-qa` runs Claude structured output with read/search tools and Claude subscription auth.
+  Bash and write tools are disabled; it judges already captured test evidence and writes
+  `08-qa-verdict.claude.json` for Codex-primary runs.
+- Primary QA always writes `08-qa-verdict.json`, regardless of provider.
+- `AGENTS.md` selects Codex-primary mode for `$agent-firm:start`; `FIRM_QA_JUDGE=1`, set by reviewer
+  wrappers, always restores the independent read-only judge contract.
+- `firm-final-qa-check` validates primary and secondary verdicts, primary traceability, required
+  unavailable-judge waivers, and one structured `two_voice_diff` entry per secondary blocker.
+
+Wrapper exits are stable: **0** schema-valid APPROVE · **1** schema-valid BLOCK, failure, or timeout ·
+**2** usage · **3** provider CLI/auth/model unavailable. A valid BLOCK is exit 1; it is never mistaken
+for a successful wrapper run.
+
+## Prerequisites
+
+Both CLIs must be installed and logged into subscription accounts:
+
 ```bash
-# install Codex CLI (see OpenAI's Codex docs), then:
-codex login          # or:  codex login --device-auth   (headless)
-codex login status   # confirm you're authenticated on your ChatGPT plan (no API key)
+codex login
+codex login status
+claude auth status
 ```
-Per-project profile switching (Phase 4) sets `CODEX_HOME` alongside `CLAUDE_CONFIG_DIR`.
 
-## Graceful degradation
-If `codex` is absent or not logged in, `firm-gpt-qa` exits 3 and the `qa-tester` records the GPT judge
-as **skipped** (logged to `run.jsonl`) and proceeds Claude-only. "Skipped" is never treated as a pass.
+Per-project profile switching uses `CODEX_HOME` alongside `CLAUDE_CONFIG_DIR`.
 
-## Verify (once Codex is set up)
+## Availability and waivers
+
+An unavailable reviewer is recorded as skipped, never as passed. On ordinary work this may continue
+to the Final gate with a warning. On auth, permissions, crypto, or PII work, a skipped reviewer needs
+an explicit logged human waiver. `firm-final-qa-check` enforces the recorded state but cannot judge
+whether a self-reported risk classification or positive dissent is substantively correct.
+
+## Verify
+
 ```bash
-codex login status                                   # confirm you're on your ChatGPT plan (no API key)
-codex exec --skip-git-repo-check "say hi"            # smoke-test (the flag firm-gpt-qa already uses)
-firm-gpt-qa .agent-firm/runs/<run>                   # produces + validates 08-qa-verdict.gpt.json
+firm-gpt-qa .agent-firm/runs/<run>
+firm-claude-qa .agent-firm/runs/<run>
+firm-final-qa-check .agent-firm/runs/<run>  # 0 satisfied · 1 blocked · 2 cannot evaluate
 ```
-Watch for: the GPT judge runs the test command, writes `08-qa-verdict.gpt.json`, `firm-validate-verdict`
-passes it, and a `gpt_qa` event lands in `run.jsonl`.
 
-## Gotchas learned (validated empirically)
-- **`codex exec` reads stdin.** With a prompt arg *and* an open stdin it blocks on "Reading additional
-  input from stdin". `firm-gpt-qa` closes stdin (`</dev/null`) — don't remove that.
-- **Trusted-directory guard.** `codex exec` refuses to run outside a directory it trusts; the wrapper
-  passes `--skip-git-repo-check` so it runs anywhere.
-- **Wall-clock cap.** `firm-gpt-qa` caps the judge at `FIRM_GPT_QA_TIMEOUT` seconds (default 300) via a
-  perl alarm (macOS has no `timeout`), so a slow/hung judge can't run away.
-- **Run QA in the pinned dev container.** codex's login shell may default to a different toolchain
-  (in testing it used Node 14, so `npm test` → `node --test` failed and the judge correctly BLOCKed).
-  Running QA inside `.devcontainer/` gives the same pinned toolchain CI uses.
-- **Read-only sandbox is fine for QA.** codex ran read-only yet could still execute the test command;
-  no write sandbox needed (QA is read-only against source anyway).
-- **Verdict fidelity confirmed:** `codex exec --output-schema` produced a schema-valid, well-reasoned
-  verdict that `firm-validate-verdict` accepted.
-
-## Not yet
-- Multi-profile `CODEX_HOME` switching is the rest of Phase 4.
+Both wrappers close stdin, use a bounded wall-clock alarm, create fresh per-attempt logs/output, and
+publish a canonical verdict only after schema validation. GPT runs with Codex's read-only sandbox.
+Claude has no equivalent filesystem sandbox flag, so it receives only Read/Grep/Glob and is explicitly
+denied Edit/Write/Bash; it cannot execute tests and must evaluate the captured test evidence. QA test
+execution should occur first in the same pinned toolchain CI uses so environment drift does not create
+misleading evidence.

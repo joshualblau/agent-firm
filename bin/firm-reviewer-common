@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Shared functions for firm-gpt-qa and firm-claude-qa. Source only.
+
+firm_qa_resolve_run() {
+  FIRM_QA_RUN_DIR="${1:-}"
+  if [[ -z "$FIRM_QA_RUN_DIR" && -f .agent-firm/CURRENT_RUN ]]; then
+    FIRM_QA_RUN_DIR="$(cat .agent-firm/CURRENT_RUN)"
+  fi
+  [[ -n "$FIRM_QA_RUN_DIR" && -d "$FIRM_QA_RUN_DIR" ]]
+}
+
+firm_qa_failure_kind() {
+  local detail_file="$1"
+  if grep -qiE 'not logged in|login required|authentication required|authentication failed|unauthorized|unauthenticated|oauth.*(expired|invalid|required)|HTTP (401|403)|status (401|403)|invalid.*credential' "$detail_file" 2>/dev/null; then
+    return 3
+  fi
+  if grep -qiE 'requires a newer version|unsupported model|unknown model|model.*(not supported|not found|does not exist|unavailable|not available)|please upgrade.*(claude|codex)|HTTP 404.*model|status 404.*model' "$detail_file" 2>/dev/null; then
+    return 3
+  fi
+  return 1
+}
+
+firm_qa_finish() {
+  local candidate="$1" out="$2" event="$3" label="$4" v_rc verdict
+  "$FIRM_QA_SELF/firm-validate-verdict" "$candidate"; v_rc=$?
+  if [[ $v_rc -ne 0 ]]; then
+    echo "$label: verdict did not validate (firm-validate-verdict rc=$v_rc) — BLOCK." >&2
+    [[ $v_rc -eq 4 ]] && echo "  Install jsonschema with: firm-bootstrap --with-python-deps" >&2
+    [[ -x "$FIRM_QA_SELF/firm-ledger-log" ]] && "$FIRM_QA_SELF/firm-ledger-log" "${event}_invalid" file="$candidate" rc="$v_rc" || true
+    return 1
+  fi
+  verdict="$(python3 - "$candidate" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8"))["verdict"])
+except Exception:
+    sys.exit(2)
+PY
+)" || { echo "$label: could not read validated verdict — BLOCK." >&2; return 1; }
+  mv -f "$candidate" "$out" || {
+    echo "$label: validated verdict could not be atomically promoted — BLOCK." >&2
+    return 1
+  }
+  [[ -x "$FIRM_QA_SELF/firm-ledger-log" ]] && "$FIRM_QA_SELF/firm-ledger-log" "$event" file="$out" verdict="$verdict" || true
+  echo "$out"
+  [[ "$verdict" == "APPROVE" ]] && return 0
+  echo "$label: judge returned BLOCK." >&2
+  return 1
+}

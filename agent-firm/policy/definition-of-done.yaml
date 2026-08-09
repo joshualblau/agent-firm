@@ -15,6 +15,11 @@ definition_of_done:
   - QA checkout left no visible changes — the LEAD runs `firm-qa-clean-check` against the same checkout
     QA used, immediately after QA returns (never QA checking itself). This proves absence of visible
     changes, not read-only enforcement — see docs/ENFORCEMENT.md. A non-zero exit is a BLOCK.
+  - >-
+    Cross-provider QA is mechanically satisfied — `firm-final-qa-check <run_dir>` exits 0 after
+    validating the primary verdict, secondary verdict or recorded availability waiver, traceability,
+    and every secondary-blocker disposition. Exit 1 is blocking; exit 2 means the gate could not be
+    evaluated and is also blocking.
   - no unexplained snapshot/baseline changes
   - secret scan run with no findings (or findings triaged + justified)
   - changelog / docs updated if the change is user-facing

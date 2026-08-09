@@ -122,9 +122,11 @@ const qa = await agent(
   `You are the QA / Test pod. Run \`firm-qa-checkout\` to get a clean checkout at the integration branch HEAD. ` +
   `Install from the lockfile and run the exact CI command: \`${ciCommand}\`. Capture each command's output under ` +
   `${runDir}/09-test-evidence/. Check acceptance-criteria coverage against ${runDir}/01-acceptance-criteria.yaml. ` +
-  `Write ${runDir}/08-qa-verdict.json conforming to agent-firm/schemas/qa-verdict.schema.json, then validate it ` +
-  `with \`firm-validate-verdict\` and run \`firm-traceability-check\`. You are READ-ONLY against source. ` +
-  `Emit BLOCK on any uncertainty. Return the verdict (APPROVE/BLOCK), the top blockers, and the untested risks.`,
+  `Write the primary ${runDir}/08-qa-verdict.json conforming to agent-firm/schemas/qa-verdict.schema.json, ` +
+  `validate it with \`firm-validate-verdict\`, and run \`firm-traceability-check\`. Then invoke the opposite ` +
+  `provider selected by run metadata (Claude-primary calls \`firm-gpt-qa\`; Codex-primary calls ` +
+  `\`firm-claude-qa\`) and record availability plus one traceability two_voice_diff entry per secondary blocker. ` +
+  `You are READ-ONLY against source. Emit BLOCK on uncertainty. Return both verdicts, blockers, and untested risks.`,
   { label: 'qa', phase: 'Test', agentType: 'qa-tester' }
 )
 
@@ -135,5 +137,5 @@ return {
   reviews,
   open_blockers: blockers,
   qa,
-  note: 'Lead: surface QA verdict + handoff at the FINAL human gate. Nothing merges/ships without sign-off.',
+  note: 'Lead: run firm-qa-clean-check and firm-final-qa-check, then surface both verdicts + handoff at the FINAL human gate. Nothing merges/ships without sign-off.',
 }

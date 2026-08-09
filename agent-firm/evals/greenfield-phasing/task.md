@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). This is a GREENFIELD, multi-module product build: stand up a new
+Operate the firm through the installed provider adapter. This is a GREENFIELD, multi-module product build: stand up a new
 "widgets" SaaS from an empty repo with, at minimum, an auth module, a catalog module, and an intake
 module — each with schema, services, HTTP handlers, and tests. The honest estimated scope is well over
 one run's `max_files_changed` cap (see the `greenfield_build` profile in

@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/firm-ledger-hook\"" },
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/firm-merge-guard\" --hook", "timeout": 30 }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/firm-notify\"", "timeout": 15 }
+        ]
+      }
+    ]
+  }
+}

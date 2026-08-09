@@ -9,7 +9,7 @@
 # See docs/ENFORCEMENT.md for the full claimed-invariant-vs-actual-enforcement table.
 #
 # Run by the LEAD, immediately after QA returns — never by QA checking itself. Self-certification is
-# exactly the thing the firm exists to avoid (see CLAUDE.md / commands/start.md, Test stage).
+# exactly the thing the firm exists to avoid (see agent-firm/contracts/lifecycle.md, Test stage).
 #
 # Fails CLOSED, matching the rest of this hardening pass: a missing checkout directory is NOT treated
 # as "nothing to report" (a vacuous pass) — it means the one thing this check exists to verify cannot

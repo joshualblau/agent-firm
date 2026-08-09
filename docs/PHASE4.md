@@ -2,7 +2,7 @@
 
 > **This is a dated build-journal entry, not reference documentation.** It records what shipped
 > and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
-> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+> `agent-firm/contracts/*`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
 
 Part 1 packages the firm as a shared, versioned plugin. Part 2 (below the divider) makes each project
 switch to the right **subscription accounts** and load its **secrets** with nothing sensitive in git.
@@ -12,33 +12,41 @@ switch to the right **subscription accounts** and load its **secrets** with noth
 # Phase 4 (part 1) — Versioned plugin distribution
 
 Goal: one shared firm, many projects. The canonical repo (`~/agent-firm`) is the single source of
-truth, published as a **versioned Claude Code plugin** via a local marketplace and installed at user
-scope. Generalizable improvements flow in through System Change PRs, get a version bump, and propagate
-to every project on `claude plugin update`.
+truth, published through Claude and Codex local marketplaces and normally installed at user scope.
+Generalizable improvements flow in through System Change PRs, get a shared base-version bump, and
+propagate to both provider caches through the joint bootstrap/refresh flow.
 
 ## How it's packaged
 - `.claude-plugin/marketplace.json` — makes this repo a local marketplace named `local`.
 - `.claude-plugin/plugin.json` — the `agent-firm` plugin manifest (carries the `version`).
-- **Auto-discovered components** (no manifest paths needed): `agents/` (the 7 roles), `commands/`
-  (`/agent-firm:start`), `hooks/hooks.json` (the ledger hook), `bin/` (the `firm-*` tools join `$PATH`).
-- **What a plugin can't ship:** a `CLAUDE.md` (so the operating manual is the `/agent-firm:start`
-  command) and `permissions` (so `firm-install` merges the allow/ask/deny rules into a project's or
-  your user `settings.json`).
+- `.agents/plugins/marketplace.json` and `.codex-plugin/plugin.json` — expose the same root to Codex as
+  `agent-firm@agent-firm-local`; the manifest selects `codex-skills/`.
+- **Provider adapters:** Claude loads `agents/`, `commands/start.md`, and `hooks/claude.json`; Codex
+  loads `codex-skills/start/SKILL.md` and the default `hooks/hooks.json`. Both hook adapters call the
+  same `firm-ledger-hook` and `firm-merge-guard` binaries.
+- **Shared components:** `agent-firm/contracts/` owns lifecycle and role bodies; `bin/` owns the
+  provider-neutral tools. The retired root `CLAUDE.md` is not a runtime manual.
+- **What a plugin can't ship:** project permission/configuration state. `firm-install` merges Claude's
+  allow/ask/deny rules; neither bootstrap nor doctor overwrites Codex project configuration.
 
 ## Install (per machine)
 ```bash
-claude plugin marketplace add ~/agent-firm
-claude plugin install agent-firm@local        # user scope = all projects
+~/agent-firm/bin/firm-bootstrap
 ```
-Per project, once: `firm-install` (grants the firm's permission policy). Then `claude` → `/agent-firm:start <goal>`.
+Both CLIs are mandatory. Bootstrap checks for `claude` and `codex` before changing either provider
+installation, then installs/refreshes both caches. Per project, run `firm-install` once for Claude's
+permission policy, then choose Claude `/agent-firm:start <goal>` or Codex `$agent-firm:start <goal>`.
 
 ## Update flow (propagate a generalizable improvement)
 1. Land the change in `~/agent-firm` (ideally via `firm-propose-system-change` → review → commit).
-2. Bump `version` in `.claude-plugin/plugin.json` (e.g. 0.2.0 → 0.2.1).
-3. `claude plugin marketplace update local && claude plugin update agent-firm@local` (restart to apply).
+2. Use `firm-version --release X.Y.Z` for a shared release base, or
+   `firm-version --local-refresh` for provider-specific local cachebusters.
+3. The refresh preflights both CLIs, updates both caches, and requires a new Codex task plus a
+   restarted/reloaded Claude session.
 
 Every project that updates picks up the change. Project-specific tweaks stay in that project's
-`.claude/` and never propagate. A change can't reach other projects without a deliberate version bump.
+`.claude/` or `.codex/` and never propagate. The obsolete project `.codex/hooks.json` prototype must
+be reviewed and removed manually if it duplicates the plugin ledger hook; automation never deletes it.
 
 ## Per-project version pinning
 Plugins install at user scope by default (one version everywhere). To pin a project to a specific
@@ -50,11 +58,13 @@ This writes `extraKnownMarketplaces` + `enabledPlugins` into the repo's `.claude
 in-flight engagement can't be blindsided by a firm change until you choose to bump it.
 
 ## Verified (isolated install test)
-- `claude plugin validate .` passes.
-- Install loads all components: **Agents (7)**, the `start` command, the PreToolUse ledger hook.
-- `firm-install` merges 57 permission rules idempotently.
-- Update flow verified: version bump 0.2.0 → 0.2.1 propagated via `marketplace update` + `plugin update agent-firm@local`.
-- Tested under an isolated `CLAUDE_CONFIG_DIR` so the global config wasn't touched during development.
+- Both manifests share a valid base version and both marketplace entries resolve from an isolated
+  tracked candidate.
+- Joint preflight failure invokes neither provider installer; fresh install and repeat refresh are
+  idempotent under stubs.
+- Provider hook manifests select their runtime-specific events while sharing guarded binaries.
+- `firm-install` remains idempotent and preserves existing project settings except for its explicit,
+  backed-up `--migrate` operation.
 
 ---
 
@@ -142,7 +152,7 @@ isolated + its own `auth.json`; (8) codex + chezmoi sanity. **Exit 1 on any FAIL
 ## Second-machine bootstrap (chezmoi)
 The only hand-carried secret is one service-account token. chezmoi owns **home-level glue only** —
 `~/.zshrc` (with the direnv hook), the `chezmoi.toml.tmpl` with `[onepassword] mode="service"`, and a
-`run_once_` provisioner that installs op/direnv/codex. It does **not** manage `~/.claude-*/` or
+`run_once_` provisioner that installs op/direnv plus both Claude Code and Codex CLIs. It does **not** manage `~/.claude-*/` or
 `~/.codex-*/` (live tokens) or per-project `.envrc` (those live in each project's repo and need a fresh
 `direnv allow` per machine).
 ```bash

@@ -1,0 +1,22 @@
+{
+  "name": "agent-firm",
+  "version": "0.8.0",
+  "description": "A dual-provider AI engineering firm with GPT staff, Claude review, shared evidence gates, worktree isolation, and guarded integration.",
+  "author": {
+    "name": "Josh Blau"
+  },
+  "license": "UNLICENSED",
+  "keywords": ["agents", "orchestration", "qa", "lifecycle", "codex", "claude-code"],
+  "skills": "./codex-skills/",
+  "interface": {
+    "displayName": "The Firm",
+    "shortDescription": "Run a governed multi-agent engineering engagement.",
+    "longDescription": "GPT-primary engineering orchestration with shared lifecycle contracts, isolated worktrees, evidence gates, and an independent Claude QA judge.",
+    "developerName": "Josh Blau",
+    "category": "Productivity",
+    "capabilities": ["Agent orchestration", "Cross-provider QA"],
+    "defaultPrompt": [
+      "$agent-firm:start Implement this task through the firm's gated lifecycle."
+    ]
+  }
+}

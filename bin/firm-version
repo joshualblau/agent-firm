@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# firm-version [--check | --release X.Y.Z | --local-refresh [token]]
+# Keeps the canonical VERSION and both provider manifests on one base version.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"; ROOT="$(cd "$SELF/.." && pwd)"
+CLAUDE_MANIFEST="$ROOT/.claude-plugin/plugin.json"
+CODEX_MANIFEST="$ROOT/.codex-plugin/plugin.json"
+VERSION_FILE="$ROOT/VERSION"
+
+mode="${1:---check}"
+case "$mode" in
+  --check)
+    python3 - "$VERSION_FILE" "$CLAUDE_MANIFEST" "$CODEX_MANIFEST" <<'PY'
+import json, re, sys
+vf, cm, xm = sys.argv[1:]
+canonical = open(vf, encoding="utf-8").read().strip()
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", canonical):
+    raise SystemExit(f"firm-version: invalid canonical base version: {canonical!r}")
+versions = []
+for provider, path in (("claude", cm), ("codex", xm)):
+    value = json.load(open(path, encoding="utf-8"))["version"]
+    base, sep, suffix = value.partition("+")
+    if base != canonical:
+        raise SystemExit(f"firm-version: {provider} base {base!r} != canonical {canonical!r}")
+    if sep and not suffix.startswith(provider + "."):
+        raise SystemExit(f"firm-version: {provider} build suffix must start with {provider}.: {value!r}")
+    versions.append(f"{provider}={value}")
+print("firm-version: OK " + " ".join(versions) + f" base={canonical}")
+PY
+    ;;
+  --release)
+    version="${2:-}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "firm-version: release must be semver" >&2; exit 2; }
+    python3 - "$VERSION_FILE" "$CLAUDE_MANIFEST" "$CODEX_MANIFEST" "$version" "$version" <<'PY'
+import json, os, sys, tempfile
+vf, cm, xm, cv, xv = sys.argv[1:]
+def write_json(path, version):
+    d = json.load(open(path, encoding="utf-8")); d["version"] = version
+    fd, tmp = tempfile.mkstemp(prefix=".firm-version.", dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(d, f, indent=2); f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+write_json(cm, cv); write_json(xm, xv)
+with open(vf, "w", encoding="utf-8") as f: f.write(cv + "\n")
+PY
+    "$0" --check
+    ;;
+  --local-refresh)
+    token="${2:-local-$(date -u +%Y%m%d-%H%M%S)}"
+    base="$(sed -n '1p' "$VERSION_FILE")"
+    [[ "$token" =~ ^[0-9A-Za-z.-]+$ ]] || { echo "firm-version: cachebuster contains invalid characters" >&2; exit 2; }
+    python3 - "$CLAUDE_MANIFEST" "$CODEX_MANIFEST" "$base+claude.$token" "$base+codex.$token" <<'PY'
+import json, os, sys, tempfile
+cm, xm, cv, xv = sys.argv[1:]
+def write_json(path, version):
+    d = json.load(open(path, encoding="utf-8")); d["version"] = version
+    fd, tmp = tempfile.mkstemp(prefix=".firm-version.", dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(d, f, indent=2); f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+write_json(cm, cv); write_json(xm, xv)
+PY
+    "$0" --check
+    if [[ "${FIRM_VERSION_SKIP_INSTALL:-0}" != "1" ]]; then "$SELF/firm-bootstrap"; fi
+    ;;
+  -h|--help)
+    sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) echo "firm-version: unknown mode '$mode'" >&2; exit 2 ;;
+esac

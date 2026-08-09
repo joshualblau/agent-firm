@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# firm-claude-qa [run_dir]
+# Independent Claude second voice for Codex-primary runs. Uses Claude subscription auth.
+# Writes <run>/08-qa-verdict.claude.json.
+# Exit: 0 valid APPROVE, 1 valid BLOCK/run failure/timeout, 2 usage, 3 unavailable CLI/auth/model.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+SCHEMA="$ROOT/agent-firm/schemas/qa-verdict.schema.json"
+FIRM_QA_SELF="$SELF"; . "$SELF/firm-reviewer-common"
+
+firm_qa_resolve_run "${1:-}" || { echo "firm-claude-qa: no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; }
+run_dir="$FIRM_QA_RUN_DIR"
+mkdir -p "$run_dir/09-test-evidence"
+out="$run_dir/08-qa-verdict.claude.json"
+rm -f "$out"
+log="$(mktemp "$run_dir/09-test-evidence/claude-qa.log.XXXXXX")" || exit 1
+if ! command -v claude >/dev/null 2>&1; then
+  echo "firm-claude-qa: claude CLI unavailable; install it and authenticate (exit 3)." > "$log"
+  cat "$log" >&2
+  exit 3
+fi
+
+FIRM_CLAUDE_QA_MODEL="${FIRM_CLAUDE_QA_MODEL:-opus}"
+preflight_log="$(mktemp "${TMPDIR:-/tmp}/firm-claude-qa-preflight.XXXXXX")" || exit 1
+raw="$(mktemp "${TMPDIR:-/tmp}/firm-claude-qa-output.XXXXXX")" || exit 1
+cleanup() {
+  case "$preflight_log" in /*/firm-claude-qa-preflight.*) rm -f "$preflight_log" ;; esac
+  case "$raw" in /*/firm-claude-qa-output.*) rm -f "$raw" ;; esac
+}
+trap cleanup EXIT
+
+if ! claude auth status > "$preflight_log" 2>&1; then
+  cp "$preflight_log" "$log"
+  echo "firm-claude-qa: Claude subscription authentication unavailable (exit 3): $(sed -n '1p' "$preflight_log")" >&2
+  exit 3
+fi
+if [[ -n "${FIRM_CLAUDE_QA_FORCE_INCOMPAT:-}" ]]; then
+  echo "configured model '$FIRM_CLAUDE_QA_MODEL' is unavailable" > "$log"
+  echo "firm-claude-qa: configured model '$FIRM_CLAUDE_QA_MODEL' is unavailable (exit 3)." >&2
+  exit 3
+fi
+
+candidate="$(mktemp "$run_dir/.qa-verdict.claude.candidate.XXXXXX")" || exit 1
+cleanup_candidate() {
+  case "$candidate" in "$run_dir"/.qa-verdict.claude.candidate.*) rm -f "$candidate" ;; esac
+}
+trap 'cleanup_candidate; cleanup' EXIT
+schema_json="$(python3 - "$SCHEMA" <<'PY'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), separators=(",", ":")))
+PY
+)" || { echo "firm-claude-qa: cannot read verdict schema" >&2; exit 1; }
+read -r -d '' PROMPT <<EOF
+You are the independent cross-provider QA judge. Inspect the source, diff, and already captured test
+evidence in ${run_dir}/09-test-evidence/, then check every criterion in
+${run_dir}/01-acceptance-criteria.yaml. You have no shell and cannot execute tests; state that boundary
+and everything not proven by the captured evidence. Never edit source/tests or update snapshots. Emit
+BLOCK on uncertainty. Return only the requested structured verdict.
+EOF
+
+echo "firm-claude-qa: running Claude judge ($FIRM_CLAUDE_QA_MODEL)..." >&2
+timeout_secs="${FIRM_CLAUDE_QA_TIMEOUT:-300}"
+FIRM_QA_JUDGE=1 perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" \
+  claude -p "$PROMPT" --model "$FIRM_CLAUDE_QA_MODEL" --effort xhigh \
+  --output-format json --json-schema "$schema_json" --permission-mode dontAsk \
+  --tools "Read,Grep,Glob" --disallowedTools "Edit,Write,Bash" --no-session-persistence \
+  </dev/null > "$raw" 2> "$log"
+rc=$?
+if [[ $rc -eq 0 ]]; then
+  if ! python3 - "$raw" "$candidate" >> "$log" 2>&1 <<'PY'
+import json, sys
+src, dst = sys.argv[1:]
+d = json.load(open(src, encoding="utf-8"))
+if isinstance(d, dict) and "verdict" in d:
+    verdict = d
+elif isinstance(d, dict) and isinstance(d.get("structured_output"), dict):
+    verdict = d["structured_output"]
+elif isinstance(d, dict) and isinstance(d.get("result"), dict):
+    verdict = d["result"]
+elif isinstance(d, dict) and isinstance(d.get("result"), str):
+    verdict = json.loads(d["result"])
+else:
+    raise ValueError("Claude output contained no structured verdict")
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(verdict, f, indent=2)
+    f.write("\n")
+PY
+  then
+    echo "firm-claude-qa: malformed structured output — BLOCK; see $log" >&2
+    exit 1
+  fi
+  firm_qa_finish "$candidate" "$out" claude_qa firm-claude-qa; exit $?
+fi
+firm_qa_failure_kind "$log"; kind=$?
+if [[ $kind -eq 3 ]]; then
+  echo "firm-claude-qa: Claude authentication or model readiness unavailable (exit 3); see $log" >&2
+  exit 3
+fi
+echo "firm-claude-qa: judge failed or timed out after ${timeout_secs}s (rc=$rc) — see $log" >&2
+exit 1

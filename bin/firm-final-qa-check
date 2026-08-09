@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# firm-final-qa-check [run_dir]
+# Mechanical final two-voice gate.
+# Exit: 0 satisfied, 1 evaluated and blocked, 2 cannot evaluate.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+
+run_dir="${1:-}"
+[[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+  echo "FINAL QA: CANNOT EVALUATE — pass a run dir or set CURRENT_RUN" >&2
+  exit 2
+fi
+primary="$run_dir/08-qa-verdict.json"
+trace="$run_dir/traceability.yaml"
+[[ -f "$primary" ]] || { echo "FINAL QA: CANNOT EVALUATE — missing $primary" >&2; exit 2; }
+[[ -f "$trace" ]] || { echo "FINAL QA: CANNOT EVALUATE — missing $trace" >&2; exit 2; }
+
+"$SELF/firm-validate-verdict" "$primary" >/dev/null 2>&1; pvalid=$?
+[[ $pvalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE — primary verdict validation rc=$pvalid" >&2; exit 2; }
+"$SELF/firm-traceability-check" "$run_dir" >/dev/null 2>&1; trc=$?
+if [[ $trc -eq 1 ]]; then echo "FINAL QA: BLOCK — primary acceptance traceability is incomplete" >&2; exit 1; fi
+[[ $trc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE — traceability checker rc=$trc" >&2; exit 2; }
+
+primary_provider="$(python3 - "$run_dir" <<'PY'
+import json, os, sys
+run = sys.argv[1]
+meta = os.path.join(run, "run-metadata.json")
+provider = "claude"
+try:
+    if os.path.exists(meta):
+        provider = json.load(open(meta, encoding="utf-8")).get("primary_provider", "claude")
+    else:
+        ledger = os.path.join(run, "run.jsonl")
+        if os.path.exists(ledger):
+            with open(ledger, encoding="utf-8") as f:
+                first = json.loads(f.readline())
+            provider = first.get("primary_provider", "claude")
+    if provider not in ("claude", "codex"):
+        raise ValueError("primary_provider must be claude or codex")
+    print(provider)
+except Exception as e:
+    print(f"firm-final-qa-check: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
+PY
+)"; mrc=$?
+[[ $mrc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE — invalid run metadata" >&2; exit 2; }
+
+if [[ "$primary_provider" == "claude" ]]; then
+  secondary_provider="gpt"; secondary="$run_dir/08-qa-verdict.gpt.json"
+else
+  secondary_provider="claude"; secondary="$run_dir/08-qa-verdict.claude.json"
+fi
+
+secondary_present=0
+if [[ -f "$secondary" ]]; then
+  secondary_present=1
+  "$SELF/firm-validate-verdict" "$secondary" >/dev/null 2>&1; svalid=$?
+  [[ $svalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE — secondary verdict validation rc=$svalid" >&2; exit 2; }
+  "$SELF/firm-traceability-check" "$run_dir" "$secondary" >/dev/null 2>&1; strc=$?
+  if [[ $strc -eq 1 ]]; then echo "FINAL QA: BLOCK — secondary acceptance traceability is incomplete" >&2; exit 1; fi
+  [[ $strc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE — secondary traceability checker rc=$strc" >&2; exit 2; }
+fi
+
+python3 - "$primary" "$secondary" "$secondary_present" "$trace" "$secondary_provider" <<'PY'
+import collections, json, sys
+
+primary_path, secondary_path, present_s, trace_path, expected_provider = sys.argv[1:]
+present = present_s == "1"
+
+def cannot(msg):
+    print(f"FINAL QA: CANNOT EVALUATE — {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+def block(msg):
+    print(f"FINAL QA: BLOCK — {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    import yaml
+except BaseException as e:
+    cannot(f"pyyaml unavailable or broken: {type(e).__name__}: {e}")
+
+try:
+    primary = json.load(open(primary_path, encoding="utf-8"))
+    trace = yaml.safe_load(open(trace_path, encoding="utf-8"))
+except Exception as e:
+    cannot(f"unreadable verdict/traceability: {type(e).__name__}: {e}")
+if not isinstance(trace, dict):
+    cannot("traceability top level is not a mapping")
+
+if primary.get("verdict") != "APPROVE":
+    block("primary QA verdict is BLOCK")
+if primary.get("blockers"):
+    block("primary QA says APPROVE but still records blockers")
+
+voice = trace.get("two_voice")
+diffs = trace.get("two_voice_diff")
+if not isinstance(voice, dict) or not isinstance(diffs, list):
+    cannot("traceability must contain two_voice mapping and two_voice_diff list")
+if voice.get("secondary_provider") != expected_provider:
+    cannot(f"secondary_provider must be {expected_provider!r}")
+
+if not present:
+    if voice.get("status") != "unavailable":
+        block("secondary verdict is missing and availability was not recorded")
+    required = voice.get("required")
+    if not isinstance(required, bool):
+        cannot("two_voice.required must be true or false")
+    waiver = voice.get("human_waiver")
+    if not isinstance(waiver, dict):
+        cannot("two_voice.human_waiver must be a mapping")
+    if required and not (waiver.get("granted") is True and isinstance(waiver.get("record"), str) and waiver.get("record").strip()):
+        block("required secondary judge is unavailable without an explicit recorded human waiver")
+    if diffs:
+        cannot("two_voice_diff cannot describe blockers when no secondary verdict exists")
+    print("FINAL QA: PASS — secondary unavailable state and required waiver policy are satisfied")
+    raise SystemExit(0)
+
+try:
+    secondary = json.load(open(secondary_path, encoding="utf-8"))
+except Exception as e:
+    cannot(f"secondary verdict unreadable: {type(e).__name__}: {e}")
+if voice.get("status") != "available":
+    cannot("secondary verdict exists but two_voice.status is not available")
+
+if secondary.get("verdict") == "APPROVE":
+    if secondary.get("blockers"):
+        block("secondary says APPROVE but still records blockers")
+    if diffs:
+        cannot("two_voice_diff must be empty when the secondary verdict approves")
+    print("FINAL QA: PASS — both provider verdicts approve")
+    raise SystemExit(0)
+
+blockers = secondary.get("blockers")
+if not isinstance(blockers, list) or not blockers or not all(isinstance(x, str) and x.strip() for x in blockers):
+    block("secondary verdict is BLOCK without an actionable blockers list")
+entries = []
+for i, entry in enumerate(diffs):
+    if not isinstance(entry, dict):
+        cannot(f"two_voice_diff entry #{i + 1} is not a mapping")
+    entries.append(entry)
+recorded = [e.get("secondary_blocker") for e in entries]
+if collections.Counter(recorded) != collections.Counter(blockers):
+    block("two_voice_diff must contain exactly one entry per secondary blocker")
+
+allowed_dispositions = {"unresolved", "fixed", "secondary_withdrew", "human_decision", "proceed_with_primary"}
+for i, entry in enumerate(entries):
+    label = entry.get("secondary_blocker")
+    position = entry.get("primary_position")
+    dissent = entry.get("positive_dissent")
+    risk = entry.get("risk")
+    bounded = entry.get("bounded_resolution")
+    evidence = entry.get("evidence")
+    disposition = entry.get("disposition")
+    if not isinstance(position, str) or not position.strip():
+        cannot(f"blocker {label!r} has no primary_position")
+    if not isinstance(dissent, bool):
+        cannot(f"blocker {label!r} positive_dissent must be true or false")
+    if risk not in ("low", "high"):
+        block(f"blocker {label!r} has ambiguous/invalid risk; ambiguity is high-risk and blocking")
+    if not isinstance(bounded, dict) or not isinstance(bounded.get("attempted"), bool):
+        cannot(f"blocker {label!r} lacks bounded_resolution.attempted")
+    if bounded.get("rerun") not in ("approve", "block", "not_run", "not_required"):
+        cannot(f"blocker {label!r} has invalid bounded_resolution.rerun")
+    if not isinstance(bounded.get("evidence"), str):
+        cannot(f"blocker {label!r} lacks bounded_resolution.evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        cannot(f"blocker {label!r} lacks evidence")
+    if disposition not in allowed_dispositions:
+        cannot(f"blocker {label!r} has invalid disposition")
+    if disposition == "unresolved":
+        block(f"secondary blocker remains unresolved: {label}")
+    if disposition == "proceed_with_primary":
+        if not dissent:
+            block(f"cannot proceed on primary without positive dissent: {label}")
+        if risk != "low":
+            block(f"cannot proceed on primary for a high-risk disagreement: {label}")
+        if not bounded.get("attempted") or not bounded.get("evidence", "").strip():
+            block(f"low-risk proceed-on-primary lacks the bounded resolution round: {label}")
+    elif disposition in ("fixed", "secondary_withdrew", "human_decision"):
+        if not bounded.get("evidence", "").strip():
+            block(f"resolved disposition lacks resolution evidence: {label}")
+
+print("FINAL QA: PASS — every secondary blocker has a policy-compliant disposition")
+PY
+exit $?

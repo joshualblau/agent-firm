@@ -8,7 +8,8 @@ Order matters — later steps depend on earlier ones. Replace `work` with your p
 `personal`, `client-acme`, …). You can start with a single profile.
 
 **Minimum to be operational:** A → B → C (one profile) → D. Sections E–H are optional, per-need.
-Run `firm-doctor` after any step — it fail-closed-checks the whole setup and tells you exactly what's off.
+Run `firm-doctor` after any step — it fail-closed-checks both provider CLIs, plugin versions, reviewer
+readiness, and the rest of the setup, then tells you exactly what's off.
 
 ---
 
@@ -72,6 +73,13 @@ cp ~/agent-firm/.env.op.example .env.op          # edit: CLAUDE_CODE_OAUTH_TOKEN
 direnv allow                                     # loads the profile + resolves secrets on cd
 
 firm-doctor                                      # fail-closed: no key leak, profiles isolated, op+direnv+refs OK
+```
+
+Start from either provider after the doctor is clean:
+
+```text
+Claude Code: /agent-firm:start <goal>
+Codex:       $agent-firm:start <goal>
 ```
 
 `.env.op` is committed (references only — no values); `.envrc` stays machine-local (gitignored).
@@ -150,7 +158,8 @@ acceptable for a given project.
 
 ```bash
 # In a node-20 environment (the devcontainer — a host shell on node 14 cannot run `node --test`):
-firm-run-evals greet-fast-path
+firm-run-evals --provider claude greet-fast-path
+# or: firm-run-evals --provider codex greet-fast-path
 # This is the first live firm run; it bills your subscription. Confirm greet-fast-path PASSes,
 # then wire `firm-run-evals` into CI as the System-Change regression gate.
 ```

@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). Run a fast_path engagement: add a `divide(a, b)` function in
+Operate the firm through the installed provider adapter. Run a fast_path engagement: add a `divide(a, b)` function in
 `src/divide.js` that returns `a / b`, throwing an `Error` when `b` is `0`, with a test in
 `test/divide.test.sh` (plain shell — no test framework is set up in this repo; follow the pattern
 already in `test/run-tests.sh`).

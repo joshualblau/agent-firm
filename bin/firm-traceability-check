@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# traceability-check [run_dir]
+# firm-traceability-check [run_dir] [verdict_path]
 # Cross-references acceptance criteria (01-acceptance-criteria.yaml) against the QA verdict's
 # acceptance_criteria_coverage (08-qa-verdict.json). Defaults to the active run
 # (.agent-firm/CURRENT_RUN).
@@ -107,10 +107,11 @@
 set -euo pipefail
 
 run_dir="${1:-}"
+verdict_path="${2:-}"
 if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent-firm/CURRENT_RUN)"; fi
 if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
 
-python3 - "$run_dir" <<'PY'
+python3 - "$run_dir" "$verdict_path" <<'PY'
 import json, re, sys, os, traceback, importlib.util
 
 # --- exit-code contract (spelled out in the shell header above) -------------
@@ -248,7 +249,7 @@ def read_text(path):
 
 run = sys.argv[1]
 ac_path = os.path.join(run, "01-acceptance-criteria.yaml")
-v_path  = os.path.join(run, "08-qa-verdict.json")
+v_path  = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.path.join(run, "08-qa-verdict.json")
 # A missing input is a CANNOT EVALUATE, and always was exit 2 -- which is now the one code for that
 # whole class rather than a separate "missing inputs" meaning.
 if not os.path.exists(ac_path):

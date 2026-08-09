@@ -32,6 +32,17 @@ assert_ok "CURRENT_RUN written"              sh -c "[ -f '$repo/.agent-firm/CURR
 assert_eq "CURRENT_RUN points at the run dir" "$out1" "$current_run_contents"
 assert_output "run_started event in run.jsonl" '"event":"run_started"' cat "$rd/run.jsonl"
 assert_output "track recorded"               '"track":"fast_path"'    cat "$rd/run.jsonl"
+assert_output "legacy invocation defaults primary to Claude" '"primary_provider":"claude"' cat "$rd/run.jsonl"
+assert_file "run metadata written" "$rd/run-metadata.json"
+assert_output "metadata records Claude primary" '"primary_provider":"claude"' cat "$rd/run-metadata.json"
+
+t_case "explicit Codex-primary run"
+repoC="$(mk_repo)"
+outC="$( (cd "$repoC" && "$NEW_RUN" --primary codex codex-engagement fast_path) )"
+rdC="$repoC/$outC"
+assert_output "run event records Codex primary" '"primary_provider":"codex"' cat "$rdC/run.jsonl"
+assert_output "metadata records Codex primary" '"primary_provider":"codex"' cat "$rdC/run-metadata.json"
+assert_rc "unknown primary provider is rejected" 2 sh -c "cd '$repoC' && '$NEW_RUN' --primary other nope"
 
 t_case "track defaults to full_track when omitted"
 repo2="$(mk_repo)"

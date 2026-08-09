@@ -1,27 +1,25 @@
 # Install & bootstrap the firm (any device)
 
-The firm ships as a **versioned Claude Code plugin** (`agent-firm`) served from a **local marketplace**
-(`local`) that is this repo. Install it once per machine at user scope, and every project on that
-machine can use it.
+The firm ships as one root-source plugin through two manifests and marketplaces: Claude Code uses
+`agent-firm@local`; Codex uses `agent-firm@agent-firm-local`. Both cache the same checkout.
 
 ## Prerequisites
 
-Beyond the `claude` CLI and `git`, the firm needs two Python packages:
+Both `claude` and `codex` CLIs, `git`, and two Python packages are required:
 
 ```bash
 python3 -m pip install --user jsonschema pyyaml
 ```
 
+This is an intentional joint prerequisite: bootstrap, install refresh, and `firm-version
+--local-refresh` do not offer a one-provider mode. `firm-bootstrap` checks for both CLIs before it
+invokes either provider, so a missing CLI leaves both provider installations unchanged.
+
 - **`jsonschema` is required.** Without it `firm-validate-verdict` cannot schema-check a QA verdict
   and exits **4 (DEGRADED)**, which does not satisfy the Final gate — an unverifiable verdict is not
   evidence. `firm-doctor` FAILs while it's missing.
-- **`pyyaml` is required to work ON the firm, and non-fatal (but degrading) to work WITH it.** It used
-  to be described as merely "advisory"; that stopped being true when the regression suite landed —
-  `tests/test-policy-yaml-valid.sh` needs it, so the suite cannot pass without it, and CI installs it.
-  In a *work project* the firm still runs without it: the acceptance-criteria and eval-assertion
-  parsers fall back to regex. But that fallback is looser and **fails closed**:
-  `firm-traceability-check` reports `CANNOT VERIFY` and exits non-zero on criteria files pyyaml would
-  have parsed exactly. `firm-doctor` WARNs (not FAILs) while it's missing.
+- **`pyyaml` is required.** In addition to exact policy/test parsing, `firm-final-qa-check` uses it to
+  validate structured two-voice dispositions. Missing/broken PyYAML is exit 2 (cannot evaluate).
 
 `firm-bootstrap` reports what's missing and prints this command; pass `--with-python-deps` to have it
 run the install for you. It never installs packages as a side effect — changing your machine should
@@ -48,6 +46,13 @@ firm-install --migrate                   # removes retired rules, prints exactly
 firm-install --user --migrate            # same, for user-scope settings
 ```
 See `agent-firm/policy/retired-permissions.json` for the full list of retired rules and why.
+
+**Migrating an obsolete project Codex hook.** `firm-doctor` warns when `.codex/hooks.json` still
+registers `firm-ledger-hook`, because the installed plugin now owns that hook. Bootstrap and doctor do
+not delete or rewrite project configuration. Review the file for project-specific hooks, remove only
+the duplicate ledger registration (or the file if that is all it contains), then rerun `firm-doctor`.
+The repository ignores `.codex/` and timestamped `.claude/settings.json.*.bak` files; those local
+configuration/backup artifacts must never be copied into a plugin package or deleted as cleanup.
 
 **What `--migrate` is allowed to delete.** Deletion is the one destructive thing `firm-install` does,
 so it is fenced in rather than trusted:
@@ -106,15 +111,18 @@ firm-doctor                              # fail-closed: no API-key leak, profile
 Start an engagement:
 ```bash
 claude
-# inside the session:
-/agent-firm:start <your goal>
+# /agent-firm:start <your goal>
+codex
+# $agent-firm:start <your goal>
 ```
-Restart any already-running `claude` session so it loads the plugin.
+Start a new Codex task and restart/reload Claude after a plugin refresh.
 
 ## Manual steps (what firm-bootstrap does)
 ```bash
 claude plugin marketplace add <path-to-this-repo>     # e.g. ~/agent-firm
-claude plugin install agent-firm@local         # user scope = all projects
+claude plugin install agent-firm@local
+codex plugin marketplace add <path-to-this-repo>
+codex plugin add agent-firm@agent-firm-local
 ~/agent-firm/bin/firm-link                     # firm-* onto your SHELL PATH (see above)
 ```
 
@@ -130,19 +138,21 @@ The plugin is served from this repo, so the repo must exist on the new machine f
    ```bash
    ~/agent-firm/bin/firm-bootstrap
    ```
-3. Per project: `firm-install`, then `claude` → `/agent-firm:start`.
+3. Per project: `firm-install`, then choose Claude `/agent-firm:start` or Codex `$agent-firm:start`.
 
 For a full second-machine bootstrap that also carries your profiles/secrets (chezmoi for home glue +
 one hand-carried 1Password service-account token), see [PHASE4.md](PHASE4.md) part 2.
 
 ## Update to a newer firm version (propagate an improvement)
-After the canonical repo changes and its `version` is bumped:
+After local development changes:
 ```bash
 git -C ~/agent-firm pull                                    # if using a remote
-claude plugin marketplace update local
-claude plugin update agent-firm@local                # restart to apply
+firm-version --local-refresh
 ```
-`firm-bootstrap` also updates in place if the plugin is already installed.
+For a release, `firm-version --release X.Y.Z` updates both manifests to the same base, then
+`firm-bootstrap` refreshes both caches. Both CLIs are required before any refresh mutation. Codex
+build metadata may carry a provider-specific cachebuster;
+`firm-version --check` compares base versions in CI.
 
 ## Per-project version pinning (optional)
 Default install is user scope (one version everywhere). To pin a project:
@@ -154,8 +164,9 @@ claude plugin install agent-firm@local --scope project   # writes enabledPlugins
 ## Verify / troubleshoot
 ```bash
 claude plugin list                       # should show agent-firm@local — ✔ enabled
-claude plugin details agent-firm@local    # Agents (7), the start command, the ledger hook
-claude plugin validate ~/agent-firm      # manifest check
+codex plugin list                        # should show agent-firm@agent-firm-local
+claude plugin validate --strict ~/agent-firm/.claude-plugin/plugin.json
+firm-version --check
 ```
 - Components don't appear → restart the `claude` session (plugins load at session start).
 - `firm-*` "not found" **in your terminal** → run `firm-link` (the plugin's `bin/` is only on PATH
@@ -171,4 +182,6 @@ claude plugin validate ~/agent-firm      # manifest check
 ~/agent-firm/bin/firm-link --uninstall    # remove the shell PATH symlinks + rc block
 claude plugin uninstall agent-firm@local
 claude plugin marketplace remove local
+codex plugin remove agent-firm@agent-firm-local
+codex plugin marketplace remove agent-firm-local
 ```

@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). GATED conceptually on: the project has a relational DB with role
+Operate the firm through the installed provider adapter. GATED conceptually on: the project has a relational DB with role
 separation (this fixture models RLS isolation over such a DB). If a project has no such DB, the
 multi-axis isolation concern is not applicable.
 

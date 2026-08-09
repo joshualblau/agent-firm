@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# new-run <slug> [track]
+# firm-new-run [--primary claude|codex] <slug> [track]
 # Scaffolds a run-ledger directory under ./.agent-firm/runs/<ts>-<slug>/, seeds it from the
 # firm templates, opens run.jsonl with a run_started event, and points .agent-firm/CURRENT_RUN at it.
 # Run from the ROOT of the work project (the git repo you are operating on).
 set -euo pipefail
 
+primary="claude"
+if [[ "${1:-}" == "--primary" ]]; then
+  primary="${2:-}"
+  shift 2 || true
+fi
 slug="${1:-}"
 track="${2:-full_track}"
 if [[ -z "$slug" ]]; then
-  echo "usage: new-run <slug> [fast_path|full_track]" >&2; exit 2
+  echo "usage: firm-new-run [--primary claude|codex] <slug> [fast_path|full_track]" >&2; exit 2
 fi
+case "$primary" in claude|codex) ;; *) echo "firm-new-run: --primary must be claude or codex" >&2; exit 2 ;; esac
+case "$track" in fast_path|full_track) ;; *) echo "firm-new-run: track must be fast_path or full_track" >&2; exit 2 ;; esac
 slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
 
 # Resolve the firm root (where templates live) from this script's location.
@@ -72,8 +79,12 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fi
 fi
 
-printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+
+# Machine-readable run metadata. Historical runs without it are Claude-primary by policy.
+printf '{"run_id":"%s","track":"%s","primary_provider":"%s"}\n' \
+  "$run_id" "$track" "$primary" > "$run_dir/run-metadata.json"
 
 # A separate file, not just the ledger line: firm-check-assertions can then do a plain file-exists
 # check for "is there a baseline at all" without parsing run.jsonl, and its absence is unambiguous.
