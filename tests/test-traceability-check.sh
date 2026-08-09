@@ -1596,4 +1596,125 @@ if bad:
     print("non-ASCII byte(s) on line(s):", bad[:20])
     sys.exit(1)' "$TC"
 
+t_case "strict mode binds one matrix row and existing evidence to the full candidate generation"
+STRICT_NEW="$BIN/firm-new-run"
+STRICT_QAC="$BIN/firm-qa-checkout"
+strict_repo="$(mk_repo)"
+( cd "$strict_repo" && "$STRICT_NEW" strict-trace fast_path >/dev/null )
+strict_run_rel="$(cat "$strict_repo/.agent-firm/CURRENT_RUN")"
+strict_run="$strict_repo/$strict_run_rel"
+strict_id="$(basename "$strict_run")"
+python3 - "$strict_run/01-acceptance-criteria.yaml" <<'PY'
+import sys,yaml
+yaml.safe_dump({"task_slug":"strict","track":"fast_path","criteria":[
+ {"id":"AC-001","type":"functional","statement":"one","verification":"automated_test"},
+ {"id":"AC-002","type":"functional","statement":"two","verification":"automated_test"}
+],"explicitly_out_of_scope":[]},open(sys.argv[1],"w"),sort_keys=False)
+PY
+( cd "$strict_repo" && git checkout -qb "integration/$strict_id" && printf 'candidate\n' > candidate.txt && git add -A && git commit -qm candidate && git checkout -q main )
+( cd "$strict_repo" && "$STRICT_QAC" >/dev/null )
+printf 'proof one\n' > "$strict_run/09-test-evidence/ac1.log"
+printf 'proof two\n' > "$strict_run/09-test-evidence/ac2.log"
+
+strict_reset() {
+  python3 - "$strict_run" <<'PY'
+import json,os,sys,yaml
+run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+verdict={
+ "verdict":"APPROVE","commit_sha":sha,"run_id":os.path.basename(run),"generation":gen,"provider":"primary",
+ "environment":"fixture","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/ac1.log"},
+ "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+ "visual":{"status":"not_applicable","evidence":"none"},
+ "acceptance_criteria_coverage":[
+  {"id":"AC-001","covered":"yes","evidence":"09-test-evidence/ac1.log"},
+  {"id":"AC-002","covered":"yes","evidence":"09-test-evidence/ac2.log"}],
+ "untested_risks":[],"blockers":[],"warnings":[],"artifacts":["09-test-evidence/ac1.log","09-test-evidence/ac2.log"],"summary":"fixture"
+}
+json.dump(verdict,open(run+"/08-qa-verdict.json","w"),indent=2)
+trace={"schema_version":1,"task_slug":"strict","candidate":{
+ "run_id":os.path.basename(run),"commit_sha":sha,"generation":gen,"checkout_path":c["checkout_path"]},
+ "matrix":[
+  {"id":"AC-001","implementation_files":["candidate.txt"],"tests":["strict one"],"manual_verification":"",
+   "evidence":[{"path":"09-test-evidence/ac1.log","candidate_sha":sha}],"status":"covered"},
+  {"id":"AC-002","implementation_files":["candidate.txt"],"tests":["strict two"],"manual_verification":"",
+   "evidence":[{"path":"09-test-evidence/ac2.log","candidate_sha":sha}],"status":"covered"}],
+ "two_voice":{"secondary_provider":"gpt","status":"available","required":False},"two_voice_diff":[]}
+yaml.safe_dump(trace,open(run+"/traceability.yaml","w"),sort_keys=False)
+PY
+}
+strict_mutate() {
+  python3 - "$strict_run/traceability.yaml" "$@" <<'PY'
+import sys,yaml
+p=sys.argv[1]; op=sys.argv[2]; d=yaml.safe_load(open(p))
+if op=="empty": d["matrix"]=[]
+elif op=="duplicate": d["matrix"][1]=dict(d["matrix"][0])
+elif op=="phantom": d["matrix"][1]["id"]="AC-999"
+elif op=="stale-evidence": d["matrix"][0]["evidence"][0]["candidate_sha"]="0"*40
+elif op=="missing-evidence": d["matrix"][0]["evidence"][0]["path"]="09-test-evidence/absent.log"
+elif op=="partial-no-gate": d["matrix"][0]["status"]="partial"; d["matrix"][0]["evidence"]=[]
+elif op=="uncovered-gate":
+ d["matrix"][0]["status"]="uncovered"; d["matrix"][0]["evidence"]=[]
+ d["matrix"][0]["gate_record"]={"path":"09-test-evidence/ac1-gate.yaml","candidate_sha":d["candidate"]["commit_sha"],"decision":"waive_uncovered"}
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+}
+
+strict_reset
+assert_rc "strict exact matrix passes" 0 "$TC" --strict "$strict_run"
+cp "$strict_run/traceability.yaml" "$strict_run/traceability.good"
+rm "$strict_run/traceability.yaml"
+assert_rc "absent matrix cannot evaluate" 2 "$TC" --strict "$strict_run"
+cp "$strict_run/traceability.good" "$strict_run/traceability.yaml"
+printf 'matrix: [\n' > "$strict_run/traceability.yaml"
+assert_rc "malformed matrix cannot evaluate" 2 "$TC" --strict "$strict_run"
+for mutation in empty duplicate phantom stale-evidence missing-evidence partial-no-gate; do
+  strict_reset; strict_mutate "$mutation"
+  assert_fail "$mutation does not pass strict traceability" "$TC" --strict "$strict_run"
+done
+
+t_case "strict partial/uncovered rows need exact current-SHA structured gate authority"
+strict_reset
+strict_mutate uncovered-gate
+cat > "$strict_run/09-test-evidence/ac1-gate.yaml" <<EOF
+schema_version: 1
+type: criterion_gate
+actor: human-maintainer
+occurred_at: 2026-08-09T15:00:00Z
+run_id: $strict_id
+candidate_sha: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$strict_run/09-test-evidence/qa-candidate.json")
+criterion_id: AC-001
+decision: waive_uncovered
+objections: [fixture-objection]
+evidence: [09-test-evidence/ac2.log]
+EOF
+python3 - "$strict_run/08-qa-verdict.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d["acceptance_criteria_coverage"][0]={"id":"AC-001","covered":"no","evidence":"09-test-evidence/ac1-gate.yaml"}; json.dump(d,open(p,"w"),indent=2)
+PY
+assert_rc "exact structured uncovered gate is accepted" 0 "$TC" --strict "$strict_run"
+python3 - "$strict_run/09-test-evidence/ac1-gate.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["candidate_sha"]="0"*40; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+assert_rc "stale structured gate blocks" 1 "$TC" --strict "$strict_run"
+
+t_case "strict verdict and candidate identity reject abbreviated, stale, dirty, moved, and reordered state"
+strict_reset
+python3 - "$strict_run/08-qa-verdict.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d["commit_sha"]=d["commit_sha"][:7]; json.dump(d,open(p,"w"),indent=2)
+PY
+assert_rc "abbreviated verdict SHA blocks" 1 "$TC" --strict "$strict_run"
+strict_reset
+checkout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$strict_run/09-test-evidence/qa-candidate.json")"
+printf 'dirty\n' > "$checkout/untracked-sentinel"
+assert_rc "dirty persisted checkout blocks" 1 "$TC" --strict "$strict_run"
+rm "$checkout/untracked-sentinel"
+strict_reset
+python3 - "$strict_run/traceability.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["candidate"]["generation"]+=1; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+assert_rc "reordered generation blocks" 1 "$TC" --strict "$strict_run"
+
 t_summary

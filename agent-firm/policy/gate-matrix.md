@@ -150,3 +150,20 @@ That is a statement about which branch applies, not about whether the issue matt
 
 - Unclear whether **primary QA dissents** → treat as **no dissent** → case 1, the block stands.
 - Unclear whether the issue is **high-risk** → treat as **high-risk** → case 2a, resolve it.
+
+### Mechanical candidate and reviewer records
+
+- Candidate identity is the persisted full SHA and generation from `qa-candidate.json`; branch names,
+  abbreviations, timestamps, and whichever checkout happens to be current are not identity.
+- Strict traceability contains exactly one matrix row per accepted criterion, rejects duplicates and
+  phantom ids, and verifies current hashes for safe run-relative evidence files. Partial/uncovered rows
+  require typed candidate-bound gate records.
+- High-risk is derived from accepted security/privacy criteria and the committed diff matched against
+  `high-risk-paths.yaml`. A supplied classification may confirm that result but cannot downgrade it;
+  ambiguity blocks.
+- Each second-voice invocation has a numbered attempt and an explicit-target ledger outcome. CLI,
+  authentication, or configured-model absence can be unavailable; timeout, malformed output, tool
+  failure, schema failure, identity mismatch, or candidate-generation drift is BLOCK.
+- A canonical provider verdict is published atomically only after schema and exact
+  run/SHA/generation/provider/attempt identity validate. Re-runs archive the prior canonical verdict
+  before work begins, so stale approval is recoverable but never current.

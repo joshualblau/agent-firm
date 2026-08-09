@@ -1,32 +1,115 @@
 #!/usr/bin/env bash
-# ledger-log <event> [key=value ...]
-# Appends one JSON event line to the current run's run.jsonl (ts added automatically).
-# Resolves the run dir from ./.agent-firm/CURRENT_RUN. Best-effort: never fails the caller.
+# firm-ledger-log [--run <run-dir>] [--strict] <event> [key=value ...]
+# An explicit run is authoritative and never consults CURRENT_RUN. Default mode remains best-effort.
 set -uo pipefail
+exec python3 - "$@" <<'PY'
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
 
-event="${1:-event}"; shift || true
+argv = sys.argv[1:]
+target = None
+strict = False
+while argv and argv[0].startswith("--"):
+    flag = argv.pop(0)
+    if flag == "--run":
+        if not argv:
+            print("firm-ledger-log: --run needs a path", file=sys.stderr)
+            raise SystemExit(2)
+        target = argv.pop(0)
+    elif flag == "--strict":
+        strict = True
+    else:
+        print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
+        raise SystemExit(2)
+event = argv.pop(0) if argv else "event"
 
-run_dir=""
-[[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
-if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
-  exit 0   # no active run; logging is best-effort
-fi
+def fail(message):
+    if strict:
+        print(f"firm-ledger-log: {message}", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0)
 
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Build a JSON object from key=value pairs using jq if available; else a minimal manual encode.
-if command -v jq >/dev/null 2>&1; then
-  args=(--arg ts "$ts" --arg event "$event")
-  filter='{ts:$ts, event:$event}'
-  i=0
-  for kv in "$@"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    args+=(--arg "k$i" "$k" --arg "v$i" "$v")
-    filter="$filter + {(\$k$i): \$v$i}"
-    i=$((i+1))
-  done
-  jq -cn "${args[@]}" "$filter" >> "$run_dir/run.jsonl" 2>/dev/null || \
-    printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
-else
-  printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
-fi
-exit 0
+if target is None:
+    current = Path.cwd() / ".agent-firm" / "CURRENT_RUN"
+    try:
+        target = current.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise SystemExit(0)
+if not target:
+    raise SystemExit(0)
+if any(ord(ch) < 32 or ord(ch) == 127 for ch in target):
+    fail("run path contains a control character")
+if ".." in Path(target).parts:
+    fail("run path contains traversal")
+
+run = Path(target)
+if not run.is_absolute():
+    run = Path.cwd() / run
+run = Path(os.path.abspath(str(run)))
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run.name) or run.name in (".", ".."):
+    fail("unsafe run id")
+if run.parent.name != "runs" or run.parent.parent.name != ".agent-firm":
+    fail("target is not <repo>/.agent-firm/runs/<safe-id>")
+repo = run.parent.parent.parent
+try:
+    for component in (repo, repo / ".agent-firm", run.parent, run):
+        st = os.lstat(component)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            fail(f"unsafe run component: {component}")
+        if st.st_uid != os.getuid():
+            fail(f"run component is not owned by the current user: {component}")
+    top = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+        stderr=subprocess.DEVNULL, text=True
+    ).strip()
+    if os.path.realpath(top) != os.path.realpath(repo):
+        fail("run is not owned through the expected repository root")
+except (OSError, subprocess.SubprocessError):
+    fail("run target is not a validated repository run")
+
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", event):
+    fail("event contains unsafe characters")
+record = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "event": event
+}
+for item in argv:
+    if "=" not in item:
+        fail(f"field is not key=value: {item}")
+    key, value = item.split("=", 1)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
+        fail(f"unsafe field name: {key}")
+    record[key] = value
+record["run_id"] = run.name
+
+ledger = run / "run.jsonl"
+try:
+    try:
+        st = os.lstat(ledger)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            fail("run.jsonl is not a regular no-follow target")
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(ledger, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+except (OSError, ValueError) as exc:
+    fail(f"could not append target ledger: {exc}")
+raise SystemExit(0)
+PY

@@ -17,9 +17,17 @@ definition_of_done:
     changes, not read-only enforcement — see docs/ENFORCEMENT.md. A non-zero exit is a BLOCK.
   - >-
     Cross-provider QA is mechanically satisfied — `firm-final-qa-check <run_dir>` exits 0 after
-    validating the primary verdict, secondary verdict or recorded availability waiver, traceability,
-    and every secondary-blocker disposition. Exit 1 is blocking; exit 2 means the gate could not be
-    evaluated and is also blocking.
+    validating the persisted clean candidate generation and full SHA, schema-valid primary verdict,
+    strict one-row-per-criterion traceability with current hashed evidence, secondary verdict or
+    recorded availability attempt plus any required human waiver, derived high-risk state, and every
+    secondary-blocker disposition. Exit 1 is blocking; exit 2 means the gate could not be evaluated
+    and is also blocking; exit 3 is an unavailable required second voice and is not approval.
+  - >-
+    Reviewer execution is auditable and bounded — each provider wrapper used the controlled judge
+    contract and disposable control root, recorded discovery/readiness/judge phases in a numbered
+    attempt, published no verdict until exact candidate identity validated, wrote explicit-target
+    run-ledger events, retained only capped redacted diagnostics by default, and left no uncontrolled
+    provider state as gate evidence.
   - no unexplained snapshot/baseline changes
   - secret scan run with no findings (or findings triaged + justified)
   - changelog / docs updated if the change is user-facing

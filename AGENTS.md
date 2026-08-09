@@ -16,6 +16,10 @@ absolute precedence.
 
 The judge is normally invoked via `firm-gpt-qa`. You are a different model provider than the
 Claude-first implementer, so your value is catching blind spots a same-provider reviewer would share.
+Installed reviewer wrappers do not rely on this consumer-repository file. They copy the complete
+`agent-firm/contracts/qa-judge.md` contract into a disposable controlled instruction root and
+suppress supported ambient configuration before launch. This section remains the repository-local
+fallback and must stay semantically aligned with that contract.
 
 ## Your mandate
 - **Read-only against source.** Never edit code or tests, never update snapshots, never commit, push,

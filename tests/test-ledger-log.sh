@@ -57,17 +57,41 @@ line3="$(tail -1 "$repo3/.agent-firm/runs/run2/run.jsonl")"
 assert_ok "fallback line is still valid JSON" is_valid_json "$line3"
 assert_output "fallback line has the event" '"event":"fallback_event"' printf '%s' "$line3"
 
-t_case "without jq: key=value pairs are dropped (documented minimal fallback), event+ts still land"
-# The fallback ONLY encodes {ts, event} -- this pins that documented limitation so a future change
-# can't silently start dropping the event/ts too without a test noticing.
-case "$line3" in
-  *'"k":"v"'*) _t_no "fallback should NOT include k=v pairs" "got: $line3" ;;
-  *)           _t_ok "fallback correctly omits k=v pairs (only ts+event, as designed)" ;;
-esac
+t_case "without jq: the shared JSON encoder preserves the same structured fields"
+assert_output "key=value survives without jq" '"k":"v"' printf '%s' "$line3"
 
 # ---------------------------------------------------------------------------
 t_case "never returns non-zero, even on a garbled/no active run + missing args"
 repo4="$(mk_repo)"
 assert_rc "no event arg at all -> still exit 0" 0 sh -c "cd '$repo4' && '$LOG'"
+
+t_case "an explicit target owns every outcome and never consults ambient CURRENT_RUN"
+repo5="$(mk_repo)"
+mk_run "$repo5" ambient
+mkdir -p "$repo5/.agent-firm/runs/target"
+printf '{"event":"ambient_seed"}\n' > "$repo5/.agent-firm/runs/ambient/run.jsonl"
+ambient_before="$(shasum -a 256 "$repo5/.agent-firm/runs/ambient/run.jsonl" | awk '{print $1}')"
+for outcome in approve block invalid timeout unavailable; do
+  assert_rc "explicit $outcome event succeeds" 0 sh -c "cd '$repo5' && '$LOG' --run '$repo5/.agent-firm/runs/target' --strict reviewer_$outcome provider=gpt generation=4 sha=0123456789012345678901234567890123456789"
+done
+ambient_after="$(shasum -a 256 "$repo5/.agent-firm/runs/ambient/run.jsonl" | awk '{print $1}')"
+assert_eq "ambient ledger is byte-identical" "$ambient_before" "$ambient_after"
+assert_eq "all five outcomes landed only in target" 5 "$(wc -l < "$repo5/.agent-firm/runs/target/run.jsonl" | tr -d ' ')"
+assert_eq "target ledger mode is 600" 600 "$(stat -f '%Lp' "$repo5/.agent-firm/runs/target/run.jsonl" 2>/dev/null || stat -c '%a' "$repo5/.agent-firm/runs/target/run.jsonl")"
+
+t_case "strict explicit targets reject outside, symlinked, and redirected writes"
+outside="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-outside.XXXXXX")"; t_track "$outside"
+assert_rc "outside target is rejected" 1 "$LOG" --run "$outside" --strict reviewer_block
+repo6="$(mk_repo)"
+mkdir -p "$repo6/.agent-firm/runs/safe"
+assert_rc "lexical traversal is rejected even when it normalizes inside runs" 1 \
+  sh -c "cd '$repo6' && '$LOG' --run '$repo6/.agent-firm/runs/../runs/safe' --strict reviewer_block"
+printf 'keep\n' > "$outside/ledger"
+ln -s "$outside/ledger" "$repo6/.agent-firm/runs/safe/run.jsonl"
+assert_rc "symlinked run.jsonl is rejected" 1 sh -c "cd '$repo6' && '$LOG' --run '$repo6/.agent-firm/runs/safe' --strict reviewer_block"
+assert_eq "redirect target remains byte-identical" keep "$(cat "$outside/ledger")"
+mv "$repo6/.agent-firm/runs/safe" "$repo6/.agent-firm/runs/real"
+ln -s "$repo6/.agent-firm/runs/real" "$repo6/.agent-firm/runs/safe"
+assert_rc "symlinked run component is rejected" 1 sh -c "cd '$repo6' && '$LOG' --run '$repo6/.agent-firm/runs/safe' --strict reviewer_block"
 
 t_summary

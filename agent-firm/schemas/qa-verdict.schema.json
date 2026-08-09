@@ -13,6 +13,10 @@
   "properties": {
     "verdict": { "type": "string", "enum": ["APPROVE", "BLOCK"] },
     "commit_sha": { "type": "string", "description": "SHA of the clean integration checkout QA ran against" },
+    "run_id": { "type": "string", "minLength": 1, "description": "Run id bound during final QA" },
+    "generation": { "type": "integer", "minimum": 1, "description": "Candidate generation bound during final QA" },
+    "provider": { "type": "string", "enum": ["primary", "gpt", "claude"] },
+    "attempt_id": { "type": "string", "minLength": 1 },
     "environment": { "type": "string", "description": "e.g. 'devcontainer node20 / pinned playwright image'" },
     "commands_run": {
       "type": "array",

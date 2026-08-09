@@ -1,34 +1,33 @@
-# Traceability matrix — every acceptance criterion mapped to code, tests, and evidence.
-# Produced during Review/QA; bin/traceability-check enforces it against 08-qa-verdict.json.
+# Candidate-bound traceability. Replace the example row with exactly one row per accepted criterion.
+schema_version: 1
 task_slug:
+candidate:
+  run_id:
+  commit_sha: ""                 # full 40-character SHA from qa-candidate.json
+  generation: 1
+  checkout_path: ""
 matrix:
   - id: AC-001
-    implementation_files: []     # e.g. [src/greet.js]
-    tests: []                    # e.g. [test/greet.test.js::adds two numbers]
-    manual_verification: ""     # if verification was manual, describe it
-    evidence: ""                # path under 09-test-evidence/ or a note
-    status: uncovered            # covered | partial | uncovered
-# Rule: an `uncovered` criterion fails the traceability gate UNLESS it carries an explicit
-# justification (e.g. waived at the Requirements gate, or out of scope).
+    implementation_files: []
+    tests: []
+    manual_verification: ""
+    evidence:
+      - path: 09-test-evidence/example.log
+        candidate_sha: ""
+    status: covered              # covered | partial | uncovered
+# partial/uncovered additionally require gate_record.path, candidate_sha, and an exact
+# waive_partial/waive_uncovered decision. A prose justification is not authority.
 
-# Cross-provider review state. `firm-final-qa-check` validates this section. The helper validates
-# recorded state; it cannot determine whether a claimed dissent or risk classification is truthful.
 two_voice:
-  secondary_provider: ""       # gpt | claude
-  status: available            # available | unavailable
-  required: false              # true for auth / permissions / crypto / PII
-  human_waiver:
-    granted: false
-    record: ""                 # required when an unavailable second voice was required
-two_voice_diff: []              # one entry for every blocker in the secondary verdict
+  secondary_provider: ""        # gpt | claude
+  status: available             # available | unavailable
+  required: true                # cross-check only; the final gate derives this value
+two_voice_diff: []
 # Example entry:
 # - secondary_blocker: "exact blocker text from the secondary verdict"
 #   primary_position: "positive dissent with the evidence read differently"
 #   positive_dissent: true
 #   risk: low                   # low | high; ambiguity is high
-#   bounded_resolution:
-#     attempted: true
-#     rerun: block              # approve | block | not_run | not_required
-#     evidence: "09-test-evidence/two-voice-resolution.md"
-#   evidence: "Primary evidence and rationale"
+#   bounded_resolution: {attempted: true, rounds: 1, rerun: block, evidence: {path: 09-test-evidence/round.json, candidate_sha: "<sha>"}}
+#   evidence: {path: 09-test-evidence/primary-position.json, candidate_sha: "<sha>"}
 #   disposition: proceed_with_primary  # unresolved | fixed | secondary_withdrew | human_decision | proceed_with_primary

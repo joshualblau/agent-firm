@@ -106,10 +106,214 @@
 # below, and the assertion in tests/test-traceability-check.sh that keeps it that way.
 set -euo pipefail
 
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+strict=0
+if [[ "${1:-}" == "--strict" ]]; then strict=1; shift; fi
 run_dir="${1:-}"
 verdict_path="${2:-}"
 if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent-firm/CURRENT_RUN)"; fi
 if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
+if [[ -f "$run_dir/09-test-evidence/qa-candidate.json" ]]; then strict=1; fi
+
+if [[ $strict -eq 1 ]]; then
+python3 - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" <<'PY'
+import collections
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+run = Path(os.path.abspath(sys.argv[1]))
+verdict_path = Path(sys.argv[2]) if sys.argv[2] else run / "08-qa-verdict.json"
+schema_path = Path(sys.argv[3])
+
+def cannot(message):
+    print(f"TRACEABILITY: CANNOT VERIFY -- {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def inadequate(message):
+    print(f"TRACEABILITY: FAIL -- {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    import yaml
+    import jsonschema
+except BaseException as exc:
+    cannot(f"strict validation prerequisites unavailable or broken: {type(exc).__name__}: {exc}")
+
+def load_yaml(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = yaml.safe_load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+    return value
+
+def load_json(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+
+def safe_file(relative, label):
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        cannot(f"{label} must be a non-empty run-relative path")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in relative):
+        cannot(f"{label} contains a control character")
+    parts = Path(relative).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        cannot(f"{label} contains traversal or an empty component")
+    current = run
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            cannot(f"{label} does not exist inside this run: {relative}: {exc}")
+        if stat.S_ISLNK(info.st_mode):
+            cannot(f"{label} contains a symlinked component: {relative}")
+    if not stat.S_ISREG(os.lstat(current).st_mode):
+        cannot(f"{label} is not a regular file: {relative}")
+    if os.path.commonpath((str(run), str(current))) != str(run):
+        cannot(f"{label} escapes the run")
+    return current
+
+def utc(value):
+    if isinstance(value, datetime.datetime):
+        return value.tzinfo is not None and value.utcoffset() == datetime.timedelta(0) and value.microsecond == 0
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return True
+    except ValueError:
+        return False
+
+candidate_path = run / "09-test-evidence" / "qa-candidate.json"
+trace_path = run / "traceability.yaml"
+criteria_path = run / "01-acceptance-criteria.yaml"
+for path, label in ((candidate_path, "candidate metadata"), (trace_path, "traceability matrix"), (criteria_path, "acceptance criteria"), (verdict_path, "QA verdict")):
+    if not path.is_file() or path.is_symlink():
+        cannot(f"missing or unsafe {label}: {path}")
+
+candidate = load_json(candidate_path, "candidate metadata")
+trace = load_yaml(trace_path, "traceability matrix")
+criteria_doc = load_yaml(criteria_path, "acceptance criteria")
+verdict = load_json(verdict_path, "QA verdict")
+schema = load_json(schema_path, "traceability schema")
+try:
+    jsonschema.validate(trace, schema)
+except Exception as exc:
+    cannot(f"traceability schema validation failed: {exc}")
+
+sha = candidate.get("candidate_sha")
+generation = candidate.get("generation")
+run_id = run.name
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    cannot("candidate metadata needs one full 40-character candidate_sha")
+if not isinstance(candidate.get("base_sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", candidate["base_sha"]):
+    cannot("candidate metadata needs one full 40-character base_sha")
+if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+    cannot("candidate generation must be a positive integer")
+if candidate.get("run_id") != run_id or candidate.get("clean") is not True:
+    cannot("candidate metadata run identity or clean flag is invalid")
+
+repo = os.path.realpath(str(candidate.get("repository_root", "")))
+checkout = os.path.realpath(str(candidate.get("checkout_path", "")))
+if not repo or not checkout or os.path.islink(candidate.get("checkout_path", "")):
+    cannot("candidate repository/checkout identity is absent or symlinked")
+try:
+    actual_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+    status = subprocess.check_output(["git", "-C", checkout, "status", "--porcelain=v1", "--untracked-files=all"], stderr=subprocess.DEVNULL, text=True)
+    actual_root = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True).strip()
+    common = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--git-common-dir"], stderr=subprocess.DEVNULL, text=True).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(checkout, common)
+except subprocess.SubprocessError as exc:
+    cannot(f"candidate checkout cannot be verified: {exc}")
+if actual_sha != sha or status or os.path.realpath(actual_root) != checkout:
+    inadequate("candidate checkout is moved, amended, mismatched, or dirty")
+if os.path.realpath(common) != os.path.realpath(str(candidate.get("git_common_dir", ""))):
+    inadequate("candidate checkout repository identity changed")
+
+tc = trace.get("candidate", {})
+if tc != {"run_id": run_id, "commit_sha": sha, "generation": generation, "checkout_path": candidate.get("checkout_path")}:
+    inadequate("traceability candidate identity does not exactly match qa-candidate.json")
+
+if not isinstance(criteria_doc, dict) or not isinstance(criteria_doc.get("criteria"), list) or not criteria_doc["criteria"]:
+    cannot("acceptance criteria must be a non-empty list")
+criteria = criteria_doc["criteria"]
+ids = []
+for item in criteria:
+    if not isinstance(item, dict) or not re.fullmatch(r"AC-[0-9]{3}", str(item.get("id", ""))):
+        cannot("every accepted criterion needs a canonical AC-NNN id")
+    ids.append(item["id"])
+if len(ids) != len(set(ids)):
+    cannot("accepted criteria contain duplicate ids")
+rows = trace["matrix"]
+row_ids = [row["id"] for row in rows]
+if collections.Counter(row_ids) != collections.Counter(ids) or len(row_ids) != len(ids):
+    inadequate("matrix must contain exactly one row for every accepted criterion and no phantom id")
+
+def evidence_ref(ref, label):
+    if ref.get("candidate_sha") != sha:
+        inadequate(f"{label} is stale or bound to a different candidate")
+    return safe_file(ref.get("path"), label)
+
+for row in rows:
+    for index, ref in enumerate(row["evidence"]):
+        evidence_ref(ref, f"{row['id']} evidence #{index + 1}")
+    if row["status"] in ("partial", "uncovered"):
+        gate = row.get("gate_record") or {}
+        if gate.get("candidate_sha") != sha:
+            inadequate(f"{row['id']} gate record is stale")
+        expected = "waive_partial" if row["status"] == "partial" else "waive_uncovered"
+        if gate.get("decision") != expected:
+            inadequate(f"{row['id']} has no exact policy-authorized {expected} decision")
+        record_path = safe_file(gate.get("path"), f"{row['id']} gate record")
+        record = load_yaml(record_path, f"{row['id']} gate record")
+        required = {
+            "schema_version": 1, "type": "criterion_gate", "run_id": run_id,
+            "candidate_sha": sha, "criterion_id": row["id"], "decision": expected
+        }
+        if not isinstance(record, dict) or any(record.get(k) != v for k, v in required.items()):
+            inadequate(f"{row['id']} gate record does not match this run/candidate/decision")
+        if not str(record.get("actor", "")).strip() or not utc(record.get("occurred_at")):
+            inadequate(f"{row['id']} gate record lacks actor or exact UTC time")
+        if not isinstance(record.get("objections"), list) or not record["objections"]:
+            inadequate(f"{row['id']} gate record lacks affected objections")
+        if not isinstance(record.get("evidence"), list) or not record["evidence"]:
+            inadequate(f"{row['id']} gate record lacks evidence")
+
+coverage = verdict.get("acceptance_criteria_coverage")
+if not isinstance(coverage, list):
+    cannot("verdict coverage is not a list")
+coverage_ids = [item.get("id") for item in coverage if isinstance(item, dict)]
+if len(coverage_ids) != len(coverage) or collections.Counter(coverage_ids) != collections.Counter(ids) or len(coverage_ids) != len(ids):
+    inadequate("verdict coverage must contain exactly one entry per accepted criterion and no phantom id")
+expected_status = {"yes": "covered", "partial": "partial", "no": "uncovered"}
+row_by_id = {row["id"]: row for row in rows}
+for item in coverage:
+    covered = item.get("covered")
+    if covered not in expected_status or row_by_id[item["id"]]["status"] != expected_status[covered]:
+        inadequate(f"verdict and matrix status disagree for {item['id']}")
+    if not isinstance(item.get("evidence"), str) or not item["evidence"].strip():
+        inadequate(f"verdict coverage lacks evidence for {item['id']}")
+if verdict.get("commit_sha") != sha or verdict.get("run_id") != run_id or verdict.get("generation") != generation:
+    inadequate("verdict is abbreviated, stale, or not bound to this candidate generation")
+print(f"STRICT TRACEABILITY: PASS -- {len(ids)} exact candidate-bound matrix rows")
+PY
+strict_rc=$?
+[[ $strict_rc -eq 0 ]] || exit "$strict_rc"
+fi
 
 python3 - "$run_dir" "$verdict_path" <<'PY'
 import json, re, sys, os, traceback, importlib.util

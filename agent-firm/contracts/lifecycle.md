@@ -63,19 +63,35 @@ Immediately before the Final gate, run `firm-ledger-log final_gate_pending`.
 ## QA and the two-voice gate
 
 Primary QA is independent of implementation, read-only against source, and always writes
-`08-qa-verdict.json`. It validates that file with `firm-validate-verdict`, proves criteria coverage
-with `firm-traceability-check`, and records what was not tested. The Lead then runs
-`firm-qa-clean-check` against the same clean checkout.
+`08-qa-verdict.json`. Before testing, `firm-qa-checkout` persists the clean detached candidate's full
+SHA, base SHA, checkout identity, and monotonically increasing generation in
+`09-test-evidence/qa-candidate.json`. QA validates its verdict with `firm-validate-verdict`, proves
+exact one-row-per-criterion coverage and current hashed evidence with `firm-traceability-check
+--strict`, and records what was not tested. The Lead then runs `firm-qa-clean-check` against that same
+candidate generation.
 
 - Claude-primary run: call `firm-gpt-qa`; it writes `08-qa-verdict.gpt.json`.
 - Codex-primary run: call `firm-claude-qa`; it writes `08-qa-verdict.claude.json`.
 
+Both wrappers share `firm-reviewer-common`. Each creates a numbered attempt, a disposable controlled
+root containing the complete judge contract and inert source snapshot, and separately bounded
+discovery, authentication, model-readiness, and judge phases. Only structured readiness output can
+establish availability. The wrappers publish atomically only after the verdict schema and exact
+run/full-SHA/generation/provider/attempt identity validate, record every outcome to the explicitly
+targeted run ledger, cap and redact retained diagnostics by default, and remove the controlled root.
+An explicit `--retain-raw-seconds` diagnostic opt-in is capped at one hour, mode 0600, expiry-recorded,
+and stored outside the transferable run package. They do not install, authenticate, upgrade, deploy,
+push, or otherwise change external state.
+
 The secondary provider's BLOCK binds unless primary QA positively dissents on that exact point.
-High-risk disagreement remains blocking. A low-risk positive dissent may proceed only after one
-bounded resolution round is recorded. Every secondary blocker gets one structured entry in
-`traceability.yaml` under `two_voice_diff`. An unavailable required judge needs a recorded human
-waiver. Primary QA BLOCK always blocks. Run `firm-final-qa-check <run_dir>`; only exit 0 satisfies the
-Definition of Done.
+High-risk state is derived from accepted security/privacy criteria and the committed candidate diff
+matched against `high-risk-paths.yaml`; ambiguity is high-risk. High-risk disagreement remains
+blocking. A low-risk positive dissent may proceed only after exactly one evidenced bounded resolution
+round is recorded. Fixed or withdrawn objections require a fresh secondary approval on the same
+candidate generation; human decisions require an exact typed record. Every secondary blocker gets one
+structured entry in `traceability.yaml` under `two_voice_diff`. An unavailable required judge needs a
+matching trusted availability-attempt record and an exact logged human waiver. Primary QA BLOCK always
+blocks. Run `firm-final-qa-check <run_dir>`; only exit 0 satisfies the Definition of Done.
 
 ## Completion
 
