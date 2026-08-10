@@ -43,6 +43,13 @@ selectors = {
     "codex_marketplace": "agent-firm-local",
     "codex_plugin": "agent-firm@agent-firm-local",
 }
+CORE = r"(?:0|[1-9][0-9]*)"
+IDENT = r"[0-9A-Za-z-]+"
+SEMVER = re.compile(
+    rf"{CORE}\.{CORE}\.{CORE}"
+    rf"(?:-(?:{IDENT})(?:\.(?:{IDENT}))*)?"
+    rf"(?:\+(?:{IDENT})(?:\.(?:{IDENT}))*)?"
+)
 
 def stop(message, code=1):
     print(f"firm-bootstrap: BLOCKED: {message}", file=sys.stderr)
@@ -120,41 +127,104 @@ def validate_source_schema():
         versions["claude" if marketplace == "local" else "codex"] = json.load(open(manifest, encoding="utf-8"))["version"]
     return versions
 
-def target_lines(text, needles):
-    matches = []
-    for line in text.splitlines():
-        compact = line.strip()
-        low = compact.lower()
-        if compact and any(needle.lower() in low for needle in needles):
-            matches.append(compact)
-    return sorted(set(matches))
+def parse_semver(value, label):
+    if not SEMVER.fullmatch(value):
+        raise ValueError(f"{label} has unparsable full SemVer {value!r}")
+    core_and_pre, _, cachebuster = value.partition("+")
+    prerelease = core_and_pre.partition("-")[2]
+    if any(part.isdigit() and len(part) > 1 and part.startswith("0")
+           for part in prerelease.split(".") if part):
+        raise ValueError(f"{label} has invalid numeric prerelease identifier {value!r}")
+    return {"version": value, "base": core_and_pre, "cachebuster": cachebuster}
 
-def state_from_results(market, plugin, provider):
-    if provider == "claude":
-        market_needles = [root]
-        plugin_needles = [selectors["claude_plugin"]]
-    else:
-        market_needles = [root, selectors["codex_marketplace"]]
-        plugin_needles = [selectors["codex_plugin"]]
-    market_lines = target_lines(market["text"], market_needles)
-    plugin_lines = target_lines(plugin["text"], plugin_needles)
+def target_collision(value, expected):
+    return value == expected or value.lower() == expected.lower() or value in expected or expected in value
+
+def parse_marketplace(text, provider):
+    expected_selector = selectors[f"{provider}_marketplace"]
+    expected_root = os.path.realpath(root)
+    pattern = (re.compile(r"^(?P<root>.+) marketplace=(?P<selector>[^ ]+)$") if provider == "claude"
+               else re.compile(r"^marketplace=(?P<selector>[^ ]+) path=(?P<root>.+)$"))
+    relevant = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = pattern.fullmatch(line)
+        if not match:
+            if expected_selector.lower() in line.lower() or expected_root.lower() in line.lower():
+                raise ValueError(f"{provider} marketplace emitted an unparsable target-like record: {line!r}")
+            continue
+        selector = match.group("selector")
+        observed_root = os.path.realpath(os.path.abspath(match.group("root")))
+        if target_collision(selector, expected_selector) or target_collision(observed_root, expected_root):
+            relevant.append({"selector": selector, "root": observed_root, "raw": line})
+    exact = [record for record in relevant
+             if record["selector"] == expected_selector and record["root"] == expected_root]
+    if relevant and (len(relevant) != 1 or len(exact) != 1):
+        raise ValueError(f"{provider} marketplace target collision: expected one exact selector/root, got {relevant!r}")
+    return exact[0] if exact else None
+
+def parse_plugin(text, provider, expected_version):
+    expected_selector = selectors[f"{provider}_plugin"]
+    pattern = re.compile(r"^(?P<selector>[^ ]+) version=(?P<version>[^ ]+)$")
+    relevant = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = pattern.fullmatch(line)
+        if not match:
+            if expected_selector.lower() in line.lower():
+                raise ValueError(f"{provider} plugin emitted an unparsable target-like record: {line!r}")
+            continue
+        selector = match.group("selector")
+        if target_collision(selector, expected_selector):
+            version = parse_semver(match.group("version"), f"{provider} plugin {selector}")
+            relevant.append({"selector": selector, **version, "raw": line})
+    exact = [record for record in relevant if record["selector"] == expected_selector]
+    if relevant and (len(relevant) != 1 or len(exact) != 1):
+        raise ValueError(f"{provider} plugin target collision: expected one exact selector, got {relevant!r}")
+    if not exact:
+        return None
+    record = exact[0]
+    expected = parse_semver(expected_version, f"expected {provider} manifest")
+    record["version_matches"] = (
+        record["version"] == expected["version"]
+        and record["base"] == expected["base"]
+        and record["cachebuster"] == expected["cachebuster"]
+    )
+    return record
+
+def state_from_results(market, plugin, provider, expected_version):
+    marketplace = parse_marketplace(market["text"], provider)
+    installed = parse_plugin(plugin["text"], provider, expected_version)
+    market_lines = [] if marketplace is None else [marketplace["raw"]]
+    plugin_lines = [] if installed is None else [installed["raw"]]
     return {
-        "marketplace_present": bool(market_lines),
+        "marketplace_present": marketplace is not None,
+        "marketplace": marketplace,
         "marketplace_state": market_lines,
         "marketplace_state_sha256": hashlib.sha256("\n".join(market_lines).encode()).hexdigest(),
-        "plugin_present": bool(plugin_lines),
+        "plugin_present": installed is not None,
+        "plugin": installed,
         "plugin_state": plugin_lines,
         "plugin_state_sha256": hashlib.sha256("\n".join(plugin_lines).encode()).hexdigest(),
     }
 
-def capture(provider, phase_prefix, preflight=False):
+def capture(provider, phase_prefix, expected_version, preflight=False):
     market = call(provider, phase_prefix + "-marketplace-state", ["plugin", "marketplace", "list"])
     plugin = call(provider, phase_prefix + "-plugin-state", ["plugin", "list"])
     if not market["ok"] or not plugin["ok"]:
         if preflight:
             stop(f"{provider} exact prior-state capture failed; fix CLI readiness and retry. No provider mutation ran.")
         raise RuntimeError(f"{provider} recovery-state capture failed (market rc={market['rc']}, plugin rc={plugin['rc']})")
-    return state_from_results(market, plugin, provider)
+    try:
+        return state_from_results(market, plugin, provider, expected_version)
+    except ValueError as exc:
+        if preflight:
+            stop(f"{provider} exact prior-state parsing failed: {exc}. No provider mutation ran.")
+        raise RuntimeError(f"{provider} exact state parsing failed: {exc}") from exc
 
 def atomic_record(record):
     base = os.environ.get("FIRM_BOOTSTRAP_RECOVERY_DIR")
@@ -207,7 +277,8 @@ try:
             ("marketplace", "list", "add", "remove"))
     require("codex", "marketplace-help", ["plugin", "marketplace", "--help"],
             ("list", "add", "remove"))
-    before = {provider: capture(provider, "prior", True) for provider in ("claude", "codex")}
+    before = {provider: capture(provider, "prior", expected_versions[provider], True)
+              for provider in ("claude", "codex")}
 
     actions = []
     if not before["claude"]["marketplace_present"]:
@@ -245,14 +316,16 @@ try:
 
     if failure is None:
         try:
-            after = {provider: capture(provider, "verify", False) for provider in ("claude", "codex")}
+            after = {provider: capture(provider, "verify", expected_versions[provider], False)
+                     for provider in ("claude", "codex")}
             missing_after = [provider for provider in ("claude", "codex")
                              if not after[provider]["marketplace_present"] or not after[provider]["plugin_present"]]
             if missing_after:
                 failure = {"provider": "both", "phase": "post-mutation-verification", "exit_code": 1,
                            "bounded_status": "state_mismatch", "missing": missing_after}
             stale_after = [provider for provider in ("claude", "codex")
-                           if not any(expected_versions[provider] in line for line in after[provider]["plugin_state"])]
+                           if after[provider]["plugin"] is None
+                           or not after[provider]["plugin"]["version_matches"]]
             if failure is None and stale_after:
                 failure = {"provider": "both", "phase": "post-mutation-version-verification", "exit_code": 1,
                            "bounded_status": "state_mismatch", "stale": stale_after}
@@ -279,7 +352,7 @@ try:
         current = {}
         for provider in ("claude", "codex"):
             try:
-                current[provider] = capture(provider, "recovery", False)
+                current[provider] = capture(provider, "recovery", expected_versions[provider], False)
             except Exception as exc:
                 capture_errors.append(f"{provider}: {exc}")
                 current[provider] = {"capture_error": str(exc)}

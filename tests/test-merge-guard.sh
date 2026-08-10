@@ -1899,9 +1899,9 @@ assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
 done
 
 # This is an explicit, disposable selection fixture, not a claim about a real provider loader. It
-# models the documented plugin + project + user source selection so duplicate behavior is driven and
-# counted. Exact-SHA real-loader evidence remains a separate release-readiness axis.
-t_case "fixture loader selection measures project/user duplicate hook event multiplication"
+# models only the bounded legacy scopes doctor actually diagnoses: Claude project+user and the
+# obsolete Codex project prototype. Exact-SHA real-loader scope/selection remains Q-02.
+t_case "bounded fixture scopes measure diagnosed legacy duplicate hook multiplication"
 LOADER_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/firm-loader-selection.XXXXXX")"; t_track "$LOADER_FIXTURE"
 mkdir -p "$LOADER_FIXTURE/project/.claude" "$LOADER_FIXTURE/project/.codex" \
   "$LOADER_FIXTURE/home/.claude" "$LOADER_FIXTURE/home/.codex"
@@ -1910,7 +1910,7 @@ import json,os,sys
 claude,codex,root=sys.argv[1:]
 for source,targets in (
     (claude,["project/.claude/settings.json","home/.claude/settings.json"]),
-    (codex,["project/.codex/hooks.json","home/.codex/hooks.json"]),
+    (codex,["project/.codex/hooks.json"]),
 ):
     hooks=json.load(open(source))["hooks"]
     for rel in targets:
@@ -1925,7 +1925,7 @@ sources=[plugin]
 if provider == "claude":
     sources += [os.path.join(project,".claude/settings.json"),os.path.join(home,".claude/settings.json")]
 else:
-    sources += [os.path.join(project,".codex/hooks.json"),os.path.join(home,".codex/hooks.json")]
+    sources += [os.path.join(project,".codex/hooks.json")]
 for source in sources:
     if not os.path.isfile(source): continue
     for entry in json.load(open(source)).get("hooks",{}).get("PreToolUse",[]):
@@ -1943,26 +1943,25 @@ run_selected_fixture_hooks() {
 }
 for provider in claude codex; do
   if [ "$provider" = claude ]; then
-    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000003Z-claude-duplicates"
+    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000003Z-claude-duplicates"; expected_pairs=3; modeled="project+user"
   else
-    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000004Z-codex-duplicates"
+    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000004Z-codex-duplicates"; expected_pairs=2; modeled="project"
   fi
   FIXTURE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"; mk_run "$FIXTURE_REPO" "$fixture_id"
   FIXTURE_LEDGER="$FIXTURE_REPO/.agent-firm/runs/$fixture_id/run.jsonl"
   assert_ok "$provider fixture executes every explicitly selected hook" \
     run_selected_fixture_hooks "$provider" "$provider_hooks" "$FIXTURE_REPO"
-  assert_ok "$provider project+user duplicates multiply measured events threefold" python3 -c "
+  assert_ok "$provider bounded $modeled duplicate scope multiplies measured events to $expected_pairs pairs" python3 -c "
 import json
 records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
-assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==3, records
-assert sum(r.get('event')=='merge_guard_permit' for r in records)==3, records
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==$expected_pairs, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==$expected_pairs, records
 "
 done
 python3 - "$LOADER_FIXTURE" <<'PY'
 import json,os,sys
 root=sys.argv[1]
-for rel in ("project/.claude/settings.json","home/.claude/settings.json",
-            "project/.codex/hooks.json","home/.codex/hooks.json"):
+for rel in ("project/.claude/settings.json","home/.claude/settings.json","project/.codex/hooks.json"):
     path=os.path.join(root,rel); d=json.load(open(path)); d["hooks"]={}
     with open(path,"w") as fh: json.dump(d,fh); fh.write("\n")
 PY

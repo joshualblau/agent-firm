@@ -107,16 +107,34 @@ t_case "obsolete Codex hook prototype is diagnosed without mutation"
 HOOK_PROJECT="$(mktemp -d "${TMPDIR:-/tmp}/firm-hook-project.XXXXXX")"; t_track "$HOOK_PROJECT"
 mkdir -p "$HOOK_PROJECT/.codex" "$HOOK_PROJECT/home" "$HOOK_PROJECT/provider-stubs"
 printf '{"hooks":{"PreToolUse":[{"command":"firm-ledger-hook"}]}}\n' > "$HOOK_PROJECT/.codex/hooks.json"
-printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 0\n' > "$HOOK_PROJECT/provider-stubs/claude"
-printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 0\nexit 0\n' > "$HOOK_PROJECT/provider-stubs/codex"
+cat > "$HOOK_PROJECT/provider-stubs/claude" <<'SH'
+#!/bin/sh
+printf 'claude' >> "$FIRM_TEST_PROVIDER_LOG"
+for arg in "$@"; do printf '\t%s' "$arg" >> "$FIRM_TEST_PROVIDER_LOG"; done
+printf '\n' >> "$FIRM_TEST_PROVIDER_LOG"
+exit 0
+SH
+cat > "$HOOK_PROJECT/provider-stubs/codex" <<'SH'
+#!/bin/sh
+printf 'codex' >> "$FIRM_TEST_PROVIDER_LOG"
+for arg in "$@"; do printf '\t%s' "$arg" >> "$FIRM_TEST_PROVIDER_LOG"; done
+printf '\n' >> "$FIRM_TEST_PROVIDER_LOG"
+exit 0
+SH
 chmod +x "$HOOK_PROJECT/provider-stubs/claude" "$HOOK_PROJECT/provider-stubs/codex"
+provider_log="$HOOK_PROJECT/provider.log"
+: > "$provider_log"
 python_exe="$(python3 -c 'import sys; print(sys.executable)')"
 hook_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
 ln -s "$python_exe" "$HOOK_PROJECT/provider-stubs/python3"
 hook_before="$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
 hook_mode="$(stat -f '%Lp' "$HOOK_PROJECT/.codex/hooks.json" 2>/dev/null || stat -c '%a' "$HOOK_PROJECT/.codex/hooks.json")"
 doctor_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
-  PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; doctor_rc=$?
+  FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
+  "$BIN/firm-doctor" 2>&1)"; doctor_rc=$?
+assert_output "doctor bounds static hook ownership to declarations and defers runtime selection" \
+  "repository manifests declare one plugin-owned ledger/merge-guard hook adapter per runtime; runtime loader selection is unverified until Q-02" \
+  printf '%s\n' "$doctor_out"
 assert_output "doctor gives a human-reviewed removal action" \
   "remove that file manually only after confirming it contains no project-specific hooks" printf '%s\n' "$doctor_out"
 assert_eq "doctor does not rewrite the prototype" "$hook_before" \
@@ -126,8 +144,97 @@ assert_eq "doctor preserves prototype mode" "$hook_mode" \
 assert_eq "confirmed Codex duplicate blocks readiness" "1" "$doctor_rc"
 rm -f "$HOOK_PROJECT/.codex/hooks.json"
 doctor_clean_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
-  PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; doctor_clean_rc=$?
+  FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
+  "$BIN/firm-doctor" 2>&1)"; doctor_clean_rc=$?
 assert_eq "readiness returns after the duplicate-only prototype is removed" "0" "$doctor_clean_rc"
+
+t_case "doctor binds both provider probes to the canonical reviewer envelope"
+: > "$provider_log"
+doctor_probe_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
+  FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
+  "$BIN/firm-doctor" --probe 2>&1)"; doctor_probe_rc=$?
+assert_eq "canonical disposable provider probes pass" "0" "$doctor_probe_rc"
+assert_output "doctor reports both canonical reviewer displays, models, and xhigh effort" \
+  "canonical reviewer models: GPT=GPT-5.6 sol (gpt-5.6-sol, xhigh) · Claude=Opus 5 (opus, xhigh)" \
+  printf '%s\n' "$doctor_probe_out"
+assert_ok "Claude and Codex receive their exact full native reviewer envelopes" python3 - "$provider_log" <<'PY'
+import pathlib, sys
+calls=[line.split("\t") for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert calls == [
+    ["claude", "auth", "status"],
+    ["claude", "-p", "Reply with exactly: ok", "--model", "opus", "--effort", "xhigh",
+     "--output-format", "text", "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"],
+    ["codex", "login", "status"],
+    ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-a", "never",
+     "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"', "Reply with exactly: ok"],
+], calls
+PY
+
+for mismatch in claude codex; do
+  : > "$provider_log"
+  if [ "$mismatch" = claude ]; then
+    mismatch_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
+      FIRM_CLAUDE_QA_MODEL=not-the-canonical-model FIRM_TEST_PROVIDER_LOG="$provider_log" \
+      PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" --probe 2>&1)"; mismatch_rc=$?
+    mismatch_name="Claude"
+  else
+    mismatch_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
+      FIRM_GPT_QA_MODEL=not-the-canonical-model FIRM_TEST_PROVIDER_LOG="$provider_log" \
+      PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" --probe 2>&1)"; mismatch_rc=$?
+    mismatch_name="Codex"
+  fi
+  assert_eq "$mismatch_name compatibility override mismatch blocks doctor" "1" "$mismatch_rc"
+  assert_output "$mismatch_name mismatch identifies the canonical-envelope block" \
+    "canonical $mismatch_name reviewer envelope" printf '%s\n' "$mismatch_out"
+  assert_eq "$mismatch_name mismatch occurs before any provider fixture" "" "$(cat "$provider_log")"
+done
+
+cat > "$HOOK_PROJECT/check-doctor-envelope.py" <<'PY'
+import pathlib, sys
+text=pathlib.Path(sys.argv[1]).read_text()
+required={
+ "claude.provider": 'resolve_reviewer_tuple claude "${FIRM_CLAUDE_QA_MODEL+x}"',
+ "claude.model": '--model "$CLAUDE_REVIEW_MODEL"',
+ "claude.display": 'Claude=$CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, $CLAUDE_REVIEW_EFFORT)',
+ "claude.effort": '--effort "$CLAUDE_REVIEW_EFFORT"',
+ "codex.provider": 'resolve_reviewer_tuple codex "${FIRM_GPT_QA_MODEL+x}"',
+ "codex.model": '-m "$CODEX_REVIEW_MODEL"',
+ "codex.display": 'GPT=$CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, $CODEX_REVIEW_EFFORT)',
+ "codex.effort": '-c "model_reasoning_effort=\\"$CODEX_REVIEW_EFFORT\\""',
+}
+bad=[name for name, needle in required.items() if text.count(needle) != 1]
+if bad:
+    raise SystemExit("invalid doctor reviewer envelope fields: " + ", ".join(bad))
+PY
+assert_ok "doctor source carries each provider/model/display/effort binding exactly once" \
+  python3 "$HOOK_PROJECT/check-doctor-envelope.py" "$BIN/firm-doctor"
+assert_ok "independent mutations kill every reviewer-envelope field for both providers" \
+  python3 - "$BIN/firm-doctor" "$HOOK_PROJECT/check-doctor-envelope.py" "$HOOK_PROJECT" <<'PY'
+import pathlib, subprocess, sys
+source, checker, target_dir = map(pathlib.Path, sys.argv[1:])
+text=source.read_text()
+mutations={
+ "claude.provider": ('resolve_reviewer_tuple claude "${FIRM_CLAUDE_QA_MODEL+x}"',
+                     'resolve_reviewer_tuple codex "${FIRM_CLAUDE_QA_MODEL+x}"'),
+ "claude.model": ('--model "$CLAUDE_REVIEW_MODEL"', '--model "mutant-claude-model"'),
+ "claude.display": ('Claude=$CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, $CLAUDE_REVIEW_EFFORT)',
+                    'Claude=Mutant ($CLAUDE_REVIEW_MODEL, $CLAUDE_REVIEW_EFFORT)'),
+ "claude.effort": ('--effort "$CLAUDE_REVIEW_EFFORT"', '--effort "high"'),
+ "codex.provider": ('resolve_reviewer_tuple codex "${FIRM_GPT_QA_MODEL+x}"',
+                    'resolve_reviewer_tuple claude "${FIRM_GPT_QA_MODEL+x}"'),
+ "codex.model": ('-m "$CODEX_REVIEW_MODEL"', '-m "mutant-codex-model"'),
+ "codex.display": ('GPT=$CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, $CODEX_REVIEW_EFFORT)',
+                   'GPT=Mutant ($CODEX_REVIEW_MODEL, $CODEX_REVIEW_EFFORT)'),
+ "codex.effort": ('-c "model_reasoning_effort=\\"$CODEX_REVIEW_EFFORT\\""',
+                  '-c "model_reasoning_effort=\\"high\\""'),
+}
+for name,(old,new) in mutations.items():
+    assert text.count(old)==1, (name, text.count(old))
+    mutant=target_dir/f"doctor-mutant-{name}"
+    mutant.write_text(text.replace(old,new,1))
+    proc=subprocess.run([sys.executable, str(checker), str(mutant)], capture_output=True, text=True)
+    assert proc.returncode != 0, (name, proc.stdout, proc.stderr)
+PY
 
 t_case "shared contracts are the adapter boundary"
 for role in architect implementer intake-analyst integrator packager qa-tester recruiter reviewer scout specialist; do
@@ -152,12 +259,16 @@ for forbidden in (
     'duplicates are detection-only',
     'continue to the final gate with a warning',
     'verified compensation, not atomicity',
+    'the supported plugin selection has one hook source per runtime',
+    'exactly one plugin hook source serves each runtime',
 ):
     assert forbidden not in low, forbidden
 required={
  'README.md':['historical implementation milestones','blocked/unproved','blocked_recovery_required'],
  'docs/INSTALL.md':['unavailable_reverses','non-ship-ready draft','one fresh check'],
- 'docs/ENFORCEMENT.md':['confirmed duplicate, never rewrites it','fixture counts do not prove real provider loader selection'],
+ 'docs/ENFORCEMENT.md':['confirmed duplicate within the bounded modeled scopes',
+                        'runtime loader selection and the supported external source set remain unverified until q-02',
+                        'fixture counts do not prove real provider loader selection'],
  'docs/INTERACTIVE-TEST.md':['one final interaction, then one fresh check','blocked_recovery_required'],
  'docs/WIRING.md':['non-ship-ready draft','no proven exact inverse'],
 }
@@ -166,6 +277,12 @@ for rel,phrases in required.items():
     for phrase in phrases: assert phrase in body,(rel,phrase)
 for name in ('PHASE3.md','PHASE4.md','PHASE5.md'):
     assert 'historical implementation here is not evidence' in (root/'docs'/name).read_text().lower(),name
+phase4=' '.join((root/'docs/PHASE4.md').read_text().lower().split())
+for phrase in ('repository manifests declare exactly one plugin hook adapter per runtime',
+               'runtime loader selection and supported external scopes are unverified until q-02',
+               'claude plugin+project+user produces three event pairs',
+               'codex plugin+obsolete-project produces two'):
+    assert phrase in phase4, phrase
 PY
 
 t_summary
