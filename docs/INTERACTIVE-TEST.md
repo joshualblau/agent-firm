@@ -12,12 +12,14 @@ git add -A && git commit -qm "init: firm config installed"
 `firm-bootstrap` requires both provider CLIs and, before either install is changed, runs bounded
 capability/selector/schema checks and captures the exact matching provider state. It installs both
 adapters from the same checkout and links the shared tools. This changes real provider stores: use it
-only after approving that external action. Failure triggers verified compensation, not atomicity; a
-failed compensation remains BLOCKED and names a mode-0600 recovery record that must be reviewed before
-retry.
+only after approving that external action. Failure triggers supported-inverse compensation, not
+atomicity. Freshly created entries have remove/uninstall inverses; a pre-existing plugin refresh does
+not. Bootstrap never reuses a forward update/add call as a reverse. Such a failure remains
+`BLOCKED_RECOVERY_REQUIRED` and names a mode-0600 recovery record that must be manually reconciled
+before retry.
 `firm-install` merges Claude's per-project permission policy; it intentionally does not overwrite
 Claude/Codex config, rules, or hooks. Claude and Codex each receive one hook source from their plugin
-manifest; legacy project/user duplicates are detection-only and require a configuration-preserving
+manifest; confirmed legacy project/user duplicates make `firm-doctor` FAIL and require a configuration-preserving
 manual review. The firm's own `tests/` and `.github/` remain in the plugin source, not the work project.
 To work on the tooling itself rather than drive it, use the agent-firm repo.
 
@@ -59,9 +61,12 @@ Then invoke the symmetric Codex-first workflow:
 4. **Permission gates engage** — anything in the `ask` list (e.g. `git commit`) prompts you; `git push`
    / `sudo` are denied. Reads and the test runner run without prompts.
 5. **Two schema-valid verdicts** — primary QA writes `08-qa-verdict.json`; the cross-provider judge
-   writes `.gpt.json` or `.claude.json`, and `firm-final-qa-check` exits 0 before handoff.
-6. **No auto-finish** — the Lead pauses at the **final gate** with a well-formed approval payload
-   (decision, context, options, recommendation, default, risk, blocking) and waits for your sign-off.
+   writes `.gpt.json` or `.claude.json`. The Packager may assemble only a non-ship-ready draft before
+   the Final interaction.
+6. **One Final interaction, then one fresh check** — exit 4 `decision_required` presents its exact
+   objections and permitted typed record options once. If you choose one, the Lead appends the matching
+   current-SHA record and reruns `firm-final-qa-check` once. Only fresh exit 0 finalizes the handoff;
+   rejection, mismatch, staleness, or another nonzero result remains blocked without a second prompt.
 
 This smoke is not package-readiness proof by itself. Release evidence must bind to the exact full SHA,
 first exercise both real loaders and repeat cache refreshes in disposable provider homes, and later

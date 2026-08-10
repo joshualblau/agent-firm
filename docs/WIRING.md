@@ -35,10 +35,12 @@ grep -E 'ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|ANTHROPIC_AUTH_TOKEN' ~/
 
 Bootstrap requires compatible Claude and Codex CLIs. It completes bounded capability, local
 selector/schema, and exact matching-state capture for both before its first provider mutation. The
-two stores cannot be updated atomically: any provider failure triggers reverse-order compensation and
-state verification. If the output says `COMPENSATION BLOCKED`, stop; inspect the mode-0600 recovery
-record and restore only the named agent-firm entries before another preflight. Do not retry against
-active state until that record is resolved.
+two stores cannot be updated atomically. A provider failure triggers only supported reverse-order
+inverses for freshly created entries. Existing plugin refresh has no proven exact inverse; bootstrap
+does not repeat the forward update/add command as rollback and emits mode-0600
+`BLOCKED_RECOVERY_REQUIRED`. Inspect its prior/observed digests, completed mutations, and unavailable
+reverses; manually restore only the named agent-firm entries before another preflight. Do not retry
+against active state until that record is resolved.
 
 ## B. 1Password backbone (once) — *you do the account steps*
 
@@ -83,7 +85,7 @@ firm-doctor                                      # fail-closed: no key leak, pro
 ```
 
 The installed plugin is the only firm hook owner for each runtime. `firm-install` merges permissions
-and preserves hook/configuration subtrees. `firm-doctor` warns about legacy Claude settings hooks or
+and preserves hook/configuration subtrees. `firm-doctor` FAILs readiness on confirmed legacy Claude settings hooks or
 `.codex/hooks.json`, but does not rewrite them: preserve custom entries and remove only confirmed
 duplicate firm commands after manual review.
 
@@ -93,6 +95,12 @@ Start from either provider after the doctor is clean:
 Claude Code: /agent-firm:start <goal>
 Codex:       $agent-firm:start <goal>
 ```
+
+The Packager first writes a non-ship-ready draft. If `firm-final-qa-check` emits exit 4
+`decision_required`, the Lead presents its exact objections and permitted record types in one Final
+interaction. A matching typed current-run/current-full-SHA record is followed by one fresh mechanical
+rerun; only exit 0 finalizes the handoff. Rejection, stale/mismatched input, or another nonzero result
+remains blocked and does not open a second prompt in that Final cycle.
 
 `.env.op` is committed (references only — no values); `.envrc` stays machine-local (gitignored).
 `firm-doctor` must show **0 FAIL** before you run an engagement.

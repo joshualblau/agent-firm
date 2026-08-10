@@ -110,14 +110,24 @@ printf '{"hooks":{"PreToolUse":[{"command":"firm-ledger-hook"}]}}\n' > "$HOOK_PR
 printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 0\n' > "$HOOK_PROJECT/provider-stubs/claude"
 printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 0\nexit 0\n' > "$HOOK_PROJECT/provider-stubs/codex"
 chmod +x "$HOOK_PROJECT/provider-stubs/claude" "$HOOK_PROJECT/provider-stubs/codex"
+python_exe="$(python3 -c 'import sys; print(sys.executable)')"
+hook_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
+ln -s "$python_exe" "$HOOK_PROJECT/provider-stubs/python3"
 hook_before="$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
-doctor_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" \
+hook_mode="$(stat -f '%Lp' "$HOOK_PROJECT/.codex/hooks.json" 2>/dev/null || stat -c '%a' "$HOOK_PROJECT/.codex/hooks.json")"
+doctor_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
   PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; doctor_rc=$?
 assert_output "doctor gives a human-reviewed removal action" \
-  "remove that file manually after confirming it contains no project-specific hooks" printf '%s\n' "$doctor_out"
+  "remove that file manually only after confirming it contains no project-specific hooks" printf '%s\n' "$doctor_out"
 assert_eq "doctor does not rewrite the prototype" "$hook_before" \
   "$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
-assert_ok "doctor result is not treated as proof of package readiness" sh -c "[ '$doctor_rc' -ne 0 ]"
+assert_eq "doctor preserves prototype mode" "$hook_mode" \
+  "$(stat -f '%Lp' "$HOOK_PROJECT/.codex/hooks.json" 2>/dev/null || stat -c '%a' "$HOOK_PROJECT/.codex/hooks.json")"
+assert_eq "confirmed Codex duplicate blocks readiness" "1" "$doctor_rc"
+rm -f "$HOOK_PROJECT/.codex/hooks.json"
+doctor_clean_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
+  PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; doctor_clean_rc=$?
+assert_eq "readiness returns after the duplicate-only prototype is removed" "0" "$doctor_clean_rc"
 
 t_case "shared contracts are the adapter boundary"
 for role in architect implementer intake-analyst integrator packager qa-tester recruiter reviewer scout specialist; do
@@ -126,5 +136,36 @@ for role in architect implementer intake-analyst integrator packager qa-tester r
 done
 assert_output "Codex start uses Codex-primary run metadata" "--primary codex" cat "$FIRM_ROOT/codex-skills/start/SKILL.md"
 assert_output "Claude start uses Claude-primary run metadata" "--primary claude" cat "$FIRM_ROOT/commands/start.md"
+
+t_case "current docs reject readiness, recovery, duplicate, loader, and Final-handoff contradictions"
+assert_ok "reference and historical docs preserve one candidate-readiness story" python3 - "$FIRM_ROOT" <<'PY'
+import pathlib,re,sys
+root=pathlib.Path(sys.argv[1])
+paths=[root/'README.md',*(root/'docs'/name for name in (
+ 'README.md','ENFORCEMENT.md','INSTALL.md','INTERACTIVE-TEST.md','PHASE3.md','PHASE4.md','PHASE5.md','WIRING.md'))]
+text='\n'.join(p.read_text() for p in paths); low=text.lower()
+for forbidden in (
+    'phase 6 / 0.8.0 (done)',
+    'two `gh` round trips',
+    'firm-doctor warns about legacy',
+    'exits 0 before handoff',
+    'duplicates are detection-only',
+    'continue to the final gate with a warning',
+    'verified compensation, not atomicity',
+):
+    assert forbidden not in low, forbidden
+required={
+ 'README.md':['historical implementation milestones','blocked/unproved','blocked_recovery_required'],
+ 'docs/INSTALL.md':['unavailable_reverses','non-ship-ready draft','one fresh check'],
+ 'docs/ENFORCEMENT.md':['confirmed duplicate, never rewrites it','fixture counts do not prove real provider loader selection'],
+ 'docs/INTERACTIVE-TEST.md':['one final interaction, then one fresh check','blocked_recovery_required'],
+ 'docs/WIRING.md':['non-ship-ready draft','no proven exact inverse'],
+}
+for rel,phrases in required.items():
+    body=(root/rel).read_text().lower()
+    for phrase in phrases: assert phrase in body,(rel,phrase)
+for name in ('PHASE3.md','PHASE4.md','PHASE5.md'):
+    assert 'historical implementation here is not evidence' in (root/'docs'/name).read_text().lower(),name
+PY
 
 t_summary

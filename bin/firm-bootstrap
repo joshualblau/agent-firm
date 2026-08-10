@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # firm-bootstrap [--with-permissions] [--with-python-deps]
 # Both CLIs are mandatory. Before the first mutation this performs bounded capability, selector/schema,
-# and exact target-state preflight for Claude and Codex. Provider failures trigger compensation to the
-# captured state; failed compensation writes a mode-0600 recovery record and remains BLOCKING.
+# and exact target-state preflight for Claude and Codex. Provider failures use only documented inverse
+# operations; an existing-install refresh has no exact inverse and therefore requires manual recovery.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -190,8 +190,9 @@ def atomic_record(record):
     os.chmod(path, 0o600)
     return path
 
-def mutation(provider, phase, argv, reverse):
-    return {"provider": provider, "phase": phase, "argv": argv, "reverse": reverse}
+def mutation(provider, phase, argv, reverse, restore_kind):
+    return {"provider": provider, "phase": phase, "argv": argv, "reverse": reverse,
+            "restore_kind": restore_kind}
 
 try:
     # Mandatory dual-CLI capability and exact-state preflight. Every command here is non-mutating.
@@ -211,25 +212,32 @@ try:
     actions = []
     if not before["claude"]["marketplace_present"]:
         actions.append(mutation("claude", "marketplace-add", ["plugin", "marketplace", "add", root],
-                                ["plugin", "marketplace", "remove", selectors["claude_marketplace"]]))
+                                ["plugin", "marketplace", "remove", selectors["claude_marketplace"]],
+                                "remove_fresh_entry"))
     if before["claude"]["plugin_present"]:
         actions.append(mutation("claude", "plugin-update", ["plugin", "update", selectors["claude_plugin"]],
-                                ["plugin", "update", selectors["claude_plugin"]]))
+                                None, "unavailable_existing_state"))
     else:
         actions.append(mutation("claude", "plugin-install", ["plugin", "install", selectors["claude_plugin"]],
-                                ["plugin", "uninstall", selectors["claude_plugin"]]))
+                                ["plugin", "uninstall", selectors["claude_plugin"]],
+                                "uninstall_fresh_entry"))
     if not before["codex"]["marketplace_present"]:
         actions.append(mutation("codex", "marketplace-add", ["plugin", "marketplace", "add", root],
-                                ["plugin", "marketplace", "remove", selectors["codex_marketplace"]]))
+                                ["plugin", "marketplace", "remove", selectors["codex_marketplace"]],
+                                "remove_fresh_entry"))
     actions.append(mutation("codex", "plugin-refresh", ["plugin", "add", selectors["codex_plugin"]],
-                            ["plugin", "add", selectors["codex_plugin"]] if before["codex"]["plugin_present"]
-                            else ["plugin", "remove", selectors["codex_plugin"]]))
+                            None if before["codex"]["plugin_present"]
+                            else ["plugin", "remove", selectors["codex_plugin"]],
+                            "unavailable_existing_state" if before["codex"]["plugin_present"]
+                            else "remove_fresh_entry"))
 
     attempted = []
     failure = None
     for action in actions:
         result = call(action["provider"], action["phase"], action["argv"])
-        attempted.append(action)
+        attempted.append({**action, "exit_code": result["rc"],
+                          "bounded_status": result["meta"].get("status", "missing"),
+                          "succeeded": result["ok"]})
         if not result["ok"]:
             failure = {"provider": action["provider"], "phase": action["phase"], "exit_code": result["rc"],
                        "bounded_status": result["meta"].get("status", "missing")}
@@ -254,7 +262,14 @@ try:
 
     if failure is not None:
         compensation = []
+        unavailable_reverses = []
         for action in reversed(attempted):
+            if action["reverse"] is None:
+                unavailable_reverses.append({"provider": action["provider"], "phase": action["phase"],
+                                             "forward_command": action["argv"],
+                                             "restore_kind": action["restore_kind"],
+                                             "reason": "CLI exposes no exact inverse for refreshing an existing installed entry"})
+                continue
             result = call(action["provider"], "compensate-" + action["phase"], action["reverse"])
             compensation.append({"provider": action["provider"], "phase": action["phase"],
                                  "command": action["reverse"], "exit_code": result["rc"],
@@ -270,18 +285,26 @@ try:
                 current[provider] = {"capture_error": str(exc)}
         exact = not capture_errors and all(current.get(provider) == before[provider]
                                            for provider in ("claude", "codex"))
-        comp_ok = all(item["succeeded"] for item in compensation) and exact
+        comp_ok = (not unavailable_reverses and
+                   all(item["succeeded"] for item in compensation) and exact)
         record = {
             "schema_version": 1,
             "status": "recovered" if comp_ok else "BLOCKED_RECOVERY_REQUIRED",
             "failure": failure,
             "captured_prior_state": before,
             "observed_recovery_state": current,
+            "attempted_mutations": [{k: v for k, v in action.items() if k != "reverse"}
+                                    for action in attempted],
+            "completed_mutations": [{"provider": action["provider"], "phase": action["phase"],
+                                      "command": action["argv"]}
+                                     for action in attempted if action["succeeded"]],
             "compensation_attempts": compensation,
+            "unavailable_reverses": unavailable_reverses,
             "capture_errors": capture_errors,
             "exact_prior_state_restored": exact,
             "safe_corrective_action": (
-                "No provider retry was performed. Inspect the named disposable/active provider stores, "
+                "No forward command was reused as a reverse and no provider retry was performed. "
+                "Inspect the named disposable/active provider stores, "
                 "compare them with captured_prior_state, restore only the agent-firm marketplace/plugin "
                 "entries, then rerun capability preflight before another mutation."
             ),

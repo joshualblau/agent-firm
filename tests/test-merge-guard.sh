@@ -1823,7 +1823,7 @@ assert_ok "a failure in the LEDGER path cannot fail a tool call (garbage stdin)"
 assert_ok "  (no active run at all)" \
   sh -c "cd '$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-norun.XXXXXX")' && printf '{}' | '$BIN/firm-ledger-hook'"
 
-t_case "AC-023 each provider has exactly one plugin-owned hook surface, ledger FIRST"
+t_case "plugin manifest commands keep ledger FIRST and one guard command per manifest"
 assert_ok "tracked settings owns permissions only and cannot duplicate the Claude plugin hooks" python3 -c "
 import json
 d = json.load(open('$SETTINGS'))
@@ -1893,6 +1893,92 @@ PY
   assert_ok "$provider effective source produces exactly one ledger event and one guard decision" python3 -c "
 import json
 records=[json.loads(line) for line in open('$EFFECTIVE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
+"
+done
+
+# This is an explicit, disposable selection fixture, not a claim about a real provider loader. It
+# models the documented plugin + project + user source selection so duplicate behavior is driven and
+# counted. Exact-SHA real-loader evidence remains a separate release-readiness axis.
+t_case "fixture loader selection measures project/user duplicate hook event multiplication"
+LOADER_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/firm-loader-selection.XXXXXX")"; t_track "$LOADER_FIXTURE"
+mkdir -p "$LOADER_FIXTURE/project/.claude" "$LOADER_FIXTURE/project/.codex" \
+  "$LOADER_FIXTURE/home/.claude" "$LOADER_FIXTURE/home/.codex"
+python3 - "$CLAUDE_HOOKS" "$CODEX_HOOKS" "$LOADER_FIXTURE" <<'PY'
+import json,os,sys
+claude,codex,root=sys.argv[1:]
+for source,targets in (
+    (claude,["project/.claude/settings.json","home/.claude/settings.json"]),
+    (codex,["project/.codex/hooks.json","home/.codex/hooks.json"]),
+):
+    hooks=json.load(open(source))["hooks"]
+    for rel in targets:
+        with open(os.path.join(root,rel),"w") as fh:
+            json.dump({"hooks":hooks,"unrelated":{"preserve":True}},fh)
+            fh.write("\n")
+PY
+cat > "$LOADER_FIXTURE/select.py" <<'PY'
+import json,os,sys
+provider,plugin,project,home=sys.argv[1:]
+sources=[plugin]
+if provider == "claude":
+    sources += [os.path.join(project,".claude/settings.json"),os.path.join(home,".claude/settings.json")]
+else:
+    sources += [os.path.join(project,".codex/hooks.json"),os.path.join(home,".codex/hooks.json")]
+for source in sources:
+    if not os.path.isfile(source): continue
+    for entry in json.load(open(source)).get("hooks",{}).get("PreToolUse",[]):
+        if entry.get("matcher") != "Bash": continue
+        for hook in entry.get("hooks",[]):
+            if hook.get("type") == "command": print(hook["command"])
+PY
+run_selected_fixture_hooks() {
+  _provider="$1"; _plugin="$2"; _repo="$3"
+  python3 "$LOADER_FIXTURE/select.py" "$_provider" "$_plugin" \
+    "$LOADER_FIXTURE/project" "$LOADER_FIXTURE/home" | while IFS= read -r _command; do
+      (cd "$_repo" && printf '%s' "$(mk_payload 'git push origin main')" | \
+        env CLAUDE_PLUGIN_ROOT="$FIRM_ROOT" PATH="$GH_OK:$PATH" sh -c "$_command") || exit $?
+    done
+}
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000003Z-claude-duplicates"
+  else
+    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000004Z-codex-duplicates"
+  fi
+  FIXTURE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"; mk_run "$FIXTURE_REPO" "$fixture_id"
+  FIXTURE_LEDGER="$FIXTURE_REPO/.agent-firm/runs/$fixture_id/run.jsonl"
+  assert_ok "$provider fixture executes every explicitly selected hook" \
+    run_selected_fixture_hooks "$provider" "$provider_hooks" "$FIXTURE_REPO"
+  assert_ok "$provider project+user duplicates multiply measured events threefold" python3 -c "
+import json
+records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==3, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==3, records
+"
+done
+python3 - "$LOADER_FIXTURE" <<'PY'
+import json,os,sys
+root=sys.argv[1]
+for rel in ("project/.claude/settings.json","home/.claude/settings.json",
+            "project/.codex/hooks.json","home/.codex/hooks.json"):
+    path=os.path.join(root,rel); d=json.load(open(path)); d["hooks"]={}
+    with open(path,"w") as fh: json.dump(d,fh); fh.write("\n")
+PY
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000005Z-claude-clean"
+  else
+    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000006Z-codex-clean"
+  fi
+  FIXTURE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"; mk_run "$FIXTURE_REPO" "$fixture_id"
+  FIXTURE_LEDGER="$FIXTURE_REPO/.agent-firm/runs/$fixture_id/run.jsonl"
+  assert_ok "$provider fixture executes the sole plugin-selected source after cleanup" \
+    run_selected_fixture_hooks "$provider" "$provider_hooks" "$FIXTURE_REPO"
+  assert_ok "$provider cleaned fixture measures one ledger event and one decision" python3 -c "
+import json
+records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
 assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
 assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
 "

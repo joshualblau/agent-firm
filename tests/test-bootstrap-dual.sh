@@ -51,37 +51,21 @@ esac
 [ -n "$action" ] || exit 64
 
 if [ "${STUB_FAIL_COMPENSATION:-}" = "$action" ]; then exit 12; fi
+if [ "${STUB_FAIL_BEFORE_ACTION:-}" = "$action" ]; then exit 9; fi
 
 case "$action" in
   claude:marketplace-add) printf '%s marketplace=local\n' "$STUB_ROOT" > "$market" ;;
   claude:marketplace-remove) rm -f "$market" ;;
   claude:plugin-install) printf 'agent-firm@local version=%s\n' "$STUB_CLAUDE_VERSION" > "$plugin" ;;
   claude:plugin-uninstall) rm -f "$plugin" ;;
-  claude:plugin-update)
-    if [ -f "$STUB_STATE/failed-claude-plugin-update" ] || \
-       { [ -n "${STUB_FAIL_ACTION:-}" ] && [ "$(cat "$plugin" 2>/dev/null)" = "agent-firm@local version=$STUB_CLAUDE_VERSION" ]; }; then
-      printf '%s\n' "${STUB_PRIOR_CLAUDE_PLUGIN:-agent-firm@local version=old}" > "$plugin"
-    else
-      printf 'agent-firm@local version=%s\n' "$STUB_CLAUDE_VERSION" > "$plugin"
-    fi
-    ;;
+  claude:plugin-update) printf 'agent-firm@local version=%s\n' "$STUB_CLAUDE_VERSION" > "$plugin" ;;
   codex:marketplace-add) printf 'marketplace=agent-firm-local path=%s\n' "$STUB_ROOT" > "$market" ;;
   codex:marketplace-remove) rm -f "$market" ;;
-  codex:plugin-add)
-    if [ -f "$STUB_STATE/failed-codex-plugin-add" ] || \
-       { [ -n "${STUB_FAIL_ACTION:-}" ] && [ "$(cat "$plugin" 2>/dev/null)" = "agent-firm@agent-firm-local version=$STUB_CODEX_VERSION" ]; }; then
-      printf '%s\n' "${STUB_PRIOR_CODEX_PLUGIN:-agent-firm@agent-firm-local version=old}" > "$plugin"
-    else
-      printf 'agent-firm@agent-firm-local version=%s\n' "$STUB_CODEX_VERSION" > "$plugin"
-    fi
-    ;;
+  codex:plugin-add) printf 'agent-firm@agent-firm-local version=%s\n' "$STUB_CODEX_VERSION" > "$plugin" ;;
   codex:plugin-remove) rm -f "$plugin" ;;
 esac
 
-if [ "${STUB_FAIL_ACTION:-}" = "$action" ] && [ ! -f "$STUB_STATE/failed-${action%%:*}-${action#*:}" ]; then
-  : > "$STUB_STATE/failed-${action%%:*}-${action#*:}"
-  exit 9
-fi
+if [ "${STUB_FAIL_ACTION:-}" = "$action" ]; then exit 9; fi
 exit 0
 SH
 chmod +x "$STUB/provider-fixture"
@@ -94,6 +78,7 @@ run_boot() {
   env PATH="$STUB:/usr/bin:/bin" STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$FIRM_ROOT" \
     STUB_CLAUDE_VERSION="$CLAUDE_VERSION" STUB_CODEX_VERSION="$CODEX_VERSION" \
     STUB_FAIL_ACTION="${STUB_FAIL_ACTION:-}" STUB_FAIL_COMPENSATION="${STUB_FAIL_COMPENSATION:-}" \
+    STUB_FAIL_BEFORE_ACTION="${STUB_FAIL_BEFORE_ACTION:-}" \
     STUB_FAIL_LIST="${STUB_FAIL_LIST:-}" STUB_OMIT_TOKEN="${STUB_OMIT_TOKEN:-}" STUB_HANG="${STUB_HANG:-}" \
     FIRM_BOOTSTRAP_TIMEOUT="${FIRM_BOOTSTRAP_TIMEOUT:-5}" FIRM_BOOTSTRAP_RECOVERY_DIR="$RECOVERY" \
     FIRM_SKIP_LINK=1 "$BOOT"
@@ -188,18 +173,36 @@ for reverse in claude:marketplace-remove claude:plugin-uninstall codex:marketpla
     "import json; d=json.load(open('$rf')); assert d['status']=='BLOCKED_RECOVERY_REQUIRED'; assert d['exact_prior_state_restored'] is False; assert 'restore only the agent-firm' in d['safe_corrective_action']"
 done
 
-t_case "existing-state update failures compensate to captured version lines"
+t_case "existing-state refresh failures never reuse a forward command as a reverse"
 reset_fixture; seed_existing
-before="$(cat "$STATE/claude-plugin")|$(cat "$STATE/codex-plugin")"
-STUB_FAIL_ACTION=claude:plugin-update assert_rc "failed Claude update blocks" 1 run_boot
-assert_eq "Claude update compensation restores both exact prior plugin states" "$before" \
-  "$(cat "$STATE/claude-plugin")|$(cat "$STATE/codex-plugin")"
+STUB_FAIL_BEFORE_ACTION=claude:plugin-update assert_rc "early failed Claude update blocks" 1 run_boot
+assert_eq "early failure invokes Claude update exactly once" "1" \
+  "$(grep -c '^claude plugin update agent-firm@local$' "$LOG" | tr -d ' ')"
+assert_output "early failure leaves observed bytes old" "version=old" cat "$STATE/claude-plugin"
+rf="$(recovery_file)"
+assert_eq "early failure recovery record is private" 600 \
+  "$(stat -f '%Lp' "$rf" 2>/dev/null || stat -c '%a' "$rf")"
+assert_ok "early failure records inverse-unavailable despite exact observed state" python3 -c \
+  "import json; d=json.load(open('$rf')); assert d['status']=='BLOCKED_RECOVERY_REQUIRED'; assert d['exact_prior_state_restored'] is True; assert d['unavailable_reverses'][0]['phase']=='plugin-update'; assert d['completed_mutations']==[]"
 
 reset_fixture; seed_existing
-before="$(cat "$STATE/claude-plugin")|$(cat "$STATE/codex-plugin")"
-STUB_FAIL_ACTION=codex:plugin-add assert_rc "failed Codex refresh blocks" 1 run_boot
-assert_eq "later Codex failure compensates both providers to exact prior versions" "$before" \
-  "$(cat "$STATE/claude-plugin")|$(cat "$STATE/codex-plugin")"
+STUB_FAIL_ACTION=claude:plugin-update assert_rc "partial-write failed Claude update blocks" 1 run_boot
+assert_eq "partial failure invokes Claude update exactly once" "1" \
+  "$(grep -c '^claude plugin update agent-firm@local$' "$LOG" | tr -d ' ')"
+assert_output "partial failure remains at the forward version" "version=$CLAUDE_VERSION" cat "$STATE/claude-plugin"
+rf="$(recovery_file)"
+assert_ok "partial failure names prior/observed digests and unavailable reverse" python3 -c \
+  "import json; d=json.load(open('$rf')); assert d['status']=='BLOCKED_RECOVERY_REQUIRED'; assert not d['exact_prior_state_restored']; assert d['captured_prior_state']['claude']['plugin_state_sha256'] != d['observed_recovery_state']['claude']['plugin_state_sha256']; assert d['unavailable_reverses'][0]['restore_kind']=='unavailable_existing_state'"
+
+reset_fixture; seed_existing
+STUB_FAIL_ACTION=codex:plugin-add assert_rc "later partial-write Codex refresh blocks" 1 run_boot
+assert_eq "Claude forward update is never retried as compensation" "1" \
+  "$(grep -c '^claude plugin update agent-firm@local$' "$LOG" | tr -d ' ')"
+assert_eq "Codex forward add is never retried as compensation" "1" \
+  "$(grep -c '^codex plugin add agent-firm@agent-firm-local$' "$LOG" | tr -d ' ')"
+rf="$(recovery_file)"
+assert_ok "later failure records completed Claude mutation and both unavailable reverses" python3 -c \
+  "import json; d=json.load(open('$rf')); assert d['status']=='BLOCKED_RECOVERY_REQUIRED'; assert d['completed_mutations']==[{'provider':'claude','phase':'plugin-update','command':['plugin','update','agent-firm@local']}]; assert {x['phase'] for x in d['unavailable_reverses']}=={'plugin-update','plugin-refresh'}"
 
 t_case "default bootstrap preserves unrelated project configuration"
 reset_fixture
