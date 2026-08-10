@@ -77,7 +77,10 @@ crypto / PII**.
 - On a **required** run (auth/permissions/crypto/PII), a skipped/unavailable judge does **not** pass
   by default: the Lead must obtain an **explicit, logged human waiver at the Final gate** to proceed
   without the second voice. No waiver ⇒ the run is not done.
-- Judge models are env-configurable (`FIRM_GPT_QA_MODEL`, `FIRM_CLAUDE_QA_MODEL`). Installing,
+- The canonical reviewer tuple—model, display, and effort—comes from
+  `firm-model-resolve --role reviewer`. `FIRM_GPT_QA_MODEL` and `FIRM_CLAUDE_QA_MODEL` are
+  equality-checked compatibility aliases, not free overrides: when set, each must equal the
+  canonical resolved model, and a mismatch blocks before provider execution. Installing,
   authenticating, or upgrading a provider CLI is the human's environment action.
 
 ### 2 · The judge RAN and BLOCKED — does the block bind? (the two-voice rule)
