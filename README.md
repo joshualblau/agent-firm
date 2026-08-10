@@ -48,6 +48,15 @@ The Lead opens a run ledger (`firm-new-run`), delegates each stage to its subage
 gates (with a well-formed approval payload), and gates on schema-valid QA evidence
 (`firm-validate-verdict`, `firm-traceability-check`, and `firm-final-qa-check`) before final sign-off.
 
+Runtime selection is fail-closed and inspectable. `firm-model-resolve --provider <claude|codex>
+--role <role>` returns the exact tier, model, display, and effort; tier and legacy-alias selectors are
+also supported. The canonical cells are: ceiling = Fable 5 (`fable`, `max`) / GPT-5.6 sol
+(`gpt-5.6-sol`, `ultra`); heavyweight = Opus 5 (`opus`, `xhigh`) / GPT-5.6 sol
+(`gpt-5.6-sol`, `xhigh`); workhorse = Sonnet 5 (`sonnet`, `high`) / GPT-5.6 terra
+(`gpt-5.6-terra`, `high`); fast = Haiku 4.5 (`haiku`, `low`) / GPT-5.6 terra
+(`gpt-5.6-terra`, `low`). Unknown roles, tiers, aliases, models, displays, or efforts block; there is
+no fallback downgrade.
+
 To update both caches from local changes, run `firm-version --local-refresh`. For a release, run
 `firm-version --release X.Y.Z`, then `firm-bootstrap`. Start a new Codex task and restart/reload the
 Claude session after either refresh.
@@ -74,7 +83,7 @@ AGENTS.md                     # Codex primary/judge mode selection; FIRM_QA_JUDG
 bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
                               #   firm-integrate, firm-qa-checkout, firm-qa-clean-check, firm-traceability-check,
                               #   firm-policy, firm-hire, firm-bench-record, firm-gpt-qa, firm-claude-qa,
-                              #   firm-final-qa-check, firm-version,
+                              #   firm-final-qa-check, firm-version, firm-model-resolve,
                               #   firm-propose-system-change, firm-run-evals, firm-check-assertions,
                               #   firm-visual-check, firm-visual-baseline, firm-notify, firm-install,
                               #   firm-link, firm-bootstrap, firm-doctor
@@ -133,3 +142,24 @@ and approves it, and only then does a golden eval guard the change. What's genui
   change; nothing runs the eval suite against a candidate change to inform the approval decision itself.
 - **Automated versioning or rollback** — reverting a System Change PR today is a manual `git revert`.
 Each of these is a real, larger project, not a small addition — deliberately out of scope here.
+
+## Evidence boundaries for this repair
+
+`firm-run-evals --structural [name]` is parse/shape-only: it validates a non-empty known assertion
+vocabulary and value shapes, but never dispatches assertions or their shell, provider, reviewer, Git,
+interpreter, filesystem, listener, or network payloads. Use `firm-run-evals --list` only to list valid
+selectors. An unknown explicit selector exits 2 and prints the valid names. Behavioral runs use
+`firm-run-evals --provider claude|codex [name]`; Codex turn events are streamed into a process-group
+supervisor and Claude receives a provider-native `--max-turns`, in addition to post-run accounting.
+
+The historical phase labels above describe shipped predecessor milestones, not approval of the
+current repair candidate. Readiness requires evidence from the exact candidate SHA: the full suite
+and security/final-gate matrices on macOS Bash 3.2 and a genuinely modern Bash, isolated real loader
+checks, exactly one bounded live smoke in each primary orientation, and the gated rollback exercise.
+No modern-Bash run or live provider smoke is performed by the ordinary build tests. Until those
+records exist and Final QA passes, report the candidate as BLOCKED/unproved rather than “done” or
+ready. A trusted secondary exit 3 is unavailable—not APPROVE—and must retain the target-run attempt,
+matching ledger event, traceability state, provider-specific verdict presence/absence, and a plain-
+text Final warning with `firm-final-qa-check <run-dir>` as the corrective command. Provider-native
+configuration suppression is a supported CLI boundary, not an OS/container or network-isolation
+guarantee; bootstrap restoration is compensating rollback, not atomic cross-provider installation.

@@ -112,7 +112,10 @@ echo '{"message":"test","title":"agent-firm"}' | FIRM_NOTIFY_ADAPTER=ntfy FIRM_N
 and checking assertions — so a System Change PR that edits an agent prompt, policy, or workflow can't
 silently regress what worked.
 
-- `firm-run-evals --structural [name]` — provider-neutral structure check (no model run; CI-safe).
+- `firm-run-evals --structural [name]` — provider-neutral parse/shape-only check. It accepts only a
+  non-empty known assertion vocabulary with valid values and exits before any assertion payload is
+  dispatched (no project/provider/reviewer/Git/interpreter/filesystem/listener/network payload).
+- `firm-run-evals --list` — names valid selectors and makes no structural or behavioral claim.
 - `firm-run-evals --provider claude|codex [name]` — opt-in behavioral run; defaults to Claude.
 - `firm-run-evals [name]` — copies the fixture to a scratch git repo, drives the firm with `claude -p`
   under a **bounded** posture, then runs `firm-check-assertions`.
@@ -127,19 +130,18 @@ settings (the real settings' project-path ledger hook doesn't exist in a scratch
 barrel through the final gate, falsely passing `final_gate_pending`. Each provider loads its installed
 start adapter, which in turn loads the shared lifecycle contract.
 
-Behavioral mode also enforces an external wall-clock alarm, a maximum number of eval cases, and a
-declared top-level-turn cap verified from each provider's result envelope. Each case receives exactly
-one provider invocation and has no retry path; the command prints `attempts=1 retries=0` with its
-limits. Claude retains `--max-budget-usd`. Codex subscription use is bounded by the case/turn/wall
-envelope because its CLI exposes no dollar-budget flag. `--structural` does not enter this path and
-remains provider-neutral, offline, credential-free, and unable to call either provider or reviewer.
+Behavioral mode supervises the provider process group with bounded wall time and kill grace, limits
+the number of eval cases, and enforces top-level turns before completion: Codex JSONL turn events are
+streamed into `firm-bounded-exec`, while Claude receives its native `--max-turns`. Post-run accounting
+is an audit check, not the terminating control. Each case receives exactly one provider invocation and
+has no retry path; the command prints `attempts=1 retries=0` with its limits. Claude retains
+`--max-budget-usd`. Codex has no dollar-budget flag. An unknown explicit eval selector exits 2 before
+provider lookup and prints the exact valid names plus `firm-run-evals --list` as corrective action.
 
-**How `final_gate_pending` is asserted headlessly.** There's no human in `-p` mode, so a correct firm
-stops **deliberately** (a clean `success` turn) having done its work but not completed the gated final
-action — the "didn't do too much" teeth live in `no_default_branch_merge` / `file_absent`. The checker
-reads the real `claude -p` JSON envelope (verified on 2.1.196: `subtype`, `is_error`, `stop_reason`,
-`permission_denials` — there is **no** `deferred_tool_use` in this version) and treats
-`subtype == "success" && !is_error` as the deliberate-stop signal.
+**How `final_gate_pending` is asserted headlessly.** There's no human in headless mode, so the Lead
+must log a positive `final_gate_pending` target-ledger event and the recorded default branch must
+remain at its run-baseline SHA. A provider success envelope alone is not evidence of a deliberate
+stop: a crash or no-op can have the same outer shape.
 
 Evals: `greet-fast-path` (fast track), `todo-full-track` (all gates + reviewer panel + QA), and
 `ambiguous-gate` (an under-specified request the firm must pause on, not guess). Requires the plugin
@@ -147,11 +149,12 @@ installed (`firm-bootstrap`) so both provider adapters and `firm-*` tools exist.
 mandatory bootstrap/refresh prerequisite; a behavioral run additionally needs the selected provider's
 subscription login.
 
-> **Not yet run live.** The scripts are built against verified CLI flags and the checker is fully
-> unit-tested against the real envelope, but a live end-to-end firm eval bills the subscription and its
-> `final_gate_pending` signal wants first-run calibration. Run `firm-run-evals greet-fast-path` once in
-> the pinned devcontainer (node 20 — this repo's shell node is 14, which can't run `node --test`) to
-> calibrate, then wire it into CI. This mirrors how Phase 3's GPT judge was validated as its own step.
+> **Current evidence boundary.** Structural green proves only parser/shape validity. This build does
+> not run provider CLIs, acquire a modern Bash, exercise a real loader, or create live/rollback proof.
+> Readiness evidence must bind to the exact candidate SHA and include one bounded live engagement in
+> each primary orientation plus genuinely distinct macOS Bash 3.2 and modern-Bash runs. Until those
+> gated records exist, those axes remain BLOCKED/unproved; predecessor phase completion is not repair
+> approval.
 
 ---
 
@@ -195,8 +198,8 @@ with `.agent-firm/runs/<id>/` as the externally-visible state.
 - `firm-check-assertions` unit-tested against a synthetic ledger across the **whole** vocabulary — every
   pass and fail path fires correctly (including `final_gate_pending` failing on `is_error`,
   `no_default_branch_merge` failing at >1 commit, `verdict_is` on BLOCK, `file_absent` on presence).
-- `firm-run-evals --structural` validates all three evals; the base image digest is a real resolved
-  Docker Hub digest.
+- `firm-run-evals --structural` validates shipped eval vocabulary and value shapes without executing
+  their payloads; that is not a behavioral pass. The base image digest statement is historical.
 
 ## Your steps (the firm never touches real creds)
 - Firewall: enable the caps + `postStartCommand`, build the container, run `verify.sh`.

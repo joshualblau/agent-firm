@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Resolve one provider-neutral Agent Firm tier/role/legacy alias to exact runtime values.
+# Exit 0 resolved, 2 invalid input/policy/mismatch. This command never guesses or downgrades.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+
+exec python3 - "$ROOT/agent-firm/policy/model-tiers.yaml" "$@" <<'PY'
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+
+DEFAULT_POLICY = sys.argv[1]
+
+parser = argparse.ArgumentParser(
+    prog="firm-model-resolve",
+    description="Resolve an Agent Firm role, tier, or legacy alias without fallback.")
+parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+selector = parser.add_mutually_exclusive_group(required=True)
+selector.add_argument("--tier")
+selector.add_argument("--role")
+selector.add_argument("--alias")
+parser.add_argument("--expect-model")
+parser.add_argument("--expect-display")
+parser.add_argument("--expect-effort")
+parser.add_argument("--format", choices=("json", "shell", "args"), default="json")
+parser.add_argument("--policy", default=DEFAULT_POLICY, help=argparse.SUPPRESS)
+args = parser.parse_args(sys.argv[2:])
+
+def fail(message):
+    print(f"firm-model-resolve: BLOCKED: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    import yaml
+except BaseException as exc:
+    fail(f"cannot load canonical model policy because PyYAML is unavailable or broken: {type(exc).__name__}: {exc}")
+
+if not os.path.isfile(args.policy) or os.path.islink(args.policy):
+    fail(f"policy must be a regular non-symlink file: {args.policy}")
+try:
+    with open(args.policy, encoding="utf-8") as fh:
+        policy = yaml.safe_load(fh)
+except BaseException as exc:
+    fail(f"cannot parse policy {args.policy}: {type(exc).__name__}: {exc}")
+if not isinstance(policy, dict) or not isinstance(policy.get("tiers"), dict) or not isinstance(policy.get("legacy_aliases"), dict):
+    fail("policy must define tier and legacy_alias mappings")
+
+# Role names are runtime selectors, not prose scraped from the policy's explanatory `roles` arrays.
+# Judge names are explicit so the two opposite-provider invocations cannot inherit a lead default.
+ROLE_TIERS = {
+    "lead": "heavyweight", "intake-analyst": "heavyweight", "architect": "heavyweight",
+    "implementer": "heavyweight", "integrator": "heavyweight", "reviewer": "heavyweight",
+    "recruiter": "workhorse", "packager": "workhorse", "qa-tester": "workhorse",
+    "specialist": "workhorse", "scout": "fast",
+    "judge": "heavyweight", "claude-judge": "heavyweight", "gpt-judge": "heavyweight",
+}
+
+if args.role is not None:
+    if args.role not in ROLE_TIERS:
+        fail(f"unknown role {args.role!r}; valid roles: {', '.join(sorted(ROLE_TIERS))}")
+    selected_by, selector_value, tier = "role", args.role, ROLE_TIERS[args.role]
+elif args.alias is not None:
+    aliases = policy["legacy_aliases"]
+    if args.alias not in aliases:
+        fail(f"unknown legacy alias {args.alias!r}; valid aliases: {', '.join(sorted(aliases))}")
+    selected_by, selector_value, tier = "alias", args.alias, aliases[args.alias]
+else:
+    selected_by, selector_value, tier = "tier", args.tier, args.tier
+
+tiers = policy["tiers"]
+if tier not in tiers:
+    fail(f"unknown tier {tier!r}; valid tiers: {', '.join(sorted(tiers))}")
+cell = tiers[tier].get(args.provider)
+if not isinstance(cell, dict) or set(cell) != {"model", "display", "effort"}:
+    fail(f"{tier}.{args.provider} must contain exactly model, display, and effort")
+for field in ("model", "display", "effort"):
+    value = cell[field]
+    if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
+        fail(f"{tier}.{args.provider}.{field} must be a non-empty printable string")
+
+expected = {
+    "model": args.expect_model,
+    "display": args.expect_display,
+    "effort": args.expect_effort,
+}
+for field, wanted in expected.items():
+    if wanted is not None and wanted != cell[field]:
+        fail(f"explicit {field} mismatch for {args.provider}/{tier}: expected {cell[field]!r}, got {wanted!r}; no fallback applied")
+
+result = {
+    "provider": args.provider,
+    "selected_by": selected_by,
+    "selector": selector_value,
+    "tier": tier,
+    "model": cell["model"],
+    "display": cell["display"],
+    "effort": cell["effort"],
+}
+if args.format == "json":
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+elif args.format == "shell":
+    for key in ("provider", "tier", "model", "display", "effort"):
+        print(f"FIRM_RESOLVED_{key.upper()}={shlex.quote(result[key])}")
+else:
+    if args.provider == "claude":
+        print("--model", shlex.quote(cell["model"]), "--effort", shlex.quote(cell["effort"]))
+    else:
+        print("-m", shlex.quote(cell["model"]), "-c", shlex.quote(f'model_reasoning_effort="{cell["effort"]}"'))
+PY

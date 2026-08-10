@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]
+# firm-check-assertions [--parse-only] <assertions.yaml> [scratch-repo] [result.json]
 # Checks the full golden-eval assertion vocabulary against the post-run scratch repo (the run ledger +
 # git state).
 #
@@ -26,6 +26,11 @@
 #   qa_checkout_clean true               (delegates to firm-qa-clean-check; NOT read-only enforcement,
 #                                          only "no visible changes were left" — see that script's header)
 #
+# `--parse-only` accepts only the assertions file, validates this complete vocabulary plus non-empty
+# value domains, and exits before assertion helper definitions or dispatch. In particular,
+# `test_passes` remains inert data; parse-only never evaluates shell, project, provider, reviewer,
+# Git, interpreter, filesystem, listener, or network payloads.
+#
 # no_default_branch_merge / final_gate_pending both compare the default branch's CURRENT sha against
 # run-baseline.json (written by firm-new-run at run start). If that baseline is missing or unusable,
 # BOTH FAIL CLOSED — never a silent pass via a weaker guess. There is no commit-count fallback: a
@@ -51,10 +56,20 @@ set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
-[ -n "${1:-}" ] && [ -n "${2:-}" ] || { echo "usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]" >&2; exit 2; }
-python3 - "$1" "$2" "${3:-}" "$SELF" <<'PY'
+parse_only=0
+if [ "${1:-}" = "--parse-only" ]; then parse_only=1; shift; fi
+if [ "$parse_only" -eq 1 ]; then
+  [ "$#" -eq 1 ] || { echo "usage: firm-check-assertions --parse-only <assertions.yaml>" >&2; exit 2; }
+  repo=""
+else
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$#" -le 3 ] || {
+    echo "usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]" >&2; exit 2; }
+  repo="$2"
+fi
+python3 - "$1" "$repo" "${3:-}" "$SELF" "$parse_only" <<'PY'
 import json, os, re, subprocess, sys, glob, importlib.util
 apath, repo, rpath, selfdir = sys.argv[1:5]
+parse_only = sys.argv[5] == "1"
 
 def cannot_evaluate(msg):
     """The assertions file itself is unusable. Exit 2, NEVER 0: an eval whose assertions did not run
@@ -229,7 +244,50 @@ else:
 if not asserts:
     cannot_evaluate(f"{apath}: 0 assertions parsed via {parse_mode} — an eval that checks nothing "
                     f"cannot pass (a vacuous 0/0 used to exit 0; it no longer does)")
+KNOWN = {
+    "file_exists": "text", "file_absent": "text",
+    "artifact_exists": "text", "artifact_absent": "text",
+    "verdict_is": "verdict", "test_passes": "text",
+    "traceability_passes": "boolean", "no_default_branch_merge": "boolean",
+    "final_gate_pending": "boolean", "qa_checkout_clean": "boolean",
+}
+
+def value_error(index, key, message):
+    cannot_evaluate(f"{apath}: assertion {index} `{key}` {message}")
+
+def validate_shape(index, item):
+    if not isinstance(item, dict) or len(item) != 1:
+        cannot_evaluate(
+            f"{apath}: assertion {index} is malformed; expected exactly one `key: value` mapping")
+    (key, value), = item.items()
+    if not isinstance(key, str) or key not in KNOWN:
+        shown = repr(key)
+        cannot_evaluate(
+            f"{apath}: assertion {index} uses unknown assertion {shown}; valid names: "
+            + ", ".join(sorted(KNOWN)))
+    kind = KNOWN[key]
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return
+        if not isinstance(value, str) or value.strip().lower() not in ("true", "false"):
+            value_error(index, key, "requires boolean true or false")
+        return
+    if not isinstance(value, str):
+        value_error(index, key, "requires a string value")
+    clean = value.strip()
+    if not clean:
+        value_error(index, key, "requires a non-empty value")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in clean):
+        value_error(index, key, "contains a control character")
+    if kind == "verdict" and clean not in ("APPROVE", "BLOCK"):
+        value_error(index, key, "must be APPROVE or BLOCK")
+
 print(f"assertions: {len(asserts)} parsed from {apath} via {parse_mode}")
+if parse_only:
+    for index, assertion in enumerate(asserts, 1):
+        validate_shape(index, assertion)
+    print(f"PARSE-ONLY: PASS -- {len(asserts)} known assertions and value shapes validated; no assertion or payload executed")
+    sys.exit(0)
 
 def find_ledger():
     cur = os.path.join(repo, ".agent-firm", "CURRENT_RUN")

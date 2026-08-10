@@ -57,17 +57,26 @@ const REVIEW_SCHEMA = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['severity', 'location', 'issue'],
+        required: ['severity', 'confidence', 'location', 'issue', 'suggested_fix', 'status'],
         properties: {
           severity: { type: 'string', enum: ['low', 'medium', 'high', 'blocker'] },
+          confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
           location: { type: 'string' },
           issue: { type: 'string' },
           suggested_fix: { type: 'string' },
+          status: { type: 'string', enum: ['open', 'accepted', 'rejected', 'fixed'] },
         },
       },
     },
   },
 }
+
+const aggregateReviewArtifact = (panel, taskSlug) => ({
+  task_slug: taskSlug,
+  reviewers: panel.map(review => review.lens),
+  findings: panel.flatMap(review => (review.findings || []).map(finding => ({ lens: review.lens, ...finding }))),
+  verdict: panel.every(review => review.verdict === 'approved') ? 'approved' : 'changes_requested',
+})
 
 // ---------- Build: one implementer per work-order, in parallel, each in its own worktree ----------
 phase('Build')
@@ -114,7 +123,12 @@ const reviews = await parallel(lenses.map(lens => () =>
   )
 )).then(r => r.filter(Boolean))
 
-const blockers = reviews.flatMap(r => (r.findings || []).filter(f => f.severity === 'blocker' || f.severity === 'high'))
+// Canonical aggregation is deliberately field-for-field: ranking (`confidence`) and disposition
+// (`status`) survive the panel boundary instead of being dropped by a hand-written projection.
+const reviewArtifact = aggregateReviewArtifact(reviews, a.task_slug || runDir.split('/').pop())
+const blockers = reviewArtifact.findings.filter(
+  f => f.status === 'open' && (f.severity === 'blocker' || f.severity === 'high')
+)
 
 // ---------- Test: independent QA from a clean checkout, schema-valid verdict ----------
 phase('Test')
@@ -135,6 +149,7 @@ return {
   reds: reds.map(r => r.work_order),
   integration,
   reviews,
+  review_artifact: reviewArtifact,
   open_blockers: blockers,
   qa,
   note: 'Lead: run firm-qa-clean-check and firm-final-qa-check, then surface both verdicts + handoff at the FINAL human gate. Nothing merges/ships without sign-off.',

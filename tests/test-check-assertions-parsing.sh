@@ -586,4 +586,48 @@ t_case "a genuinely FAILING assertion is still exit 1 under a working parser (th
 assert_rc "real pyyaml: a failing assertion is 1"        1 with_yaml_parser "$CA" "$failing" "$repo"
 assert_rc "genuine absence: a failing assertion is 1"    1 without_yaml     "$CA" "$failing" "$repo"
 
+t_case "parse-only accepts every known assertion verb and validates its value domain"
+vocab="$(af parse_only_vocab 'assertions:
+  - file_exists: path
+  - file_absent: path
+  - artifact_exists: artifact.json
+  - artifact_absent: artifact.json
+  - verdict_is: APPROVE
+  - test_passes: exit 99
+  - traceability_passes: true
+  - no_default_branch_merge: false
+  - final_gate_pending: true
+  - qa_checkout_clean: false')"
+assert_rc "full known vocabulary parses without evaluating" 0 "$CA" --parse-only "$vocab"
+assert_output "authoritative count is reported" "assertions: 10 parsed" "$CA" --parse-only "$vocab"
+assert_output "completion marker disclaims execution" "no assertion or payload executed" "$CA" --parse-only "$vocab"
+
+t_case "parse-only mutation failures cover unknown, empty, malformed, verdict, boolean, and type axes"
+unknown="$(af parse_unknown 'assertions:
+  - definitely_unknown: value')"
+empty_value="$(af parse_empty_value 'assertions:
+  - file_exists: ""')"
+bad_verdict="$(af parse_bad_verdict 'assertions:
+  - verdict_is: MAYBE')"
+bad_boolean="$(af parse_bad_boolean 'assertions:
+  - final_gate_pending: perhaps')"
+bad_type="$(af parse_bad_type 'assertions:
+  - test_passes: [echo, nope]')"
+malformed_shape="$(af parse_malformed_shape 'assertions:
+  - {file_exists: x, file_absent: y}')"
+for item in "$unknown" "$empty_value" "$bad_verdict" "$bad_boolean" "$bad_type" "$malformed_shape"; do
+  assert_rc "invalid shape $(basename "$item") fails closed" 2 "$CA" --parse-only "$item"
+done
+assert_output "unknown failure lists valid operations" "valid names:" "$CA" --parse-only "$unknown"
+assert_output "boolean failure names accepted values" "boolean true or false" "$CA" --parse-only "$bad_boolean"
+assert_output "verdict failure names accepted values" "APPROVE or BLOCK" "$CA" --parse-only "$bad_verdict"
+
+t_case "parse-only never dispatches a valid test_passes payload"
+PARSE_TRIP="$W/parse-only-trip"
+payload="$(af parse_payload "assertions:
+  - test_passes: /usr/bin/touch $PARSE_TRIP")"
+assert_rc "payload text is shape-valid" 0 "$CA" --parse-only "$payload"
+assert_no_file "payload did not execute" "$PARSE_TRIP"
+assert_rc "parse-only rejects an evaluation repo argument" 2 "$CA" --parse-only "$payload" "$repo"
+
 t_summary
