@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import sys
 argv = sys.argv[1:]
 target = None
 strict = False
+requested_event_id = None
+print_event_id = False
 while argv and argv[0].startswith("--"):
     flag = argv.pop(0)
     if flag == "--run":
@@ -25,6 +28,13 @@ while argv and argv[0].startswith("--"):
         target = argv.pop(0)
     elif flag == "--strict":
         strict = True
+    elif flag == "--event-id":
+        if not argv:
+            print("firm-ledger-log: --event-id needs a value", file=sys.stderr)
+            raise SystemExit(2)
+        requested_event_id = argv.pop(0)
+    elif flag == "--print-event-id":
+        print_event_id = True
     else:
         print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
         raise SystemExit(2)
@@ -76,9 +86,16 @@ except (OSError, subprocess.SubprocessError):
 
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", event):
     fail("event contains unsafe characters")
+event_id = requested_event_id or (
+    "evt-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") +
+    f"-{os.getpid()}-{secrets.token_hex(8)}"
+)
+if not re.fullmatch(r"evt-[A-Za-z0-9._:-]{1,128}", event_id):
+    fail("event id contains unsafe characters")
 record = {
     "ts": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "event": event
+    "event": event,
+    "event_id": event_id
 }
 for item in argv:
     if "=" not in item:
@@ -86,6 +103,8 @@ for item in argv:
     key, value = item.split("=", 1)
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
         fail(f"unsafe field name: {key}")
+    if key in ("ts", "event", "event_id", "run_id"):
+        fail(f"reserved field cannot be overridden: {key}")
     record[key] = value
 record["run_id"] = run.name
 
@@ -97,13 +116,22 @@ try:
             fail("run.jsonl is not a regular no-follow target")
     except FileNotFoundError:
         pass
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(ledger, flags, 0o600)
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        os.lseek(fd, 0, os.SEEK_SET)
+        existing = os.read(fd, os.fstat(fd).st_size).decode("utf-8", "strict")
+        for number, line in enumerate(existing.splitlines(), 1):
+            try:
+                prior = json.loads(line)
+            except Exception as exc:
+                fail(f"existing run.jsonl line {number} is malformed: {exc}")
+            if isinstance(prior, dict) and prior.get("event_id") == event_id:
+                fail(f"duplicate event id: {event_id}")
         payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
         os.write(fd, payload)
         os.fsync(fd)
@@ -111,5 +139,7 @@ try:
         os.close(fd)
 except (OSError, ValueError) as exc:
     fail(f"could not append target ledger: {exc}")
+if print_event_id:
+    print(event_id)
 raise SystemExit(0)
 PY

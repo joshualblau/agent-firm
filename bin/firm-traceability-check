@@ -119,9 +119,11 @@ if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or se
 if [[ -f "$run_dir/09-test-evidence/qa-candidate.json" ]]; then strict=1; fi
 
 if [[ $strict -eq 1 ]]; then
-python3 - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" <<'PY'
+python3 - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$SELF/firm-new-run" <<'PY'
 import collections
 import datetime
+import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -133,6 +135,8 @@ import sys
 run = Path(os.path.abspath(sys.argv[1]))
 verdict_path = Path(sys.argv[2]) if sys.argv[2] else run / "08-qa-verdict.json"
 schema_path = Path(sys.argv[3])
+policy_path = Path(sys.argv[4])
+metadata_reader = Path(sys.argv[5])
 
 def cannot(message):
     print(f"TRACEABILITY: CANNOT VERIFY -- {message}", file=sys.stderr)
@@ -209,6 +213,7 @@ trace = load_yaml(trace_path, "traceability matrix")
 criteria_doc = load_yaml(criteria_path, "acceptance criteria")
 verdict = load_json(verdict_path, "QA verdict")
 schema = load_json(schema_path, "traceability schema")
+policy = load_yaml(policy_path, "high-risk path policy")
 try:
     jsonschema.validate(trace, schema)
 except Exception as exc:
@@ -223,29 +228,56 @@ if not isinstance(candidate.get("base_sha"), str) or not re.fullmatch(r"[0-9a-f]
     cannot("candidate metadata needs one full 40-character base_sha")
 if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
     cannot("candidate generation must be a positive integer")
-if candidate.get("run_id") != run_id or candidate.get("clean") is not True:
+if candidate.get("schema_version") != 2 or candidate.get("run_id") != run_id or candidate.get("clean") is not True:
     cannot("candidate metadata run identity or clean flag is invalid")
 
 repo = os.path.realpath(str(candidate.get("repository_root", "")))
 checkout = os.path.realpath(str(candidate.get("checkout_path", "")))
 if not repo or not checkout or os.path.islink(candidate.get("checkout_path", "")):
     cannot("candidate repository/checkout identity is absent or symlinked")
+expected_run = os.path.join(repo, ".agent-firm", "runs", run_id)
+if os.path.realpath(run) != os.path.realpath(expected_run):
+    cannot("run is not the candidate repository's canonical run directory")
 try:
+    for component in (repo, os.path.join(repo, ".agent-firm"), os.path.join(repo, ".agent-firm", "runs"), str(run)):
+        info = os.lstat(component)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            cannot(f"canonical run component is unsafe: {component}")
     actual_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     status = subprocess.check_output(["git", "-C", checkout, "status", "--porcelain=v1", "--untracked-files=all"], stderr=subprocess.DEVNULL, text=True)
     actual_root = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True).strip()
     common = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--git-common-dir"], stderr=subprocess.DEVNULL, text=True).strip()
     if not os.path.isabs(common):
         common = os.path.join(checkout, common)
+    source_ref = candidate.get("source_ref")
+    if not isinstance(source_ref, str) or not re.fullmatch(r"refs/heads/integration/[A-Za-z0-9._/-]+", source_ref):
+        cannot("candidate source_ref is not refs/heads/integration/*")
+    source_sha = subprocess.check_output(["git", "-C", repo, "rev-parse", "--verify", source_ref + "^{commit}"], stderr=subprocess.DEVNULL, text=True).strip()
+    ancestry = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", candidate["base_sha"], sha], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 except subprocess.SubprocessError as exc:
     cannot(f"candidate checkout cannot be verified: {exc}")
 if actual_sha != sha or status or os.path.realpath(actual_root) != checkout:
     inadequate("candidate checkout is moved, amended, mismatched, or dirty")
 if os.path.realpath(common) != os.path.realpath(str(candidate.get("git_common_dir", ""))):
     inadequate("candidate checkout repository identity changed")
+if source_sha != sha or candidate.get("source_ref_sha") != sha or ancestry != 0:
+    inadequate("candidate integration ref or accepted-base ancestry changed")
+try:
+    metadata_done = subprocess.run([str(metadata_reader), "--metadata-view", str(run)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    metadata = json.loads(metadata_done.stdout) if metadata_done.returncode == 0 else None
+except Exception:
+    metadata = None
+if not isinstance(metadata, dict) or metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+    cannot("current approval-eligible run metadata is required")
+if metadata.get("accepted_base_sha") != candidate.get("base_sha") or os.path.realpath(str(metadata.get("git_common_dir", ""))) != os.path.realpath(common):
+    inadequate("run metadata accepted-base/common-dir identity differs from candidate")
 
 tc = trace.get("candidate", {})
-if tc != {"run_id": run_id, "commit_sha": sha, "generation": generation, "checkout_path": candidate.get("checkout_path")}:
+expected_trace_candidate = {key:candidate.get(key) for key in (
+    "run_id", "repository_root", "git_common_dir", "checkout_path", "source_ref", "source_ref_sha", "base_sha"
+)}
+expected_trace_candidate.update({"commit_sha":sha, "generation":generation})
+if tc != expected_trace_candidate:
     inadequate("traceability candidate identity does not exactly match qa-candidate.json")
 
 if not isinstance(criteria_doc, dict) or not isinstance(criteria_doc.get("criteria"), list) or not criteria_doc["criteria"]:
@@ -263,22 +295,49 @@ row_ids = [row["id"] for row in rows]
 if collections.Counter(row_ids) != collections.Counter(ids) or len(row_ids) != len(ids):
     inadequate("matrix must contain exactly one row for every accepted criterion and no phantom id")
 
+try:
+    with open(run / "run.jsonl", encoding="utf-8") as fh:
+        ledger = [json.loads(line) for line in fh if line.strip()]
+    if not all(isinstance(item, dict) for item in ledger):
+        raise ValueError("non-object ledger record")
+except Exception as exc:
+    cannot(f"target ledger is malformed: {exc}")
+
 def evidence_ref(ref, label):
-    if ref.get("candidate_sha") != sha:
+    if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
         inadequate(f"{label} is stale or bound to a different candidate")
-    return safe_file(ref.get("path"), label)
+    path = safe_file(ref.get("path"), label)
+    raw = path.read_bytes()
+    if ref.get("sha256") != hashlib.sha256(raw).hexdigest() or ref.get("bytes") != len(raw):
+        inadequate(f"{label} digest or byte size changed")
+    producer = ref.get("producer")
+    if not isinstance(producer, dict):
+        inadequate(f"{label} lacks an exact producer")
+    matches = [event for event in ledger if event.get("event_id") == producer.get("event_id")]
+    if len(matches) != 1 or matches[0].get("event") != producer.get("event"):
+        inadequate(f"{label} producer event is missing or duplicated")
+    event = matches[0]
+    origin = ref.get("path")
+    if event.get("sha") != sha or str(event.get("generation")) != str(generation) or origin not in (event.get("path"), event.get("verdict"), event.get("attempt")):
+        inadequate(f"{label} producer is bound to another candidate or artifact")
+    digest_field = "verdict_sha256" if origin == event.get("verdict") else "sha256"
+    bytes_field = "verdict_bytes" if origin == event.get("verdict") else "bytes"
+    if event.get(digest_field) != ref.get("sha256") or str(event.get(bytes_field)) != str(ref.get("bytes")):
+        inadequate(f"{label} producer digest/size does not match")
+    for field in ("provider", "generation", "attempt_id"):
+        if field in producer and str(event.get(field)) != str(producer[field]):
+            inadequate(f"{label} producer {field} does not match")
+    return path
 
 for row in rows:
     for index, ref in enumerate(row["evidence"]):
         evidence_ref(ref, f"{row['id']} evidence #{index + 1}")
     if row["status"] in ("partial", "uncovered"):
         gate = row.get("gate_record") or {}
-        if gate.get("candidate_sha") != sha:
-            inadequate(f"{row['id']} gate record is stale")
         expected = "waive_partial" if row["status"] == "partial" else "waive_uncovered"
         if gate.get("decision") != expected:
             inadequate(f"{row['id']} has no exact policy-authorized {expected} decision")
-        record_path = safe_file(gate.get("path"), f"{row['id']} gate record")
+        record_path = evidence_ref(gate, f"{row['id']} gate record")
         record = load_yaml(record_path, f"{row['id']} gate record")
         required = {
             "schema_version": 1, "type": "criterion_gate", "run_id": run_id,
@@ -309,6 +368,51 @@ for item in coverage:
         inadequate(f"verdict coverage lacks evidence for {item['id']}")
 if verdict.get("commit_sha") != sha or verdict.get("run_id") != run_id or verdict.get("generation") != generation:
     inadequate("verdict is abbreviated, stale, or not bound to this candidate generation")
+if verdict.get("provider") != "primary" or not isinstance(verdict.get("attempt_id"), str) or not verdict["attempt_id"]:
+    inadequate("primary verdict provider/attempt identity is not exact")
+
+try:
+    jsonschema.validate(policy, {"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/highRiskPolicy","$defs":schema["$defs"]})
+except Exception as exc:
+    cannot(f"high-risk policy schema validation failed: {exc}")
+criterion_types = {item["id"]:item.get("type") for item in criteria}
+changed_paths = set(subprocess.check_output(
+    ["git", "-C", repo, "diff", "--name-only", "--no-renames", candidate["base_sha"], sha, "--"],
+    stderr=subprocess.DEVNULL, text=True
+).splitlines())
+def risk_for(entry):
+    affected_criteria = entry.get("affected_criteria")
+    affected_paths = entry.get("affected_paths")
+    reasons = []
+    high = False
+    if not affected_criteria and not affected_paths:
+        return "high", ["ambiguity:no-mapped-criterion-or-path"]
+    for criterion_id in affected_criteria:
+        if criterion_id not in criterion_types:
+            return "high", [f"ambiguity:unknown-criterion:{criterion_id}"]
+        criterion_type = str(criterion_types[criterion_id])
+        reasons.append(f"criterion:{criterion_id}:{criterion_type}")
+        if criterion_type == "security_privacy":
+            high = True
+    for path in affected_paths:
+        if path not in changed_paths:
+            reasons.append(f"ambiguity:unchanged-path:{path}")
+            high = True
+            continue
+        matches=[]
+        for category, patterns in policy["categories"].items():
+            for pattern in patterns:
+                if fnmatch.fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])):
+                    matches.append(f"path:{path}:{category}:{pattern}")
+        if matches:
+            reasons.extend(sorted(matches)); high=True
+        else:
+            reasons.append(f"path:{path}:benign")
+    return ("high" if high else "low"), sorted(set(reasons))
+for index, entry in enumerate(trace.get("two_voice_diff", []), 1):
+    derived_risk, derived_reasons = risk_for(entry)
+    if entry.get("risk") != derived_risk or sorted(entry.get("risk_reasons") or []) != derived_reasons:
+        inadequate(f"two_voice_diff #{index} risk/reasons do not match mechanical derivation")
 print(f"STRICT TRACEABILITY: PASS -- {len(ids)} exact candidate-bound matrix rows")
 PY
 strict_rc=$?

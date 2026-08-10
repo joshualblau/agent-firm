@@ -1,9 +1,112 @@
 #!/usr/bin/env bash
 # firm-new-run [--primary claude|codex] <slug> [track]
+# firm-new-run --metadata-view <run-dir>
 # Scaffolds a run-ledger directory under ./.agent-firm/runs/<ts>-<slug>/, seeds it from the
 # firm templates, opens run.jsonl with a run_started event, and points .agent-firm/CURRENT_RUN at it.
 # Run from the ROOT of the work project (the git repo you are operating on).
 set -euo pipefail
+
+# Resolve the firm root before dispatching either creation or the shared metadata reader.
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
+FIRM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEMPLATES="$FIRM_ROOT/agent-firm/templates"
+
+if [[ "${1:-}" == "--metadata-view" ]]; then
+  [[ $# -eq 2 ]] || { echo "usage: firm-new-run --metadata-view <run-dir>" >&2; exit 2; }
+  exec python3 - "$2" <<'PY'
+import json, os, re, stat, subprocess, sys
+
+def fail(message):
+    print(f"firm-new-run: metadata view unavailable: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+run = os.path.abspath(sys.argv[1])
+if any(ord(ch) < 32 or ord(ch) == 127 for ch in run) or ".." in sys.argv[1].replace("\\", "/").split("/"):
+    fail("unsafe run path")
+run_id = os.path.basename(run)
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+    fail("unsafe run id")
+repo = os.path.dirname(os.path.dirname(os.path.dirname(run)))
+if os.path.basename(os.path.dirname(run)) != "runs" or os.path.basename(os.path.dirname(os.path.dirname(run))) != ".agent-firm":
+    fail("run is not <repo>/.agent-firm/runs/<safe-id>")
+for path in (repo, os.path.join(repo, ".agent-firm"), os.path.dirname(run), run):
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        fail(f"missing run component: {exc}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        fail(f"unsafe run component: {path}")
+try:
+    top = subprocess.check_output(["git", "-C", repo, "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True).strip()
+    common = subprocess.check_output(["git", "-C", repo, "rev-parse", "--git-common-dir"], stderr=subprocess.DEVNULL, text=True).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(repo, common)
+except subprocess.SubprocessError:
+    fail("run repository is not a readable git worktree")
+if os.path.realpath(top) != os.path.realpath(repo):
+    fail("run repository identity is mismatched")
+
+metadata_path = os.path.join(run, "run-metadata.json")
+try:
+    info = os.lstat(metadata_path)
+except FileNotFoundError:
+    info = None
+if info is not None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("current metadata is not a regular no-follow file")
+    try:
+        with open(metadata_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        fail(f"current metadata is malformed: {exc}")
+    required = {
+        "schema_version", "run_id", "track", "primary_provider", "repository_root",
+        "git_common_dir", "accepted_base_sha", "historical", "approval_eligible"
+    }
+    if not isinstance(data, dict) or set(data) != required:
+        fail("current metadata fields are incomplete or unknown")
+    if data.get("schema_version") != 2 or data.get("run_id") != run_id:
+        fail("current metadata version/run identity is invalid")
+    if data.get("track") not in ("fast_path", "full_track") or data.get("primary_provider") not in ("claude", "codex"):
+        fail("current metadata track/provider is invalid")
+    if data.get("historical") is not False or not isinstance(data.get("approval_eligible"), bool):
+        fail("current metadata historical/eligibility flags are invalid")
+    if os.path.realpath(str(data.get("repository_root", ""))) != os.path.realpath(repo) or os.path.realpath(str(data.get("git_common_dir", ""))) != os.path.realpath(common):
+        fail("current metadata repository identity is invalid")
+    base = data.get("accepted_base_sha")
+    if data["approval_eligible"] and (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
+        fail("approval-eligible metadata needs a full accepted base SHA")
+    print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+
+ledger = os.path.join(run, "run.jsonl")
+try:
+    if os.path.islink(ledger) or not os.path.isfile(ledger):
+        raise ValueError("missing regular ledger")
+    with open(ledger, encoding="utf-8") as fh:
+        first = json.loads(fh.readline())
+except Exception as exc:
+    fail(f"metadata absence is not recognizable historical state: {exc}")
+if not isinstance(first, dict) or first.get("event") != "run_started" or first.get("run_id") != run_id:
+    fail("metadata absence is not backed by this run's start event")
+if "primary_provider" in first:
+    fail("provider-aware run is missing required current metadata")
+track = first.get("track", "full_track")
+if track not in ("fast_path", "full_track"):
+    fail("historical track is invalid")
+base = first.get("base_sha")
+if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
+    base = None
+view = {
+    "schema_version": 2, "run_id": run_id, "track": track, "primary_provider": "claude",
+    "repository_root": os.path.realpath(repo), "git_common_dir": os.path.realpath(common),
+    "accepted_base_sha": base, "historical": True, "approval_eligible": False
+}
+print(json.dumps(view, sort_keys=True, separators=(",", ":")))
+PY
+fi
 
 primary="claude"
 if [[ "${1:-}" == "--primary" ]]; then
@@ -18,13 +121,6 @@ fi
 case "$primary" in claude|codex) ;; *) echo "firm-new-run: --primary must be claude or codex" >&2; exit 2 ;; esac
 case "$track" in fast_path|full_track) ;; *) echo "firm-new-run: track must be fast_path or full_track" >&2; exit 2 ;; esac
 slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
-
-# Resolve the firm root (where templates live) from this script's location.
-__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
-while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
-SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
-FIRM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEMPLATES="$FIRM_ROOT/agent-firm/templates"
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 run_id="${ts}-${slug}"
@@ -44,7 +140,17 @@ fi
 
 # Open the append-only event log.
 repo="$(basename "$(pwd)")"
-base_sha="$(git rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
+repo_root=""
+git_common_dir=""
+base_sha=""
+approval_eligible=false
+if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" && base_sha="$(git rev-parse --verify HEAD^{commit} 2>/dev/null)"; then
+  repo_root="$(cd "$repo_root" && pwd -P)"
+  git_common_dir="$(git rev-parse --git-common-dir)"
+  case "$git_common_dir" in /*) ;; *) git_common_dir="$repo_root/$git_common_dir" ;; esac
+  git_common_dir="$(cd "$git_common_dir" && pwd -P)"
+  approval_eligible=true
+fi
 
 # Resolve the DEFAULT branch (distinct from HEAD/base_sha above — a run can start on a feature branch)
 # and its SHA at run start. This lets firm-check-assertions PROVE the default branch hasn't moved by
@@ -79,12 +185,14 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fi
 fi
 
-printf '{"ts":"%s","event":"run_started","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+printf '{"ts":"%s","event":"run_started","event_id":"evt-run-started-%s","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+chmod 600 "$run_dir/run.jsonl"
 
-# Machine-readable run metadata. Historical runs without it are Claude-primary by policy.
-printf '{"run_id":"%s","track":"%s","primary_provider":"%s"}\n' \
-  "$run_id" "$track" "$primary" > "$run_dir/run-metadata.json"
+# Machine-readable current metadata. Historical runs are interpreted only through --metadata-view.
+printf '{"schema_version":2,"run_id":"%s","track":"%s","primary_provider":"%s","repository_root":"%s","git_common_dir":"%s","accepted_base_sha":"%s","historical":false,"approval_eligible":%s}\n' \
+  "$run_id" "$track" "$primary" "$repo_root" "$git_common_dir" "$base_sha" "$approval_eligible" > "$run_dir/run-metadata.json"
+chmod 600 "$run_dir/run-metadata.json"
 
 # A separate file, not just the ledger line: firm-check-assertions can then do a plain file-exists
 # check for "is there a baseline at all" without parsing run.jsonl, and its absence is unambiguous.

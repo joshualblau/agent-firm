@@ -44,6 +44,7 @@ PY
 run_id="$(basename "$run_dir")"
 branch="${1:-integration/${run_id}}"
 case "$branch" in *[!A-Za-z0-9._/-]*|*..*|/*) echo "firm-qa-checkout: unsafe branch name" >&2; exit 2 ;; esac
+case "$branch" in integration/*) ;; *) echo "firm-qa-checkout: candidate source must be an integration/* branch" >&2; exit 2 ;; esac
 if ! git -C "$repo" show-ref --verify --quiet "refs/heads/${branch}"; then
   echo "branch '${branch}' not found — run firm-integrate first (or pass a branch)" >&2; exit 1
 fi
@@ -57,6 +58,19 @@ trap cleanup_lock EXIT HUP INT TERM
 
 sha="$(git -C "$repo" rev-parse --verify "refs/heads/${branch}^{commit}")"
 case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "firm-qa-checkout: could not resolve a full candidate SHA" >&2; exit 1 ;; esac
+metadata_json="$("$SELF/firm-new-run" --metadata-view "$run_dir")" || {
+  echo "firm-qa-checkout: current run metadata is unavailable or malformed" >&2; exit 2;
+}
+accepted_base="$(printf '%s' "$metadata_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["approval_eligible"] is True and d["historical"] is False; print(d["accepted_base_sha"])')" || {
+  echo "firm-qa-checkout: historical or approval-ineligible metadata cannot capture a current candidate" >&2; exit 2;
+}
+case "$accepted_base" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "firm-qa-checkout: accepted base is not a full SHA" >&2; exit 2 ;; esac
+git -C "$repo" cat-file -e "$accepted_base^{commit}" 2>/dev/null || {
+  echo "firm-qa-checkout: accepted base commit is unavailable" >&2; exit 1;
+}
+git -C "$repo" merge-base --is-ancestor "$accepted_base" "$sha" || {
+  echo "firm-qa-checkout: integration candidate does not descend from the accepted base" >&2; exit 1;
+}
 
 qa_parent="$repo/.agent-firm/qa-checkout"
 qa_dir="$qa_parent/$run_id"
@@ -79,9 +93,9 @@ evidence="$run_dir/09-test-evidence"
 mkdir -p "$evidence"
 chmod 700 "$evidence"
 candidate="$evidence/qa-candidate.json"
-python3 - "$repo" "$run_dir" "$qa_dir" "$branch" "$sha" "$candidate" <<'PY'
+generation="$(python3 - "$repo" "$run_dir" "$qa_dir" "$branch" "$sha" "$accepted_base" "$candidate" <<'PY'
 import datetime, json, os, stat, subprocess, sys
-repo, run, checkout, branch, sha, target = sys.argv[1:]
+repo, run, checkout, branch, sha, base, target = sys.argv[1:]
 run_id=os.path.basename(run)
 generation=1
 try:
@@ -95,28 +109,15 @@ except FileNotFoundError:
 except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
     print(f"firm-qa-checkout: refusing malformed prior candidate metadata: {exc}", file=sys.stderr)
     raise SystemExit(1)
-base=sha
-try:
-    with open(os.path.join(run, "run.jsonl"), encoding="utf-8") as fh:
-        for line in fh:
-            event=json.loads(line)
-            if event.get("event") == "run_started" and event.get("base_sha"):
-                raw=str(event["base_sha"])
-                base=subprocess.check_output(
-                    ["git", "-C", repo, "rev-parse", "--verify", raw+"^{commit}"],
-                    stderr=subprocess.DEVNULL, text=True
-                ).strip()
-                break
-except Exception:
-    try:
-        base=subprocess.check_output(["git","-C",repo,"rev-parse",sha+"^"], text=True).strip()
-    except Exception:
-        base=sha
 common=subprocess.check_output(["git","-C",repo,"rev-parse","--git-common-dir"], text=True).strip()
 if not os.path.isabs(common):
     common=os.path.join(repo, common)
+resolved=subprocess.check_output(["git","-C",repo,"rev-parse","--verify","refs/heads/"+branch+"^{commit}"],text=True).strip()
+if resolved != sha or subprocess.run(["git","-C",repo,"merge-base","--is-ancestor",base,sha]).returncode != 0:
+    print("firm-qa-checkout: source ref moved or accepted-base ancestry changed during capture", file=sys.stderr)
+    raise SystemExit(1)
 doc={
-  "schema_version":1,
+  "schema_version":2,
   "run_id":run_id,
   "repository_root":os.path.realpath(repo),
   "git_common_dir":os.path.realpath(common),
@@ -146,7 +147,8 @@ finally:
     except FileNotFoundError: pass
 print(generation)
 PY
+  )" || exit $?
 
-"$SELF/firm-ledger-log" --run "$run_dir" --strict qa_checkout dir="$qa_dir" branch="$branch" sha="$sha" candidate="$candidate" >/dev/null
+"$SELF/firm-ledger-log" --run "$run_dir" --strict qa_checkout dir="$qa_dir" branch="$branch" source_ref="refs/heads/$branch" base_sha="$accepted_base" sha="$sha" generation="$generation" candidate="$candidate" >/dev/null
 echo "clean QA checkout: $qa_dir  (detached candidate ${sha}, metadata $candidate)"
 echo "QA: run only read-only checks in this checkout and capture evidence for candidate ${sha}. Do NOT edit source."

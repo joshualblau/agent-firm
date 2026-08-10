@@ -55,6 +55,12 @@
     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "paths to logs, screenshots, reports" },
     "summary": { "type": "string", "description": "2-4 sentence human-readable verdict rationale" }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"commit_sha": {"pattern": "^[0-9a-f]{40}$"}}, "required": ["commit_sha"]},
+      "then": {"required": ["run_id", "generation", "provider", "attempt_id"]}
+    }
+  ],
   "$defs": {
     "stageResult": {
       "type": "object",

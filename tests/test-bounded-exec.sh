@@ -43,6 +43,19 @@ assert_eq "only 64 bytes retained" 64 "$(wc -c < "$WORK/cap.out" | tr -d ' ')"
 assert_eq "result marks truncation" True "$(result_field "$WORK/cap.json" truncated)"
 assert_eq "result records full observed output" 4097 "$(result_field "$WORK/cap.json" output_bytes)"
 
+t_case "a large newline-free provider record has an independent bounded parser buffer"
+assert_rc "16 MiB newline-free stream completes without growing the parser with output" 0 "$BOUND" \
+  --phase judge --provider gpt --timeout 10 --grace 1 --max-output 4096 --generation 1 \
+  --output "$WORK/no-newline.out" --result "$WORK/no-newline.json" -- \
+  python3 -c 'import sys; chunk=b"X"*65536; [sys.stdout.buffer.write(chunk) for _ in range(256)]; sys.stdout.buffer.flush()'
+assert_eq "retained bytes remain independently capped" 4096 "$(wc -c < "$WORK/no-newline.out" | tr -d ' ')"
+assert_eq "overlong event record has an explicit parser state" overlong_record "$(result_field "$WORK/no-newline.json" parser_status)"
+assert_ok "parser peak never exceeds its fixed 64 KiB bound" python3 - "$WORK/no-newline.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); assert d["parser_peak_bytes"] <= d["parser_limit_bytes"] == 65536
+assert d["overlong_records"] == 1
+PY
+
 t_case "wall timeout supervises the process group and escalates TERM to KILL"
 for phase in discovery authentication model judge; do
   pidfile="$WORK/$phase.pid"

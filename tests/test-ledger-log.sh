@@ -94,4 +94,48 @@ mv "$repo6/.agent-firm/runs/safe" "$repo6/.agent-firm/runs/real"
 ln -s "$repo6/.agent-firm/runs/real" "$repo6/.agent-firm/runs/safe"
 assert_rc "symlinked run component is rejected" 1 sh -c "cd '$repo6' && '$LOG' --run '$repo6/.agent-firm/runs/safe' --strict reviewer_block"
 
+t_case "strict events carry one immutable event id and can print the generated producer id"
+repo7="$(mk_repo)"; mk_run "$repo7" producer
+printed_id="$(cd "$repo7" && "$LOG" --run "$repo7/.agent-firm/runs/producer" --strict --print-event-id evidence_captured sha=0123456789012345678901234567890123456789 path=09-test-evidence/proof.log)"
+assert_output "generated producer id has the required prefix" "evt-" printf '%s' "$printed_id"
+assert_ok "printed id names the exact retained event" python3 - "$repo7/.agent-firm/runs/producer/run.jsonl" "$printed_id" <<'PY'
+import json,sys
+records=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+assert len(records)==1, records
+record=records[0]
+assert record["event_id"]==sys.argv[2]
+assert record["event"]=="evidence_captured"
+assert record["run_id"]=="producer"
+assert record["sha"]=="0123456789012345678901234567890123456789"
+assert record["path"]=="09-test-evidence/proof.log"
+PY
+
+t_case "requested producer ids are unique and a duplicate cannot append or mutate the ledger"
+repo8="$(mk_repo)"; mk_run "$repo8" unique
+event_id="evt-explicit-producer-0001"
+assert_rc "first explicit producer event succeeds" 0 \
+  "$LOG" --run "$repo8/.agent-firm/runs/unique" --strict --event-id "$event_id" evidence_captured path=09-test-evidence/a.log
+unique_before="$(shasum -a 256 "$repo8/.agent-firm/runs/unique/run.jsonl" | awk '{print $1}')"
+assert_rc "duplicate producer event id is rejected" 1 \
+  "$LOG" --run "$repo8/.agent-firm/runs/unique" --strict --event-id "$event_id" evidence_captured path=09-test-evidence/b.log
+assert_eq "duplicate rejection leaves the ledger byte-identical" "$unique_before" \
+  "$(shasum -a 256 "$repo8/.agent-firm/runs/unique/run.jsonl" | awk '{print $1}')"
+assert_eq "only one event owns the explicit producer id" 1 \
+  "$(python3 -c 'import json,sys; print(sum(json.loads(x).get("event_id")==sys.argv[2] for x in open(sys.argv[1]) if x.strip()))' "$repo8/.agent-firm/runs/unique/run.jsonl" "$event_id")"
+
+t_case "strict producer fields are closed and malformed prior ledger bytes fail without append"
+for reserved in ts event event_id run_id; do
+  assert_rc "reserved field $reserved cannot override ledger identity" 1 \
+    "$LOG" --run "$repo8/.agent-firm/runs/unique" --strict evidence_captured "$reserved=forged"
+done
+assert_eq "reserved-field attempts leave the ledger byte-identical" "$unique_before" \
+  "$(shasum -a 256 "$repo8/.agent-firm/runs/unique/run.jsonl" | awk '{print $1}')"
+repo9="$(mk_repo)"; mk_run "$repo9" malformed
+printf 'not-json\n' > "$repo9/.agent-firm/runs/malformed/run.jsonl"
+malformed_before="$(shasum -a 256 "$repo9/.agent-firm/runs/malformed/run.jsonl" | awk '{print $1}')"
+assert_rc "malformed existing target ledger is rejected" 1 \
+  "$LOG" --run "$repo9/.agent-firm/runs/malformed" --strict evidence_captured
+assert_eq "malformed target remains byte-identical" "$malformed_before" \
+  "$(shasum -a 256 "$repo9/.agent-firm/runs/malformed/run.jsonl" | awk '{print $1}')"
+
 t_summary

@@ -1618,10 +1618,18 @@ printf 'proof two\n' > "$strict_run/09-test-evidence/ac2.log"
 
 strict_reset() {
   python3 - "$strict_run" <<'PY'
-import json,os,sys,yaml
+import hashlib,json,os,secrets,sys,yaml
 run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+def ref(path):
+ raw=open(run+"/"+path,"rb").read(); event_id="evt-strict-"+secrets.token_hex(8)
+ event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":event_id,
+        "run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,
+        "sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+ with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+ return {"path":path,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
+         "producer":{"event_id":event_id,"event":"evidence_produced"}}
 verdict={
- "verdict":"APPROVE","commit_sha":sha,"run_id":os.path.basename(run),"generation":gen,"provider":"primary",
+ "verdict":"APPROVE","commit_sha":sha,"run_id":os.path.basename(run),"generation":gen,"provider":"primary","attempt_id":"primary-fixture",
  "environment":"fixture","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/ac1.log"},
  "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
  "visual":{"status":"not_applicable","evidence":"none"},
@@ -1631,13 +1639,15 @@ verdict={
  "untested_risks":[],"blockers":[],"warnings":[],"artifacts":["09-test-evidence/ac1.log","09-test-evidence/ac2.log"],"summary":"fixture"
 }
 json.dump(verdict,open(run+"/08-qa-verdict.json","w"),indent=2)
-trace={"schema_version":1,"task_slug":"strict","candidate":{
- "run_id":os.path.basename(run),"commit_sha":sha,"generation":gen,"checkout_path":c["checkout_path"]},
+trace={"schema_version":2,"task_slug":"strict","candidate":{
+ "run_id":os.path.basename(run),"repository_root":c["repository_root"],"git_common_dir":c["git_common_dir"],
+ "checkout_path":c["checkout_path"],"source_ref":c["source_ref"],"source_ref_sha":c["source_ref_sha"],
+ "base_sha":c["base_sha"],"commit_sha":sha,"generation":gen},
  "matrix":[
   {"id":"AC-001","implementation_files":["candidate.txt"],"tests":["strict one"],"manual_verification":"",
-   "evidence":[{"path":"09-test-evidence/ac1.log","candidate_sha":sha}],"status":"covered"},
+   "evidence":[ref("09-test-evidence/ac1.log")],"status":"covered"},
   {"id":"AC-002","implementation_files":["candidate.txt"],"tests":["strict two"],"manual_verification":"",
-   "evidence":[{"path":"09-test-evidence/ac2.log","candidate_sha":sha}],"status":"covered"}],
+   "evidence":[ref("09-test-evidence/ac2.log")],"status":"covered"}],
  "two_voice":{"secondary_provider":"gpt","status":"available","required":False},"two_voice_diff":[]}
 yaml.safe_dump(trace,open(run+"/traceability.yaml","w"),sort_keys=False)
 PY
@@ -1654,7 +1664,7 @@ elif op=="missing-evidence": d["matrix"][0]["evidence"][0]["path"]="09-test-evid
 elif op=="partial-no-gate": d["matrix"][0]["status"]="partial"; d["matrix"][0]["evidence"]=[]
 elif op=="uncovered-gate":
  d["matrix"][0]["status"]="uncovered"; d["matrix"][0]["evidence"]=[]
- d["matrix"][0]["gate_record"]={"path":"09-test-evidence/ac1-gate.yaml","candidate_sha":d["candidate"]["commit_sha"],"decision":"waive_uncovered"}
+ d["matrix"][0]["gate_record"]={"path":"09-test-evidence/ac1-gate.yaml","candidate_sha":d["candidate"]["commit_sha"],"sha256":"0"*64,"bytes":0,"producer":{"event_id":"evt-placeholder","event":"gate_recorded"},"decision":"waive_uncovered"}
 yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 }
@@ -1687,6 +1697,16 @@ decision: waive_uncovered
 objections: [fixture-objection]
 evidence: [09-test-evidence/ac2.log]
 EOF
+python3 - "$strict_run" <<'PY'
+import hashlib,json,os,secrets,sys,yaml
+run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); c=json.load(open(run+"/09-test-evidence/qa-candidate.json"))
+rel="09-test-evidence/ac1-gate.yaml"; raw=open(run+"/"+rel,"rb").read(); event_id="evt-gate-"+secrets.token_hex(8)
+event={"ts":"2026-08-10T00:00:00Z","event":"gate_recorded","event_id":event_id,"run_id":os.path.basename(run),
+       "sha":c["candidate_sha"],"generation":str(c["generation"]),"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+d["matrix"][0]["gate_record"].update({"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":event_id,"event":"gate_recorded"}})
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
 python3 - "$strict_run/08-qa-verdict.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["acceptance_criteria_coverage"][0]={"id":"AC-001","covered":"no","evidence":"09-test-evidence/ac1-gate.yaml"}; json.dump(d,open(p,"w"),indent=2)

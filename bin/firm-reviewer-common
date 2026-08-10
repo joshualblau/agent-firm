@@ -189,6 +189,8 @@ if not isinstance(generation, int) or isinstance(generation, bool) or generation
     stop("candidate metadata generation is invalid", 2)
 if candidate.get("run_id") != run.name or os.path.realpath(str(candidate.get("repository_root", ""))) != os.path.realpath(repo):
     stop("candidate metadata run/repository identity is mismatched", 2)
+if candidate.get("schema_version") != 2 or not re.fullmatch(r"refs/heads/integration/[A-Za-z0-9._/-]+", str(candidate.get("source_ref", ""))):
+    stop("candidate metadata version/source_ref is invalid", 2)
 
 def verify_candidate():
     try:
@@ -203,6 +205,8 @@ def verify_candidate():
         common = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--git-common-dir"], stderr=subprocess.DEVNULL, text=True).strip()
         if not os.path.isabs(common):
             common = os.path.join(checkout, common)
+        source = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--verify", candidate["source_ref"] + "^{commit}"], stderr=subprocess.DEVNULL, text=True).strip()
+        ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", candidate["base_sha"], sha], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
     except Exception as exc:
         return False, f"candidate checkout verification failed: {exc}"
     if head != sha or dirty:
@@ -211,11 +215,53 @@ def verify_candidate():
         return False, "candidate checkout path identity changed"
     if os.path.realpath(common) != os.path.realpath(str(candidate.get("git_common_dir", ""))):
         return False, "candidate repository identity changed"
+    if source != sha or candidate.get("source_ref_sha") != sha or ancestry != 0:
+        return False, "candidate source ref or accepted-base ancestry changed"
     return True, ""
 
 valid, reason = verify_candidate()
 if not valid:
     stop(reason, 1)
+
+try:
+    metadata_done = subprocess.run(
+        [str(self_dir / "firm-new-run"), "--metadata-view", str(run)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if metadata_done.returncode != 0:
+        raise ValueError(metadata_done.stderr.strip() or "metadata view failed")
+    normalized_metadata = json.loads(metadata_done.stdout)
+except Exception as exc:
+    stop(f"run metadata is unavailable or malformed: {exc}", 2)
+if normalized_metadata.get("historical") is not False or normalized_metadata.get("approval_eligible") is not True:
+    stop("historical or approval-ineligible metadata cannot launch current QA", 2)
+if (normalized_metadata.get("run_id") != run.name
+        or os.path.realpath(str(normalized_metadata.get("repository_root", ""))) != os.path.realpath(repo)
+        or os.path.realpath(str(normalized_metadata.get("git_common_dir", ""))) != os.path.realpath(str(candidate.get("git_common_dir", "")))
+        or normalized_metadata.get("accepted_base_sha") != candidate.get("base_sha")):
+    stop("normalized run metadata does not match candidate repository/base identity", 2)
+
+resolver_provider = "codex" if provider == "gpt" else "claude"
+resolved_done = subprocess.run(
+    [str(self_dir / "firm-model-resolve"), "--provider", resolver_provider, "--role", "reviewer", "--format", "json"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+)
+if resolved_done.returncode != 0:
+    stop(f"canonical reviewer model resolution failed: {resolved_done.stderr.strip()}", 2)
+try:
+    resolved_model = json.loads(resolved_done.stdout)
+    model = str(resolved_model["model"])
+    model_display = str(resolved_model["display"])
+    model_effort = str(resolved_model["effort"])
+    model_tier = str(resolved_model["tier"])
+except Exception as exc:
+    stop(f"canonical reviewer model resolution was malformed: {exc}", 2)
+if model_tier != "heavyweight" or model_effort != "xhigh":
+    stop("canonical reviewer role must resolve to heavyweight/xhigh", 2)
+override_name = "FIRM_GPT_QA_MODEL" if provider == "gpt" else "FIRM_CLAUDE_QA_MODEL"
+override = os.environ.get(override_name)
+if override is not None and override != model:
+    stop(f"{override_name} must equal canonical reviewer model {model!r}", 2)
 
 # Raw provider output is never part of the transferable run directory. Explicit opt-in stores it
 # under a separate private repository surface for at most one hour; every invocation purges expired
@@ -244,22 +290,60 @@ for old in list(private_run.iterdir()):
     shutil.rmtree(old)
 
 lock = evidence / f".reviewer-{provider}.lock"
+lock_owner = {"schema_version":1, "pid":os.getpid(), "provider":provider, "run_id":run.name,
+              "candidate_sha":sha, "generation":generation,
+              "started_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")}
 try:
     os.mkdir(lock, 0o700)
 except FileExistsError:
-    stop(f"another {provider} reviewer attempt holds the run lock", 1)
+    try:
+        info = os.lstat(lock)
+        owner_path = lock / "owner.json"
+        owner_info = os.lstat(owner_path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("lock is not an owned regular directory")
+        if stat.S_ISLNK(owner_info.st_mode) or not stat.S_ISREG(owner_info.st_mode):
+            raise ValueError("lock owner record is unsafe")
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        pid = int(owner["pid"])
+        if owner.get("provider") != provider or owner.get("run_id") != run.name or owner.get("candidate_sha") != sha or owner.get("generation") != generation:
+            raise ValueError("stale lock identity does not match this candidate")
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        if alive:
+            stop(f"another {provider} reviewer attempt holds the run lock", 1)
+        stale = evidence / f".reviewer-{provider}.stale.{os.getpid()}.{os.urandom(4).hex()}"
+        os.rename(lock, stale)
+        shutil.rmtree(stale)
+        os.mkdir(lock, 0o700)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        stop(f"reviewer lock is unsafe or not provably stale: {exc}", 1)
+atomic_write(lock / "owner.json", json_bytes(lock_owner), 0o600)
 
 attempt = None
 attempt_path = None
 diagnostic_path = None
 control = None
+private_attempt = None
 
-def ledger(event, **fields):
-    command = [str(self_dir / "firm-ledger-log"), "--run", str(run), "--strict", event]
+def make_event_id(kind):
+    return f"evt-{kind}-{provider}-g{generation}-{os.getpid()}-{os.urandom(6).hex()}"
+
+def ledger(event, event_id=None, **fields):
+    event_id = event_id or make_event_id(event)
+    command = [str(self_dir / "firm-ledger-log"), "--run", str(run), "--strict", "--event-id", event_id, event]
     command.extend(f"{key}={value}" for key, value in fields.items())
     done = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if done.returncode != 0:
         stop(f"target-ledger write failed: {done.stderr.strip()}", 1)
+    return event_id
 
 def update_attempt(status, exit_code, **fields):
     attempt["status"] = status
@@ -267,6 +351,19 @@ def update_attempt(status, exit_code, **fields):
     attempt["finished_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     attempt.update(fields)
     atomic_write(attempt_path, json_bytes(attempt), 0o600)
+
+def finalize_attempt(status, exit_code, event, ledger_fields=None, **fields):
+    outcome_event_id = make_event_id(event)
+    update_attempt(status, exit_code, outcome_event_id=outcome_event_id, **fields)
+    payload = attempt_path.read_bytes()
+    event_fields = {
+        "provider":provider, "generation":generation, "sha":sha, "attempt":attempt_rel,
+        "attempt_id":attempt_id, "exit_code":exit_code,
+        "sha256":hashlib.sha256(payload).hexdigest(), "bytes":len(payload)
+    }
+    event_fields.update(ledger_fields or {})
+    ledger(event, event_id=outcome_event_id, **event_fields)
+    return outcome_event_id
 
 try:
     attempts_dir = safe_dir(evidence / "reviewer-attempts", 0o700, create=True)
@@ -308,25 +405,35 @@ try:
         existing = os.lstat(canonical)
         if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
             stop(f"canonical {provider} verdict is not a regular no-follow target", 2)
-        prior_verdict = attempt_dir / "prior-verdict.json"
-        os.replace(canonical, prior_verdict)
-        os.chmod(prior_verdict, 0o600, follow_symlinks=False)
+        try:
+            prior_doc = json.loads(canonical.read_text(encoding="utf-8"))
+            prior_id = prior_doc.get("attempt_id")
+            prior_local = attempts_dir / str(prior_id) / "verdict.json"
+            if not prior_id or not prior_local.is_file() or prior_local.is_symlink() or prior_local.read_bytes() != canonical.read_bytes():
+                stop(f"canonical {provider} verdict has no matching immutable attempt-local source", 1)
+            prior_verdict = prior_local
+        except Exception as exc:
+            stop(f"canonical {provider} verdict cannot be archived safely: {exc}", 1)
+        os.unlink(canonical)
     except FileNotFoundError:
         pass
     state = {"schema_version":1, "provider":provider, "candidate_sha":sha, "generation":generation, "last_attempt":counter, "attempt_id":attempt_id}
     atomic_write(state_path, json_bytes(state), 0o600)
+    started_event_id = make_event_id("reviewer-attempt-started")
     attempt = {
         "schema_version":1, "attempt_id":attempt_id, "provider":provider,
         "run_id":run.name, "candidate_sha":sha, "generation":generation,
         "status":"started", "exit_code":None,
         "started_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "trusted_reason":None, "phases":[],
+        "model":{"provider":resolver_provider,"tier":resolved_model.get("tier"),"model":model,"display":model_display,"effort":model_effort},
+        "started_event_id":started_event_id, "outcome_event_id":None,
         "prior_verdict":str(prior_verdict.relative_to(run)) if prior_verdict else None,
         "private_raw":str(private_attempt.relative_to(repo)) if private_attempt else None,
         "raw_expires_epoch":raw_expires_epoch
     }
     atomic_write(attempt_path, json_bytes(attempt), 0o600)
-    ledger("reviewer_attempt_started", provider=provider, generation=generation, sha=sha, attempt=attempt_rel)
+    ledger("reviewer_attempt_started", event_id=started_event_id, provider=provider, generation=generation, sha=sha, attempt=attempt_rel, attempt_id=attempt_id)
 
     control = attempt_dir / "control"
     os.mkdir(control, 0o700)
@@ -348,6 +455,8 @@ try:
     atomic_write(instruction_root / "CLAUDE.md", contract, 0o400)
     empty_mcp = instruction_root / "empty-mcp.json"
     atomic_write(empty_mcp, b'{"mcpServers":{}}\n', 0o400)
+    controlled_schema = instruction_root / "qa-verdict.schema.json"
+    atomic_write(controlled_schema, (root / "agent-firm" / "schemas" / "qa-verdict.schema.json").read_bytes(), 0o400)
 
     # Reconstruct committed bytes only. Symlink blobs become inert text evidence, never live links.
     listing = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-rz", "--full-tree", sha])
@@ -387,32 +496,130 @@ try:
         return text
 
     copied = 0
-    sources = [
-        run / "01-acceptance-criteria.yaml", run / "traceability.yaml",
-        candidate_path, run / "08-qa-verdict.json"
-    ]
-    for entry in evidence.iterdir():
-        if entry.name in ("reviewer-attempts",) or entry.name.startswith(".private-"):
-            continue
-        if entry.is_file() and not entry.is_symlink() and entry not in sources:
-            sources.append(entry)
-    seen = set()
-    for source in sources:
-        if source in seen or not source.is_file() or source.is_symlink():
-            continue
-        seen.add(source)
-        raw = source.read_bytes()
+    manifest_entries = []
+    seen_origins = set()
+    ledger_source = run / "run.jsonl"
+    try:
+        ledger_records = [json.loads(line) for line in ledger_source.read_text(encoding="utf-8").splitlines() if line]
+        if not all(isinstance(item, dict) for item in ledger_records):
+            raise ValueError("ledger contains a non-object")
+    except Exception as exc:
+        stop(f"target ledger is malformed before judge snapshot: {exc}", 1)
+
+    def safe_run_source(origin):
+        if not isinstance(origin, str) or not origin or os.path.isabs(origin) or any(part in ("", ".", "..") for part in Path(origin).parts):
+            stop(f"unsafe judge-input origin: {origin!r}", 1)
+        current = run
+        for part in Path(origin).parts:
+            current = current / part
+            try:
+                info = os.lstat(current)
+            except OSError as exc:
+                stop(f"required judge input is missing: {origin}: {exc}", 1)
+            if stat.S_ISLNK(info.st_mode):
+                stop(f"judge input contains a symlinked component: {origin}", 1)
+        if not stat.S_ISREG(os.lstat(current).st_mode):
+            stop(f"judge input is not a regular file: {origin}", 1)
+        return current
+
+    def add_payload(origin, raw, source_mode, transform="redacted_utf8"):
+        global copied
+        if origin in seen_origins:
+            return
+        if any(part in ("", ".", "..") for part in Path(origin).parts):
+            stop(f"unsafe or duplicate manifest origin: {origin}", 1)
+        seen_origins.add(origin)
         copied += len(raw)
         if copied > 8 * 1024 * 1024:
             stop("bounded evidence snapshot exceeds 8 MiB; curate current evidence before review", 1)
-        name = source.name
-        if source.parent == evidence:
-            name = "09-test-evidence--" + name
-        atomic_write(run_snapshot / name, redact(raw).encode("utf-8"), 0o400)
+        controlled = redact(raw).encode("utf-8") if transform == "redacted_utf8" else raw
+        destination = run_snapshot / "files" / origin
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write(destination, controlled, 0o400)
+        manifest_entries.append({
+            "origin_path":origin, "controlled_path":str(destination.relative_to(instruction_root)),
+            "source_sha256":hashlib.sha256(raw).hexdigest(), "source_bytes":len(raw),
+            "source_mode":format(source_mode & 0o777, "04o"),
+            "controlled_sha256":hashlib.sha256(controlled).hexdigest(), "controlled_bytes":len(controlled),
+            "transform":transform
+        })
+
+    def add_source(origin):
+        source = safe_run_source(origin)
+        add_payload(origin, source.read_bytes(), os.lstat(source).st_mode)
+
+    required_origins = [
+        "01-acceptance-criteria.yaml", "traceability.yaml", "09-test-evidence/qa-candidate.json",
+        "run-metadata.json", "run.jsonl", "07-review-findings.yaml",
+        "06-implementation-summary.md", "integration-summary.md", "08-qa-verdict.json"
+    ]
+    for origin in required_origins:
+        add_source(origin)
+    normalized_raw = json_bytes(normalized_metadata)
+    add_payload("normalized-run-metadata.json", normalized_raw, 0o600, "generated_normalized_metadata")
+
+    try:
+        import yaml
+        trace_doc = yaml.safe_load((run / "traceability.yaml").read_text(encoding="utf-8"))
+        primary_doc = json.loads((run / "08-qa-verdict.json").read_text(encoding="utf-8"))
+    except Exception as exc:
+        stop(f"cannot inventory traceability/primary inputs: {exc}", 1)
+
+    references = []
+    def walk_refs(value):
+        if isinstance(value, dict):
+            if {"path", "candidate_sha", "sha256", "bytes", "producer"}.issubset(value):
+                references.append(value)
+            for nested in value.values():
+                walk_refs(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk_refs(nested)
+    walk_refs(trace_doc)
+    for ref in references:
+        origin = ref.get("path")
+        source = safe_run_source(origin)
+        raw = source.read_bytes()
+        if ref.get("candidate_sha") != sha or ref.get("sha256") != hashlib.sha256(raw).hexdigest() or ref.get("bytes") != len(raw):
+            stop(f"judge input reference digest/size/candidate mismatch: {origin}", 1)
+        producer = ref.get("producer")
+        if not isinstance(producer, dict):
+            stop(f"judge input reference lacks producer: {origin}", 1)
+        matches = [item for item in ledger_records if item.get("event_id") == producer.get("event_id")]
+        if len(matches) != 1 or matches[0].get("event") != producer.get("event"):
+            stop(f"judge input producer event is missing or duplicated: {origin}", 1)
+        event = matches[0]
+        if event.get("sha") != sha or str(event.get("generation")) != str(generation):
+            stop(f"judge input producer candidate identity mismatch: {origin}", 1)
+        if origin not in (event.get("path"), event.get("verdict"), event.get("attempt")):
+            stop(f"judge input producer does not name its artifact: {origin}", 1)
+        digest_field = "verdict_sha256" if origin == event.get("verdict") else "sha256"
+        bytes_field = "verdict_bytes" if origin == event.get("verdict") else "bytes"
+        if str(event.get(digest_field)) != ref.get("sha256") or str(event.get(bytes_field)) != str(ref.get("bytes")):
+            stop(f"judge input producer digest/size mismatch: {origin}", 1)
+        for field, event_field in (("provider", "provider"), ("generation", "generation"), ("attempt_id", "attempt_id")):
+            if field in producer and str(event.get(event_field)) != str(producer[field]):
+                stop(f"judge input producer {field} mismatch: {origin}", 1)
+        add_payload(origin, raw, os.lstat(source).st_mode)
+
+    def artifact_strings(value):
+        if isinstance(value, dict):
+            for nested in value.values():
+                yield from artifact_strings(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from artifact_strings(nested)
+        elif isinstance(value, str) and value.startswith("09-test-evidence/"):
+            yield value
+    for origin in artifact_strings(primary_doc):
+        add_source(origin)
     diff = subprocess.check_output(["git", "-C", str(repo), "diff", "--no-ext-diff", "--no-color", candidate["base_sha"], sha, "--"], stderr=subprocess.DEVNULL)
     if len(diff) > 2 * 1024 * 1024:
         stop("trusted candidate diff exceeds 2 MiB controlled-root bound", 1)
-    atomic_write(run_snapshot / "candidate.diff", redact(diff).encode("utf-8"), 0o400)
+    add_payload("candidate.diff", diff, 0o400)
+    manifest = {"schema_version":1, "run_id":run.name, "candidate_sha":sha, "generation":generation,
+                "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"])}
+    atomic_write(run_snapshot / "input-manifest.json", json_bytes(manifest), 0o400)
 
     for current, dirs, files in os.walk(instruction_root, topdown=False):
         for name in files:
@@ -428,6 +635,7 @@ try:
             phase_environment[key] = value
         elif upper in ("LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT"):
             phase_environment[key] = value
+    behavior_sentinel = temp_root / "behavior-sentinel.json"
     phase_environment.update({
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(config_root),
@@ -436,12 +644,16 @@ try:
         "CLAUDE_CONFIG_DIR": str(config_root / "claude"),
         "TMPDIR": str(temp_root),
         "FIRM_QA_JUDGE": "1",
+        "FIRM_QA_ATTEMPT_ID": attempt_id,
+        "FIRM_QA_INPUT_MANIFEST": str(run_snapshot / "input-manifest.json"),
+        "FIRM_QA_BEHAVIOR_SENTINEL": str(behavior_sentinel),
         "PYTHONUTF8": "1"
     })
     for directory in (config_root / "xdg", config_root / "codex", config_root / "claude"):
         os.mkdir(directory, 0o700)
 
-    diagnostics = {"schema_version":1, "provider":provider, "attempt_id":attempt_id, "cap_bytes":16384, "phases":[]}
+    diagnostics = {"schema_version":2, "provider":provider, "attempt_id":attempt_id, "cap_bytes":16384,
+                   "content_policy":"allowlisted_metadata_only", "phases":[]}
     raw_files = []
     def run_phase(name, timeout, command):
         raw_path = control / f".{name}.raw"
@@ -464,25 +676,19 @@ try:
         attempt["phases"].append({
             "phase":name, "status":result.get("status"), "exit_code":result.get("exit_code"),
             "duration_ms":result.get("duration_ms"), "truncated":result.get("truncated"),
-            "turn_count":result.get("turn_count")
+            "turn_count":result.get("turn_count"), "output_bytes":result.get("output_bytes"),
+            "retained_bytes":result.get("retained_bytes"), "parser_status":result.get("parser_status"),
+            "parser_peak_bytes":result.get("parser_peak_bytes")
         })
-        summary = redact(raw)
-        if len(summary.encode("utf-8")) > 4096:
-            summary = summary.encode("utf-8")[:4096].decode("utf-8", "ignore") + "\n[DIAGNOSTIC CAPPED]"
         diagnostics["phases"].append({
             "phase":name, "status":result.get("status"), "exit_code":result.get("exit_code"),
             "duration_ms":result.get("duration_ms"), "truncated":result.get("truncated"),
-            "summary":summary
+            "output_bytes":result.get("output_bytes"), "retained_bytes":result.get("retained_bytes"),
+            "turn_count":result.get("turn_count"), "parser_status":result.get("parser_status"),
+            "parser_peak_bytes":result.get("parser_peak_bytes")
         })
         atomic_write(attempt_path, json_bytes(attempt), 0o600)
         diagnostic_payload = json_bytes(diagnostics)
-        while len(diagnostic_payload) > diagnostics["cap_bytes"] and diagnostics["phases"][-1]["summary"]:
-            current = diagnostics["phases"][-1]["summary"].encode("utf-8")
-            excess = len(diagnostic_payload) - diagnostics["cap_bytes"]
-            keep = max(0, len(current) - excess - 64)
-            suffix = "\n[DIAGNOSTIC CAPPED]" if keep else ""
-            diagnostics["phases"][-1]["summary"] = current[:keep].decode("utf-8", "ignore") + suffix
-            diagnostic_payload = json_bytes(diagnostics)
         if len(diagnostic_payload) > diagnostics["cap_bytes"]:
             stop("diagnostic metadata exceeds its hard 16 KiB retention cap", 1)
         atomic_write(diagnostic_path, diagnostic_payload, 0o600)
@@ -490,19 +696,16 @@ try:
 
     executable = shutil.which("codex" if provider == "gpt" else "claude", path=phase_environment["PATH"])
     if not executable:
-        update_attempt("unavailable", 3, trusted_reason="cli_missing", diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_unavailable", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=3, reason="cli_missing")
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"cli_missing"}, trusted_reason="cli_missing", diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"{provider} CLI unavailable from the controlled readiness PATH (exit 3)", 3)
 
     discovery_command = [executable, "--help"]
     rc, result, raw = run_phase("discovery", discovery_timeout, discovery_command)
     if result.get("status") in ("timeout", "turn_limit"):
-        update_attempt("timeout", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_timeout", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="discovery")
+        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("bounded capability discovery timed out; BLOCK", 1)
     if rc != 0:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="discovery")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("capability discovery failed; BLOCK", 1)
     help_text = raw.decode("utf-8", "replace")
     required_flags = (
@@ -512,8 +715,7 @@ try:
     )
     missing = [flag for flag in required_flags if flag not in help_text]
     if missing:
-        update_attempt("unavailable", 3, trusted_reason="unsupported_capability", missing_capabilities=missing, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_unavailable", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=3, reason="unsupported_capability")
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"}, trusted_reason="unsupported_capability", missing_capabilities=missing, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"required provider controls unsupported: {', '.join(missing)} (exit 3)", 3)
 
     auth_command = [executable, "login", "status", "--json"] if provider == "gpt" else [executable, "auth", "status", "--json"]
@@ -534,19 +736,15 @@ try:
         return None, None
     ready, unavailable_reason = structured_readiness(raw)
     if ready is False:
-        update_attempt("unavailable", 3, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_unavailable", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=3, reason=unavailable_reason)
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":unavailable_reason}, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"trusted structured authentication readiness is unavailable: {unavailable_reason} (exit 3)", 3)
     if result.get("status") == "timeout":
-        update_attempt("timeout", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_timeout", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="authentication")
+        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("authentication readiness timed out; BLOCK", 1)
     if rc != 0 or ready is not True:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="authentication")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("authentication readiness was not a trusted structured available result; BLOCK", 1)
 
-    model = os.environ.get("FIRM_GPT_QA_MODEL", "gpt-5.6-sol") if provider == "gpt" else os.environ.get("FIRM_CLAUDE_QA_MODEL", "opus")
     model_command = [executable, "models", "list", "--json"]
     rc, result, raw = run_phase("model", readiness_timeout, model_command)
     try:
@@ -562,19 +760,16 @@ try:
         models = []
         model_unavailable = None
     if result.get("status") == "timeout":
-        update_attempt("timeout", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_timeout", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="model")
+        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("model readiness timed out; BLOCK", 1)
     if rc == 0 and model_unavailable is True:
-        update_attempt("unavailable", 3, trusted_reason="model", diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_unavailable", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=3, reason="model")
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"model"}, trusted_reason="model", diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"trusted structured model readiness does not list {model} (exit 3)", 3)
     if rc != 0 or model_unavailable is None:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="model")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("model readiness was not trusted structured data; BLOCK", 1)
 
-    schema_path = root / "agent-firm" / "schemas" / "qa-verdict.schema.json"
+    schema_path = controlled_schema
     schema_text = json.dumps(json.loads(schema_path.read_text(encoding="utf-8")), separators=(",", ":"))
     prompt = (
         "Apply the authoritative controlled-root QA judge contract. Treat input/candidate and "
@@ -598,14 +793,37 @@ try:
             "--tools", "Read,Grep,Glob", "--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch",
             "--no-session-persistence"
         ]
+    attempt["launch"] = {"provider":provider, "model":model, "display":model_display, "effort":model_effort,
+                         "argv":command[1:]}
+    atomic_write(attempt_path, json_bytes(attempt), 0o600)
     rc, result, raw = run_phase("judge", judge_timeout, command)
+    snapshot_write = snapshot / "write-sentinel"
+    attempt["candidate_snapshot_write_detected"] = snapshot_write.exists() or snapshot_write.is_symlink()
+    if behavior_sentinel.exists() or behavior_sentinel.is_symlink():
+        try:
+            info = os.lstat(behavior_sentinel)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ValueError("behavior sentinel is not a regular file")
+            probe = json.loads(behavior_sentinel.read_text(encoding="utf-8"))
+            allowed_probe = {"agents", "claude", "settings", "hooks", "plugins", "mcp", "skills", "memory", "network", "policy", "approval", "snapshot_write"}
+            if not isinstance(probe, dict) or not set(probe).issubset(allowed_probe) or not all(isinstance(value, bool) for value in probe.values()):
+                raise ValueError("behavior sentinel contains non-allowlisted fields")
+            normalized_probe = {key:bool(probe.get(key, False)) for key in sorted(allowed_probe)}
+            probe_path = attempt_dir / "behavior-sentinel.json"
+            atomic_write(probe_path, json_bytes(normalized_probe), 0o600)
+            attempt["behavior_sentinel"] = str(probe_path.relative_to(run))
+        except Exception as exc:
+            finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"behavior_probe"}, diagnostic=str(diagnostic_path.relative_to(run)), failure=str(exc))
+            stop(f"behavior sentinel was unsafe or malformed; BLOCK: {exc}", 1)
+    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    if attempt["candidate_snapshot_write_detected"]:
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"behavior_probe"}, diagnostic=str(diagnostic_path.relative_to(run)))
+        stop("provider wrote the controlled candidate snapshot; BLOCK", 1)
     if result.get("status") in ("timeout", "turn_limit"):
-        update_attempt("timeout", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_timeout", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="judge")
+        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"judge"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("main judge timed out; post-start output cannot downgrade this BLOCK", 1)
     if rc != 0:
-        update_attempt("block", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_block", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="judge")
+        finalize_attempt("block", 1, "reviewer_block", {"phase":"judge"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("main judge failed; post-start auth/model text remains BLOCKING", 1)
 
     try:
@@ -638,55 +856,51 @@ try:
             else:
                 raise ValueError("Claude output has no structured verdict")
     except Exception as exc:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="judge")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"judge"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"structured verdict is malformed; BLOCK: {exc}", 1)
 
     try:
         import jsonschema
         jsonschema.validate(verdict, json.loads(schema_text))
     except BaseException as exc:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="validation")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"verdict schema validation failed; BLOCK: {exc}", 1)
     if verdict.get("commit_sha") != sha or verdict.get("run_id") != run.name or verdict.get("generation") != generation:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="identity")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"identity"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("verdict is abbreviated, stale, or bound to another candidate generation", 1)
-    if verdict.get("provider") not in (None, provider) or verdict.get("attempt_id") not in (None, attempt_id):
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="identity")
+    if verdict.get("provider") != provider or verdict.get("attempt_id") != attempt_id:
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"identity"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("verdict provider/attempt identity is mismatched", 1)
-    verdict["provider"] = provider
-    verdict["attempt_id"] = attempt_id
     valid, reason = verify_candidate()
     if not valid:
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="promotion")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"promotion"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(reason, 1)
-    atomic_write(canonical, json_bytes(verdict), 0o600)
     verdict_word = verdict.get("verdict")
     if verdict_word == "APPROVE" and verdict.get("blockers"):
-        update_attempt("invalid", 1, diagnostic=str(diagnostic_path.relative_to(run)))
-        ledger("reviewer_invalid", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=1, phase="validation")
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("APPROVE verdict still contains blockers", 1)
+    attempt_verdict = attempt_dir / "verdict.json"
+    verdict_payload = json_bytes(verdict)
+    atomic_write(attempt_verdict, verdict_payload, 0o600)
+    atomic_write(canonical, verdict_payload, 0o600)
     outcome = "approve" if verdict_word == "APPROVE" else "block"
     exit_code = 0 if outcome == "approve" else 1
-    update_attempt(outcome, exit_code, verdict=str(canonical.relative_to(run)), diagnostic=str(diagnostic_path.relative_to(run)))
-    ledger("reviewer_approve" if outcome == "approve" else "reviewer_block", provider=provider, generation=generation, sha=sha, attempt=attempt_rel, exit_code=exit_code, verdict=str(canonical.relative_to(run)), phase="judge")
+    verdict_rel = str(attempt_verdict.relative_to(run))
+    finalize_attempt(
+        outcome, exit_code, "reviewer_approve" if outcome == "approve" else "reviewer_block",
+        {"verdict":verdict_rel, "canonical":str(canonical.relative_to(run)), "phase":"judge",
+         "verdict_sha256":hashlib.sha256(verdict_payload).hexdigest(), "verdict_bytes":len(verdict_payload)},
+        verdict=verdict_rel, canonical=str(canonical.relative_to(run)), canonical_promoted=True,
+        verdict_sha256=hashlib.sha256(verdict_payload).hexdigest(), verdict_bytes=len(verdict_payload),
+        diagnostic=str(diagnostic_path.relative_to(run))
+    )
     print(canonical)
     raise SystemExit(exit_code)
 except BaseException as exc:
     if attempt is not None and attempt_path is not None and attempt.get("status") == "started":
         try:
-            update_attempt("invalid", 1, failure=f"{type(exc).__name__}: reviewer attempt stopped before a classified outcome")
-        except BaseException:
-            pass
-        try:
-            ledger(
-                "reviewer_invalid", provider=provider, generation=generation, sha=sha,
-                attempt=str(attempt_path.relative_to(run)), exit_code=1, phase="wrapper"
-            )
+            finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"wrapper"},
+                             failure=f"{type(exc).__name__}: reviewer attempt stopped before a classified outcome")
         except BaseException:
             pass
     raise
@@ -714,7 +928,15 @@ finally:
             shutil.rmtree(control)
         except OSError:
             pass
+    if private_attempt is not None and private_attempt.exists():
+        try:
+            shutil.rmtree(private_attempt)
+        except OSError:
+            pass
     try:
+        owner = lock / "owner.json"
+        if owner.exists() and not owner.is_symlink():
+            os.unlink(owner)
         os.rmdir(lock)
     except OSError:
         pass

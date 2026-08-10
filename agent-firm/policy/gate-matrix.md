@@ -167,3 +167,39 @@ That is a statement about which branch applies, not about whether the issue matt
 - A canonical provider verdict is published atomically only after schema and exact
   run/SHA/generation/provider/attempt identity validate. Re-runs archive the prior canonical verdict
   before work begins, so stale approval is recoverable but never current.
+
+### Versioned candidate, evidence, and attempt contract
+
+Current approval state uses traceability schema version 2 and current run metadata schema version 2.
+The persisted QA candidate binds the canonical repository root and Git common-dir, an
+`integration/*` source ref and its exact full SHA, the accepted base and ancestry, a clean detached
+checkout at the same full SHA, and a monotonically increasing generation. Moving or rewriting the
+source ref, changing the checkout, using an abbreviated SHA, or presenting a different repository or
+run blocks.
+
+Every evidence, command-result, gate, disposition, and verdict reference is a closed object containing
+its canonical run-relative path, full candidate SHA, lowercase SHA-256, byte size, and producer. The
+producer names one unique explicit-target ledger `event_id` and event; reviewer producers additionally
+name provider, generation, and immutable attempt id. Consumers open references no-follow, recompute
+bytes and digest, and require the producer event to name the same artifact and identity exactly.
+Copied, changed, symlinked, outside-run, unproduced, multiply produced, or stale evidence cannot clear
+a gate.
+
+Each secondary invocation has one immutable attempt record and one terminal explicit-target outcome
+event. An attempt-local verdict may be projected to the canonical provider verdict only after schema,
+candidate, generation, provider, attempt, checkout, and ledger identity all revalidate. A prior BLOCK
+remains in its original attempt when a later APPROVE becomes current; dispositions answer the retained
+BLOCK and cannot treat the archive itself as a current verdict. Historical metadata without a provider
+remains readable as Claude-primary provenance but is always `historical: true` and
+`approval_eligible: false`.
+
+### One Final decision sequence
+
+When all mechanical evidence is valid but an exact human decision is still required,
+`firm-final-qa-check` returns the distinct nonpassing `decision_required` state (exit 4) and records the
+unresolved objections plus permitted record types. Exit 4 is neither PASS nor an unavailable/error
+substitute. The Lead may prepare a clearly non-ship-ready draft handoff from that state, performs one
+Final human interaction with the exact objections and options, appends the resulting typed,
+candidate-bound record, and reruns the mechanical check once. Only a fresh exit 0 permits finalizing
+the handoff/package. A missing, rejecting, stale, wrong-run/SHA/generation, or wrong-objection record
+remains nonpassing; there is no second approval prompt hidden behind packaging.

@@ -19,6 +19,7 @@ MAX_TIMEOUT = 900
 MAX_GRACE = 30
 MAX_OUTPUT = 1024 * 1024
 MAX_TURNS = 1000
+MAX_EVENT_RECORD = 65536
 
 def positive(name, value, maximum):
     if not re.fullmatch(r"[0-9]+", str(value or "")):
@@ -117,6 +118,10 @@ result = {
     "term_sent": False,
     "kill_sent": False,
     "turn_count": 0
+    ,"parser_limit_bytes": MAX_EVENT_RECORD
+    ,"parser_peak_bytes": 0
+    ,"parser_status": "ok"
+    ,"overlong_records": 0
 }
 control_paths_valid = False
 
@@ -179,6 +184,7 @@ result["generation"] = generation
 retained = bytearray()
 total = 0
 line_buffer = bytearray()
+discarding_record = False
 proc = None
 pgid = None
 try:
@@ -247,16 +253,40 @@ while True:
         room = output_limit - len(retained)
         if room > 0:
             retained.extend(chunk[:room])
-        line_buffer.extend(chunk)
-        while b"\n" in line_buffer:
-            line, _, rest = line_buffer.partition(b"\n")
-            line_buffer = bytearray(rest)
-            if turn_event(line):
-                result["turn_count"] += 1
-                if turns is not None and result["turn_count"] >= turns and termination_reason is None:
-                    termination_reason = "turn_limit"
-                    result["term_sent"] = signal_group(signal.SIGTERM)
-                    term_at = time.monotonic()
+        pending = chunk
+        while pending:
+            newline = pending.find(b"\n")
+            if discarding_record:
+                if newline < 0:
+                    break
+                discarding_record = False
+                pending = pending[newline + 1:]
+                continue
+            if newline < 0:
+                room = MAX_EVENT_RECORD - len(line_buffer)
+                line_buffer.extend(pending[:room])
+                result["parser_peak_bytes"] = max(result["parser_peak_bytes"], len(line_buffer))
+                if len(pending) > room:
+                    result["parser_status"] = "overlong_record"
+                    result["overlong_records"] += 1
+                    line_buffer.clear()
+                    discarding_record = True
+                break
+            piece = pending[:newline]
+            if len(line_buffer) + len(piece) > MAX_EVENT_RECORD:
+                result["parser_status"] = "overlong_record"
+                result["overlong_records"] += 1
+            else:
+                line_buffer.extend(piece)
+                result["parser_peak_bytes"] = max(result["parser_peak_bytes"], len(line_buffer))
+                if turn_event(line_buffer):
+                    result["turn_count"] += 1
+                    if turns is not None and result["turn_count"] >= turns and termination_reason is None:
+                        termination_reason = "turn_limit"
+                        result["term_sent"] = signal_group(signal.SIGTERM)
+                        term_at = time.monotonic()
+            line_buffer.clear()
+            pending = pending[newline + 1:]
 
     child_done = proc.poll() is not None
     if child_done and not pipe_open:
@@ -275,6 +305,8 @@ result["output_bytes"] = total
 result["retained_bytes"] = len(retained)
 result["truncated"] = total > len(retained)
 result["exit_code"] = rc
+if line_buffer and not discarding_record and turn_event(line_buffer):
+    result["turn_count"] += 1
 if termination_reason == "timeout":
     result["status"] = "timeout"
     finish(124, bytes(retained))

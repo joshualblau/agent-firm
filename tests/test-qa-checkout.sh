@@ -24,7 +24,20 @@ assert_ok "does not point at the nonexistent bin/integrate" \
 t_case "an explicit, nonexistent branch argument is refused the same way"
 repo1b="$(mk_repo)"
 ( cd "$repo1b" && "$NEW_RUN" explicit-missing fast_path >/dev/null )
-assert_rc "exit 1" 1 sh -c "cd '$repo1b' && '$QAC' does-not-exist"
+assert_rc "non-integration names are rejected before resolution" 2 sh -c "cd '$repo1b' && '$QAC' does-not-exist"
+assert_rc "existing main can never be captured as the QA candidate" 2 sh -c "cd '$repo1b' && '$QAC' main"
+
+t_case "integration candidate must descend from the immutable full accepted base"
+repo1c="$(mk_repo)"
+( cd "$repo1c" && "$NEW_RUN" unrelated fast_path >/dev/null )
+id1c="$(basename "$(cat "$repo1c/.agent-firm/CURRENT_RUN")")"
+( cd "$repo1c" && git checkout -q --orphan unrelated-root && git rm -q -rf . && printf 'other\n' > other.txt && git add other.txt && git commit -qm unrelated && git branch "integration/$id1c" && git checkout -q main )
+assert_rc "unrelated integration history is rejected" 1 sh -c "cd '$repo1c' && '$QAC'"
+python3 - "$repo1c/.agent-firm/runs/$id1c/run-metadata.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d["accepted_base_sha"]=d["accepted_base_sha"][:7]; json.dump(d,open(p,"w"))
+PY
+assert_rc "abbreviated accepted base is rejected" 2 sh -c "cd '$repo1c' && '$QAC'"
 
 # ---------------------------------------------------------------------------
 t_case "materializes a clean checkout at the integration branch HEAD"
