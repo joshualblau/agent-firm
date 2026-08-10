@@ -73,7 +73,7 @@ for path in bin/firm-claude-qa bin/firm-final-qa-check bin/firm-version \
   assert_output "executable Git mode: $path" "100755" sh -c \
     "git -C '$FIRM_ROOT' ls-files -s '$path' | cut -d' ' -f1"
 done
-assert_output "sourced reviewer library keeps non-executable mode" "100644" sh -c \
+assert_output "shared reviewer engine has executable Git mode" "100755" sh -c \
   "git -C '$FIRM_ROOT' ls-files -s bin/firm-reviewer-common | cut -d' ' -f1"
 
 t_case "isolated candidate resolves and excludes local state"
