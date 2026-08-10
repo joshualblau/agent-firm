@@ -33,20 +33,27 @@ propagate to both provider caches through the joint bootstrap/refresh flow.
 ```bash
 ~/agent-firm/bin/firm-bootstrap
 ```
-Both CLIs are mandatory. Bootstrap checks for `claude` and `codex` before changing either provider
-installation, then installs/refreshes both caches. Per project, run `firm-install` once for Claude's
-permission policy, then choose Claude `/agent-firm:start <goal>` or Codex `$agent-firm:start <goal>`.
+Both CLIs are mandatory. Current bootstrap runs bounded executable/subcommand, selector/schema, and
+exact prior-state checks for Claude and Codex before changing either provider installation, then
+installs/refreshes both caches. A provider failure compensates toward the captured states; the stores
+are not atomic, and failed compensation remains BLOCKED with a recovery record. Per project, run
+`firm-install` once for Claude's permission policy, then choose Claude `/agent-firm:start <goal>` or
+Codex `$agent-firm:start <goal>`.
 
 ## Update flow (propagate a generalizable improvement)
 1. Land the change in `~/agent-firm` (ideally via `firm-propose-system-change` → review → commit).
-2. Use `firm-version --release X.Y.Z` for a shared release base, or
-   `firm-version --local-refresh` for provider-specific local cachebusters.
+2. Use `firm-version --release X.Y.Z` for a fully validated shared SemVer release base, or
+   `firm-version --local-refresh` for provider-prefixed, non-empty SemVer cachebusters. `VERSION` and
+   both manifests are staged/validated before a recoverable three-target replacement; any failed
+   write, rename, or paired refresh restores original source bytes before completion can be claimed.
 3. The refresh preflights both CLIs, updates both caches, and requires a new Codex task plus a
    restarted/reloaded Claude session.
 
 Every project that updates picks up the change. Project-specific tweaks stay in that project's
-`.claude/` or `.codex/` and never propagate. The obsolete project `.codex/hooks.json` prototype must
-be reviewed and removed manually if it duplicates the plugin ledger hook; automation never deletes it.
+`.claude/` or `.codex/` and never propagate. Exactly one plugin hook source serves each runtime;
+tracked `.claude/settings.json` owns permissions, not hooks. Obsolete Claude settings hook blocks and
+the project `.codex/hooks.json` prototype must be reviewed and removed manually only when they
+duplicate the plugin commands; automation preserves unrelated configuration and never deletes them.
 
 ## Per-project version pinning
 Plugins install at user scope by default (one version everywhere). To pin a project to a specific
@@ -60,11 +67,20 @@ in-flight engagement can't be blindsided by a firm change until you choose to bu
 ## Verified (isolated install test)
 - Both manifests share a valid base version and both marketplace entries resolve from an isolated
   tracked candidate.
-- Joint preflight failure invokes neither provider installer; fresh install and repeat refresh are
-  idempotent under stubs.
-- Provider hook manifests select their runtime-specific events while sharing guarded binaries.
+- Joint capability/schema/state preflight failure invokes neither provider installer; fresh install,
+  repeat refresh, every provider-mutation failure, and every compensation failure are exercised under
+  disposable stubs. These fixture results do not replace a gated real-loader/cache cycle.
+- Provider hook manifests select their runtime-specific events while sharing guarded binaries; fixture
+  execution produces one ledger event and one guard decision per runtime call inside the timeout.
 - `firm-install` remains idempotent and preserves existing project settings except for its explicit,
   backed-up `--migrate` operation.
+
+Real package readiness and rollback remain later evidence axes: use an exact-SHA clean archive and
+disposable provider homes, prove fresh/repeat loader behavior and unchanged project settings, then
+exercise normal and interruption-between-providers rollback. Preserve unrelated cache entries,
+configuration, permissions, and history; retain actionable failed-compensation state; require human
+review of the rollback record. Active provider state is never a fallback, and compensation must never
+be called atomicity.
 
 ---
 

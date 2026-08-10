@@ -3,12 +3,14 @@
 Two different kinds of document live here — know which one you're reading.
 
 ## Reference (current behavior — start here)
-- [INSTALL.md](INSTALL.md) — setup, including on a new device; the Python (`jsonschema`/`pyyaml`)
-  prerequisite; migrating a project past a retired permission rule.
+- [INSTALL.md](INSTALL.md) — setup, including on a new device; the mandatory dual-CLI and Python
+  prerequisites; compensating provider recovery; recoverable SemVer/version refresh; single-hook
+  migration; isolated loader and rollback evidence.
 - [WIRING.md](WIRING.md) — one-time runbook for accounts/secrets/hardening (1Password, per-project
   profiles, egress firewall, visual baselines, phone approvals, eval calibration).
 - [INTERACTIVE-TEST.md](INTERACTIVE-TEST.md) — drive the firm with a real Claude or Codex session and
-  watch the lifecycle engage, end to end.
+  watch the lifecycle engage, end to end; it also states what the smoke does not prove and which
+  exact-SHA loader/rollback evidence remains separately gated.
 - [ENFORCEMENT.md](ENFORCEMENT.md) — the repo's load-bearing claimed invariants and what actually
   enforces each: tool scope, permission rule, sandbox, a script, or prompt instructions alone. The
   table is hand-maintained, so treat it as the best current map rather than a complete inventory — an

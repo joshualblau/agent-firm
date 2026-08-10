@@ -456,10 +456,73 @@ else
 fi
 info "reviewer models: GPT=${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} · Claude=${FIRM_CLAUDE_QA_MODEL:-opus}"
 
+section "9.5. Plugin hook ownership and legacy duplicates"
+FIRM_SOURCE_ROOT="$(cd "$SELF/.." && pwd)"
+if python3 - "$FIRM_SOURCE_ROOT" <<'PY' >/dev/null 2>&1
+import json, os, sys
+root = sys.argv[1]
+claude_plugin = json.load(open(os.path.join(root, ".claude-plugin", "plugin.json")))
+codex_plugin = json.load(open(os.path.join(root, ".codex-plugin", "plugin.json")))
+assert claude_plugin.get("hooks") == "./hooks/claude.json"
+assert "hooks" not in codex_plugin
+for rel in ("hooks/claude.json", "hooks/hooks.json"):
+    doc = json.load(open(os.path.join(root, rel)))
+    pre = [entry for entry in doc["hooks"]["PreToolUse"] if entry.get("matcher") == "Bash"]
+    assert len(pre) == 1
+    commands = [hook.get("command", "") for hook in pre[0].get("hooks", [])]
+    assert sum("firm-ledger-hook" in command for command in commands) == 1
+    assert sum("firm-merge-guard" in command for command in commands) == 1
+    guard = next(hook for hook in pre[0]["hooks"] if "firm-merge-guard" in hook.get("command", ""))
+    assert isinstance(guard.get("timeout"), int) and guard["timeout"] > 0
+settings = json.load(open(os.path.join(root, ".claude", "settings.json")))
+assert "hooks" not in settings, "tracked project settings duplicate the Claude plugin hook source"
+PY
+then
+  pass "one plugin-owned ledger/merge-guard hook source is selected for each runtime; tracked settings contain no duplicate"
+else
+  fail "plugin hook ownership is ambiguous or malformed — reinstall/repair the package before running the firm"
+  info "expected Claude hooks/claude.json, Codex hooks/hooks.json, and no tracked .claude/settings.json hook block."
+fi
+
+check_legacy_claude_hooks() {
+  _legacy_scope="$1"; _legacy_file="$2"
+  [ -f "$_legacy_file" ] || return 0
+  _legacy_out="$(python3 - "$_legacy_file" <<'PY' 2>&1
+import json, sys
+doc = json.load(open(sys.argv[1]))
+hits = []
+def walk(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "command" and isinstance(child, str) and ("firm-ledger-hook" in child or "firm-merge-guard" in child):
+                hits.append(child)
+            walk(child)
+    elif isinstance(value, list):
+        for child in value: walk(child)
+walk(doc.get("hooks", {}))
+print("\n".join(hits))
+PY
+)"; _legacy_rc=$?
+  if [ "$_legacy_rc" -ne 0 ]; then
+    if grep -Eq 'firm-(ledger-hook|merge-guard)' "$_legacy_file" 2>/dev/null; then
+      warn "$_legacy_scope Claude settings may contain a legacy firm hook but JSON could not be parsed — inspect $_legacy_file manually; firm-doctor did not rewrite it."
+    fi
+  elif [ -n "$_legacy_out" ]; then
+    warn "$_legacy_scope Claude settings contain a legacy duplicate firm hook — review $_legacy_file, preserve unrelated hooks/settings, and remove only confirmed duplicate firm command objects manually; firm-doctor did not rewrite it."
+  fi
+}
+
+_canonical_settings="$FIRM_SOURCE_ROOT/.claude/settings.json"
+_project_settings="$(pwd)/.claude/settings.json"
+if [ "$_project_settings" != "$_canonical_settings" ]; then
+  check_legacy_claude_hooks "project" "$_project_settings"
+fi
+check_legacy_claude_hooks "user" "$HOME/.claude/settings.json"
+
 # Codex loads hooks from every matching source. The old project prototype duplicates the plugin's
 # ledger hook and must be removed manually; bootstrap never overwrites project config.
 if [ -f .codex/hooks.json ] && grep -q 'firm-ledger-hook' .codex/hooks.json 2>/dev/null; then
-  warn "obsolete duplicate .codex/hooks.json ledger hook detected — remove that file manually after confirming it contains no project-specific hooks; the plugin now provides hooks/hooks.json."
+  warn "obsolete duplicate .codex/hooks.json ledger hook detected — preserve project-specific hooks; remove that file manually after confirming it contains no project-specific hooks, or remove only the confirmed duplicate command object. firm-doctor did not rewrite it; the plugin now provides hooks/hooks.json."
 fi
 if command -v chezmoi >/dev/null 2>&1; then
   cfg="$HOME/.config/chezmoi/chezmoi.toml"

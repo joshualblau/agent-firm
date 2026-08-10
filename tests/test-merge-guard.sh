@@ -885,7 +885,7 @@ t_case "AC-015/SEC-06/SEC-19 the WHOLE hook budget — PARSE and waits — fits 
 # budget nobody drives is just a number, the two assertions after the arithmetic MEASURE it: one
 # runs a worst-case-shaped fixture AT MAX_COMMAND_BYTES through the real script, the other runs the
 # original SEC-19 reproducer, and both must finish inside PARSE_BUDGET.
-assert_ok "PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= the timeout in BOTH registrations" python3 -c "
+assert_ok "PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= each provider plugin timeout" python3 -c "
 import json, re
 src = open('$GUARD').read()
 m = re.search(r'^GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = (\d+), (\d+), (\d+)\$', src, re.M)
@@ -901,7 +901,7 @@ parse = int(mp.group(1))
 assert parse > 0, 'PARSE_BUDGET is zero, so the parse phase is not really in the budget'
 budget = parse + gh + gt + 2 * grace + int(mm.group(1))
 found = []
-for path in ('$SETTINGS', '$CLAUDE_HOOKS', '$CODEX_HOOKS'):
+for path in ('$CLAUDE_HOOKS', '$CODEX_HOOKS'):
     d = json.load(open(path))
     for entry in d['hooks']['PreToolUse']:
         for h in entry['hooks']:
@@ -911,7 +911,7 @@ for path in ('$SETTINGS', '$CLAUDE_HOOKS', '$CODEX_HOOKS'):
                 found.append((path.rsplit('/', 1)[-1], t))
                 assert budget <= t, (f'{path}: worst case {parse}+{gh}+{gt}+2*{grace}+{mm.group(1)}'
                                      f'={budget}s does not fit under the registered {t}s hook timeout')
-assert len(found) == 3, f'expected the guard in project, Claude-plugin, and Codex-plugin registrations, found {found}'
+assert len(found) == 2, f'expected exactly one Claude-plugin and one Codex-plugin registration, found {found}'
 print('ok', found, 'budget', budget)
 "
 assert_ok "the KILL_GRACE constant is the one actually used to reap a hung child" python3 -c "
@@ -1823,18 +1823,12 @@ assert_ok "a failure in the LEDGER path cannot fail a tool call (garbage stdin)"
 assert_ok "  (no active run at all)" \
   sh -c "cd '$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-norun.XXXXXX")' && printf '{}' | '$BIN/firm-ledger-hook'"
 
-t_case "AC-023 project plus BOTH provider hook surfaces are wired, ledger FIRST"
-assert_ok "settings.json (project mode) keeps the ledger hook and adds the guard" python3 -c "
+t_case "AC-023 each provider has exactly one plugin-owned hook surface, ledger FIRST"
+assert_ok "tracked settings owns permissions only and cannot duplicate the Claude plugin hooks" python3 -c "
 import json
 d = json.load(open('$SETTINGS'))
-pre = d['hooks']['PreToolUse']
-bash = [e for e in pre if e.get('matcher') == 'Bash']
-assert len(bash) == 1, pre
-cmds = [h['command'] for h in bash[0]['hooks']]
-assert len(cmds) == 2, cmds
-assert 'firm-ledger-hook' in cmds[0], cmds
-assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
-assert 'CLAUDE_PROJECT_DIR' in cmds[1], cmds
+assert 'permissions' in d
+assert 'hooks' not in d, d
 "
 assert_ok "Claude plugin hook keeps the ledger hook and adds the guard" python3 -c "
 import json
@@ -1866,6 +1860,43 @@ assert 'CLAUDE_PLUGIN_ROOT' in cmds[1], cmds
 n = d['hooks']['PermissionRequest'][0]['hooks'][0]['command']
 assert 'firm-notify' in n, n
 "
+
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; effective_id="20260810T000001Z-claude-effective"
+  else
+    provider_hooks="$CODEX_HOOKS"; effective_id="20260810T000002Z-codex-effective"
+  fi
+  EFFECTIVE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"
+  mk_run "$EFFECTIVE_REPO" "$effective_id"
+  EFFECTIVE_LEDGER="$EFFECTIVE_REPO/.agent-firm/runs/$effective_id/run.jsonl"
+  hook_commands="$(python3 - "$provider_hooks" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))['hooks']['PreToolUse']
+entry=next(item for item in d if item.get('matcher')=='Bash')
+for hook in entry['hooks']:
+    print(hook['command'])
+PY
+)"
+  ledger_command="$(printf '%s\n' "$hook_commands" | sed -n '1p')"
+  guard_command="$(printf '%s\n' "$hook_commands" | sed -n '2p')"
+  registered_timeout="$(python3 -c "import json; d=json.load(open('$provider_hooks'))['hooks']['PreToolUse'][0]['hooks']; print(next(h['timeout'] for h in d if 'firm-merge-guard' in h['command']))")"
+  effective_payload="$(mk_payload 'git push origin main')"
+  started_ms="$(python3 -c 'import time; print(int(time.monotonic()*1000))')"
+  assert_rc "$provider effective plugin ledger hook exits 0" 0 sh -c \
+    "cd '$EFFECTIVE_REPO' && printf '%s' '$effective_payload' | env CLAUDE_PLUGIN_ROOT='$FIRM_ROOT' PATH='$GH_OK:$PATH' sh -c '$ledger_command'"
+  assert_rc "$provider effective plugin guard decision exits 0" 0 sh -c \
+    "cd '$EFFECTIVE_REPO' && printf '%s' '$effective_payload' | env CLAUDE_PLUGIN_ROOT='$FIRM_ROOT' PATH='$GH_OK:$PATH' sh -c '$guard_command'"
+  elapsed_ms=$(( $(python3 -c 'import time; print(int(time.monotonic()*1000))') - started_ms ))
+  assert_ok "$provider effective event pair completes inside its registered timeout" sh -c \
+    "[ '$elapsed_ms' -lt '$((registered_timeout * 1000))' ]"
+  assert_ok "$provider effective source produces exactly one ledger event and one guard decision" python3 -c "
+import json
+records=[json.loads(line) for line in open('$EFFECTIVE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
+"
+done
 
 # ============================================================ AC-024 · the firm's own fixtures
 t_case "AC-024 the firm's own scratch repos and tooling are not false-positived"

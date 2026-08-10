@@ -33,6 +33,13 @@ grep -E 'ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|ANTHROPIC_AUTH_TOKEN' ~/
 ~/agent-firm/bin/firm-bootstrap
 ```
 
+Bootstrap requires compatible Claude and Codex CLIs. It completes bounded capability, local
+selector/schema, and exact matching-state capture for both before its first provider mutation. The
+two stores cannot be updated atomically: any provider failure triggers reverse-order compensation and
+state verification. If the output says `COMPENSATION BLOCKED`, stop; inspect the mode-0600 recovery
+record and restore only the named agent-firm entries before another preflight. Do not retry against
+active state until that record is resolved.
+
 ## B. 1Password backbone (once) — *you do the account steps*
 
 1. In the 1Password app, create a **shared** vault named `Firm`. (Not your Private vault — service
@@ -74,6 +81,11 @@ direnv allow                                     # loads the profile + resolves 
 
 firm-doctor                                      # fail-closed: no key leak, profiles isolated, op+direnv+refs OK
 ```
+
+The installed plugin is the only firm hook owner for each runtime. `firm-install` merges permissions
+and preserves hook/configuration subtrees. `firm-doctor` warns about legacy Claude settings hooks or
+`.codex/hooks.json`, but does not rewrite them: preserve custom entries and remove only confirmed
+duplicate firm commands after manual review.
 
 Start from either provider after the doctor is clean:
 
@@ -171,6 +183,12 @@ firm-run-evals --provider claude greet-fast-path
 A–C repeat (plus `chezmoi` for home glue — see `docs/PHASE4.md`, "Second-machine bootstrap"). The only
 hand-carried secret is the one `OP_SERVICE_ACCOUNT_TOKEN`. Per project you re-clone, `cp` the two files,
 edit `FIRM_PROFILE`, and `direnv allow`. Then `firm-doctor` to verify.
+
+Before treating a new machine as release-ready, separately gate an exact-SHA exercise in disposable
+Claude/Codex homes: fresh load, repeat refresh/idempotence, one effective hook event pair per runtime,
+and normal plus interrupted cross-provider rollback. Compare project configuration and provider-store
+inventories before/after, preserve history and unrelated entries, and obtain human review of the
+rollback record. Fixture tests and a successful bootstrap are not substitutes for that evidence.
 
 See also: `docs/INSTALL.md` (plugin install), `docs/PHASE4.md` (profiles/secrets rationale + the macOS
 Keychain caveat), `docs/PHASE5.md` (firewall/visual/approvals/evals details).
