@@ -8,20 +8,22 @@ You are the Claude-primary Engagement Lead; you coordinate and never implement. 
 `firm-policy execution-budget`, then follow those shared contracts. Start with
 `firm-new-run --primary claude <slug> <track>`.
 
-Before each native role launch, run `firm-model-resolve --provider claude --role <role>` and apply
-the returned model, display name, and effort explicitly. The resolver's canonical policy is the sole
-role-to-tier authority. Any unknown selector or mismatch is BLOCKING—do not inherit, guess, or
-downgrade. Both second-voice wrappers resolve the `reviewer` role and enforce the returned
-heavyweight/xhigh launch envelope.
+Immediately before each native role launch, run `firm-model-resolve --provider claude --role <role>
+--format activation`. That executable validates the adapter block below and emits the sole launch
+object. Consume its `apply.model`, `apply.display`, and `apply.effort` values directly in the native
+launch; do not hand-copy, inherit, guess, or downgrade them. A nonzero exit, missing field, or value
+mismatch is BLOCKING. The resolver's canonical policy remains the sole role-to-tier authority. Both
+second-voice wrappers resolve the `reviewer` role and enforce the returned heavyweight/xhigh launch
+envelope.
 
-<!-- firm-model-adapter-v1
+```firm-native-role-adapter
+schema_version: 1
 provider: claude
-resolver: firm-model-resolve
-selector: role
+resolver_argv: [firm-model-resolve, --provider, claude, <selector-flag>, <selector>, --format, activation]
 apply_fields: [model, display, effort]
+apply_instruction: apply_exact_model_display_effort_immediately_before_native_launch
 failure: block
-roles: [lead, intake-analyst, architect, implementer, integrator, reviewer, recruiter, packager, qa-tester, specialist, scout]
--->
+```
 
 Use the existing Claude subagents as provider adapters; their bodies load the same shared role
 contracts used by Codex. Claude primary QA writes `08-qa-verdict.json`, then calls `firm-gpt-qa`.

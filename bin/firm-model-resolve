@@ -12,10 +12,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import sys
 
 DEFAULT_POLICY = sys.argv[1]
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(DEFAULT_POLICY), "..", ".."))
 
 parser = argparse.ArgumentParser(
     prog="firm-model-resolve",
@@ -28,7 +30,7 @@ selector.add_argument("--alias")
 parser.add_argument("--expect-model")
 parser.add_argument("--expect-display")
 parser.add_argument("--expect-effort")
-parser.add_argument("--format", choices=("json", "shell", "args"), default="json")
+parser.add_argument("--format", choices=("json", "shell", "args", "activation"), default="json")
 parser.add_argument("--policy", default=DEFAULT_POLICY, help=argparse.SUPPRESS)
 args = parser.parse_args(sys.argv[2:])
 
@@ -81,6 +83,11 @@ EXPECTED_ROLES = {
 }
 EXPECTED_ALIASES = {"fable", "opus", "sonnet", "haiku", "codex"}
 PROVIDERS = {"claude", "codex"}
+ACTIVATION_SOURCES = {
+    "claude": "commands/start.md",
+    "codex": "codex-skills/start/SKILL.md",
+}
+ACTIVATION_INSTRUCTION = "apply_exact_model_display_effort_immediately_before_native_launch"
 
 if not isinstance(policy, dict) or set(policy) != EXPECTED_ROOT_KEYS:
     fail("policy root must contain exactly principle, tiers, role_tiers, legacy_aliases, and quota_discipline")
@@ -150,11 +157,68 @@ result = {
     "effort": cell["effort"],
     "policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
 }
+
+def load_native_adapter(provider):
+    relative = ACTIVATION_SOURCES[provider]
+    adapter_path = os.path.join(REPO_ROOT, relative)
+    if not os.path.isfile(adapter_path) or os.path.islink(adapter_path):
+        fail(f"native adapter must be a regular non-symlink file: {relative}")
+    try:
+        with open(adapter_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        matches = re.findall(
+            r"^```firm-native-role-adapter[ \t]*\n(.*?)^```[ \t]*$", text, re.MULTILINE | re.DOTALL)
+        if len(matches) != 1:
+            fail(f"{relative} must contain exactly one executable firm-native-role-adapter block")
+        adapter = yaml.load(matches[0], Loader=UniqueKeyLoader)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        fail(f"cannot parse native adapter {relative}: {type(exc).__name__}: {exc}")
+    expected = {
+        "schema_version": 1,
+        "provider": provider,
+        "resolver_argv": [
+            "firm-model-resolve", "--provider", provider, "<selector-flag>", "<selector>",
+            "--format", "activation",
+        ],
+        "apply_fields": ["model", "display", "effort"],
+        "apply_instruction": ACTIVATION_INSTRUCTION,
+        "failure": "block",
+    }
+    if adapter != expected:
+        fail(f"native adapter contract mismatch in {relative}")
+    return relative
+
 if args.format == "json":
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 elif args.format == "shell":
     for key in ("provider", "tier", "model", "display", "effort"):
         print(f"FIRM_RESOLVED_{key.upper()}={shlex.quote(result[key])}")
+elif args.format == "activation":
+    adapter_source = load_native_adapter(args.provider)
+    activation = {
+        "schema_version": 1,
+        "action": "native_role_launch",
+        "provider": args.provider,
+        "selected_by": selected_by,
+        "selector": selector_value,
+        "tier": tier,
+        "policy_sha256": result["policy_sha256"],
+        "adapter_source": adapter_source,
+        "resolver_argv": [
+            "firm-model-resolve", "--provider", args.provider, f"--{selected_by}", selector_value,
+            "--format", "activation",
+        ],
+        "apply": {
+            "model": result["model"],
+            "display": result["display"],
+            "effort": result["effort"],
+        },
+        "apply_instruction": ACTIVATION_INSTRUCTION,
+        "failure": "block",
+    }
+    print(json.dumps(activation, sort_keys=True, separators=(",", ":")))
 else:
     if args.provider == "claude":
         print("--model", shlex.quote(cell["model"]), "--effort", shlex.quote(cell["effort"]))

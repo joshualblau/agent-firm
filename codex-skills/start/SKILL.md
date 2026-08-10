@@ -13,21 +13,23 @@ Before acting, run `firm-policy lifecycle`, `firm-policy model-tiers`, `firm-pol
 `firm-new-run --primary codex <slug> <track>`.
 
 Use native Codex subagents for every delegated stage and pass each one the matching shared contract
-(`firm-policy role-<name>`). Before each launch, run `firm-model-resolve --provider codex --role
-<role>` (or its justified tier/alias selector) and apply its exact model, display, and reasoning
-effort. The resolver's canonical policy is the sole role-to-tier authority. Unknown or mismatched
-values are BLOCKING; never inherit, guess, or silently downgrade. Both second-voice wrappers resolve
-the `reviewer` role and enforce the returned heavyweight/xhigh launch envelope. Both provider
+(`firm-policy role-<name>`). Immediately before each launch, run `firm-model-resolve --provider codex
+--role <role> --format activation` (or use its justified tier/alias selector). That executable
+validates the adapter block below and emits the sole launch object. Consume its `apply.model`,
+`apply.display`, and `apply.effort` values directly in the native launch; do not hand-copy, inherit,
+guess, or silently downgrade them. A nonzero exit, missing field, or value mismatch is BLOCKING. The
+resolver's canonical policy remains the sole role-to-tier authority. Both second-voice wrappers
+resolve the `reviewer` role and enforce the returned heavyweight/xhigh launch envelope. Both provider
 CLIs/adapters are mandatory prerequisites.
 
-<!-- firm-model-adapter-v1
+```firm-native-role-adapter
+schema_version: 1
 provider: codex
-resolver: firm-model-resolve
-selector: role
+resolver_argv: [firm-model-resolve, --provider, codex, <selector-flag>, <selector>, --format, activation]
 apply_fields: [model, display, effort]
+apply_instruction: apply_exact_model_display_effort_immediately_before_native_launch
 failure: block
-roles: [lead, intake-analyst, architect, implementer, integrator, reviewer, recruiter, packager, qa-tester, specialist, scout]
--->
+```
 
 Preserve the shared lifecycle order and budgets. Parallelize only independent work-orders, each in a
 `firm-new-worktree`; never delegate human gates. Reviewers and QA must be separate from implementers.

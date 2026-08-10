@@ -128,9 +128,9 @@ for alias, tier in base["legacy_aliases"].items():
 assert counter == 40, counter
 PY
 
-t_case "native adapters parse to exact resolver and reviewer launch envelopes"
-assert_ok "Claude frontmatter and both native launch adapters match policy" python3 - "$FIRM_ROOT" <<'PY'
-import json, pathlib, re, subprocess, sys, yaml
+t_case "native adapters consume an executable resolver-bound launch object"
+assert_ok "Claude frontmatter projections match policy" python3 - "$FIRM_ROOT" <<'PY'
+import json, pathlib, subprocess, sys, yaml
 root = pathlib.Path(sys.argv[1])
 resolve = root / "bin/firm-model-resolve"
 roles = ["lead", "intake-analyst", "architect", "implementer", "integrator", "reviewer",
@@ -141,13 +141,107 @@ for role in [r for r in roles if r != "lead"]:
     got = json.loads(subprocess.check_output([resolve, "--provider", "claude", "--role", role], text=True))
     assert front["name"] == role
     assert (front["model"], front["effort"]) == (got["model"], got["effort"]), (role, front, got)
-for rel, provider in (("commands/start.md", "claude"), ("codex-skills/start/SKILL.md", "codex")):
-    text = (root / rel).read_text()
-    matches = re.findall(r"<!-- firm-model-adapter-v1\n(.*?)\n-->", text, re.S)
-    assert len(matches) == 1, (rel, len(matches))
-    adapter = yaml.safe_load(matches[0])
-    assert adapter == {"provider": provider, "resolver": "firm-model-resolve", "selector": "role",
-                       "apply_fields": ["model", "display", "effort"], "failure": "block", "roles": roles}, adapter
+PY
+assert_ok "both provider adapters reject every resolver and apply mutation" python3 - "$FIRM_ROOT" "$W" <<'PY'
+import json, pathlib, re, shutil, subprocess, sys, yaml
+
+root, workspace = map(pathlib.Path, sys.argv[1:])
+sources = {"claude": "commands/start.md", "codex": "codex-skills/start/SKILL.md"}
+instruction = "apply_exact_model_display_effort_immediately_before_native_launch"
+
+def run(root_dir, provider, output_format):
+    return subprocess.run(
+        [root_dir / "bin/firm-model-resolve", "--provider", provider, "--role", "lead",
+         "--format", output_format],
+        capture_output=True, text=True)
+
+def verify(root_dir, provider):
+    canonical_run = run(root_dir, provider, "json")
+    assert canonical_run.returncode == 0, (provider, canonical_run.stderr)
+    canonical = json.loads(canonical_run.stdout)
+    activation_run = run(root_dir, provider, "activation")
+    assert activation_run.returncode == 0, (provider, activation_run.stderr)
+    activation = json.loads(activation_run.stdout)
+    assert activation == {
+        "action": "native_role_launch",
+        "adapter_source": sources[provider],
+        "apply": {
+            "display": canonical["display"],
+            "effort": canonical["effort"],
+            "model": canonical["model"],
+        },
+        "apply_instruction": instruction,
+        "failure": "block",
+        "policy_sha256": canonical["policy_sha256"],
+        "provider": provider,
+        "resolver_argv": ["firm-model-resolve", "--provider", provider, "--role", "lead",
+                          "--format", "activation"],
+        "schema_version": 1,
+        "selected_by": "role",
+        "selector": "lead",
+        "tier": canonical["tier"],
+    }, activation
+    return activation
+
+def copied_root(provider, mutation):
+    target = workspace / f"activation-{provider}-{mutation}"
+    for relative in ("bin/firm-model-resolve", "agent-firm/policy/model-tiers.yaml",
+                     "commands/start.md", "codex-skills/start/SKILL.md"):
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / relative, destination)
+    return target
+
+def mutate_adapter(target, provider, mutation):
+    adapter_path = target / sources[provider]
+    text = adapter_path.read_text()
+    match = re.search(r"^```firm-native-role-adapter\n(.*?)^```$", text, re.M | re.S)
+    assert match, (provider, mutation)
+    adapter = yaml.safe_load(match.group(1))
+    if mutation == "resolver-removed":
+        adapter.pop("resolver_argv")
+    elif mutation == "resolver-contradicted":
+        adapter["resolver_argv"][0] = "not-firm-model-resolve"
+    elif mutation == "instruction-removed":
+        adapter.pop("apply_instruction")
+    elif mutation == "instruction-changed":
+        adapter["apply_instruction"] = "inherit_or_guess"
+    elif mutation.startswith("apply-field-"):
+        adapter["apply_fields"].remove(mutation.removeprefix("apply-field-"))
+    else:
+        raise AssertionError(mutation)
+    rendered = "```firm-native-role-adapter\n" + yaml.safe_dump(adapter, sort_keys=False) + "```"
+    adapter_path.write_text(text[:match.start()] + rendered + text[match.end():])
+
+def mutate_activation_output(target, field):
+    resolver = target / "bin/firm-model-resolve"
+    text = resolver.read_text()
+    original = f'"{field}": result["{field}"],'
+    replacement = f'"{field}": "MUTATED",'
+    assert text.count(original) == 1, (field, text.count(original))
+    resolver.write_text(text.replace(original, replacement, 1))
+
+def require_rejection(provider, mutation, mutate):
+    target = copied_root(provider, mutation)
+    mutate(target)
+    try:
+        verify(target, provider)
+    except (AssertionError, json.JSONDecodeError) as exc:
+        print(f"MUTATION_PASS provider={provider} mutation={mutation} rejected={type(exc).__name__}")
+        return
+    raise AssertionError((provider, mutation, "mutation survived"))
+
+for provider in sources:
+    baseline = verify(root, provider)
+    print(f"ACTIVATION_PASS provider={provider} adapter={baseline['adapter_source']}")
+    for mutation in ("resolver-removed", "resolver-contradicted", "instruction-removed",
+                     "instruction-changed", "apply-field-model", "apply-field-display",
+                     "apply-field-effort"):
+        require_rejection(provider, mutation,
+                          lambda target, mutation=mutation: mutate_adapter(target, provider, mutation))
+    for field in ("model", "display", "effort"):
+        require_rejection(provider, "output-" + field,
+                          lambda target, field=field: mutate_activation_output(target, field))
 PY
 assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" python3 - "$BIN/firm-reviewer-common" <<'PY'
 import ast, pathlib, sys
