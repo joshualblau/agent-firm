@@ -21,7 +21,10 @@ definition_of_done:
     strict one-row-per-criterion traceability with current hashed evidence, secondary verdict or
     recorded availability attempt plus any required human waiver, derived high-risk state, and every
     secondary-blocker disposition. Exit 1 is blocking; exit 2 means the gate could not be evaluated
-    and is also blocking; exit 3 is an unavailable required second voice and is not approval.
+    and is also blocking; exit 3 is an unavailable required second voice and is not approval. Exit 4
+    is decision_required: it authorizes only a non-ship-ready draft plus one exact Final interaction,
+    not completion. After one matching typed human record is appended, one fresh mechanical rerun must
+    exit 0; rejection, mismatch, staleness, or any other nonzero result remains blocking.
   - >-
     Reviewer execution is auditable and bounded — each provider wrapper used the controlled judge
     contract and disposable control root, recorded discovery/readiness/judge phases in a numbered
@@ -33,7 +36,10 @@ definition_of_done:
   - changelog / docs updated if the change is user-facing
   - rollback / migration notes included if relevant
   - run.jsonl and the run-ledger are complete
-  - final human approval recorded in 10-handoff.md
+  - >-
+    10-handoff.md was first assembled as a non-ship-ready draft, the Final human interaction occurred
+    once with exact objections/options, any resulting human record is typed and digest-bound to the
+    current run/full SHA, and the handoff was finalized only after a fresh firm-final-qa-check exit 0
   # Applies only when the project has a relational DB with role separation:
   - least-privilege DB grants — for any change adding DB tables/roles, the request-path role holds NO
     write on catalog/config/append-only/PII/identity tables; every engagement-scoped table has FORCE

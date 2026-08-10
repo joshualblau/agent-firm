@@ -3,6 +3,7 @@
 > **This is a dated build-journal entry, not reference documentation.** It records what shipped
 > and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
 > `agent-firm/contracts/*`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+> Historical implementation here is not evidence that the current repair candidate is ready.
 
 Part 1 packages the firm as a shared, versioned plugin. Part 2 (below the divider) makes each project
 switch to the right **subscription accounts** and load its **secrets** with nothing sensitive in git.
@@ -35,8 +36,9 @@ propagate to both provider caches through the joint bootstrap/refresh flow.
 ```
 Both CLIs are mandatory. Current bootstrap runs bounded executable/subcommand, selector/schema, and
 exact prior-state checks for Claude and Codex before changing either provider installation, then
-installs/refreshes both caches. A provider failure compensates toward the captured states; the stores
-are not atomic, and failed compensation remains BLOCKED with a recovery record. Per project, run
+installs/refreshes both caches. A provider failure uses supported inverses for fresh entries only; the
+stores are not atomic. Existing-entry refresh has no proven exact inverse and remains
+`BLOCKED_RECOVERY_REQUIRED` with a recovery record and manual restoration guidance. Per project, run
 `firm-install` once for Claude's permission policy, then choose Claude `/agent-firm:start <goal>` or
 Codex `$agent-firm:start <goal>`.
 
@@ -70,8 +72,9 @@ in-flight engagement can't be blindsided by a firm change until you choose to bu
 - Joint capability/schema/state preflight failure invokes neither provider installer; fresh install,
   repeat refresh, every provider-mutation failure, and every compensation failure are exercised under
   disposable stubs. These fixture results do not replace a gated real-loader/cache cycle.
-- Provider hook manifests select their runtime-specific events while sharing guarded binaries; fixture
-  execution produces one ledger event and one guard decision per runtime call inside the timeout.
+- Explicit disposable loader-selection fixtures select plugin/project/user sources while sharing
+  guarded binaries; they measure three event pairs with two legacy duplicates and one after cleanup.
+  This is fixture-selection evidence only, not proof of a real provider loader.
 - `firm-install` remains idempotent and preserves existing project settings except for its explicit,
   backed-up `--migrate` operation.
 
@@ -79,8 +82,8 @@ Real package readiness and rollback remain later evidence axes: use an exact-SHA
 disposable provider homes, prove fresh/repeat loader behavior and unchanged project settings, then
 exercise normal and interruption-between-providers rollback. Preserve unrelated cache entries,
 configuration, permissions, and history; retain actionable failed-compensation state; require human
-review of the rollback record. Active provider state is never a fallback, and compensation must never
-be called atomicity.
+review of the rollback record. Active provider state is never a fallback. Never call compensation
+atomicity or reuse a forward refresh command as a reverse.
 
 ---
 

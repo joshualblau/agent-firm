@@ -2,6 +2,7 @@
 
 > **This is a dated build-journal entry, not reference documentation.** For current behavior, read
 > `agent-firm/contracts/lifecycle.md`, `agent-firm/policy/gate-matrix.md`, and the `firm-*-qa` tools.
+> Historical implementation here is not evidence that the current repair candidate is ready.
 
 The goal is two voices from different providers, so a blind spot shared by primary staff and a
 same-provider reviewer still gets caught. In 0.8.0 this is symmetric: GPT judges Claude-primary runs,
@@ -52,10 +53,12 @@ attempt-local provider state and use subscription authentication only through th
 An unavailable reviewer is recorded as skipped, never as passed. Only a matching numbered attempt
 showing trusted CLI, subscription-authentication, or configured-model absence qualifies. Timeout,
 malformed output, tool failure, schema failure, identity mismatch, or candidate drift is BLOCK. On
-ordinary work an unavailable voice may continue to the Final gate with a warning. On work whose
+ordinary work an unavailable required voice makes the Final checker emit nonpassing
+`decision_required` (exit 4): only a draft and one exact human interaction are allowed, followed by a
+matching typed record and one fresh mechanical rerun. On work whose
 accepted criteria or committed paths derive auth/permissions/crypto/PII or another configured
-high-risk surface, it needs an exact logged human waiver tied to the run, SHA, provider, reason,
-attempt, and objections.
+high-risk surface, that permitted record must be an exact logged human waiver tied to the run, SHA,
+provider, reason, attempt, and objections. Any nonzero fresh rerun remains blocked.
 
 ## Verify
 

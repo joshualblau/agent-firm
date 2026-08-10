@@ -3,6 +3,7 @@
 > **This is a dated build-journal entry, not reference documentation.** It records what shipped
 > and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
 > `agent-firm/contracts/*`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+> Historical implementation here is not evidence that the current repair candidate is ready.
 
 Phase 5 makes the firm safer to run unsupervised and closes the last gaps in "tests its own work" and
 "minimal supervision." Five tracks: an **egress firewall**, a **visual-regression suite**, **remote
@@ -50,7 +51,7 @@ how to refresh it. That image is a Node base, **not** a Playwright browser image
 
 ## 2. Visual-regression suite
 
-Completes the original "unit, integration, **and visual**" requirement. Playwright `toHaveScreenshot`
+Implemented the historical "unit, integration, **and visual**" requirement. Playwright `toHaveScreenshot`
 asserts rendered UI against committed baselines; the `qa-tester` writes the result into the QA verdict's
 `visual` field. **Project-gated** (only for UI-visible changes) and **read-only** — QA never updates
 baselines.

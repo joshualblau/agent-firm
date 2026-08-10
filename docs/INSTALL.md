@@ -39,14 +39,19 @@ firm-install                             # merges the firm's permission rules in
 ```
 
 Bootstrap changes two independent provider stores; it is **not atomic**. It captures the matching
-Claude/Codex marketplace and plugin state before mutation and, on any provider failure, attempts
-compensation in reverse order and verifies the captured target state. Every failed operation writes a
+Claude/Codex marketplace and plugin state before mutation and, on any provider failure, attempts only
+supported inverse operations in reverse order. Fresh marketplace additions can be removed and fresh
+plugin installs can be uninstalled. Refreshing an existing Claude or Codex plugin entry has no proven
+exact CLI inverse; bootstrap never repeats `plugin update` or `plugin add` and calls that a restore.
+Every failed operation writes a
 mode-`0600` JSON record under `FIRM_BOOTSTRAP_RECOVERY_DIR` when set, otherwise
 `$XDG_STATE_HOME/agent-firm/recovery` or `~/.local/state/agent-firm/recovery`. A successful
-compensation still leaves that bootstrap attempt
-failed and safe to inspect. Failed or unverifiable compensation is `BLOCKED_RECOVERY_REQUIRED`: do not
-rerun or claim “nothing changed”; compare the record's `captured_prior_state` and
-`observed_recovery_state`, restore only the named agent-firm entries, and repeat preflight.
+compensation still leaves that bootstrap attempt failed and safe to inspect. An attempted existing-
+entry refresh always records `BLOCKED_RECOVERY_REQUIRED` because its reverse is unavailable, even when
+an early failure leaves the observed bytes equal to the prior capture. Do not rerun or claim “nothing
+changed”; compare `captured_prior_state`, `attempted_mutations`, `completed_mutations`,
+`unavailable_reverses`, and `observed_recovery_state`, manually restore only the named agent-firm
+entries, and repeat preflight.
 
 **Migrating a project installed before this fix:** `firm-install` only ever *adds* rules, so a project
 set up before the fix that retired `Bash(cat:*)` / `Bash(jq:*)` (they read straight around the
@@ -61,7 +66,7 @@ See `agent-firm/policy/retired-permissions.json` for the full list of retired ru
 
 **Migrating obsolete project hooks.** Each runtime now has one plugin-owned source: Claude selects
 `hooks/claude.json`; Codex discovers `hooks/hooks.json`. The tracked `.claude/settings.json` contains
-permissions only. `firm-doctor` detects legacy firm commands in project/user Claude settings and the
+permissions only. `firm-doctor` FAILs readiness when it confirms legacy firm commands in project/user Claude settings or the
 obsolete project `.codex/hooks.json`. Bootstrap, doctor, and `firm-install --migrate` never delete or
 rewrite those external hook/configuration trees. Preserve unrelated settings and custom hooks, remove
 only confirmed duplicate firm command objects (or a prototype file if that is all it contains), then
@@ -131,6 +136,12 @@ codex
 # $agent-firm:start <your goal>
 ```
 Start a new Codex task and restart/reload Claude after a plugin refresh.
+
+At engagement completion, `firm-final-qa-check` exit 4 is nonpassing `decision_required`. It permits a
+clearly marked non-ship-ready draft and one Final interaction naming the artifact's exact objections
+and permitted record types. Append only the matching typed current-run/current-full-SHA human record,
+then run one fresh check. Finalize the handoff only on exit 0; rejection, mismatch, staleness, or any
+other nonzero exit remains blocked without a second prompt in that Final cycle.
 
 ## Manual steps (what firm-bootstrap does)
 ```bash

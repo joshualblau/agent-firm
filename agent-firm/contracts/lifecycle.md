@@ -35,7 +35,7 @@ run directory as the source of truth and record milestones with `firm-ledger-log
 | Review | reviewer panel | `07-review-findings.yaml` | crit; human when risky |
 | Test | primary qa-tester | `08-qa-verdict.json`, `09-test-evidence/` | none |
 | Cross-provider QA | opposite provider | `.gpt.json` or `.claude.json` verdict | two-voice rule |
-| Package | packager | `10-handoff.md` | Final, always |
+| Package | packager | draft then finalized `10-handoff.md` | Final, always |
 | Close | Lead | `11-retrospective.md`, proposed system changes | human per proposal |
 
 Fast path collapses planning, integration, and panel overhead only when risk and dependency shape
@@ -58,7 +58,9 @@ work-orders to wide heavyweight fan-out.
 
 Ask only at gates in `firm-policy gate-matrix`, and ask once using:
 `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`.
-Immediately before the Final gate, run `firm-ledger-log final_gate_pending`.
+Immediately before the one Final interaction, run `firm-ledger-log final_gate_pending`. Present the
+draft handoff together with every exact objection from the current `decision_required` artifact and
+only its `permitted_record_types`; do not summarize objections into a broader authorization.
 
 ## QA and the two-voice gate
 
@@ -91,11 +93,24 @@ round is recorded. Fixed or withdrawn objections require a fresh secondary appro
 candidate generation; human decisions require an exact typed record. Every secondary blocker gets one
 structured entry in `traceability.yaml` under `two_voice_diff`. An unavailable required judge needs a
 matching trusted availability-attempt record and an exact logged human waiver. Primary QA BLOCK always
-blocks. Run `firm-final-qa-check <run_dir>`; only exit 0 satisfies the Definition of Done.
+blocks. Run `firm-final-qa-check <run_dir>` before the Final interaction:
+
+- exit 0 permits the Packager to present the draft handoff with the ordinary approve/reject Final
+  choice once; after approval, the Packager finalizes it against that current passing result;
+- exit 4 (`decision_required`) permits only a non-ship-ready draft handoff and one Final interaction
+  naming the exact objections and permitted typed record options from that artifact;
+- exits 1, 2, or 3 block the interaction as stale, invalid, unevaluable, or unavailable evidence.
+
+If the human chooses a permitted option, the Lead appends exactly one typed, digest-bound,
+current-run/current-full-SHA record and its required ledger reference. The Lead then runs one fresh
+`firm-final-qa-check <run_dir>`. Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
+wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
+manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.
 
 ## Completion
 
-Package only after all blocking review findings are resolved and the mechanical QA checks pass.
-The handoff names delivered behavior, criteria status, evidence, both provider verdicts, recorded
-disagreements/waivers, known risks, rollback/migration notes, and the pending human decision. Nothing
-is merged, deployed, published, or otherwise shipped automatically.
+After review, the Packager may assemble a clearly marked non-ship-ready draft. It names delivered
+behavior, criteria status, evidence, both provider verdicts, exact objections/options, recorded
+disagreements/waivers, known risks, rollback/migration notes, and the pending human decision. It is
+finalized only after the applicable fresh mechanical Final check exits 0. Nothing is merged, deployed,
+published, or otherwise shipped automatically.

@@ -508,7 +508,7 @@ PY
       warn "$_legacy_scope Claude settings may contain a legacy firm hook but JSON could not be parsed — inspect $_legacy_file manually; firm-doctor did not rewrite it."
     fi
   elif [ -n "$_legacy_out" ]; then
-    warn "$_legacy_scope Claude settings contain a legacy duplicate firm hook — review $_legacy_file, preserve unrelated hooks/settings, and remove only confirmed duplicate firm command objects manually; firm-doctor did not rewrite it."
+    fail "$_legacy_scope Claude settings contain a confirmed legacy duplicate firm hook — readiness is blocked. Review $_legacy_file, preserve unrelated hooks/settings, and remove only confirmed duplicate firm command objects manually; firm-doctor did not rewrite it."
   fi
 }
 
@@ -521,8 +521,30 @@ check_legacy_claude_hooks "user" "$HOME/.claude/settings.json"
 
 # Codex loads hooks from every matching source. The old project prototype duplicates the plugin's
 # ledger hook and must be removed manually; bootstrap never overwrites project config.
-if [ -f .codex/hooks.json ] && grep -q 'firm-ledger-hook' .codex/hooks.json 2>/dev/null; then
-  warn "obsolete duplicate .codex/hooks.json ledger hook detected — preserve project-specific hooks; remove that file manually after confirming it contains no project-specific hooks, or remove only the confirmed duplicate command object. firm-doctor did not rewrite it; the plugin now provides hooks/hooks.json."
+if [ -f .codex/hooks.json ]; then
+  _codex_legacy_out="$(python3 - .codex/hooks.json <<'PY' 2>&1
+import json, sys
+doc=json.load(open(sys.argv[1]))
+hits=[]
+def walk(value):
+    if isinstance(value,dict):
+        for key,child in value.items():
+            if key == "command" and isinstance(child,str) and ("firm-ledger-hook" in child or "firm-merge-guard" in child):
+                hits.append(child)
+            walk(child)
+    elif isinstance(value,list):
+        for child in value: walk(child)
+walk(doc.get("hooks",{}))
+print("\n".join(hits))
+PY
+)"; _codex_legacy_rc=$?
+  if [ "$_codex_legacy_rc" -ne 0 ]; then
+    if grep -Eq 'firm-(ledger-hook|merge-guard)' .codex/hooks.json 2>/dev/null; then
+      warn "obsolete .codex/hooks.json may contain a legacy firm hook but JSON could not be parsed — inspect it manually; firm-doctor did not rewrite it."
+    fi
+  elif [ -n "$_codex_legacy_out" ]; then
+    fail "confirmed obsolete duplicate .codex/hooks.json firm hook detected — readiness is blocked. Preserve project-specific hooks; remove that file manually only after confirming it contains no project-specific hooks, or remove only the confirmed duplicate command object. firm-doctor did not rewrite it; the plugin now provides hooks/hooks.json."
+  fi
 fi
 if command -v chezmoi >/dev/null 2>&1; then
   cfg="$HOME/.config/chezmoi/chezmoi.toml"

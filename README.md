@@ -110,18 +110,18 @@ bench/registry.yaml           # durable specialist bench (governance, tracked). 
                               #   $(git rev-parse --git-common-dir)/agent-firm/bench-usage.jsonl
 ```
 
-## Roadmap (see the plan)
-- **Phase 0 (done):** core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff.
-- **Phase 1 (done):** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
-- **Phase 2 (done):** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts). Promotion to the durable bench takes **≥3 successful uses across ≥3 distinct projects, each with a QA APPROVE, and no eval regression attributable to the specialist** — or explicit human approval, and genuinely cross-project either way. (Bare use-counting was the original bar; it was too weak and, before `firm-bench-record`, unmeasurable. `bench/registry.yaml` is authoritative.)
-- **Phase 3 (done):** symmetric cross-provider QA via `firm-gpt-qa` and `firm-claude-qa`, with the
+## Historical implementation milestones (not current-candidate readiness)
+- **Phase 0 implementation:** core roles, ledger, permissions, sandbox, gates, QA schema, caps, handoff.
+- **Phase 1 implementation:** worktree/integration/clean-QA tooling, traceability gate, the build-review-test workflow, retro → System-Change-PR + golden-eval loop.
+- **Phase 2 implementation:** Recruiter + generic `specialist` + `firm-hire` — hire expertise per engagement; the bench stays general (no permanent domain experts). Promotion to the durable bench takes **≥3 successful uses across ≥3 distinct projects, each with a QA APPROVE, and no eval regression attributable to the specialist** — or explicit human approval, and genuinely cross-project either way. (Bare use-counting was the original bar; it was too weak and, before `firm-bench-record`, unmeasurable. `bench/registry.yaml` is authoritative.)
+- **Phase 3 implementation:** symmetric cross-provider QA via `firm-gpt-qa` and `firm-claude-qa`, with the
   binding two-voice matrix mechanically enforced by `firm-final-qa-check` (see docs/PHASE3.md).
-- **Phase 6 / 0.8.0 (done):** one root-source plugin for both runtimes, GPT-primary native subagents,
+- **Phase 6 / 0.8.0 implementation:** one root-source plugin for both runtimes, GPT-primary native subagents,
   shared lifecycle/role contracts, provider-specific hooks, dual bootstrap/update flow, and
-  provider-aware behavioral evals.
-- **Phase 4 (done):** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
-- **Phase 5 (done):** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
-- **Hardening and measurement phase (done):** the firm's OWN tooling gets the same evidence-not-
+  provider-aware behavioral evals. This describes repository content, not readiness of this repair.
+- **Phase 4 implementation:** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
+- **Phase 5 implementation:** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
+- **Hardening and measurement implementation:** the firm's OWN tooling gets the same evidence-not-
   confidence bar it holds the deliverable to — a `bin/` regression suite + CI
   (`.github/workflows/ci.yml`; bash + git + the firm's own python3/jsonschema/pyyaml prerequisites, no
   test framework), a fail-closed `run-baseline.json` SHA comparison replacing the old
@@ -159,7 +159,12 @@ checks, exactly one bounded live smoke in each primary orientation, and the gate
 No modern-Bash run or live provider smoke is performed by the ordinary build tests. Until those
 records exist and Final QA passes, report the candidate as BLOCKED/unproved rather than “done” or
 ready. A trusted secondary exit 3 is unavailable—not APPROVE—and must retain the target-run attempt,
-matching ledger event, traceability state, provider-specific verdict presence/absence, and a plain-
-text Final warning with `firm-final-qa-check <run-dir>` as the corrective command. Provider-native
+matching ledger event, traceability state, and provider-specific verdict presence/absence. The Final
+checker may then emit nonpassing `decision_required` (exit 4), which permits only a non-ship-ready
+draft and one exact human interaction; a matching typed record plus one fresh exit 0 is required before
+finalization. Provider-native
 configuration suppression is a supported CLI boundary, not an OS/container or network-isolation
-guarantee; bootstrap restoration is compensating rollback, not atomic cross-provider installation.
+guarantee. Bootstrap compensation uses only supported inverse operations for freshly created entries.
+Refreshing a pre-existing installed entry has no proven exact inverse; failure records
+`BLOCKED_RECOVERY_REQUIRED` for manual comparison/restoration rather than repeating the forward
+update/add command as a supposed rollback.

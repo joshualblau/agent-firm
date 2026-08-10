@@ -47,7 +47,8 @@ const IMPL_SCHEMA = {
     integrator_asks: { type: 'array', items: { type: 'string' } },
   },
 }
-const REVIEW_SCHEMA = {
+// Exported so artifact-contract tests validate the exact schema passed to reviewer agents.
+export const REVIEW_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['lens', 'verdict', 'findings'],
   properties: {
@@ -71,7 +72,7 @@ const REVIEW_SCHEMA = {
   },
 }
 
-const aggregateReviewArtifact = (panel, taskSlug) => ({
+export const aggregateReviewArtifact = (panel, taskSlug) => ({
   task_slug: taskSlug,
   reviewers: panel.map(review => review.lens),
   findings: panel.flatMap(review => (review.findings || []).map(finding => ({ lens: review.lens, ...finding }))),
@@ -130,6 +131,22 @@ const blockers = reviewArtifact.findings.filter(
   f => f.status === 'open' && (f.severity === 'blocker' || f.severity === 'high')
 )
 
+// Review is a real control boundary. QA must not be launched against a candidate the panel has
+// already identified as blocked; the Lead resolves the exact findings and runs a fresh workflow.
+if (blockers.length) {
+  return {
+    status: 'review_blocked',
+    built,
+    reds: reds.map(r => r.work_order),
+    integration,
+    reviews,
+    review_artifact: reviewArtifact,
+    open_blockers: blockers,
+    qa: null,
+    note: 'Review BLOCKED: resolve every open blocker/high finding, then launch one fresh workflow. QA was not launched.',
+  }
+}
+
 // ---------- Test: independent QA from a clean checkout, schema-valid verdict ----------
 phase('Test')
 const qa = await agent(
@@ -145,6 +162,7 @@ const qa = await agent(
 )
 
 return {
+  status: 'qa_complete',
   built,
   reds: reds.map(r => r.work_order),
   integration,
