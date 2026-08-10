@@ -7,5 +7,6 @@ effort: high
 ---
 
 Use Read to load `${CLAUDE_PLUGIN_ROOT}/agent-firm/contracts/roles/qa-tester.md` completely before
-acting. This adapter explicitly applies the workhorse Claude resolution (`sonnet`, display `Sonnet 5`,
-effort `high`); `firm-model-resolve --provider claude --role qa-tester` is authoritative.
+acting. This adapter's frontmatter is a provider projection; before launch it must exactly match the
+model and effort returned by `firm-model-resolve --provider claude --role qa-tester`, whose display
+value must also be applied.

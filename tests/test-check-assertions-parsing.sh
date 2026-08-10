@@ -597,9 +597,10 @@ vocab="$(af parse_only_vocab 'assertions:
   - traceability_passes: true
   - no_default_branch_merge: false
   - final_gate_pending: true
-  - qa_checkout_clean: false')"
+  - qa_checkout_clean: false
+  - trusted_unavailability_chain: true')"
 assert_rc "full known vocabulary parses without evaluating" 0 "$CA" --parse-only "$vocab"
-assert_output "authoritative count is reported" "assertions: 10 parsed" "$CA" --parse-only "$vocab"
+assert_output "authoritative count is reported" "assertions: 11 parsed" "$CA" --parse-only "$vocab"
 assert_output "completion marker disclaims execution" "no assertion or payload executed" "$CA" --parse-only "$vocab"
 
 t_case "parse-only mutation failures cover unknown, empty, malformed, verdict, boolean, and type axes"
@@ -629,5 +630,158 @@ payload="$(af parse_payload "assertions:
 assert_rc "payload text is shape-valid" 0 "$CA" --parse-only "$payload"
 assert_no_file "payload did not execute" "$PARSE_TRIP"
 assert_rc "parse-only rejects an evaluation repo argument" 2 "$CA" --parse-only "$payload" "$repo"
+
+# CR-10 structured availability-chain proof. A copied checker and local final-check stub keep the
+# fixture wholly offline while still proving that the assertion invokes the sibling checker and
+# compares its current exit with the captured exit. Every negative rebuilds a fresh chain and mutates
+# exactly one correlation axis.
+CHAIN_BIN="$W/chain-bin"; mkdir "$CHAIN_BIN"
+cp "$CA" "$CHAIN_BIN/firm-check-assertions"; chmod +x "$CHAIN_BIN/firm-check-assertions"
+cat > "$CHAIN_BIN/firm-final-qa-check" <<'SH'
+#!/bin/sh
+printf '%s\n' "$1" >> "$FIRM_FINAL_CALLS"
+exit "${FIRM_FINAL_RC:-0}"
+SH
+chmod +x "$CHAIN_BIN/firm-final-qa-check"
+CHAIN_CA="$CHAIN_BIN/firm-check-assertions"
+CHAIN_ASSERT="$W/chain-assertions.yaml"
+printf 'assertions:\n  - trusted_unavailability_chain: true\n' > "$CHAIN_ASSERT"
+CHAIN_FINAL_CALLS="$W/chain-final-calls"
+
+make_chain() { # repo orientation
+  python3 - "$1" "$2" <<'PY'
+import hashlib,json,os,pathlib,shutil,sys,yaml
+repo=pathlib.Path(sys.argv[1]); orientation=sys.argv[2]
+shutil.rmtree(repo,ignore_errors=True)
+run_id=f"availability-{orientation}"; run=repo/".agent-firm"/"runs"/run_id
+(run/"09-test-evidence"/"reviewer-attempts").mkdir(parents=True)
+(repo/".agent-firm"/"CURRENT_RUN").write_text(f".agent-firm/runs/{run_id}\n")
+sha=("a" if orientation=="claude" else "b")*40; generation=2
+selected="gpt" if orientation=="claude" else "claude"
+attempt_id=f"{selected}-c{generation}-a0001"
+attempt_rel=f"09-test-evidence/reviewer-attempts/{attempt_id}/attempt.json"
+adir=run/pathlib.Path(attempt_rel).parent; adir.mkdir()
+start_id=f"evt-start-{attempt_id}"; outcome_id=f"evt-unavailable-{attempt_id}"
+attempt={"schema_version":1,"attempt_id":attempt_id,"provider":selected,"run_id":run_id,
+         "candidate_sha":sha,"generation":generation,"status":"unavailable","exit_code":3,
+         "trusted_reason":"authentication","phases":[],"started_at":"2026-08-10T00:00:00Z",
+         "finished_at":"2026-08-10T00:00:01Z","started_event_id":start_id,"outcome_event_id":outcome_id}
+attempt_raw=(json.dumps(attempt,sort_keys=True,indent=2)+"\n").encode()
+(run/attempt_rel).write_bytes(attempt_raw)
+digest=hashlib.sha256(attempt_raw).hexdigest(); size=len(attempt_raw)
+json.dump({"schema_version":2,"run_id":run_id,"primary_provider":orientation},open(run/"run-metadata.json","w"),separators=(",",":"))
+json.dump({"schema_version":2,"run_id":run_id,"candidate_sha":sha,"generation":generation},open(run/"09-test-evidence"/"qa-candidate.json","w"),separators=(",",":"))
+json.dump({"schema_version":1,"provider":selected,"candidate_sha":sha,"generation":generation,
+           "last_attempt":1,"attempt_id":attempt_id},open(run/"09-test-evidence"/f"reviewer-state.{selected}.json","w"),separators=(",",":"))
+events=[
+ {"ts":"2026-08-10T00:00:00Z","event":"reviewer_attempt_started","event_id":start_id,
+  "run_id":run_id,"provider":selected,"generation":str(generation),"sha":sha,"attempt":attempt_rel,"attempt_id":attempt_id},
+ {"ts":"2026-08-10T00:00:01Z","event":"reviewer_unavailable","event_id":outcome_id,
+  "run_id":run_id,"provider":selected,"generation":str(generation),"sha":sha,"attempt":attempt_rel,
+  "attempt_id":attempt_id,"exit_code":"3","reason":"authentication","sha256":digest,"bytes":str(size)}]
+(run/"run.jsonl").write_text("".join(json.dumps(e,separators=(",",":"))+"\n" for e in events))
+ref={"path":attempt_rel,"provider":selected,"generation":generation,"attempt_id":attempt_id,
+     "candidate_sha":sha,"sha256":digest,"bytes":size,
+     "producer":{"event_id":outcome_id,"event":"reviewer_unavailable","provider":selected,
+                 "generation":generation,"attempt_id":attempt_id}}
+trace={"schema_version":2,"candidate":{"run_id":run_id,"commit_sha":sha,"generation":generation},
+       "two_voice":{"secondary_provider":selected,"status":"unavailable","required":False,"attempt":ref},
+       "matrix":[],"two_voice_diff":[]}
+yaml.safe_dump(trace,open(run/"traceability.yaml","w"),sort_keys=False)
+before=b"FINAL QA: BLOCK -- secondary not complete\n"; after=b"FINAL QA: PASS\n"
+(run/"09-test-evidence"/"final-qa-before-unavailable.txt").write_bytes(before)
+(run/"09-test-evidence"/"final-qa-after-unavailable.txt").write_bytes(after)
+def output_ref(name,payload):
+ return {"path":f"09-test-evidence/{name}","sha256":hashlib.sha256(payload).hexdigest(),"bytes":len(payload)}
+capture={"schema_version":1,"run_id":run_id,"candidate_sha":sha,"generation":generation,
+         "provider":selected,"attempt_id":attempt_id,
+         "before":{"argv":["firm-final-qa-check",f".agent-firm/runs/{run_id}"],"exit_code":1,
+                   "output":output_ref("final-qa-before-unavailable.txt",before)},
+         "after":{"argv":["firm-final-qa-check",f".agent-firm/runs/{run_id}"],"exit_code":0,
+                  "output":output_ref("final-qa-after-unavailable.txt",after)}}
+json.dump(capture,open(run/"09-test-evidence"/"final-qa-unavailable.json","w"),indent=2,sort_keys=True)
+PY
+}
+
+chain_run() { # repo orientation [final-rc]
+  : > "$CHAIN_FINAL_CALLS"
+  env FIRM_EVAL_PROVIDER="$2" FIRM_FINAL_CALLS="$CHAIN_FINAL_CALLS" FIRM_FINAL_RC="${3:-0}" \
+    "$CHAIN_CA" "$CHAIN_ASSERT" "$1"
+}
+
+mutate_chain() { # repo mutation
+  python3 - "$1" "$2" <<'PY'
+import hashlib,json,pathlib,sys,yaml
+repo=pathlib.Path(sys.argv[1]); mutation=sys.argv[2]
+run=repo/(repo/".agent-firm"/"CURRENT_RUN").read_text().strip()
+def jload(rel): return json.load(open(run/rel))
+def jwrite(rel,d): json.dump(d,open(run/rel,"w"),indent=2,sort_keys=True)
+trace=yaml.safe_load(open(run/"traceability.yaml")); ref=trace["two_voice"]["attempt"]
+capture=jload("09-test-evidence/final-qa-unavailable.json")
+events=[json.loads(x) for x in (run/"run.jsonl").read_text().splitlines() if x]
+selected=trace["two_voice"]["secondary_provider"]
+if mutation=="candidate_sha":
+ d=jload("09-test-evidence/qa-candidate.json"); d["candidate_sha"]="c"*40; jwrite("09-test-evidence/qa-candidate.json",d)
+elif mutation=="generation":
+ d=jload("09-test-evidence/qa-candidate.json"); d["generation"]+=1; jwrite("09-test-evidence/qa-candidate.json",d)
+elif mutation=="primary_provider":
+ d=jload("run-metadata.json"); d["primary_provider"]="codex" if d["primary_provider"]=="claude" else "claude"; jwrite("run-metadata.json",d)
+elif mutation=="attempt_id": ref["attempt_id"]="direct-artifact"
+elif mutation=="attempt_path": ref["path"]="09-test-evidence/copied-attempt.json"
+elif mutation=="attempt_digest": ref["sha256"]="0"*64
+elif mutation=="attempt_bytes": ref["bytes"]+=1
+elif mutation=="selected_provider": trace["two_voice"]["secondary_provider"]="claude" if selected=="gpt" else "gpt"
+elif mutation=="exit_event": events[1]["exit_code"]="2"
+elif mutation=="trace_producer": ref["producer"]["event_id"]="evt-hand-authored"
+elif mutation=="nonselected_verdict":
+ nonselected="claude" if selected=="gpt" else "gpt"; (run/f"08-qa-verdict.{nonselected}.json").write_text("{}\n")
+elif mutation=="nonselected_state":
+ nonselected="claude" if selected=="gpt" else "gpt"; jwrite(f"09-test-evidence/reviewer-state.{nonselected}.json",{})
+elif mutation=="nonselected_event":
+ nonselected="claude" if selected=="gpt" else "gpt"; duplicate=dict(events[0]); duplicate["event_id"]="evt-nonselected"; duplicate["provider"]=nonselected; events.append(duplicate)
+elif mutation=="final_capture": capture["after"]["exit_code"]=1
+elif mutation=="before_exit": capture["before"]["exit_code"]=4
+elif mutation=="direct_wrapper": events=events[1:]
+elif mutation=="duplicate_terminal":
+ duplicate=dict(events[1]); duplicate["event_id"]="evt-duplicate-terminal"; events.append(duplicate)
+elif mutation=="attempt_content":
+ rel=ref["path"]; d=jload(rel); d["trusted_reason"]="hand-authored"; jwrite(rel,d)
+else: raise SystemExit(f"unknown mutation {mutation}")
+yaml.safe_dump(trace,open(run/"traceability.yaml","w"),sort_keys=False)
+jwrite("09-test-evidence/final-qa-unavailable.json",capture)
+(run/"run.jsonl").write_text("".join(json.dumps(e,separators=(",",":"))+"\n" for e in events))
+PY
+}
+
+t_case "trusted unavailable correlation passes in both primary orientations"
+for orientation in claude codex; do
+  CHAIN_REPO="$W/chain-$orientation"; make_chain "$CHAIN_REPO" "$orientation"
+  assert_rc "$orientation-primary exact chain passes" 0 chain_run "$CHAIN_REPO" "$orientation" 0
+  assert_eq "$orientation-primary rechecks final exactly once" "1" "$(wc -l < "$CHAIN_FINAL_CALLS" | tr -d ' ')"
+done
+
+t_case "one-axis correlation mutations and direct artifacts fail closed"
+CHAIN_REPO="$W/chain-mutations"
+for mutation in candidate_sha generation primary_provider attempt_id attempt_path attempt_digest \
+                attempt_bytes selected_provider exit_event trace_producer nonselected_verdict \
+                nonselected_state nonselected_event final_capture before_exit direct_wrapper \
+                duplicate_terminal attempt_content; do
+  make_chain "$CHAIN_REPO" claude
+  mutate_chain "$CHAIN_REPO" "$mutation"
+  chain_run "$CHAIN_REPO" claude 0 >/dev/null 2>&1; mutation_rc=$?
+  if [ "$mutation_rc" -eq 1 ]; then
+    _t_ok "$mutation mismatch fails"
+  else
+    _t_no "$mutation mismatch fails" "expected rc=1 got $mutation_rc"
+  fi
+done
+
+t_case "hand-authored captured pass cannot override the current final-check exit"
+make_chain "$CHAIN_REPO" claude
+assert_rc "current final rc 1 defeats captured rc 0" 1 chain_run "$CHAIN_REPO" claude 1
+false_chain="$(af false_chain 'assertions:
+  - trusted_unavailability_chain: false')"
+assert_rc "negative inversion is unsupported" 1 env FIRM_EVAL_PROVIDER=claude FIRM_FINAL_CALLS="$CHAIN_FINAL_CALLS" \
+  "$CHAIN_CA" "$false_chain" "$CHAIN_REPO"
 
 t_summary

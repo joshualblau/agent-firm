@@ -14,22 +14,34 @@ tiers:
 
   heavyweight:
     role: "Default heavyweight."
-    roles: [lead, intake-analyst, architect, implementer, integrator, reviewer]
     claude: {model: opus, display: "Opus 5", effort: xhigh}
     codex: {model: gpt-5.6-sol, display: "GPT-5.6 sol", effort: xhigh}
 
   workhorse:
     role: "Workhorse."
-    roles: [recruiter, packager, qa-tester, "hired specialists, unless the job spec justifies more"]
     claude: {model: sonnet, display: "Sonnet 5", effort: high}
     codex: {model: gpt-5.6-terra, display: "GPT-5.6 terra", effort: high}
 
   fast:
     role: "Cheap/fast."
-    roles: [scout]
     used_for: "Broad read-only sweeps, simple classification, mechanical work — keeps expensive models focused on the diff."
     claude: {model: haiku, display: "Haiku 4.5", effort: low}
     codex: {model: gpt-5.6-terra, display: "GPT-5.6 terra", effort: low}
+
+# This closed mapping is the sole role-to-tier authority. Provider adapters are projections that
+# must be checked against the resolver before launch; they are not a second mapping source.
+role_tiers:
+  lead: heavyweight
+  intake-analyst: heavyweight
+  architect: heavyweight
+  implementer: heavyweight
+  integrator: heavyweight
+  reviewer: heavyweight
+  recruiter: workhorse
+  packager: workhorse
+  qa-tester: workhorse
+  specialist: workhorse
+  scout: fast
 
 legacy_aliases:
   fable: ceiling

@@ -6,13 +6,8 @@ assertions:
   - file_exists: src/ping.js
   - file_exists: test/ping.test.js
   - test_passes: node --test
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); grep -q "\"primary_provider\":\"${FIRM_EVAL_PROVIDER}\"" "$r/run-metadata.json"'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); s=gpt; [ "${FIRM_EVAL_PROVIDER}" = codex ] && s=claude; grep -q "secondary_provider: $s" "$r/traceability.yaml" && grep -q "status: unavailable" "$r/traceability.yaml"'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); s=gpt; [ "${FIRM_EVAL_PROVIDER}" = codex ] && s=claude; grep -q "\"event\":\"reviewer_unavailable\"" "$r/run.jsonl" && grep -q "\"provider\":\"$s\"" "$r/run.jsonl" && grep -q "\"exit_code\":3" "$r/run.jsonl"'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); s=gpt; p=claude; [ "${FIRM_EVAL_PROVIDER}" = codex ] && { s=claude; p=gpt; }; find "$r/09-test-evidence/reviewer-attempts" -name "$s-*" -type d | grep -q . && ! find "$r/09-test-evidence/reviewer-attempts" -name "$p-*" -type d | grep -q .'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); s=gpt; [ "${FIRM_EVAL_PROVIDER}" = codex ] && s=claude; test ! -e "$r/08-qa-verdict.$s.json"'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); grep -qi unavailable "$r/10-handoff.md" && grep -qi BLOCK "$r/10-handoff.md" && grep -q "firm-final-qa-check" "$r/10-handoff.md"'
-  - test_passes: 'r=$(cat .agent-firm/CURRENT_RUN); test -s "$r/09-test-evidence/final-qa-before-unavailable.txt" && grep -qi BLOCK "$r/09-test-evidence/final-qa-before-unavailable.txt" && test -s "$r/09-test-evidence/final-qa-after-unavailable.txt" && grep -q "FINAL QA: PASS" "$r/09-test-evidence/final-qa-after-unavailable.txt"'
+  - trusted_unavailability_chain: true
+  - traceability_passes: true
   - artifact_exists: 08-qa-verdict.json
   - verdict_is: APPROVE
   - final_gate_pending: true

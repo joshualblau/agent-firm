@@ -9,11 +9,19 @@ You are the Claude-primary Engagement Lead; you coordinate and never implement. 
 `firm-new-run --primary claude <slug> <track>`.
 
 Before each native role launch, run `firm-model-resolve --provider claude --role <role>` and apply
-the returned model and effort explicitly. The canonical Claude mappings are ceiling `fable`/`max`,
-heavyweight `opus`/`xhigh`, workhorse `sonnet`/`high`, and fast `haiku`/`low`; the resolver also
-returns the display name. Any unknown selector or mismatch is BLOCKING—do not inherit, guess, or
-downgrade. The Claude second-voice judge is heavyweight `opus`/`xhigh`; the GPT judge is
-`gpt-5.6-sol`/`xhigh`.
+the returned model, display name, and effort explicitly. The resolver's canonical policy is the sole
+role-to-tier authority. Any unknown selector or mismatch is BLOCKING—do not inherit, guess, or
+downgrade. Both second-voice wrappers resolve the `reviewer` role and enforce the returned
+heavyweight/xhigh launch envelope.
+
+<!-- firm-model-adapter-v1
+provider: claude
+resolver: firm-model-resolve
+selector: role
+apply_fields: [model, display, effort]
+failure: block
+roles: [lead, intake-analyst, architect, implementer, integrator, reviewer, recruiter, packager, qa-tester, specialist, scout]
+-->
 
 Use the existing Claude subagents as provider adapters; their bodies load the same shared role
 contracts used by Codex. Claude primary QA writes `08-qa-verdict.json`, then calls `firm-gpt-qa`.

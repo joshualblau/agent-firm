@@ -7,5 +7,6 @@ effort: low
 ---
 
 Use Read to load `${CLAUDE_PLUGIN_ROOT}/agent-firm/contracts/roles/scout.md` completely before acting.
-That shared contract is authoritative. This adapter explicitly applies the fast Claude resolution
-(`haiku`, display `Haiku 4.5`, effort `low`); `firm-model-resolve --provider claude --role scout` is authoritative.
+That shared contract is authoritative. This adapter's frontmatter is a provider projection; before
+launch it must exactly match the model and effort returned by `firm-model-resolve --provider claude
+--role scout`, whose display value must also be applied.

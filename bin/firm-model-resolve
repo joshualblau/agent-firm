@@ -9,9 +9,9 @@ ROOT="$(cd "$SELF/.." && pwd)"
 
 exec python3 - "$ROOT/agent-firm/policy/model-tiers.yaml" "$@" <<'PY'
 import argparse
+import hashlib
 import json
 import os
-import re
 import shlex
 import sys
 
@@ -41,48 +41,95 @@ try:
 except BaseException as exc:
     fail(f"cannot load canonical model policy because PyYAML is unavailable or broken: {type(exc).__name__}: {exc}")
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Fail before PyYAML can silently collapse a duplicate policy key."""
+
+def construct_unique_mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"unhashable policy key: {key!r}", key_node.start_mark) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"duplicate policy key: {key!r}", key_node.start_mark)
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_unique_mapping)
+
 if not os.path.isfile(args.policy) or os.path.islink(args.policy):
     fail(f"policy must be a regular non-symlink file: {args.policy}")
 try:
-    with open(args.policy, encoding="utf-8") as fh:
-        policy = yaml.safe_load(fh)
+    with open(args.policy, "rb") as fh:
+        policy_bytes = fh.read()
+    policy = yaml.load(policy_bytes, Loader=UniqueKeyLoader)
 except BaseException as exc:
     fail(f"cannot parse policy {args.policy}: {type(exc).__name__}: {exc}")
-if not isinstance(policy, dict) or not isinstance(policy.get("tiers"), dict) or not isinstance(policy.get("legacy_aliases"), dict):
-    fail("policy must define tier and legacy_alias mappings")
 
-# Role names are runtime selectors, not prose scraped from the policy's explanatory `roles` arrays.
-# Judge names are explicit so the two opposite-provider invocations cannot inherit a lead default.
-ROLE_TIERS = {
-    "lead": "heavyweight", "intake-analyst": "heavyweight", "architect": "heavyweight",
-    "implementer": "heavyweight", "integrator": "heavyweight", "reviewer": "heavyweight",
-    "recruiter": "workhorse", "packager": "workhorse", "qa-tester": "workhorse",
-    "specialist": "workhorse", "scout": "fast",
-    "judge": "heavyweight", "claude-judge": "heavyweight", "gpt-judge": "heavyweight",
+EXPECTED_ROOT_KEYS = {"principle", "tiers", "role_tiers", "legacy_aliases", "quota_discipline"}
+EXPECTED_TIERS = {"ceiling", "heavyweight", "workhorse", "fast"}
+EXPECTED_ROLES = {
+    "lead", "intake-analyst", "architect", "implementer", "integrator", "reviewer",
+    "recruiter", "packager", "qa-tester", "specialist", "scout",
 }
+EXPECTED_ALIASES = {"fable", "opus", "sonnet", "haiku", "codex"}
+PROVIDERS = {"claude", "codex"}
+
+if not isinstance(policy, dict) or set(policy) != EXPECTED_ROOT_KEYS:
+    fail("policy root must contain exactly principle, tiers, role_tiers, legacy_aliases, and quota_discipline")
+tiers = policy["tiers"]
+role_tiers = policy["role_tiers"]
+aliases = policy["legacy_aliases"]
+if not isinstance(tiers, dict) or set(tiers) != EXPECTED_TIERS:
+    fail(f"tiers must contain exactly: {', '.join(sorted(EXPECTED_TIERS))}")
+if not isinstance(role_tiers, dict) or set(role_tiers) != EXPECTED_ROLES:
+    fail(f"role_tiers must contain exactly: {', '.join(sorted(EXPECTED_ROLES))}")
+if not isinstance(aliases, dict) or set(aliases) != EXPECTED_ALIASES:
+    fail(f"legacy_aliases must contain exactly: {', '.join(sorted(EXPECTED_ALIASES))}")
+
+for tier_name, tier_data in tiers.items():
+    if not isinstance(tier_data, dict):
+        fail(f"tier {tier_name!r} must be a mapping")
+    allowed = PROVIDERS | {"role", "used_for", "never"}
+    if not PROVIDERS.issubset(tier_data) or set(tier_data) - allowed:
+        fail(f"tier {tier_name!r} must define both providers and only supported descriptive fields")
+    for provider in sorted(PROVIDERS):
+        cell = tier_data[provider]
+        if not isinstance(cell, dict) or set(cell) != {"model", "display", "effort"}:
+            fail(f"{tier_name}.{provider} must contain exactly model, display, and effort")
+        for field in ("model", "display", "effort"):
+            value = cell[field]
+            if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
+                fail(f"{tier_name}.{provider}.{field} must be a non-empty printable string")
+
+for role, mapped_tier in role_tiers.items():
+    if not isinstance(mapped_tier, str) or mapped_tier not in tiers:
+        fail(f"role_tiers.{role} references unknown tier {mapped_tier!r}")
+for alias, mapped_tier in aliases.items():
+    if not isinstance(mapped_tier, str) or mapped_tier not in tiers:
+        fail(f"legacy_aliases.{alias} references unknown tier {mapped_tier!r}")
 
 if args.role is not None:
-    if args.role not in ROLE_TIERS:
-        fail(f"unknown role {args.role!r}; valid roles: {', '.join(sorted(ROLE_TIERS))}")
-    selected_by, selector_value, tier = "role", args.role, ROLE_TIERS[args.role]
+    if args.role not in role_tiers:
+        fail(f"unknown role {args.role!r}; valid roles: {', '.join(sorted(role_tiers))}")
+    selected_by, selector_value, tier = "role", args.role, role_tiers[args.role]
 elif args.alias is not None:
-    aliases = policy["legacy_aliases"]
     if args.alias not in aliases:
         fail(f"unknown legacy alias {args.alias!r}; valid aliases: {', '.join(sorted(aliases))}")
     selected_by, selector_value, tier = "alias", args.alias, aliases[args.alias]
 else:
     selected_by, selector_value, tier = "tier", args.tier, args.tier
 
-tiers = policy["tiers"]
 if tier not in tiers:
     fail(f"unknown tier {tier!r}; valid tiers: {', '.join(sorted(tiers))}")
-cell = tiers[tier].get(args.provider)
-if not isinstance(cell, dict) or set(cell) != {"model", "display", "effort"}:
-    fail(f"{tier}.{args.provider} must contain exactly model, display, and effort")
-for field in ("model", "display", "effort"):
-    value = cell[field]
-    if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
-        fail(f"{tier}.{args.provider}.{field} must be a non-empty printable string")
+cell = tiers[tier][args.provider]
 
 expected = {
     "model": args.expect_model,
@@ -101,6 +148,7 @@ result = {
     "model": cell["model"],
     "display": cell["display"],
     "effort": cell["effort"],
+    "policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
 }
 if args.format == "json":
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

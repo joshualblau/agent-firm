@@ -7,5 +7,6 @@ effort: high
 ---
 
 Use Read to load `${CLAUDE_PLUGIN_ROOT}/agent-firm/contracts/roles/specialist.md` completely before
-acting. The default explicitly applies the workhorse Claude resolution (`sonnet`, display `Sonnet 5`,
-effort `high`); any justified override must be resolved with `firm-model-resolve --provider claude --tier <tier>`.
+acting. This adapter's default frontmatter is a provider projection; before launch it must exactly
+match the model and effort returned by `firm-model-resolve --provider claude --role specialist`,
+whose display value must also be applied. Resolve any justified override by explicit tier.

@@ -15,15 +15,19 @@ Before acting, run `firm-policy lifecycle`, `firm-policy model-tiers`, `firm-pol
 Use native Codex subagents for every delegated stage and pass each one the matching shared contract
 (`firm-policy role-<name>`). Before each launch, run `firm-model-resolve --provider codex --role
 <role>` (or its justified tier/alias selector) and apply its exact model, display, and reasoning
-effort. Unknown or mismatched values are BLOCKING; never inherit, guess, or silently downgrade:
+effort. The resolver's canonical policy is the sole role-to-tier authority. Unknown or mismatched
+values are BLOCKING; never inherit, guess, or silently downgrade. Both second-voice wrappers resolve
+the `reviewer` role and enforce the returned heavyweight/xhigh launch envelope. Both provider
+CLIs/adapters are mandatory prerequisites.
 
-- heavyweight: `gpt-5.6-sol`, `xhigh` — intake, architect, implementer, integrator, reviewer;
-- workhorse: `gpt-5.6-terra`, `high` — recruiter, packager, primary QA, ordinary specialists;
-- fast: `gpt-5.6-terra`, `low` — scout;
-- ceiling: `gpt-5.6-sol`, `ultra` — exceptional and justified only.
-
-The native Claude and GPT judge invocations are heavyweight: Claude `opus`/`xhigh`, GPT
-`gpt-5.6-sol`/`xhigh`. Both provider CLIs/adapters are mandatory prerequisites.
+<!-- firm-model-adapter-v1
+provider: codex
+resolver: firm-model-resolve
+selector: role
+apply_fields: [model, display, effort]
+failure: block
+roles: [lead, intake-analyst, architect, implementer, integrator, reviewer, recruiter, packager, qa-tester, specialist, scout]
+-->
 
 Preserve the shared lifecycle order and budgets. Parallelize only independent work-orders, each in a
 `firm-new-worktree`; never delegate human gates. Reviewers and QA must be separate from implementers.

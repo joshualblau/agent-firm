@@ -67,7 +67,7 @@ else
   repo="$2"
 fi
 python3 - "$1" "$repo" "${3:-}" "$SELF" "$parse_only" <<'PY'
-import json, os, re, subprocess, sys, glob, importlib.util
+import glob, hashlib, importlib.util, json, os, re, stat, subprocess, sys
 apath, repo, rpath, selfdir = sys.argv[1:5]
 parse_only = sys.argv[5] == "1"
 
@@ -250,6 +250,7 @@ KNOWN = {
     "verdict_is": "verdict", "test_passes": "text",
     "traceability_passes": "boolean", "no_default_branch_merge": "boolean",
     "final_gate_pending": "boolean", "qa_checkout_clean": "boolean",
+    "trusted_unavailability_chain": "boolean",
 }
 
 def value_error(index, key, message):
@@ -344,6 +345,236 @@ def final_gate_event_logged():
         except Exception:
             continue
     return False
+
+def trusted_unavailability_chain():
+    """Correlate one complete opposite-provider exit-3 chain; never accept independent matches.
+
+    This assertion is intentionally specific to the no-network availability eval. It binds the
+    current primary orientation to one immutable reviewer attempt, its two exact target-ledger
+    events, the current state projection, traceability reference, absence of both possible
+    provider-suffixed verdicts, and a structured before/after final-check capture. It then reruns the
+    sibling final checker and requires the captured after-exit to equal the current exit.
+    """
+    led = find_ledger()
+    if led is None:
+        return False, "no run ledger found"
+    led = os.path.realpath(led)
+    runs_root = os.path.realpath(os.path.join(repo, ".agent-firm", "runs"))
+    try:
+        inside_runs = os.path.commonpath((runs_root, led)) == runs_root
+    except ValueError:
+        inside_runs = False
+    if not inside_runs or led == runs_root:
+        return False, "run ledger is outside the scratch repository's runs root"
+    if not os.path.isdir(led) or os.path.islink(led):
+        return False, "run ledger is not a regular directory"
+    run_id = os.path.basename(led)
+
+    def regular(rel):
+        if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+            raise ValueError(f"unsafe relative path {rel!r}")
+        normalized = os.path.normpath(rel)
+        if normalized != rel or normalized == ".." or normalized.startswith("../"):
+            raise ValueError(f"noncanonical relative path {rel!r}")
+        path = os.path.join(led, rel)
+        if os.path.realpath(path) != os.path.join(led, rel):
+            raise ValueError(f"path escapes or traverses a symlink: {rel}")
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"not a regular no-follow file: {rel}")
+        return path
+
+    def raw(rel):
+        path = regular(rel)
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def json_doc(rel):
+        value = json.loads(raw(rel))
+        if not isinstance(value, dict):
+            raise ValueError(f"{rel} is not a JSON object")
+        return value
+
+    def exact_ref(ref, rel, provider, generation, attempt_id, sha, digest, size, event_id):
+        if not isinstance(ref, dict):
+            return False
+        producer = ref.get("producer")
+        return (
+            ref.get("path") == rel and ref.get("provider") == provider
+            and ref.get("generation") == generation and ref.get("attempt_id") == attempt_id
+            and ref.get("candidate_sha") == sha and ref.get("sha256") == digest
+            and ref.get("bytes") == size and isinstance(producer, dict)
+            and producer.get("event_id") == event_id
+            and producer.get("event") == "reviewer_unavailable"
+            and producer.get("provider") == provider
+            and producer.get("generation") == generation
+            and producer.get("attempt_id") == attempt_id
+        )
+
+    try:
+        if yaml is None:
+            raise ValueError("structured availability correlation requires pyyaml")
+        orientation = os.environ.get("FIRM_EVAL_PROVIDER")
+        if orientation not in ("claude", "codex"):
+            raise ValueError("FIRM_EVAL_PROVIDER must be claude or codex")
+        selected = "gpt" if orientation == "claude" else "claude"
+        nonselected = "claude" if selected == "gpt" else "gpt"
+
+        metadata = json_doc("run-metadata.json")
+        candidate = json_doc("09-test-evidence/qa-candidate.json")
+        if metadata.get("run_id") != run_id or metadata.get("primary_provider") != orientation:
+            raise ValueError("run metadata does not match selected primary orientation")
+        sha = candidate.get("candidate_sha")
+        generation = candidate.get("generation")
+        if (candidate.get("run_id") != run_id or not isinstance(sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or not isinstance(generation, int) or isinstance(generation, bool) or generation < 1):
+            raise ValueError("candidate identity is incomplete or invalid")
+
+        trace = yaml.safe_load(raw("traceability.yaml"))
+        if not isinstance(trace, dict) or trace.get("schema_version") != 2:
+            raise ValueError("traceability.yaml is not schema version 2")
+        trace_candidate = trace.get("candidate")
+        two_voice = trace.get("two_voice")
+        if (not isinstance(trace_candidate, dict)
+                or trace_candidate.get("run_id") != run_id
+                or trace_candidate.get("commit_sha") != sha
+                or trace_candidate.get("generation") != generation):
+            raise ValueError("traceability candidate does not match current candidate")
+        if (not isinstance(two_voice, dict) or two_voice.get("secondary_provider") != selected
+                or two_voice.get("status") != "unavailable"):
+            raise ValueError("traceability does not select the expected unavailable second voice")
+        attempt_ref = two_voice.get("attempt")
+        if not isinstance(attempt_ref, dict):
+            raise ValueError("traceability unavailable state has no structured attempt reference")
+        attempt_id = attempt_ref.get("attempt_id")
+        if not isinstance(attempt_id, str) or not re.fullmatch(
+                rf"{re.escape(selected)}-c{generation}-a[0-9]{{4}}", attempt_id):
+            raise ValueError("attempt id does not bind selected provider and generation")
+        attempt_rel = f"09-test-evidence/reviewer-attempts/{attempt_id}/attempt.json"
+        attempt_raw = raw(attempt_rel)
+        attempt_digest = hashlib.sha256(attempt_raw).hexdigest()
+        attempt_size = len(attempt_raw)
+        attempt = json.loads(attempt_raw)
+        if not isinstance(attempt, dict):
+            raise ValueError("attempt record is not an object")
+        event_id = attempt.get("outcome_event_id")
+        start_event_id = attempt.get("started_event_id")
+        if (attempt.get("schema_version") != 1 or attempt.get("run_id") != run_id
+                or attempt.get("provider") != selected or attempt.get("attempt_id") != attempt_id
+                or attempt.get("candidate_sha") != sha or attempt.get("generation") != generation
+                or attempt.get("status") != "unavailable" or attempt.get("exit_code") != 3
+                or not isinstance(attempt.get("trusted_reason"), str) or not attempt.get("trusted_reason")
+                or not isinstance(event_id, str) or not event_id
+                or not isinstance(start_event_id, str) or not start_event_id):
+            raise ValueError("attempt record does not describe one trusted exit-3 outcome")
+        if not exact_ref(attempt_ref, attempt_rel, selected, generation, attempt_id, sha,
+                         attempt_digest, attempt_size, event_id):
+            raise ValueError("traceability attempt reference does not match attempt bytes and event")
+
+        state = json_doc(f"09-test-evidence/reviewer-state.{selected}.json")
+        expected_counter = int(attempt_id.rsplit("a", 1)[1])
+        if (state.get("schema_version") != 1 or state.get("provider") != selected
+                or state.get("candidate_sha") != sha or state.get("generation") != generation
+                or state.get("attempt_id") != attempt_id or state.get("last_attempt") != expected_counter):
+            raise ValueError("current reviewer state does not project the exact attempt")
+
+        events = []
+        for number, line in enumerate(raw("run.jsonl").decode("utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError(f"ledger line {number} is not an object")
+            events.append(item)
+        starts = [e for e in events if e.get("event_id") == start_event_id]
+        outcomes = [e for e in events if e.get("event_id") == event_id]
+        if len(starts) != 1 or len(outcomes) != 1:
+            raise ValueError("attempt start/outcome event id is missing or duplicated")
+        start = starts[0]
+        outcome = outcomes[0]
+        common = lambda event: (
+            event.get("run_id") == run_id and event.get("provider") == selected
+            and str(event.get("generation")) == str(generation) and event.get("sha") == sha
+            and event.get("attempt") == attempt_rel and event.get("attempt_id") == attempt_id
+        )
+        if start.get("event") != "reviewer_attempt_started" or not common(start):
+            raise ValueError("attempt start event is not the exact target-ledger start")
+        if (outcome.get("event") != "reviewer_unavailable" or not common(outcome)
+                or str(outcome.get("exit_code")) != "3"
+                or outcome.get("reason") != attempt.get("trusted_reason")
+                or outcome.get("sha256") != attempt_digest
+                or str(outcome.get("bytes")) != str(attempt_size)):
+            raise ValueError("attempt outcome is not the exact digest-bound exit-3 event")
+        terminal_names = {"reviewer_approve", "reviewer_block", "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable"}
+        current_terminals = [e for e in events if e.get("event") in terminal_names
+                             and e.get("provider") == selected and e.get("sha") == sha
+                             and str(e.get("generation")) == str(generation)]
+        if len(current_terminals) != 1 or current_terminals[0].get("event_id") != event_id:
+            raise ValueError("selected provider has zero, duplicate, or competing terminal outcomes")
+        nonselected_events = [e for e in events
+                              if e.get("event") in terminal_names | {"reviewer_attempt_started"}
+                              and e.get("provider") == nonselected and e.get("sha") == sha
+                              and str(e.get("generation")) == str(generation)]
+        if nonselected_events:
+            raise ValueError("nonselected provider has a current-generation reviewer event")
+
+        attempts_root = os.path.join(led, "09-test-evidence", "reviewer-attempts")
+        selected_dirs = []
+        nonselected_dirs = []
+        for entry in os.scandir(attempts_root):
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                raise ValueError("reviewer-attempts contains an unsafe entry")
+            if entry.name.startswith(f"{selected}-c{generation}-a"):
+                selected_dirs.append(entry.name)
+            if entry.name.startswith(f"{nonselected}-c{generation}-a"):
+                nonselected_dirs.append(entry.name)
+        if selected_dirs != [attempt_id] or nonselected_dirs:
+            raise ValueError("current generation does not contain exactly one selected attempt and zero nonselected attempts")
+        for provider in (selected, nonselected):
+            if os.path.lexists(os.path.join(led, f"08-qa-verdict.{provider}.json")):
+                raise ValueError(f"unexpected provider-suffixed verdict exists for {provider}")
+        if os.path.lexists(os.path.join(led, f"09-test-evidence/reviewer-state.{nonselected}.json")):
+            raise ValueError("nonselected reviewer state exists")
+
+        capture = json_doc("09-test-evidence/final-qa-unavailable.json")
+        if (capture.get("schema_version") != 1 or capture.get("run_id") != run_id
+                or capture.get("candidate_sha") != sha or capture.get("generation") != generation
+                or capture.get("provider") != selected or capture.get("attempt_id") != attempt_id
+                or set(capture) != {"schema_version", "run_id", "candidate_sha", "generation", "provider", "attempt_id", "before", "after"}):
+            raise ValueError("final-check capture identity is mismatched")
+        for label, expected_rel in (
+                ("before", "09-test-evidence/final-qa-before-unavailable.txt"),
+                ("after", "09-test-evidence/final-qa-after-unavailable.txt")):
+            item = capture.get(label)
+            if not isinstance(item, dict) or set(item) != {"argv", "exit_code", "output"}:
+                raise ValueError(f"final-check {label} capture is malformed")
+            expected_run_arg = f".agent-firm/runs/{run_id}"
+            if item.get("argv") != ["firm-final-qa-check", expected_run_arg]:
+                raise ValueError(f"final-check {label} argv is not canonical")
+            output = item.get("output")
+            payload = raw(expected_rel)
+            if (not isinstance(output, dict) or set(output) != {"path", "sha256", "bytes"}
+                    or output.get("path") != expected_rel
+                    or output.get("sha256") != hashlib.sha256(payload).hexdigest()
+                    or output.get("bytes") != len(payload)):
+                raise ValueError(f"final-check {label} output reference is not digest-bound")
+            if label == "before":
+                if item.get("exit_code") != 1:
+                    raise ValueError("before final-check exit must be the exact blocking exit 1")
+                if b"BLOCK" not in payload:
+                    raise ValueError("before final-check output does not contain BLOCK")
+            elif item.get("exit_code") != 0 or b"FINAL QA: PASS" not in payload:
+                raise ValueError("after final-check capture is not an exact pass")
+        final_checker = os.path.join(selfdir, "firm-final-qa-check")
+        if not os.path.isfile(final_checker) or os.path.islink(final_checker) or not os.access(final_checker, os.X_OK):
+            raise ValueError("sibling firm-final-qa-check is missing, linked, or not executable")
+        current_final = subprocess.run([final_checker, led], cwd=repo, capture_output=True)
+        if current_final.returncode != capture["after"]["exit_code"]:
+            raise ValueError(f"captured final-check exit does not match current exit {current_final.returncode}")
+        return True, f"{orientation}-primary/{selected} attempt={attempt_id} sha={sha} generation={generation} final_rc=0"
+    except Exception as exc:
+        return False, _one_line_ascii(f"{type(exc).__name__}: {exc}")
 
 fails = []
 def check(name, ok, detail=""):
@@ -509,6 +740,16 @@ for a in asserts:
             check("qa_checkout_clean", False, f"CANNOT VERIFY (fail-closed): {msg}")
         else:
             check("qa_checkout_clean", (r.returncode == 0) == want, msg)
+    elif k == "trusted_unavailability_chain":
+        want = (v.lower() == "true")
+        status, detail = trusted_unavailability_chain()
+        # False is not an assertion mode for this positive trust chain: permitting callers to invert
+        # any parse/correlation failure would turn "could not verify" into a successful eval.
+        if not want:
+            check("trusted_unavailability_chain", False,
+                  "false is unsupported; this is a positive fail-closed trust assertion")
+        else:
+            check("trusted_unavailability_chain", status, detail)
     else:
         check(f"unknown_assertion:{k}", False)
 

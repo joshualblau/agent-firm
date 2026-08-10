@@ -154,4 +154,163 @@ env PATH="$CLAUDE_STUB:/usr/bin:/bin" CLAUDE_ARGS="$CLAUDE_ARGS" FIRM_EVAL_MAX_T
   "$TURN_ROOT/bin/firm-run-evals" --provider claude gradual >/dev/null 2>&1 || true
 assert_output "native --max-turns is explicit" "--max-turns 3" cat "$CLAUDE_ARGS"
 
+# CR-11 deleted-regression axis inventory (predecessor -> retained R-E executable proof):
+#   selected/nonselected routing -> provider call-log identity for both orientations
+#   exactly one attempt/no retry -> nonzero provider call count remains exactly one
+#   wall timeout -> stalled Codex stub is killed and produces one call
+#   total-case cap -> two cases with cap one produce one provider call and a blocking result
+#   invalid bounds -> zero/negative/nonnumeric/excess for every bound, all pre-provider
+#   malformed/empty/prose result -> provider output is rejected before checker dispatch
+#   missing checker -> preflight blocks before provider dispatch
+#   checker crash/exit -> rc 1, rc 2, and unsupported rc are classified distinctly
+
+BEHAVIOR_ROOT="$W/behavior-root"; mk_root "$BEHAVIOR_ROOT"
+mk_eval "$BEHAVIOR_ROOT" bounded-one
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$BEHAVIOR_ROOT/agent-firm/evals/bounded-one/assertions.yaml"
+mv "$BEHAVIOR_ROOT/bin/firm-check-assertions" "$BEHAVIOR_ROOT/bin/firm-check-assertions-real"
+cat > "$BEHAVIOR_ROOT/bin/firm-check-assertions" <<'SH'
+#!/bin/sh
+printf 'checker\n' >> "$FIRM_CHECKER_CALLS"
+case "${FIRM_CHECKER_STUB_MODE:-real}" in
+  real) exec "$(dirname "$0")/firm-check-assertions-real" "$@" ;;
+  assertions-failed) echo 'stub assertions failed' >&2; exit 1 ;;
+  malformed) echo 'stub assertions malformed' >&2; exit 2 ;;
+  crash) echo 'stub checker crash' >&2; exit 7 ;;
+esac
+exit 8
+SH
+chmod +x "$BEHAVIOR_ROOT/bin/firm-check-assertions"
+
+BEHAVIOR_STUB="$W/behavior-stub"; mkdir "$BEHAVIOR_STUB"
+cat > "$BEHAVIOR_STUB/claude" <<'SH'
+#!/bin/sh
+printf 'claude %s\n' "$*" >> "$FIRM_PROVIDER_CALLS"
+case "${FIRM_PROVIDER_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 4 ;;
+  fail) exit 9 ;;
+  malformed) printf '{broken-json\n' ;;
+  empty) : ;;
+  prose) printf 'provider returned prose only\n' ;;
+  excess) printf '{"num_turns":99,"is_error":false}\n' ;;
+  *) printf '{"num_turns":1,"subtype":"success","is_error":false}\n' ;;
+esac
+SH
+cat > "$BEHAVIOR_STUB/codex" <<'SH'
+#!/bin/sh
+printf 'codex %s\n' "$*" >> "$FIRM_PROVIDER_CALLS"
+case "${FIRM_PROVIDER_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 4 ;;
+  fail) exit 9 ;;
+  malformed) printf '{broken-json\n' ;;
+  empty) : ;;
+  prose) printf 'provider returned prose only\n' ;;
+  excess) printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.started"}' '{"type":"turn.started"}' ;;
+  *) printf '{"type":"turn.started"}\n' ;;
+esac
+SH
+chmod +x "$BEHAVIOR_STUB/claude" "$BEHAVIOR_STUB/codex"
+BEHAVIOR_RUN="$BEHAVIOR_ROOT/bin/firm-run-evals"
+PROVIDER_CALLS="$W/behavior-provider-calls"
+CHECKER_CALLS="$W/behavior-checker-calls"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+
+behavior_run() { # mode timeout turns cases provider [eval]
+  env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+    FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_PROVIDER_STUB_MODE="$1" \
+    FIRM_CHECKER_STUB_MODE="${FIRM_CHECKER_TEST_MODE:-real}" \
+    FIRM_EVAL_TIMEOUT_SECONDS="$2" FIRM_EVAL_MAX_TURNS="$3" FIRM_EVAL_MAX_CASES="$4" \
+    FIRM_EVAL_KILL_GRACE=1 "$BEHAVIOR_RUN" --provider "$5" "${6:-bounded-one}"
+}
+
+t_case "behavioral provider selection excludes the nonselected provider"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "Claude selection succeeds" 0 behavior_run ok 3 2 2 claude
+assert_eq "Claude selected exactly once" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "Codex not selected" "0" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "Codex selection succeeds" 0 behavior_run ok 3 2 2 codex
+assert_eq "Codex selected exactly once" "1" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "Claude not selected" "0" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+
+t_case "provider failure and wall timeout permit exactly one attempt and no retry"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "provider nonzero blocks" 1 behavior_run fail 3 2 2 claude
+assert_eq "nonzero provider attempted once" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "checker not reached after provider failure" "0" "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "wall timeout blocks" 1 behavior_run timeout 1 2 2 codex
+assert_eq "timed-out provider attempted once" "1" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "checker not reached after timeout" "0" "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')"
+
+t_case "total-case cap blocks before a second provider attempt"
+mk_eval "$BEHAVIOR_ROOT" bounded-two
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$BEHAVIOR_ROOT/agent-firm/evals/bounded-two/assertions.yaml"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "one-case cap blocks a two-case run" 1 env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" \
+  FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" FIRM_CHECKER_CALLS="$CHECKER_CALLS" \
+  FIRM_PROVIDER_STUB_MODE=ok FIRM_CHECKER_STUB_MODE=real FIRM_EVAL_TIMEOUT_SECONDS=3 \
+  FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=1 FIRM_EVAL_KILL_GRACE=1 \
+  "$BEHAVIOR_RUN" --provider claude
+assert_eq "case cap allows exactly one provider invocation" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+
+t_case "zero, negative, nonnumeric, and excess bounds all fail before provider work"
+for spec in \
+  'FIRM_EVAL_TIMEOUT_SECONDS|0' 'FIRM_EVAL_TIMEOUT_SECONDS|-1' 'FIRM_EVAL_TIMEOUT_SECONDS|text' 'FIRM_EVAL_TIMEOUT_SECONDS|901' \
+  'FIRM_EVAL_MAX_TURNS|0' 'FIRM_EVAL_MAX_TURNS|-1' 'FIRM_EVAL_MAX_TURNS|text' 'FIRM_EVAL_MAX_TURNS|1001' \
+  'FIRM_EVAL_MAX_CASES|0' 'FIRM_EVAL_MAX_CASES|-1' 'FIRM_EVAL_MAX_CASES|text' 'FIRM_EVAL_MAX_CASES|9'; do
+  bound_name="${spec%%|*}"; bound_value="${spec#*|}"
+  : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+  env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+    FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 \
+    FIRM_EVAL_MAX_CASES=2 "$bound_name=$bound_value" \
+    "$BEHAVIOR_RUN" --provider claude bounded-one >/dev/null 2>&1
+  bound_rc=$?
+  if [ "$bound_rc" -eq 2 ] && [ ! -s "$PROVIDER_CALLS" ] && [ ! -s "$CHECKER_CALLS" ]; then
+    _t_ok "$bound_name=$bound_value rejected pre-provider"
+  else
+    _t_no "$bound_name=$bound_value rejected pre-provider" "rc=$bound_rc provider=$(wc -l < "$PROVIDER_CALLS") checker=$(wc -l < "$CHECKER_CALLS")"
+  fi
+done
+
+t_case "malformed, empty, and prose provider results fail before assertion dispatch"
+for provider in claude codex; do
+  for result_kind in malformed empty prose; do
+    : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+    behavior_run "$result_kind" 3 2 2 "$provider" >/dev/null 2>&1
+    result_rc=$?
+    if [ "$result_rc" -eq 1 ] && [ "$(grep -c "^$provider " "$PROVIDER_CALLS" | tr -d ' ')" = 1 ] \
+      && [ ! -s "$CHECKER_CALLS" ]; then
+      _t_ok "$provider $result_kind result propagated as failure"
+    else
+      _t_no "$provider $result_kind result propagated as failure" "rc=$result_rc calls=$(_t_ctx "$(cat "$PROVIDER_CALLS")")"
+    fi
+  done
+done
+
+t_case "missing, failing, malformed, and crashed checkers classify without retry"
+MISSING_ROOT="$W/missing-checker-root"; mk_root "$MISSING_ROOT"; mk_eval "$MISSING_ROOT" bounded-one
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$MISSING_ROOT/agent-firm/evals/bounded-one/assertions.yaml"
+rm "$MISSING_ROOT/bin/firm-check-assertions"
+: > "$PROVIDER_CALLS"
+assert_rc "missing checker blocks" 1 env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" \
+  FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 \
+  FIRM_EVAL_MAX_CASES=2 "$MISSING_ROOT/bin/firm-run-evals" --provider claude bounded-one
+assert_eq "missing checker blocks pre-provider" "0" "$(wc -l < "$PROVIDER_CALLS" | tr -d ' ')"
+for checker_case in 'assertions-failed|one or more assertions failed' \
+                    'malformed|malformed or unevaluable assertions' \
+                    'crash|crashed or returned unsupported rc=7'; do
+  checker_mode="${checker_case%%|*}"; checker_message="${checker_case#*|}"
+  : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+  FIRM_CHECKER_TEST_MODE="$checker_mode" behavior_run ok 3 2 2 claude > "$W/checker-$checker_mode.out" 2>&1
+  checker_run_rc=$?
+  if [ "$checker_run_rc" -eq 1 ] \
+    && grep -q "$checker_message" "$W/checker-$checker_mode.out" \
+    && [ "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')" = 1 ] \
+    && [ "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')" = 1 ]; then
+    _t_ok "$checker_mode checker rc classified after one provider attempt"
+  else
+    _t_no "$checker_mode checker rc classified after one provider attempt" "rc=$checker_run_rc output=$(_t_ctx "$(cat "$W/checker-$checker_mode.out")")"
+  fi
+done
+
 t_summary

@@ -46,7 +46,8 @@ while [ $# -gt 0 ]; do
       [ "$operation_seen" -eq 0 ] || { echo "firm-run-evals: choose only one of --structural or --list" >&2; exit 2; }
       mode=list; operation_seen=1; shift ;;
     --provider)
-      provider="${2:-}"; shift 2 || true
+      [ $# -ge 2 ] || { echo "firm-run-evals: --provider requires claude or codex" >&2; exit 2; }
+      provider="$2"; shift 2
       case "$provider" in claude|codex) ;; *) echo "firm-run-evals: --provider must be claude or codex" >&2; exit 2 ;; esac ;;
     -*) echo "firm-run-evals: unknown option '$1'" >&2; exit 2 ;;
     *) [ -z "$want" ] || { echo "firm-run-evals: only one eval name may be selected" >&2; exit 2; }; want="$1"; shift ;;
@@ -154,7 +155,8 @@ PY
 }
 
 run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
-  local d="$1" name="$2" provider_rc turns prompt
+  local d="$1" name="$2" provider_rc turns prompt checker_rc
+  [ -x "$CHECKER" ] || { echo "FAIL $name: missing executable firm-check-assertions at $CHECKER; provider phase not started" >&2; return 1; }
   command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
   [ -x "$BOUNDED" ] || { echo "FAIL $name: missing executable firm-bounded-exec" >&2; return 1; }
 
@@ -250,10 +252,16 @@ print("    envelope:", {k:d.get(k) for k in ("subtype","is_error","num_turns","s
 print("    permission_denials:", len(d.get("permission_denials") or []))
 PY
 
-  FIRM_EVAL_PROVIDER="$provider" "$SELF/firm-check-assertions" "$d/assertions.yaml" "$scratch" "$out/result.json"
-  local rc=$?
+  FIRM_EVAL_PROVIDER="$provider" "$CHECKER" "$d/assertions.yaml" "$scratch" "$out/result.json"
+  checker_rc=$?
   echo "    (scratch: $scratch — inspect .eval-out/ and .agent-firm/ on failure)"
-  return $rc
+  case "$checker_rc" in
+    0) return 0 ;;
+    1) echo "  (assertion checker completed: one or more assertions failed; no retry attempted)" >&2 ;;
+    2) echo "  (assertion checker rejected malformed or unevaluable assertions; no retry attempted)" >&2 ;;
+    *) echo "  (assertion checker crashed or returned unsupported rc=$checker_rc; no retry attempted)" >&2 ;;
+  esac
+  return 1
 }
 
 if [ "$mode" = "structural" ]; then

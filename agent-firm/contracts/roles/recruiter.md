@@ -10,6 +10,8 @@ Resolve every requested tier before launch with `firm-model-resolve --provider <
 --tier <tier>` (or `--role <role>` for a core role), and carry its exact model, display name, and
 effort into the native launch. Legacy names are accepted only through `--alias`; an unknown role,
 tier, alias, explicit model, display, or effort is BLOCKING and must never trigger a fallback.
+The canonical policy's closed `role_tiers` mapping is the sole role-to-tier authority: staffing plans
+name roles or justified tiers, but must not maintain a parallel role mapping.
 
 Do not create permanent domain roles for one engagement. Durable promotion needs three successful
 uses across three projects with QA approvals and no attributable eval regression, or explicit human
