@@ -77,6 +77,103 @@ t_case "template, role, exported production schema, and aggregator share one exa
 assert_ok "canonical artifact validates through the production schema and projection" \
   contract_check "$TEMPLATE" "$ROLE" "$WORKFLOW"
 
+cat > "$W/current-contract.js" <<'JS'
+const fs=require('fs')
+const source=fs.readFileSync(process.argv[2],'utf8')
+const sm=source.match(/export const REVIEW_SCHEMA = (\{[\s\S]*?\n\})\n\nexport const aggregateReviewArtifact/)
+if (!sm) throw new Error('exported REVIEW_SCHEMA not found')
+const REVIEW_SCHEMA=eval(`(${sm[1]})`)
+const am=source.match(/export const aggregateReviewArtifact = \(panel, taskSlug\) => \(\{[\s\S]*?\n\}\)/)
+if (!am) throw new Error('exported aggregateReviewArtifact not found')
+const aggregateReviewArtifact=eval(`(${am[0].replace('export const aggregateReviewArtifact = ','')})`)
+const input=JSON.parse(fs.readFileSync(0,'utf8'))
+process.stdout.write(JSON.stringify({schema:REVIEW_SCHEMA,aggregate:aggregateReviewArtifact(input.panel,input.task_slug)}))
+JS
+
+cat > "$W/current-artifact-check.py" <<'PY'
+import hashlib,json,pathlib,subprocess,sys,yaml,jsonschema
+run,workflow,helper=map(pathlib.Path,sys.argv[1:])
+expected={
+ '07-review-findings.R02.yaml':(26743,'99291f6d350d6157a7df1a948791cf4ef068e59ff95c61e8b92d73c9a33701de'),
+ '07-review-correctness.R02.yaml':(20442,'f9662ce9cdf7f8e5cf6bfe9a5aff9f3002b2b31d01e0e728cd94a71458192541'),
+ '07-review-security.R02.yaml':(10051,'2e3b0d476b07ecf9631da18fb59dea4263b3ca4c171706dc1d76955408442522'),
+ '07-review-compatibility.R02.yaml':(12854,'7ecb5b0dcd12019b13558192a0cfc285d6e2fe0795879a4299a3035e2d5cf351'),
+ '07-review-test-quality.R02.yaml':(15572,'c53693da2af59b897e2a65f1b42b81048114dbe790bb3b9fcaad0c0f8c25ada3'),
+}
+before={name:(run/name).read_bytes() for name in expected}
+for name,(size,sha) in expected.items():
+ data=before[name]
+ assert len(data)==size,(name,len(data),size)
+ assert hashlib.sha256(data).hexdigest()==sha,(name,hashlib.sha256(data).hexdigest(),sha)
+docs={name:yaml.safe_load(data) for name,data in before.items()}
+canonical=docs['07-review-findings.R02.yaml']
+sources=canonical['source_lenses']
+assert len(sources)==4 and len({entry['path'] for entry in sources})==4,sources
+assert canonical['synthesis_method']['raw_open_findings']==19
+required=['severity','confidence','location','issue','suggested_fix','status']
+panel=[]
+expected_flat=[]
+for source in sources:
+ name=source['path']; assert name in expected and name!='07-review-findings.R02.yaml',name
+ raw=before[name]
+ assert source['bytes']==len(raw) and source['sha256']==hashlib.sha256(raw).hexdigest(),source
+ doc=docs[name]
+ findings=doc.get('findings',doc.get('build_findings'))
+ assert isinstance(findings,list) and source['raw_open_findings']==sum(item.get('status')=='open' for item in findings),(name,source,findings)
+ projected=[]
+ for finding in findings:
+  item={field:finding[field] for field in required}
+  assert set(item)==set(required)
+  projected.append(item)
+ review={'lens':source['lens'],'verdict':doc['verdict'],'findings':projected}
+ panel.append(review)
+ expected_flat.extend([{'lens':source['lens'],**item} for item in projected])
+payload=json.dumps({'task_slug':canonical['task_slug'],'panel':panel},separators=(',',':'))
+done=subprocess.run(['node',str(helper),str(workflow)],input=payload,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+assert done.returncode==0,done.stderr
+runtime=json.loads(done.stdout); schema=runtime['schema']; aggregate=runtime['aggregate']
+for review in panel: jsonschema.validate(review,schema)
+expected_aggregate={
+ 'task_slug':canonical['task_slug'],
+ 'reviewers':[source['lens'] for source in sources],
+ 'findings':expected_flat,
+ 'verdict':canonical['verdict'],
+}
+assert canonical['verdict']=='changes_requested'
+assert aggregate==expected_aggregate,(aggregate,expected_aggregate)
+assert len(aggregate['findings'])==sum(len(review['findings']) for review in panel)==19
+after={name:(run/name).read_bytes() for name in expected}
+assert before==after,'current review input bytes changed during validation'
+print('CURRENT_R02_CONTRACT_PASS canonical=1 lenses=4 projected_findings=19 input_bytes_unchanged=yes')
+PY
+
+discover_current_r02_run() {
+  if [ -n "${FIRM_R02_REVIEW_RUN:-}" ]; then printf '%s\n' "$FIRM_R02_REVIEW_RUN"; return; fi
+  _common="$(git -C "$FIRM_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  case "$_common" in /*) : ;; *) _common="$FIRM_ROOT/$_common" ;; esac
+  _repo="$(cd "$(dirname "$_common")" 2>/dev/null && pwd)" || return 0
+  _found=""
+  for _candidate in "$_repo"/.agent-firm/runs/*; do
+    [ -f "$_candidate/07-review-findings.R02.yaml" ] || continue
+    _sha="$(shasum -a 256 "$_candidate/07-review-findings.R02.yaml" | awk '{print $1}')"
+    [ "$_sha" = 99291f6d350d6157a7df1a948791cf4ef068e59ff95c61e8b92d73c9a33701de ] || continue
+    [ -z "$_found" ] || return 1
+    _found="$_candidate"
+  done
+  printf '%s\n' "$_found"
+}
+
+t_case "current canonical aggregate and all four current R-02 lenses use the production contract"
+CURRENT_R02_RUN="$(discover_current_r02_run)"; current_discovery_rc=$?
+if [ "$current_discovery_rc" -ne 0 ]; then
+  _t_no "exactly one current R-02 input set is discoverable" "multiple digest-matching runs"
+elif [ -n "$CURRENT_R02_RUN" ]; then
+  assert_ok "actual current inputs bind, validate, aggregate losslessly, and remain byte-identical" \
+    python3 "$W/current-artifact-check.py" "$CURRENT_R02_RUN" "$WORKFLOW" "$W/current-contract.js"
+else
+  _t_ok "portable checkout has no current R-02 run; no synthetic artifact was substituted (set FIRM_R02_REVIEW_RUN for engagement proof)"
+fi
+
 t_case "real schema inner requirements, strictness, every enum, and projection are mutation-sensitive"
 python3 - "$WORKFLOW" "$W" <<'PY'
 import pathlib,sys
@@ -122,16 +219,56 @@ cat > "$W/workflow-harness.js" <<'JS'
 const fs=require('fs')
 const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor
 const source=fs.readFileSync(process.argv[2],'utf8').replaceAll('export const ','const ')
-async function run(track,blocked) {
-  const state={phases:[],qa:0}
-  const args={run_dir:'.agent-firm/runs/fixture',task_slug:'fixture',track,work_orders:[{id:'wo1',brief:'fixture'}],review_lenses:['correctness','security_privacy']}
+const implementation=(id,result='green')=>({work_order:id,branch:`wt/${id}`,files_changed:[],tests_added:[],test_result:result,summary:'ok'})
+const integration=(result='green')=>({status:result,branch:'integration/fixture',conflicts_resolved:[],test_result:result,summary:'ok'})
+const review=(lens,verdict='approved')=>({lens,verdict,findings:verdict==='approved'?[]:[{severity:'medium',confidence:'high',location:'x:1',issue:'change',suggested_fix:'fix',status:'open'}]})
+async function run(track,scenario='clean',single=false) {
+  const state={phases:[],build:0,integrate:0,review:0,qa:0}
+  const work_orders=single?[{id:'wo1',brief:'fixture'}]:[{id:'wo1',brief:'fixture'},{id:'wo2',brief:'fixture'}]
+  const args={run_dir:'.agent-firm/runs/fixture',task_slug:'fixture',track,work_orders,review_lenses:['correctness','security_privacy']}
+  if (scenario==='build-empty') args.work_orders=[]
+  if (scenario==='review-empty-input') args.review_lenses=[]
+  if (scenario==='review-duplicate-input') args.review_lenses=['correctness','correctness']
   const phase=x=>state.phases.push(x)
   const log=()=>{}
-  const parallel=tasks=>Promise.all(tasks.map(task=>task()))
+  const parallel=async tasks=>{
+    const results=await Promise.all(tasks.map(task=>task()))
+    if (scenario==='review-duplicate' && state.phases[state.phases.length-1]==='Review') return [...results,results[0]]
+    return results
+  }
   const agent=async (_prompt,options)=>{
-    if (options.agentType==='implementer') return {work_order:'wo1',branch:'wt/x',files_changed:[],tests_added:[],test_result:'green',summary:'ok'}
-    if (options.agentType==='integrator') return {status:'green'}
-    if (options.agentType==='reviewer') return {lens:options.label.slice(7),verdict:blocked?'changes_requested':'approved',findings:blocked?[{severity:'high',confidence:'high',location:'x:1',issue:'block',suggested_fix:'fix',status:'open'}]:[]}
+    if (options.agentType==='implementer') {
+      const index=state.build++
+      const id=options.label.slice(6)
+      if (scenario==='build-rejected') throw new Error('fixture rejection')
+      if (scenario==='build-null' || (scenario==='build-partial' && index===1)) return null
+      if (scenario==='build-malformed') return {work_order:id,test_result:'green'}
+      if (scenario==='build-duplicate' && index===1) return implementation('wo1')
+      if (scenario==='build-mismatch') return implementation(`wrong-${id}`)
+      if (scenario==='build-red') return implementation(id,'red')
+      if (scenario==='build-blocked') return implementation(id,'blocked')
+      return implementation(id)
+    }
+    if (options.agentType==='integrator') {
+      state.integrate+=1
+      if (scenario==='integration-rejected') throw new Error('fixture rejection')
+      if (scenario==='integration-null') return null
+      if (scenario==='integration-malformed') return {status:'green'}
+      if (scenario==='integration-red') return integration('red')
+      if (scenario==='integration-blocked') return integration('blocked')
+      return integration()
+    }
+    if (options.agentType==='reviewer') {
+      const index=state.review++
+      const lens=options.label.slice(7)
+      if (scenario==='review-rejected') throw new Error('fixture rejection')
+      if (scenario==='review-null' || (scenario==='review-partial' && (track==='fast_path' || index===1))) return null
+      if (scenario==='review-malformed') return {lens,verdict:'approved'}
+      if (scenario==='review-duplicate' && index===1) return review('correctness')
+      if (scenario==='review-mismatch') return review(`wrong-${lens}`)
+      if (scenario==='review-changes') return review(lens,'changes_requested')
+      return review(lens)
+    }
     if (options.agentType==='qa-tester') { state.qa+=1; return {verdict:'APPROVE'} }
     throw new Error(options.agentType)
   }
@@ -140,16 +277,34 @@ async function run(track,blocked) {
 }
 (async()=>{
   for (const track of ['full_track','fast_path']) {
-    const blocked=await run(track,true)
-    if (blocked.result.status!=='review_blocked' || blocked.result.qa!==null || blocked.state.qa!==0 || blocked.state.phases.includes('Test')) throw new Error(JSON.stringify({track,blocked}))
-    const clean=await run(track,false)
+    for (const scenario of ['build-empty','build-rejected','build-null','build-partial','build-malformed','build-duplicate','build-mismatch','build-red','build-blocked']) {
+      const blocked=await run(track,scenario)
+      if (blocked.result.status!=='build_blocked' || blocked.result.failed_stage!=='Build' || blocked.result.qa!==null || blocked.state.integrate!==0 || blocked.state.review!==0 || blocked.state.qa!==0 || blocked.state.phases.includes('Test')) throw new Error(JSON.stringify({track,scenario,blocked}))
+    }
+    for (const scenario of ['integration-rejected','integration-null','integration-malformed','integration-red','integration-blocked']) {
+      const blocked=await run(track,scenario)
+      if (blocked.result.status!=='integration_blocked' || blocked.result.failed_stage!=='Integrate' || blocked.result.qa!==null || blocked.state.review!==0 || blocked.state.qa!==0 || blocked.state.phases.includes('Test')) throw new Error(JSON.stringify({track,scenario,blocked}))
+    }
+    for (const scenario of ['review-rejected','review-null','review-partial','review-malformed','review-duplicate','review-mismatch','review-changes']) {
+      const blocked=await run(track,scenario)
+      if (blocked.result.status!=='review_blocked' || blocked.result.failed_stage!=='Review' || blocked.result.qa!==null || blocked.state.qa!==0 || blocked.state.phases.includes('Test')) throw new Error(JSON.stringify({track,scenario,blocked}))
+    }
+    const clean=await run(track)
     if (clean.result.status!=='qa_complete' || clean.state.qa!==1 || clean.state.phases.filter(x=>x==='Test').length!==1) throw new Error(JSON.stringify({track,clean}))
   }
+  for (const scenario of ['review-empty-input','review-duplicate-input']) {
+    const blocked=await run('full_track',scenario)
+    if (blocked.result.status!=='build_blocked' || blocked.result.qa!==null || blocked.state.build!==0 || blocked.state.qa!==0) throw new Error(JSON.stringify({scenario,blocked}))
+  }
+  const fastSingle=await run('fast_path','clean',true)
+  if (fastSingle.result.status!=='qa_complete' || fastSingle.state.integrate!==0 || fastSingle.state.qa!==1) throw new Error(JSON.stringify({fastSingle}))
+  const fullSingle=await run('full_track','clean',true)
+  if (fullSingle.result.status!=='qa_complete' || fullSingle.state.integrate!==1 || fullSingle.state.qa!==1) throw new Error(JSON.stringify({fullSingle}))
 })().catch(error=>{console.error(error);process.exit(1)})
 JS
 
-t_case "full_track and fast_path stop before QA on review blockers, then clean runs launch QA once"
-assert_ok "mocked production workflow enforces the Review-to-Test boundary in both tracks" \
+t_case "full_track and fast_path require exact green Build, required Integrator, and Review panels"
+assert_ok "null/rejected/red/blocked/duplicate/malformed/partial/empty stage states never enter Test" \
   node "$W/workflow-harness.js" "$WORKFLOW"
 
 t_summary

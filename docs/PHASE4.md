@@ -22,9 +22,10 @@ propagate to both provider caches through the joint bootstrap/refresh flow.
 - `.claude-plugin/plugin.json` — the `agent-firm` plugin manifest (carries the `version`).
 - `.agents/plugins/marketplace.json` and `.codex-plugin/plugin.json` — expose the same root to Codex as
   `agent-firm@agent-firm-local`; the manifest selects `codex-skills/`.
-- **Provider adapters:** Claude loads `agents/`, `commands/start.md`, and `hooks/claude.json`; Codex
-  loads `codex-skills/start/SKILL.md` and the default `hooks/hooks.json`. Both hook adapters call the
-  same `firm-ledger-hook` and `firm-merge-guard` binaries.
+- **Provider adapters:** Claude's manifest declares `agents/`, `commands/start.md`, and
+  `hooks/claude.json`; the Codex marketplace/manifest declare `codex-skills/start/SKILL.md`, with
+  `hooks/hooks.json` as the repository's default hook adapter. Both declared hook adapters call the
+  same `firm-ledger-hook` and `firm-merge-guard` binaries; real runtime selection remains Q-02.
 - **Shared components:** `agent-firm/contracts/` owns lifecycle and role bodies; `bin/` owns the
   provider-neutral tools. The retired root `CLAUDE.md` is not a runtime manual.
 - **What a plugin can't ship:** project permission/configuration state. `firm-install` merges Claude's
@@ -52,10 +53,11 @@ Codex `$agent-firm:start <goal>`.
    restarted/reloaded Claude session.
 
 Every project that updates picks up the change. Project-specific tweaks stay in that project's
-`.claude/` or `.codex/` and never propagate. Exactly one plugin hook source serves each runtime;
-tracked `.claude/settings.json` owns permissions, not hooks. Obsolete Claude settings hook blocks and
-the project `.codex/hooks.json` prototype must be reviewed and removed manually only when they
-duplicate the plugin commands; automation preserves unrelated configuration and never deletes them.
+`.claude/` or `.codex/` and never propagate. Repository manifests declare exactly one plugin hook
+adapter per runtime; they do not prove which source a real loader selects. Tracked
+`.claude/settings.json` owns permissions, not hooks. Obsolete Claude settings hook blocks and the
+project `.codex/hooks.json` prototype must be reviewed and removed manually only when they duplicate
+the plugin commands; automation preserves unrelated configuration and never deletes them.
 
 ## Per-project version pinning
 Plugins install at user scope by default (one version everywhere). To pin a project to a specific
@@ -72,9 +74,11 @@ in-flight engagement can't be blindsided by a firm change until you choose to bu
 - Joint capability/schema/state preflight failure invokes neither provider installer; fresh install,
   repeat refresh, every provider-mutation failure, and every compensation failure are exercised under
   disposable stubs. These fixture results do not replace a gated real-loader/cache cycle.
-- Explicit disposable loader-selection fixtures select plugin/project/user sources while sharing
-  guarded binaries; they measure three event pairs with two legacy duplicates and one after cleanup.
-  This is fixture-selection evidence only, not proof of a real provider loader.
+- Explicit disposable selection fixtures model only the scopes diagnosed by doctor while sharing
+  guarded binaries: Claude plugin+project+user produces three event pairs, and Codex
+  plugin+obsolete-project produces two; each returns to one after fixture cleanup. Repository
+  manifests merely declare the adapters. Runtime loader selection and supported external scopes are
+  unverified until Q-02; fixture counts are not proof of a real provider loader.
 - `firm-install` remains idempotent and preserves existing project settings except for its explicit,
   backed-up `--migrate` operation.
 

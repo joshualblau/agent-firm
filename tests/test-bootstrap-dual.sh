@@ -52,6 +52,7 @@ esac
 
 if [ "${STUB_FAIL_COMPENSATION:-}" = "$action" ]; then exit 12; fi
 if [ "${STUB_FAIL_BEFORE_ACTION:-}" = "$action" ]; then exit 9; fi
+if [ "${STUB_NO_WRITE_ACTION:-}" = "$action" ]; then exit 0; fi
 
 case "$action" in
   claude:marketplace-add) printf '%s marketplace=local\n' "$STUB_ROOT" > "$market" ;;
@@ -79,6 +80,7 @@ run_boot() {
     STUB_CLAUDE_VERSION="$CLAUDE_VERSION" STUB_CODEX_VERSION="$CODEX_VERSION" \
     STUB_FAIL_ACTION="${STUB_FAIL_ACTION:-}" STUB_FAIL_COMPENSATION="${STUB_FAIL_COMPENSATION:-}" \
     STUB_FAIL_BEFORE_ACTION="${STUB_FAIL_BEFORE_ACTION:-}" \
+    STUB_NO_WRITE_ACTION="${STUB_NO_WRITE_ACTION:-}" \
     STUB_FAIL_LIST="${STUB_FAIL_LIST:-}" STUB_OMIT_TOKEN="${STUB_OMIT_TOKEN:-}" STUB_HANG="${STUB_HANG:-}" \
     FIRM_BOOTSTRAP_TIMEOUT="${FIRM_BOOTSTRAP_TIMEOUT:-5}" FIRM_BOOTSTRAP_RECOVERY_DIR="$RECOVERY" \
     FIRM_SKIP_LINK=1 "$BOOT"
@@ -87,9 +89,15 @@ run_boot() {
 reset_fixture() { rm -f "$STATE"/* "$RECOVERY"/* "$LOG"; : > "$LOG"; }
 seed_existing() {
   printf '%s marketplace=local\n' "$FIRM_ROOT" > "$STATE/claude-market"
-  printf 'agent-firm@local version=old\n' > "$STATE/claude-plugin"
+  printf 'agent-firm@local version=0.7.0\n' > "$STATE/claude-plugin"
   printf 'marketplace=agent-firm-local path=%s\n' "$FIRM_ROOT" > "$STATE/codex-market"
-  printf 'agent-firm@agent-firm-local version=old\n' > "$STATE/codex-plugin"
+  printf 'agent-firm@agent-firm-local version=0.7.0\n' > "$STATE/codex-plugin"
+}
+seed_exact() {
+  printf '%s marketplace=local\n' "$FIRM_ROOT" > "$STATE/claude-market"
+  printf 'agent-firm@local version=%s\n' "$CLAUDE_VERSION" > "$STATE/claude-plugin"
+  printf 'marketplace=agent-firm-local path=%s\n' "$FIRM_ROOT" > "$STATE/codex-market"
+  printf 'agent-firm@agent-firm-local version=%s\n' "$CODEX_VERSION" > "$STATE/codex-plugin"
 }
 provider_mutations() { grep -E 'plugin marketplace (add|remove)|plugin (install|update|uninstall|add|remove)' "$LOG" || true; }
 recovery_file() { find "$RECOVERY" -type f -name 'bootstrap-*.json' | head -1; }
@@ -133,6 +141,89 @@ assert_rc "wrong Codex marketplace selector/schema is rejected" 1 env PATH="$STU
   STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$BADROOT" STUB_CLAUDE_VERSION="$CLAUDE_VERSION" \
   STUB_CODEX_VERSION="$CODEX_VERSION" FIRM_SKIP_LINK=1 "$BADROOT/bin/firm-bootstrap"
 assert_eq "schema mismatch invokes no provider mutation" "" "$(provider_mutations)"
+
+t_case "provider output parsing rejects duplicates, collisions, case drift, and unparsable targets before mutation"
+run_rejected_state() {
+  _file="$1"; _payload="$2"
+  reset_fixture; seed_exact; printf '%b' "$_payload" > "$STATE/$_file"
+  run_boot
+}
+for spec in \
+  "claude-market|$FIRM_ROOT marketplace=local\\n$FIRM_ROOT marketplace=local\\n|duplicate exact Claude marketplace" \
+  "claude-market|$FIRM_ROOT marketplace=LOCAL\\n|case-drifted Claude selector" \
+  "claude-market|$FIRM_ROOT-copy marketplace=local\\n|suffix-collision Claude root" \
+  "claude-market|$FIRM_ROOT marketplace local\\n|unparsable Claude target" \
+  "claude-plugin|agent-firm@local version=$CLAUDE_VERSION\\nagent-firm@local version=$CLAUDE_VERSION\\n|duplicate exact Claude plugin" \
+  "claude-plugin|Agent-Firm@local version=$CLAUDE_VERSION\\n|case-drifted Claude plugin" \
+  "claude-plugin|agent-firm@local-extra version=$CLAUDE_VERSION\\n|suffix-collision Claude plugin" \
+  "claude-plugin|agent-firm@local version=not-semver\\n|unparsable Claude version" \
+  "codex-market|marketplace=agent-firm-local path=$FIRM_ROOT\\nmarketplace=agent-firm-local path=$FIRM_ROOT\\n|duplicate exact Codex marketplace" \
+  "codex-market|marketplace=AGENT-FIRM-LOCAL path=$FIRM_ROOT\\n|case-drifted Codex selector" \
+  "codex-market|marketplace=agent-firm-local path=$FIRM_ROOT-copy\\n|suffix-collision Codex root" \
+  "codex-market|marketplace agent-firm-local path=$FIRM_ROOT\\n|unparsable Codex target" \
+  "codex-plugin|agent-firm@agent-firm-local version=$CODEX_VERSION\\nagent-firm@agent-firm-local version=$CODEX_VERSION\\n|duplicate exact Codex plugin" \
+  "codex-plugin|Agent-Firm@agent-firm-local version=$CODEX_VERSION\\n|case-drifted Codex plugin" \
+  "codex-plugin|agent-firm@agent-firm-local-extra version=$CODEX_VERSION\\n|suffix-collision Codex plugin" \
+  "codex-plugin|agent-firm@agent-firm-local version=not-semver\\n|unparsable Codex version"
+do
+  _file="${spec%%|*}"; _rest="${spec#*|}"; _payload="${_rest%%|*}"; _desc="${_rest#*|}"
+  assert_rc "$_desc fails closed" 1 run_rejected_state "$_file" "$_payload"
+  assert_eq "$_desc causes no provider mutation" "" "$(provider_mutations)"
+done
+
+t_case "zero post-state and full SemVer lookalikes never satisfy exact success"
+for provider in claude codex; do
+  reset_fixture
+  if [ "$provider" = claude ]; then action=claude:marketplace-add; else action=codex:marketplace-add; fi
+  STUB_NO_WRITE_ACTION="$action" assert_rc "$provider zero marketplace post-state blocks" 1 run_boot
+  for wrong in 10.8.0 0.8.0-rc.1; do
+    reset_fixture; seed_exact
+    if [ "$provider" = claude ]; then
+      printf 'agent-firm@local version=%s\n' "$wrong" > "$STATE/claude-plugin"
+      action=claude:plugin-update
+    else
+      printf 'agent-firm@agent-firm-local version=%s\n' "$wrong" > "$STATE/codex-plugin"
+      action=codex:plugin-add
+    fi
+    STUB_NO_WRITE_ACTION="$action" assert_rc "$provider $wrong cannot satisfy exact $provider version" 1 run_boot
+  done
+done
+
+CACHE_ROOT="$WORK/cache-root"
+mkdir -p "$CACHE_ROOT/bin" "$CACHE_ROOT/.claude-plugin" "$CACHE_ROOT/.codex-plugin" "$CACHE_ROOT/.agents/plugins"
+cp "$BOOT" "$CACHE_ROOT/bin/firm-bootstrap"; cp "$BIN/firm-bounded-exec" "$CACHE_ROOT/bin/firm-bounded-exec"
+cp "$BIN/firm-version" "$CACHE_ROOT/bin/firm-version"; cp "$FIRM_ROOT/VERSION" "$CACHE_ROOT/VERSION"
+cp "$FIRM_ROOT/.claude-plugin/plugin.json" "$CACHE_ROOT/.claude-plugin/plugin.json"
+cp "$FIRM_ROOT/.codex-plugin/plugin.json" "$CACHE_ROOT/.codex-plugin/plugin.json"
+cp "$FIRM_ROOT/.claude-plugin/marketplace.json" "$CACHE_ROOT/.claude-plugin/marketplace.json"
+cp "$FIRM_ROOT/.agents/plugins/marketplace.json" "$CACHE_ROOT/.agents/plugins/marketplace.json"
+python3 - "$CACHE_ROOT" <<'PY'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+for provider,rel in [('claude','.claude-plugin/plugin.json'),('codex','.codex-plugin/plugin.json')]:
+ p=root/rel; d=json.loads(p.read_text()); d['version']=f"0.8.0+{provider}.fresh"; p.write_text(json.dumps(d,indent=2)+"\n")
+PY
+CACHE_CLAUDE_VERSION=0.8.0+claude.fresh
+CACHE_CODEX_VERSION=0.8.0+codex.fresh
+run_cache_boot() {
+  env PATH="$STUB:/usr/bin:/bin" STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$CACHE_ROOT" \
+    STUB_CLAUDE_VERSION="$CACHE_CLAUDE_VERSION" STUB_CODEX_VERSION="$CACHE_CODEX_VERSION" \
+    STUB_NO_WRITE_ACTION="${STUB_NO_WRITE_ACTION:-}" FIRM_BOOTSTRAP_RECOVERY_DIR="$RECOVERY" \
+    FIRM_SKIP_LINK=1 "$CACHE_ROOT/bin/firm-bootstrap"
+}
+for provider in claude codex; do
+  reset_fixture
+  printf '%s marketplace=local\n' "$CACHE_ROOT" > "$STATE/claude-market"
+  printf 'marketplace=agent-firm-local path=%s\n' "$CACHE_ROOT" > "$STATE/codex-market"
+  printf 'agent-firm@local version=%s\n' "$CACHE_CLAUDE_VERSION" > "$STATE/claude-plugin"
+  printf 'agent-firm@agent-firm-local version=%s\n' "$CACHE_CODEX_VERSION" > "$STATE/codex-plugin"
+  if [ "$provider" = claude ]; then
+    printf 'agent-firm@local version=0.8.0\n' > "$STATE/claude-plugin"; action=claude:plugin-update
+  else
+    printf 'agent-firm@agent-firm-local version=0.8.0\n' > "$STATE/codex-plugin"; action=codex:plugin-add
+  fi
+  STUB_NO_WRITE_ACTION="$action" assert_rc "$provider stale provider cachebuster cannot satisfy exact success" 1 run_cache_boot
+done
 
 t_case "fresh install, exact version verification, and idempotent repeat refresh"
 reset_fixture
@@ -178,7 +269,7 @@ reset_fixture; seed_existing
 STUB_FAIL_BEFORE_ACTION=claude:plugin-update assert_rc "early failed Claude update blocks" 1 run_boot
 assert_eq "early failure invokes Claude update exactly once" "1" \
   "$(grep -c '^claude plugin update agent-firm@local$' "$LOG" | tr -d ' ')"
-assert_output "early failure leaves observed bytes old" "version=old" cat "$STATE/claude-plugin"
+assert_output "early failure leaves observed bytes old" "version=0.7.0" cat "$STATE/claude-plugin"
 rf="$(recovery_file)"
 assert_eq "early failure recovery record is private" 600 \
   "$(stat -f '%Lp' "$rf" 2>/dev/null || stat -c '%a' "$rf")"

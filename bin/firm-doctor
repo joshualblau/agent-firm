@@ -417,44 +417,86 @@ if [ -x "$SELF/firm-version" ]; then
   if "$SELF/firm-version" --check >/dev/null 2>&1; then pass "Claude and Codex plugin manifest base versions match"
   else fail "plugin manifest versions drifted — run 'firm-version --check' for details"; fi
 fi
-if command -v claude >/dev/null 2>&1; then
+
+resolve_reviewer_tuple() {
+  _provider="$1"; _override_set="$2"; _override="$3"
+  _resolver_args=(--provider "$_provider" --role reviewer --format json)
+  if [ "$_override_set" = x ]; then _resolver_args+=(--expect-model "$_override"); fi
+  _resolved="$($SELF/firm-model-resolve "${_resolver_args[@]}" 2>&1)"; _resolved_rc=$?
+  [ "$_resolved_rc" -eq 0 ] || { printf '%s\n' "$_resolved" >&2; return "$_resolved_rc"; }
+  printf '%s' "$_resolved" | python3 -c '
+import json,sys
+provider=sys.argv[1]; d=json.load(sys.stdin)
+assert set(d)=={"provider","selected_by","selector","tier","model","display","effort","policy_sha256"}
+assert d["provider"]==provider and d["selected_by"]=="role" and d["selector"]=="reviewer"
+assert d["tier"]=="heavyweight" and d["effort"]=="xhigh"
+for field in ("model","display","effort"):
+ value=d[field]; assert isinstance(value,str) and value and not any(ord(ch)<32 for ch in value)
+print("\t".join((d["model"],d["display"],d["effort"])))
+' "$_provider"
+}
+
+MODEL_ENVELOPE_READY=1
+_claude_tuple="$(resolve_reviewer_tuple claude "${FIRM_CLAUDE_QA_MODEL+x}" "${FIRM_CLAUDE_QA_MODEL:-}")"; _claude_tuple_rc=$?
+if [ "$_claude_tuple_rc" -ne 0 ]; then
+  fail "canonical Claude reviewer envelope or FIRM_CLAUDE_QA_MODEL compatibility alias is invalid; no provider command ran"
+  MODEL_ENVELOPE_READY=0
+else
+  IFS=$'\t' read -r CLAUDE_REVIEW_MODEL CLAUDE_REVIEW_DISPLAY CLAUDE_REVIEW_EFFORT <<< "$_claude_tuple"
+fi
+_codex_tuple="$(resolve_reviewer_tuple codex "${FIRM_GPT_QA_MODEL+x}" "${FIRM_GPT_QA_MODEL:-}")"; _codex_tuple_rc=$?
+if [ "$_codex_tuple_rc" -ne 0 ]; then
+  fail "canonical Codex reviewer envelope or FIRM_GPT_QA_MODEL compatibility alias is invalid; no provider command ran"
+  MODEL_ENVELOPE_READY=0
+else
+  IFS=$'\t' read -r CODEX_REVIEW_MODEL CODEX_REVIEW_DISPLAY CODEX_REVIEW_EFFORT <<< "$_codex_tuple"
+fi
+
+if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v claude >/dev/null 2>&1; then
   pass "claude present — Claude-primary orchestration and firm-claude-qa are available"
   if run_capped 10 claude auth status >/dev/null 2>&1; then
     pass "Claude subscription authentication is ready"
     if [ "$PROBE" = 1 ]; then
-      if run_capped 45 claude -p "Reply with exactly: ok" --model "${FIRM_CLAUDE_QA_MODEL:-opus}" \
-        --effort xhigh --output-format text --permission-mode dontAsk --tools "" \
+      if run_capped 45 claude -p "Reply with exactly: ok" --model "$CLAUDE_REVIEW_MODEL" \
+        --effort "$CLAUDE_REVIEW_EFFORT" --output-format text --permission-mode dontAsk --tools "" \
         --no-session-persistence >/dev/null 2>&1; then
-        pass "Claude reviewer model ${FIRM_CLAUDE_QA_MODEL:-opus} completed a bounded no-tools probe"
+        pass "Claude reviewer $CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, effort $CLAUDE_REVIEW_EFFORT) completed a bounded no-tools probe"
       else
-        warn "Claude reviewer model ${FIRM_CLAUDE_QA_MODEL:-opus} failed its bounded probe — check model compatibility, quota, and login."
+        warn "Claude reviewer $CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, effort $CLAUDE_REVIEW_EFFORT) failed its bounded probe — check model compatibility, quota, and login."
       fi
     else
-      info "configured Claude reviewer model: ${FIRM_CLAUDE_QA_MODEL:-opus} (run firm-doctor --probe to verify it live)"
+      info "canonical Claude reviewer: display=$CLAUDE_REVIEW_DISPLAY model=$CLAUDE_REVIEW_MODEL effort=$CLAUDE_REVIEW_EFFORT (run firm-doctor --probe to verify it live)"
     fi
   else warn "Claude authentication is not ready — run 'claude auth' or the provider's login flow before using Claude staff/reviewer."; fi
+elif [ "$MODEL_ENVELOPE_READY" != 1 ]; then
+  info "Claude provider checks skipped because canonical reviewer-envelope validation failed first."
 else
   fail "claude not found — dual-provider Agent Firm installation is incomplete"
 fi
-if command -v codex >/dev/null 2>&1; then
+if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v codex >/dev/null 2>&1; then
   pass "codex present — Codex-primary orchestration and firm-gpt-qa are available"
   if run_capped 10 codex login status >/dev/null 2>&1; then
     pass "Codex ChatGPT subscription authentication is ready"
     if [ "$PROBE" = 1 ]; then
       if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
-        -m "${FIRM_GPT_QA_MODEL:-gpt-5.6-sol}" "Reply with exactly: ok" >/dev/null 2>&1; then
-        pass "GPT reviewer model ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} completed a bounded read-only probe"
+        -m "$CODEX_REVIEW_MODEL" -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" \
+        "Reply with exactly: ok" >/dev/null 2>&1; then
+        pass "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) completed a bounded read-only probe"
       else
-        warn "GPT reviewer model ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} failed its bounded probe — check model compatibility, quota, and login."
+        warn "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) failed its bounded probe — check model compatibility, quota, and login."
       fi
     else
-      info "configured GPT reviewer model: ${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} (run firm-doctor --probe to verify it live)"
+      info "canonical Codex reviewer: display=$CODEX_REVIEW_DISPLAY model=$CODEX_REVIEW_MODEL effort=$CODEX_REVIEW_EFFORT (run firm-doctor --probe to verify it live)"
     fi
   else warn "Codex authentication is not ready — run 'codex login' before using GPT staff/reviewer."; fi
+elif [ "$MODEL_ENVELOPE_READY" != 1 ]; then
+  info "Codex provider checks skipped because canonical reviewer-envelope validation failed first."
 else
   fail "codex not found — dual-provider Agent Firm installation is incomplete"
 fi
-info "reviewer models: GPT=${FIRM_GPT_QA_MODEL:-gpt-5.6-sol} · Claude=${FIRM_CLAUDE_QA_MODEL:-opus}"
+if [ "$MODEL_ENVELOPE_READY" = 1 ]; then
+  info "canonical reviewer models: GPT=$CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, $CODEX_REVIEW_EFFORT) · Claude=$CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, $CLAUDE_REVIEW_EFFORT)"
+fi
 
 section "9.5. Plugin hook ownership and legacy duplicates"
 FIRM_SOURCE_ROOT="$(cd "$SELF/.." && pwd)"
@@ -478,7 +520,7 @@ settings = json.load(open(os.path.join(root, ".claude", "settings.json")))
 assert "hooks" not in settings, "tracked project settings duplicate the Claude plugin hook source"
 PY
 then
-  pass "one plugin-owned ledger/merge-guard hook source is selected for each runtime; tracked settings contain no duplicate"
+  pass "repository manifests declare one plugin-owned ledger/merge-guard hook adapter per runtime; runtime loader selection is unverified until Q-02; tracked settings contain no duplicate"
 else
   fail "plugin hook ownership is ambiguous or malformed — reinstall/repair the package before running the firm"
   info "expected Claude hooks/claude.json, Codex hooks/hooks.json, and no tracked .claude/settings.json hook block."
@@ -519,8 +561,9 @@ if [ "$_project_settings" != "$_canonical_settings" ]; then
 fi
 check_legacy_claude_hooks "user" "$HOME/.claude/settings.json"
 
-# Codex loads hooks from every matching source. The old project prototype duplicates the plugin's
-# ledger hook and must be removed manually; bootstrap never overwrites project config.
+# The bounded repository model diagnoses only the obsolete project Codex prototype. Actual supported
+# Codex loader scopes and runtime selection remain unverified until Q-02; bootstrap never overwrites
+# project config.
 if [ -f .codex/hooks.json ]; then
   _codex_legacy_out="$(python3 - .codex/hooks.json <<'PY' 2>&1
 import json, sys
