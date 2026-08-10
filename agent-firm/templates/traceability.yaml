@@ -33,11 +33,12 @@ two_voice:
   required: true                # cross-check only; the final gate derives this value
 two_voice_diff: []
 # Example entry:
-# - secondary_blocker: "exact blocker text from the secondary verdict"
+# - secondary_blocker_id: "obj-exact-immutable-id"
+#   secondary_blocker: "exact blocker text from the secondary verdict"
 #   primary_position: "positive dissent with the evidence read differently"
 #   positive_dissent: true
-#   affected_criteria: [AC-001]
-#   affected_paths: [src/example]
+#   affected_criteria: [AC-001] # exact cross-check of the producer's blocker object
+#   affected_paths: [src/example] # exact cross-check; the gate derives risk from the producer object
 #   risk: low                   # cross-check only; the checker derives it, and ambiguity is high
 #   risk_reasons: [criterion:AC-001:functional]
 #   bounded_resolution: {attempted: true, rounds: 1, rerun: block, evidence: {path: 09-test-evidence/round.json, candidate_sha: "<sha>", sha256: "<digest>", bytes: 0, producer: {event_id: "evt-round", event: evidence_produced}}}

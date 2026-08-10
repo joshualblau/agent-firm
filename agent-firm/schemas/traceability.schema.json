@@ -132,8 +132,9 @@
     "disposition": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["secondary_blocker", "primary_position", "positive_dissent", "affected_criteria", "affected_paths", "risk", "risk_reasons", "bounded_resolution", "evidence", "disposition"],
+      "required": ["secondary_blocker_id", "secondary_blocker", "primary_position", "positive_dissent", "affected_criteria", "affected_paths", "risk", "risk_reasons", "bounded_resolution", "evidence", "disposition"],
       "properties": {
+        "secondary_blocker_id": {"type": "string", "pattern": "^obj-[A-Za-z0-9._:-]{1,128}$"},
         "secondary_blocker": {"type": "string", "minLength": 1},
         "primary_position": {"type": "string", "minLength": 1},
         "positive_dissent": {"type": "boolean"},

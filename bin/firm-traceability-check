@@ -204,6 +204,15 @@ def utc(value):
 candidate_path = run / "09-test-evidence" / "qa-candidate.json"
 trace_path = run / "traceability.yaml"
 criteria_path = run / "01-acceptance-criteria.yaml"
+evidence_parent = run / "09-test-evidence"
+try:
+    evidence_info = os.lstat(evidence_parent)
+    if (stat.S_ISLNK(evidence_info.st_mode) or not stat.S_ISDIR(evidence_info.st_mode)
+            or evidence_info.st_uid != os.getuid()
+            or os.path.realpath(evidence_parent) != os.path.join(os.path.realpath(run),"09-test-evidence")):
+        cannot("candidate evidence parent is unsafe or redirected")
+except OSError as exc:
+    cannot(f"candidate evidence parent is missing or unsafe: {exc}")
 for path, label in ((candidate_path, "candidate metadata"), (trace_path, "traceability matrix"), (criteria_path, "acceptance criteria"), (verdict_path, "QA verdict")):
     if not path.is_file() or path.is_symlink():
         cannot(f"missing or unsafe {label}: {path}")
@@ -236,13 +245,20 @@ checkout = os.path.realpath(str(candidate.get("checkout_path", "")))
 if not repo or not checkout or os.path.islink(candidate.get("checkout_path", "")):
     cannot("candidate repository/checkout identity is absent or symlinked")
 expected_run = os.path.join(repo, ".agent-firm", "runs", run_id)
+expected_checkout = os.path.join(repo, ".agent-firm", "qa-checkout", run_id)
 if os.path.realpath(run) != os.path.realpath(expected_run):
     cannot("run is not the candidate repository's canonical run directory")
 try:
-    for component in (repo, os.path.join(repo, ".agent-firm"), os.path.join(repo, ".agent-firm", "runs"), str(run)):
+    for component in (
+        repo, os.path.join(repo, ".agent-firm"), os.path.join(repo, ".agent-firm", "runs"), str(run),
+        os.path.join(repo, ".agent-firm", "qa-checkout"), expected_checkout, str(evidence_parent)
+    ):
         info = os.lstat(component)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             cannot(f"canonical run component is unsafe: {component}")
+    if (os.path.abspath(str(candidate.get("checkout_path", ""))) != expected_checkout
+            or checkout != expected_checkout):
+        cannot("candidate checkout is not the exact canonical QA path")
     actual_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     status = subprocess.check_output(["git", "-C", checkout, "status", "--porcelain=v1", "--untracked-files=all"], stderr=subprocess.DEVNULL, text=True)
     actual_root = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True).strip()
@@ -410,9 +426,31 @@ def risk_for(entry):
             reasons.append(f"path:{path}:benign")
     return ("high" if high else "low"), sorted(set(reasons))
 for index, entry in enumerate(trace.get("two_voice_diff", []), 1):
-    derived_risk, derived_reasons = risk_for(entry)
+    if isinstance(entry.get("blocked_secondary_verdict"),dict):
+        producer_path=evidence_ref(entry["blocked_secondary_verdict"],f"two_voice_diff #{index} archived producer verdict")
+    else:
+        secondary_provider=trace.get("two_voice",{}).get("secondary_provider")
+        producer_path=safe_file(f"08-qa-verdict.{secondary_provider}.json",f"two_voice_diff #{index} current producer verdict")
+    producer=load_json(producer_path,f"two_voice_diff #{index} producer verdict")
+    if producer.get("verdict")!="BLOCK" or producer.get("commit_sha")!=sha or producer.get("run_id")!=run_id or producer.get("generation")!=generation:
+        inadequate(f"two_voice_diff #{index} producer verdict is not a current-candidate BLOCK")
+    objects=producer.get("blocker_objects")
+    texts=producer.get("blockers")
+    if not isinstance(objects,list) or not objects or not isinstance(texts,list) or [item.get("text") for item in objects if isinstance(item,dict)]!=texts:
+        inadequate(f"two_voice_diff #{index} producer verdict lacks exact blocker objects")
+    by_id={item.get("id"):item for item in objects if isinstance(item,dict)}
+    if len(by_id)!=len(objects):
+        inadequate(f"two_voice_diff #{index} producer objection ids are missing or duplicated")
+    objection=by_id.get(entry.get("secondary_blocker_id"))
+    if objection is None:
+        inadequate(f"two_voice_diff #{index} does not name a producer objection id")
+    if (entry.get("secondary_blocker")!=objection.get("text")
+            or entry.get("affected_criteria")!=objection.get("affected_criteria")
+            or entry.get("affected_paths")!=objection.get("affected_paths")):
+        inadequate(f"two_voice_diff #{index} contradicts its producer objection")
+    derived_risk, derived_reasons = risk_for(objection)
     if entry.get("risk") != derived_risk or sorted(entry.get("risk_reasons") or []) != derived_reasons:
-        inadequate(f"two_voice_diff #{index} risk/reasons do not match mechanical derivation")
+        inadequate(f"two_voice_diff #{index} risk/reasons do not match producer-bound mechanical derivation")
 print(f"STRICT TRACEABILITY: PASS -- {len(ids)} exact candidate-bound matrix rows")
 PY
 strict_rc=$?

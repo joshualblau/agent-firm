@@ -93,7 +93,10 @@ answer is neither: **binding by default, with a bounded escalation when the two 
 the same evidence differently.**
 
 Apply this **per disputed point**, not per verdict — a judge BLOCK usually carries several blockers, and
-they can land in different branches.
+they can land in different branches. A disputed point is identified by the producer verdict's stable
+blocker-object id. The disposition must repeat that object's text, affected criteria, and affected
+paths exactly, and mechanical risk classification reads the producer object rather than disposition
+input.
 
 | # | Situation | Outcome |
 |---|---|---|
@@ -167,6 +170,11 @@ That is a statement about which branch applies, not about whether the issue matt
 - A canonical provider verdict is published atomically only after schema and exact
   run/SHA/generation/provider/attempt identity validate. Re-runs archive the prior canonical verdict
   before work begins, so stale approval is recoverable but never current.
+- Before any provider phase, the wrapper requires the run's immutable baseline to match exactly one
+  `run_started` relation and to be an ancestor of the candidate. The baseline is included in the
+  controlled manifest with exact source/copy digest, size, mode, and transform.
+- Candidate QA, evidence, and private reviewer-control parents are owned no-follow directories at the
+  exact canonical path. Producers and every consumer repeat parent containment checks before use.
 
 ### Versioned candidate, evidence, and attempt contract
 
@@ -199,7 +207,8 @@ When all mechanical evidence is valid but an exact human decision is still requi
 `firm-final-qa-check` returns the distinct nonpassing `decision_required` state (exit 4) and records the
 unresolved objections plus permitted record types. Exit 4 is neither PASS nor an unavailable/error
 substitute. The Lead may prepare a clearly non-ship-ready draft handoff from that state, performs one
-Final human interaction with the exact objections and options, appends the resulting typed,
-candidate-bound record, and reruns the mechanical check once. Only a fresh exit 0 permits finalizing
+Final human interaction with the complete aggregated producer-id/text objection set and options,
+appends one shared typed candidate-bound record naming every relevant producer id and text, references
+that same exact record from every relevant disposition, and reruns the mechanical check once. Only a fresh exit 0 permits finalizing
 the handoff/package. A missing, rejecting, stale, wrong-run/SHA/generation, or wrong-objection record
 remains nonpassing; there is no second approval prompt hidden behind packaging.

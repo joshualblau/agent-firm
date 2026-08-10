@@ -1737,4 +1737,48 @@ p=sys.argv[1]; d=yaml.safe_load(open(p)); d["candidate"]["generation"]+=1; yaml.
 PY
 assert_rc "reordered generation blocks" 1 "$TC" --strict "$strict_run"
 
+t_case "strict dispositions derive identity and risk only from either provider's producer object"
+strict_objection_reset() {
+  strict_reset
+  python3 - "$strict_run" "$1" <<'PY'
+import hashlib,json,os,secrets,sys,yaml
+run,provider=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+def ref(path):
+ raw=open(run+"/"+path,"rb").read(); eid="evt-objection-"+secrets.token_hex(8)
+ event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+ with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+ return {"path":path,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":"evidence_produced"}}
+producer={"verdict":"BLOCK","commit_sha":sha,"run_id":os.path.basename(run),"generation":gen,"provider":provider,"attempt_id":provider+"-fixture",
+ "blockers":["producer defect"],"blocker_objects":[{"id":"obj-producer-defect","text":"producer defect","affected_criteria":["AC-001"],"affected_paths":["candidate.txt"]}]}
+json.dump(producer,open(run+f"/08-qa-verdict.{provider}.json","w"),indent=2)
+p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); d["two_voice"]["secondary_provider"]=provider
+d["two_voice_diff"]=[{"secondary_blocker_id":"obj-producer-defect","secondary_blocker":"producer defect","primary_position":"fixture position","positive_dissent":True,
+ "affected_criteria":["AC-001"],"affected_paths":["candidate.txt"],"risk":"low","risk_reasons":["criterion:AC-001:functional","path:candidate.txt:benign"],
+ "bounded_resolution":{"attempted":True,"rounds":1,"rerun":"block","evidence":ref("09-test-evidence/ac2.log")},
+ "evidence":ref("09-test-evidence/ac1.log"),"disposition":"proceed_with_primary"}]
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+}
+for secondary_provider in gpt claude; do
+  strict_objection_reset "$secondary_provider"
+  assert_rc "$secondary_provider producer-object baseline passes strict" 0 "$TC" --strict "$strict_run"
+  python3 - "$strict_run/traceability.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["secondary_blocker_id"]="obj-substituted"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "$secondary_provider substituted producer id fails strict" 1 "$TC" --strict "$strict_run"
+  strict_objection_reset "$secondary_provider"
+  python3 - "$strict_run/traceability.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["affected_paths"]=["other.txt"]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "$secondary_provider contradictory affected path fails strict" 1 "$TC" --strict "$strict_run"
+  strict_objection_reset "$secondary_provider"
+  python3 - "$strict_run/08-qa-verdict.$secondary_provider.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); del d["blocker_objects"]; json.dump(d,open(p,"w"),indent=2)
+PY
+  assert_rc "$secondary_provider omitted producer objects fail strict" 1 "$TC" --strict "$strict_run"
+done
+
 t_summary

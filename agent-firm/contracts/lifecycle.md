@@ -81,9 +81,11 @@ discovery, authentication, model-readiness, and judge phases. Only structured re
 establish availability. The wrappers publish atomically only after the verdict schema and exact
 run/full-SHA/generation/provider/attempt identity validate, record every outcome to the explicitly
 targeted run ledger, cap and redact retained diagnostics by default, and remove the controlled root.
-An explicit `--retain-raw-seconds` diagnostic opt-in is capped at one hour, mode 0600, expiry-recorded,
-and stored outside the transferable run package. They do not install, authenticate, upgrade, deploy,
-push, or otherwise change external state.
+Persistent raw retention is unsupported: every nonzero `--retain-raw-seconds` request is rejected
+before provider execution. Transient raw bytes exist only below the package-excluded, owned
+`private-reviewer-control` tree and an independent guardian removes the complete attempt tree after
+normal exit or wrapper death; any cleanup failure is visibly marked mode 0600 and makes the wrapper
+BLOCK. They do not install, authenticate, upgrade, deploy, push, or otherwise change external state.
 
 The secondary provider's BLOCK binds unless primary QA positively dissents on that exact point.
 High-risk state is derived from accepted security/privacy criteria and the committed candidate diff
@@ -91,7 +93,9 @@ matched against `high-risk-paths.yaml`; ambiguity is high-risk. High-risk disagr
 blocking. A low-risk positive dissent may proceed only after exactly one evidenced bounded resolution
 round is recorded. Fixed or withdrawn objections require a fresh secondary approval on the same
 candidate generation; human decisions require an exact typed record. Every secondary blocker gets one
-structured entry in `traceability.yaml` under `two_voice_diff`. An unavailable required judge needs a
+producer-authored object with a stable id, exact text, affected criteria, and affected paths; its
+`two_voice_diff` entry must bind that id and repeat those fields exactly. Risk is derived from the
+producer object, never from disposition-authored affected fields. An unavailable required judge needs a
 matching trusted availability-attempt record and an exact logged human waiver. Primary QA BLOCK always
 blocks. Run `firm-final-qa-check <run_dir>` before the Final interaction:
 
@@ -101,8 +105,10 @@ blocks. Run `firm-final-qa-check <run_dir>` before the Final interaction:
   naming the exact objections and permitted typed record options from that artifact;
 - exits 1, 2, or 3 block the interaction as stale, invalid, unevaluable, or unavailable evidence.
 
-If the human chooses a permitted option, the Lead appends exactly one typed, digest-bound,
-current-run/current-full-SHA record and its required ledger reference. The Lead then runs one fresh
+The decision-required artifact aggregates the complete relevant objection set and each producer id,
+text, derived risk, and permitted record type. If the human chooses a permitted option, the Lead
+appends exactly one shared typed, digest-bound, current-run/current-full-SHA record naming every
+relevant producer id and text, references it from every relevant disposition, and then runs one fresh
 `firm-final-qa-check <run_dir>`. Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
 wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
 manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.

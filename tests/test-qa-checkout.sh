@@ -105,4 +105,29 @@ id4="$(basename "$(cat "$repo4/.agent-firm/CURRENT_RUN")")"
 printf '.agent-firm/runs/../runs/%s\n' "$id4" > "$repo4/.agent-firm/CURRENT_RUN"
 assert_rc "contained-looking traversal is rejected" 2 sh -c "cd '$repo4' && '$QAC'"
 
+t_case "QA and evidence parent redirects are rejected without touching either target"
+repo5="$(mk_repo)"
+( cd "$repo5" && "$NEW_RUN" checkout-parent-redirect fast_path >/dev/null )
+id5="$(basename "$(cat "$repo5/.agent-firm/CURRENT_RUN")")"
+( cd "$repo5" && git branch "integration/$id5" )
+redirect5="$(mktemp -d "${TMPDIR:-/tmp}/firm-qa-parent.XXXXXX")"; t_track "$redirect5"
+printf 'qa target sentinel\n' > "$redirect5/qa-sentinel"
+qa_before="$(shasum -a 256 "$redirect5/qa-sentinel" | awk '{print $1}')"
+ln -s "$redirect5" "$repo5/.agent-firm/qa-checkout"
+assert_rc "symlinked QA parent is rejected" 2 sh -c "cd '$repo5' && '$QAC'"
+assert_eq "QA redirect sentinel stays byte-identical" "$qa_before" "$(shasum -a 256 "$redirect5/qa-sentinel" | awk '{print $1}')"
+assert_no_file "QA redirect receives no checkout" "$redirect5/$id5"
+rm "$repo5/.agent-firm/qa-checkout"
+
+run5="$repo5/.agent-firm/runs/$id5"
+mv "$run5/09-test-evidence" "$redirect5/evidence-target"
+printf 'evidence target sentinel\n' > "$redirect5/evidence-target/sentinel"
+evidence_before="$(shasum -a 256 "$redirect5/evidence-target/sentinel" | awk '{print $1}')"
+ln -s "$redirect5/evidence-target" "$run5/09-test-evidence"
+assert_rc "symlinked evidence parent is rejected" 2 sh -c "cd '$repo5' && '$QAC'"
+assert_eq "evidence redirect sentinel stays byte-identical" "$evidence_before" "$(shasum -a 256 "$redirect5/evidence-target/sentinel" | awk '{print $1}')"
+assert_no_file "evidence redirect receives no candidate metadata" "$redirect5/evidence-target/qa-candidate.json"
+rm "$run5/09-test-evidence"
+mv "$redirect5/evidence-target" "$run5/09-test-evidence"
+
 t_summary

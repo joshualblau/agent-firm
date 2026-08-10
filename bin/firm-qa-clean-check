@@ -60,7 +60,17 @@ try:
 except Exception as exc:
     emit("cannot_verify", 2, f"explicit run cannot be validated: {exc}", "unsafe_run")
 
-candidate_path = os.path.join(run, "09-test-evidence", "qa-candidate.json")
+evidence_parent = os.path.join(run, "09-test-evidence")
+try:
+    info = os.lstat(evidence_parent)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("evidence parent is not an owned no-follow directory")
+    if os.path.realpath(evidence_parent) != os.path.join(os.path.realpath(run), "09-test-evidence"):
+        raise ValueError("evidence parent is redirected")
+except Exception as exc:
+    emit("cannot_verify", 2, f"candidate evidence parent is unsafe: {exc}", "candidate_parent")
+
+candidate_path = os.path.join(evidence_parent, "qa-candidate.json")
 try:
     info = os.lstat(candidate_path)
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -73,11 +83,26 @@ except Exception as exc:
 sha = candidate.get("candidate_sha")
 generation = candidate.get("generation")
 checkout = str(candidate.get("checkout_path", ""))
+expected_checkout = os.path.join(repo, ".agent-firm", "qa-checkout", run_id)
+expected_checkout_literal = os.path.join(str(candidate.get("repository_root", "")), ".agent-firm", "qa-checkout", run_id)
 if (candidate.get("schema_version") != 2 or candidate.get("run_id") != run_id
         or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
         or not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
         or candidate.get("repository_root") != os.path.realpath(repo)):
     emit("cannot_verify", 2, "candidate metadata identity is invalid", "candidate_identity", run, candidate)
+try:
+    for component in (
+        os.path.join(repo, ".agent-firm", "qa-checkout"),
+        expected_checkout,
+    ):
+        info = os.lstat(component)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(f"unsafe checkout component {component}")
+    if (os.path.abspath(checkout) != os.path.abspath(expected_checkout_literal)
+            or os.path.realpath(checkout) != os.path.realpath(expected_checkout)):
+        raise ValueError("checkout is not the exact canonical QA path")
+except Exception as exc:
+    emit("cannot_verify", 2, f"candidate checkout parent is unsafe: {exc}", "candidate_parent", run, candidate)
 try:
     with open(os.path.join(run,"run.jsonl"),encoding="utf-8") as fh:
         events=[json.loads(line) for line in fh if line.strip()]

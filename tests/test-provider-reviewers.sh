@@ -68,6 +68,7 @@ base={"commit_sha":sha,"run_id":run,"generation":int(gen),"attempt_id":"__ATTEMP
 for provider in ("gpt","claude"):
  for word in ("APPROVE","BLOCK"):
   d=dict(base); d["provider"]=provider; d["verdict"]=word; d["blockers"]=[] if word=="APPROVE" else ["fixture blocker"]
+  if word=="BLOCK": d["blocker_objects"]=[{"id":"obj-fixture","text":"fixture blocker","affected_criteria":[],"affected_paths":[]}]
   json.dump(d,open(os.path.join(w,f"{provider}-{word.lower()}.json"),"w"))
 PY
 
@@ -97,6 +98,7 @@ echo 'Authorization: Bearer super-secret token=abc account_id=user@example.com h
 case "$STUB_MODE" in
   timeout) (sleep 30) & echo $! > "$STUB_CHILD"; wait ;;
   authphrase_main) echo 'not logged in; unsupported model' >&2; exit 1 ;;
+  hard_kill) echo 'HARD-KILL-RAW-SECRET-91b7'; sleep 30 ;;
   malformed) printf '{bad json\n' > "$out"; exit 0 ;;
   reorder) printf '{"changed":true}\n' > "$STUB_CANDIDATE"; src="$STUB_GPT_APPROVE" ;;
   hold) sleep 1; src="$STUB_GPT_APPROVE" ;;
@@ -161,6 +163,7 @@ echo 'Cookie: session=super-secret request_id=req-123 device_code=987 user@examp
 case "$STUB_MODE" in
   timeout) (sleep 30) & echo $! > "$STUB_CHILD"; wait ;;
   authphrase_main) echo 'authentication required; unknown model' >&2; exit 1 ;;
+  hard_kill) echo 'HARD-KILL-RAW-SECRET-91b7'; sleep 30 ;;
   malformed) echo 'not-json'; exit 0 ;;
   hold) sleep 1; src="$STUB_CLAUDE_APPROVE" ;;
   diagnostic_symlink) rm -f "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; src="$STUB_CLAUDE_APPROVE" ;;
@@ -236,7 +239,7 @@ for value in 0 -1 nope 901; do
   assert_rc "judge timeout $value rejected" 2 review_env approve "$GPT" --judge-timeout "$value"
   assert_eq "provider did not execute for timeout $value" "" "$(cat "$CALLS")"
 done
-for value in -1 nope 3601; do
+for value in 1 300 -1 nope 3601; do
   : > "$CALLS"
   assert_rc "raw retention $value rejected" 2 review_env approve "$GPT" --retain-raw-seconds "$value"
   assert_eq "provider did not execute for raw retention $value" "" "$(cat "$CALLS")"
@@ -280,12 +283,12 @@ assert_eq "provider did not execute for model override" "" "$(cat "$CALLS")"
 : > "$CALLS"
 assert_rc "fresh canonical GPT call seeds controlled-layout records" 0 review_env approve "$GPT"
 layout_gpt_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
-layout_gpt_root="$RUN/09-test-evidence/reviewer-attempts/$layout_gpt_attempt/control/root"
-layout_gpt_home="$RUN/09-test-evidence/reviewer-attempts/$layout_gpt_attempt/control/config"
+layout_gpt_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/root"
+layout_gpt_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/config"
 assert_rc "fresh canonical Claude call seeds controlled-layout records" 0 review_env approve "$CLAUDE"
 layout_claude_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
-layout_claude_root="$RUN/09-test-evidence/reviewer-attempts/$layout_claude_attempt/control/root"
-layout_claude_home="$RUN/09-test-evidence/reviewer-attempts/$layout_claude_attempt/control/config"
+layout_claude_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/root"
+layout_claude_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/config"
 
 t_case "controlled layout keeps hostile ambient surfaces nested and records every behavioral probe"
 assert_output "fresh GPT provider call records exist" "codex cwd=" cat "$CALLS"
@@ -332,7 +335,7 @@ for executable, root, home in (
         )
 PY
 assert_ok "controlled cwd is not the consumer repository" sh -c "! grep -q 'cwd=$REPO ' '$CALLS'"
-assert_output "controlled HOME is attempt-local" "/control/config" cat "$CALLS"
+assert_output "controlled HOME is private and attempt-local" "/private-reviewer-control/$RUN_ID/" cat "$CALLS"
 checkout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$RUN/09-test-evidence/qa-candidate.json")"
 assert_no_file "provider could not write candidate snapshot" "$checkout/write-sentinel"
 assert_ok "production wrappers expose no FORCE bypass" sh -c "! grep -R 'FORCE_INCOMPAT' '$BIN/firm-gpt-qa' '$BIN/firm-claude-qa' '$BIN/firm-reviewer-common'"
@@ -359,13 +362,15 @@ assert_ok "manifest has exact required origins and nested referenced evidence" p
 import hashlib,json,os,sys
 manifest,run=sys.argv[1:]; d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
 required={"01-acceptance-criteria.yaml","traceability.yaml","09-test-evidence/qa-candidate.json","run-metadata.json",
-          "normalized-run-metadata.json","run.jsonl","07-review-findings.yaml","06-implementation-summary.md",
+          "run-baseline.json","normalized-run-metadata.json","run.jsonl","07-review-findings.yaml","06-implementation-summary.md",
           "integration-summary.md","08-qa-verdict.json","09-test-evidence/nested/proof.log","candidate.diff"}
 assert required <= set(entries), required-set(entries)
 for origin,item in entries.items():
     if origin in ("normalized-run-metadata.json","candidate.diff","run.jsonl"): continue
     raw=open(os.path.join(run,origin),"rb").read()
     assert item["source_sha256"]==hashlib.sha256(raw).hexdigest() and item["source_bytes"]==len(raw)
+    assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o")
+    assert item["transform"]=="redacted_utf8"
 PY
 python3 - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
@@ -379,6 +384,18 @@ p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="resolved";
 PY
 
 t_case "manifest omission, total cap, and nested symlink fail before provider execution"
+cp "$RUN/run-baseline.json" "$WORK/run-baseline.json"
+rm "$RUN/run-baseline.json"
+: > "$CALLS"; assert_rc "missing run baseline blocks" 1 review_env approve "$GPT"
+assert_eq "provider did not run without baseline" "" "$(cat "$CALLS")"
+cp "$WORK/run-baseline.json" "$RUN/run-baseline.json"
+python3 - "$RUN/run-baseline.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d["default_branch_start_sha"]="0"*40; json.dump(d,open(p,"w"))
+PY
+: > "$CALLS"; assert_rc "mutated run baseline blocks" 1 review_env approve "$GPT"
+assert_eq "provider did not run for mutated baseline" "" "$(cat "$CALLS")"
+mv "$WORK/run-baseline.json" "$RUN/run-baseline.json"
 mv "$RUN/integration-summary.md" "$WORK/integration-summary.md"
 : > "$CALLS"; assert_rc "missing required integration summary blocks" 1 review_env approve "$GPT"
 assert_eq "provider did not run for manifest omission" "" "$(cat "$CALLS")"
@@ -460,9 +477,9 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_rc "$provider rejects symlinked lock" 1 review_env approve "$wrapper"
   rm "$RUN/09-test-evidence/.reviewer-$provider.lock"
 
-  private_run="$REPO/.agent-firm/private-reviewer-raw/$RUN_ID"
+  private_run="$REPO/.agent-firm/private-reviewer-control/$RUN_ID"
   ln -s "$WORK/redirect-target" "$private_run/hostile-$provider"
-  assert_rc "$provider rejects symlinked private-raw component" 2 review_env approve "$wrapper"
+  assert_rc "$provider rejects symlinked private reviewer-control component" 2 review_env approve "$wrapper"
   rm "$private_run/hostile-$provider"
 
   assert_rc "$provider rejects a diagnostic target replaced during execution" 1 review_env diagnostic_symlink "$wrapper"
@@ -564,11 +581,46 @@ assert_ok "unlabeled source sentinel is absent" sh -c "! grep -q 'UNLABELED-PRIV
 assert_eq "no raw provider diagnostics remain" "" "$(find "$RUN/09-test-evidence/reviewer-attempts" -name '*.raw' -print)"
 assert_eq "private raw package surface is absent" "" "$(find "$RUN/09-test-evidence" -name '.private-reviewer-raw' -print)"
 
-t_case "explicit raw opt-in is package-excluded and deleted when the process exits"
-assert_rc "bounded raw opt-in succeeds" 0 review_env approve "$GPT" --retain-raw-seconds 300 --max-output 4096
-private_run="$REPO/.agent-firm/private-reviewer-raw/$RUN_ID"
-assert_eq "no raw is under the transferable run" "" "$(find "$RUN" -name '*.raw' -print)"
-assert_eq "private raw and retention records are gone at process end" "" "$(find "$private_run" -type f -print)"
-assert_eq "private raw root remains mode 700" 700 "$(stat -f '%Lp' "$private_run" 2>/dev/null || stat -c '%a' "$private_run")"
+t_case "persistent raw requests expire without later invocation because they are rejected before launch"
+: > "$CALLS"
+assert_rc "one-second raw retention is rejected" 2 review_env approve "$GPT" --retain-raw-seconds 1 --max-output 4096
+sleep 2
+assert_eq "provider never ran for retention request" "" "$(cat "$CALLS")"
+assert_eq "no delayed raw artifact exists without another invocation" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '*.raw' -print)"
+
+t_case "hard termination is independently cleaned without exposing raw output"
+review_env hard_kill "$GPT" >"$WORK/hard-kill.out" 2>&1 & hard_shell=$!
+hard_lock="$RUN/09-test-evidence/.reviewer-gpt.lock/owner.json"
+for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  test -f "$hard_lock" && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q . && break
+  sleep 0.1
+done
+hard_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
+kill -9 "$hard_pid" 2>/dev/null || true
+wait "$hard_shell" 2>/dev/null || true
+for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' | grep -q . || break
+  sleep 0.1
+done
+assert_eq "hard-killed attempt control is gone" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' -print)"
+assert_ok "hard-kill raw secret is absent from run and private control" sh -c \
+  "! grep -R 'HARD-KILL-RAW-SECRET-91b7' '$RUN' '$REPO/.agent-firm/private-reviewer-control/$RUN_ID' 2>/dev/null"
+
+t_case "cleanup deletion failure is visible, blocking, and never retains raw bytes"
+export FIRM_TEST_RAW_CLEANUP_FAIL=1
+assert_rc "injected cleanup failure blocks the wrapper" 1 review_env approve "$GPT"
+unset FIRM_TEST_RAW_CLEANUP_FAIL
+failure_marker="$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name 'cleanup-failure.gpt-*.json' -type f | tail -1)"
+assert_file "cleanup failure marker is visible" "$failure_marker"
+assert_eq "cleanup failure marker is mode 600" 600 "$(stat -f '%Lp' "$failure_marker" 2>/dev/null || stat -c '%a' "$failure_marker")"
+assert_eq "cleanup failure retains no raw file" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '*.raw' -print)"
+assert_ok "cleanup-failure surface contains no provider secret" sh -c \
+  "! grep -R 'super-secret\|HARD-KILL-RAW-SECRET-91b7' '$REPO/.agent-firm/private-reviewer-control/$RUN_ID' 2>/dev/null"
+for failed_control in "$REPO/.agent-firm/private-reviewer-control/$RUN_ID"/gpt-c*-a*; do
+  test -d "$failed_control" || continue
+  chmod -R u+w "$failed_control"
+  rm -rf "$failed_control"
+done
+rm -f "$failure_marker"
 
 t_summary

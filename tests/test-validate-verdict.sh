@@ -18,7 +18,11 @@ t_track "$WORK"
 cat > "$WORK/good.json" <<'JSON'
 {
   "verdict": "APPROVE",
-  "commit_sha": "abc1234",
+  "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+  "run_id": "20260810T000000Z-current-fixture",
+  "generation": 1,
+  "provider": "primary",
+  "attempt_id": "primary-c1-a0001",
   "environment": "test",
   "commands_run": [{"cmd": "sh test/run-tests.sh", "exit_code": 0, "duration_s": 1.5, "artifact": "09-test-evidence/unit.log"}],
   "unit":        {"status": "pass", "evidence": "09-test-evidence/unit.log"},
@@ -46,7 +50,15 @@ json.dump(missing, open(os.path.join(w, "missing-key.json"), "w"))
 bad = dict(d); bad["verdict"] = "LGTM"
 json.dump(bad, open(os.path.join(w, "bad-verdict.json"), "w"))
 blocked = dict(d); blocked["verdict"] = "BLOCK"
+blocked["blockers"] = ["fixture blocker"]
+blocked["blocker_objects"] = [{"id":"obj-fixture","text":"fixture blocker","affected_criteria":["AC-001"],"affected_paths":[]}]
 json.dump(blocked, open(os.path.join(w, "block.json"), "w"))
+abbreviated = dict(d); abbreviated["commit_sha"] = "abc1234"
+json.dump(abbreviated, open(os.path.join(w, "abbreviated.json"), "w"))
+historical = dict(d)
+for key in ("run_id", "generation", "provider", "attempt_id"):
+    historical.pop(key)
+json.dump(historical, open(os.path.join(w, "historical-readable.json"), "w"))
 PY
 
 # Hide `jsonschema` from a child python without uninstalling it: a stub package earlier on the path
@@ -66,6 +78,8 @@ assert_output "says it used the schema" "jsonschema"  "$VALIDATE" "$WORK/good.js
 assert_rc "malformed JSON is INVALID"              1 "$VALIDATE" "$WORK/malformed.json"
 assert_rc "a missing required key is INVALID"      1 "$VALIDATE" "$WORK/missing-key.json"
 assert_rc "an out-of-enum verdict is INVALID"      1 "$VALIDATE" "$WORK/bad-verdict.json"
+assert_rc "an abbreviated current SHA is INVALID"   1 "$VALIDATE" "$WORK/abbreviated.json"
+assert_rc "historical readable input is not current-valid evidence" 1 "$VALIDATE" "$WORK/historical-readable.json"
 
 # ---------------------------------------------------------------------------
 t_case "without jsonschema — degraded, and never a silent pass"

@@ -49,16 +49,21 @@ yaml.safe_dump(trace,open(run+"/traceability.yaml","w"),sort_keys=False)
 PY
 }
 
-wrapper_attempt() { # provider APPROVE|BLOCK blocker attempt-id current yes|no
-  python3 - "$run" "$1" "$2" "$3" "$4" "$5" <<'PY'
+wrapper_attempt() { # provider APPROVE|BLOCK blocker attempt-id current yes|no [affected-path] [second-blocker] [second-path]
+  python3 - "$run" "$1" "$2" "$3" "$4" "$5" "${6:-result.txt}" "${7:-}" "${8:-auth/token.txt}" <<'PY'
 import hashlib,json,os,sys
-run,provider,word,blocker,attempt_id,current=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+run,provider,word,blocker,attempt_id,current,affected_path,second_blocker,second_path=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 adir=run+"/09-test-evidence/reviewer-attempts/"+attempt_id; os.makedirs(adir,exist_ok=False)
 verdict={"verdict":word,"commit_sha":sha,"run_id":os.path.basename(run),"generation":gen,"provider":provider,"attempt_id":attempt_id,
 "environment":"fixture","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
 "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},"visual":{"status":"not_applicable","evidence":"none"},
 "acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/proof.log"}],"untested_risks":[],
 "blockers":([blocker] if blocker else []),"warnings":[],"artifacts":["09-test-evidence/proof.log"],"summary":"fixture"}
+if blocker:
+ verdict["blocker_objects"]=[{"id":"obj-secondary-defect","text":blocker,"affected_criteria":["AC-001"],"affected_paths":[affected_path]}]
+if second_blocker:
+ verdict["blockers"].append(second_blocker)
+ verdict["blocker_objects"].append({"id":"obj-protected-defect","text":second_blocker,"affected_criteria":["AC-001"],"affected_paths":[second_path]})
 vraw=(json.dumps(verdict,indent=2,sort_keys=True)+"\n").encode(); open(adir+"/verdict.json","wb").write(vraw); os.chmod(adir+"/verdict.json",0o600)
 eid="evt-wrapper-"+attempt_id; status="approve" if word=="APPROVE" else "block"; rc=0 if status=="approve" else 1
 arel="09-test-evidence/reviewer-attempts/"+attempt_id+"/attempt.json"; vrel="09-test-evidence/reviewer-attempts/"+attempt_id+"/verdict.json"
@@ -95,7 +100,7 @@ provider=d["two_voice"]["secondary_provider"]
 criteria=["AC-001"]; paths=["result.txt"]; reasons=["criterion:AC-001:functional","path:result.txt:benign"]
 if risk=="high":
  paths=["auth/token.txt"]; reasons=["criterion:AC-001:functional","path:auth/token.txt:auth_permissions_crypto_pii:**/*auth*","path:auth/token.txt:auth_permissions_crypto_pii:**/auth/**"]
-entry={"secondary_blocker":"secondary defect","primary_position":"positive evidence-based contrary reading","positive_dissent":True,
+entry={"secondary_blocker_id":"obj-secondary-defect","secondary_blocker":"secondary defect","primary_position":"positive evidence-based contrary reading","positive_dissent":True,
 "affected_criteria":criteria,"affected_paths":paths,"risk":risk,"risk_reasons":reasons,
 "bounded_resolution":{"attempted":True,"rounds":1,"rerun":"block","evidence":ref("09-test-evidence/round.log")},
 "evidence":ref("09-test-evidence/proof.log"),"disposition":kind}
@@ -107,6 +112,26 @@ d["two_voice_diff"]=[entry]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 }
 
+set_mixed_human_dispositions() {
+  python3 - "$run" <<'PY'
+import hashlib,json,os,secrets,sys,yaml
+run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
+def ref(path):
+ raw=open(run+"/"+path,"rb").read(); eid="evt-mixed-"+secrets.token_hex(8)
+ event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+ with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+ return {"path":path,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":"evidence_produced"}}
+common={"primary_position":"positive evidence-based contrary reading","positive_dissent":True,
+ "bounded_resolution":{"attempted":True,"rounds":1,"rerun":"block","evidence":ref("09-test-evidence/round.log")},
+ "evidence":ref("09-test-evidence/proof.log"),"disposition":"human_decision"}
+d["two_voice_diff"]=[
+ {**common,"secondary_blocker_id":"obj-secondary-defect","secondary_blocker":"secondary defect","affected_criteria":["AC-001"],"affected_paths":["result.txt"],"risk":"low","risk_reasons":["criterion:AC-001:functional","path:result.txt:benign"]},
+ {**common,"secondary_blocker_id":"obj-protected-defect","secondary_blocker":"protected defect","affected_criteria":["AC-001"],"affected_paths":["auth/token.txt"],"risk":"high","risk_reasons":["criterion:AC-001:functional","path:auth/token.txt:auth_permissions_crypto_pii:**/*auth*","path:auth/token.txt:auth_permissions_crypto_pii:**/auth/**"]}
+]
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+}
+
 add_record_ref() { # relative event field-name
   python3 - "$run" "$1" "$2" "$3" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
@@ -115,7 +140,8 @@ record={"ts":"2026-08-10T00:00:00Z","event":event,"event_id":eid,"run_id":os.pat
 with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(record,separators=(",",":"))+"\n")
 ref={"path":rel,"candidate_sha":d["candidate"]["commit_sha"],"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":event}}
 if field=="waiver": d["two_voice"]["unavailable_waiver"]=ref
-else: d["two_voice_diff"][0]["record"]=ref
+else:
+ for entry in d["two_voice_diff"]: entry["record"]=ref
 yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 }
@@ -140,8 +166,34 @@ import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["risk"]="high"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 assert_rc "caller-supplied high/low mismatch blocks" 1 "$FINAL" "$run"
+reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0202 yes auth/token.txt
 set_disposition proceed_with_primary high '' ''
 assert_rc "path-derived high risk cannot proceed with primary" 1 "$FINAL" "$run"
+
+t_case "both provider orientations fail closed on omitted, substituted, or contradictory producer objections"
+for orientation in "claude:gpt" "codex:claude"; do
+  primary="${orientation%%:*}"; secondary="${orientation#*:}"
+  reset_case "$primary"; wrapper_attempt "$secondary" BLOCK 'secondary defect' "$secondary-c1-a0251" yes
+  set_disposition proceed_with_primary low '' ''
+  assert_rc "$secondary producer-bound BLOCK baseline passes" 0 "$FINAL" "$run"
+  python3 - "$run/traceability.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["secondary_blocker_id"]="obj-substituted"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "$secondary substituted objection id blocks" 1 "$FINAL" "$run"
+  set_disposition proceed_with_primary low '' ''
+  python3 - "$run/traceability.yaml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["affected_paths"]=["auth/token.txt"]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "$secondary contradictory affected path blocks" 1 "$FINAL" "$run"
+  set_disposition proceed_with_primary low '' ''
+  python3 - "$run/08-qa-verdict.$secondary.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); del d["blocker_objects"]; json.dump(d,open(p,"w"),indent=2)
+PY
+  assert_rc "$secondary omitted producer objects block" 1 "$FINAL" "$run"
+done
 
 t_case "archived wrapper BLOCK followed by latest current APPROVE is the only fixed/withdrawn chain"
 reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0301 no
@@ -193,7 +245,7 @@ EOF
 add_record_ref 09-test-evidence/waiver.yaml waiver_recorded waiver
 assert_rc "exact digest-bound waiver passes" 0 "$FINAL" "$run"
 
-reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0501 yes
+reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0501 yes auth/token.txt
 set_disposition human_decision high '' ''
 assert_rc "missing high-risk human decision is decision_required" 4 "$FINAL" "$run"
 cat > "$run/09-test-evidence/human.yaml" <<EOF
@@ -204,9 +256,41 @@ occurred_at: 2026-08-10T00:00:00Z
 run_id: $run_id
 candidate_sha: $sha
 decision: proceed
+objection_ids: [obj-secondary-defect]
 objections: [secondary defect]
 EOF
 add_record_ref 09-test-evidence/human.yaml human_decision_recorded record
 assert_rc "exact digest-bound human record permits fresh mechanical pass" 0 "$FINAL" "$run"
+
+t_case "one decision_required artifact aggregates mixed benign and protected objections"
+reset_case claude
+wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0601 yes result.txt 'protected defect' auth/token.txt
+set_mixed_human_dispositions
+before_count="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+assert_rc "two missing human records yield one decision_required result" 4 "$FINAL" "$run"
+after_count="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+assert_eq "exactly one aggregate decision artifact was added" 1 "$((after_count-before_count))"
+aggregate_file="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f -exec grep -l '"id": "obj-protected-defect"' {} \; | tail -1)"
+assert_ok "aggregate artifact contains both producer ids and derived risks" python3 - "$aggregate_file" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); objects={x["id"]:x for x in d["objections"]}
+assert set(objects)=={"obj-secondary-defect","obj-protected-defect"}
+assert objects["obj-secondary-defect"]["risk"]=="low"
+assert objects["obj-protected-defect"]["risk"]=="high"
+assert all(x["permitted_record_types"]==["human_decision"] for x in objects.values())
+PY
+cat > "$run/09-test-evidence/human-mixed.yaml" <<EOF
+schema_version: 1
+type: human_decision
+actor: human-fixture
+occurred_at: 2026-08-10T00:00:00Z
+run_id: $run_id
+candidate_sha: $sha
+decision: proceed
+objection_ids: [obj-secondary-defect, obj-protected-defect]
+objections: [secondary defect, protected defect]
+EOF
+add_record_ref 09-test-evidence/human-mixed.yaml human_decision_recorded record
+assert_rc "one shared exact record permits one fresh mechanical rerun" 0 "$FINAL" "$run"
 
 t_summary

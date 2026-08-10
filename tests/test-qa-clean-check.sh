@@ -69,4 +69,22 @@ done
 cp "$candidate.good" "$candidate"; chmod 600 "$candidate"
 rm -f "$candidate.good"
 
+t_case "consumer rejects redirected evidence and QA parents without touching redirect targets"
+redirect_root="$(mktemp -d "${TMPDIR:-/tmp}/firm-clean-parent.XXXXXX")"; t_track "$redirect_root"
+mv "$run/09-test-evidence" "$redirect_root/evidence-saved"
+mkdir "$redirect_root/evidence-target"; printf 'evidence sentinel\n' > "$redirect_root/evidence-target/sentinel"
+evidence_before="$(shasum -a 256 "$redirect_root/evidence-target/sentinel" | awk '{print $1}')"
+ln -s "$redirect_root/evidence-target" "$run/09-test-evidence"
+assert_rc "redirected evidence parent cannot be consumed" 2 "$QCC" --run "$run"
+assert_eq "evidence redirect target is byte-identical" "$evidence_before" "$(shasum -a 256 "$redirect_root/evidence-target/sentinel" | awk '{print $1}')"
+rm "$run/09-test-evidence"; mv "$redirect_root/evidence-saved" "$run/09-test-evidence"
+
+qa_parent="$repo/.agent-firm/qa-checkout"; mv "$qa_parent" "$redirect_root/qa-saved"
+mkdir "$redirect_root/qa-target"; printf 'qa sentinel\n' > "$redirect_root/qa-target/sentinel"
+qa_before="$(shasum -a 256 "$redirect_root/qa-target/sentinel" | awk '{print $1}')"
+ln -s "$redirect_root/qa-target" "$qa_parent"
+assert_rc "redirected QA parent cannot be consumed" 2 "$QCC" --run "$run"
+assert_eq "QA redirect target is byte-identical" "$qa_before" "$(shasum -a 256 "$redirect_root/qa-target/sentinel" | awk '{print $1}')"
+rm "$qa_parent"; mv "$redirect_root/qa-saved" "$qa_parent"
+
 t_summary

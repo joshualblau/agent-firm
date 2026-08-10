@@ -69,6 +69,8 @@ retain_raw_seconds = bounded_nonnegative(
     "raw retention", args.retain_raw_seconds if args.retain_raw_seconds is not None else os.environ.get("FIRM_QA_RETAIN_RAW_SECONDS"),
     0, 3600
 )
+if retain_raw_seconds != 0:
+    stop("persistent raw retention is disabled; use allowlisted diagnostics only", 2)
 
 def atomic_write(path, payload, mode=0o600):
     path = Path(path)
@@ -172,6 +174,8 @@ def resolve_run(raw):
 run_arg = args.run_option or args.run_dir
 repo, run = resolve_run(run_arg)
 evidence = safe_dir(run / "09-test-evidence", 0o700, create=True)
+if os.path.realpath(evidence) != os.path.join(os.path.realpath(run), "09-test-evidence"):
+    stop("09-test-evidence parent is redirected", 2)
 candidate_path = evidence / "qa-candidate.json"
 try:
     if candidate_path.is_symlink():
@@ -183,6 +187,8 @@ except Exception as exc:
 sha = candidate.get("candidate_sha")
 generation = candidate.get("generation")
 checkout = candidate.get("checkout_path")
+expected_checkout = repo / ".agent-firm" / "qa-checkout" / run.name
+expected_checkout_literal = Path(str(candidate.get("repository_root", ""))) / ".agent-firm" / "qa-checkout" / run.name
 if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
     stop("candidate metadata needs a full 40-character SHA", 2)
 if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
@@ -191,6 +197,16 @@ if candidate.get("run_id") != run.name or os.path.realpath(str(candidate.get("re
     stop("candidate metadata run/repository identity is mismatched", 2)
 if candidate.get("schema_version") != 2 or not re.fullmatch(r"refs/heads/integration/[A-Za-z0-9._/-]+", str(candidate.get("source_ref", ""))):
     stop("candidate metadata version/source_ref is invalid", 2)
+try:
+    for component in (repo / ".agent-firm" / "qa-checkout", expected_checkout):
+        info = os.lstat(component)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(component)
+    if (os.path.abspath(str(checkout)) != os.path.abspath(expected_checkout_literal)
+            or os.path.realpath(str(checkout)) != os.path.realpath(expected_checkout)):
+        raise ValueError("candidate checkout is not the exact canonical QA path")
+except Exception as exc:
+    stop(f"candidate checkout parent is unsafe or redirected: {exc}", 2)
 
 def verify_candidate():
     try:
@@ -263,31 +279,17 @@ override = os.environ.get(override_name)
 if override is not None and override != model:
     stop(f"{override_name} must equal canonical reviewer model {model!r}", 2)
 
-# Raw provider output is never part of the transferable run directory. Explicit opt-in stores it
-# under a separate private repository surface for at most one hour; every invocation purges expired
-# or unaccounted-for directories before starting a new attempt.
-private_root = safe_dir(repo / ".agent-firm" / "private-reviewer-raw", 0o700, create=True)
+# Raw provider output exists only in a private, package-excluded transient control tree. Each attempt
+# has an independent cleanup guardian; persistent raw retention is deliberately unsupported.
+private_root = safe_dir(repo / ".agent-firm" / "private-reviewer-control", 0o700, create=True)
 private_run = safe_dir(private_root / run.name, 0o700, create=True)
-now_epoch = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 for old in list(private_run.iterdir()):
     try:
         info = os.lstat(old)
     except OSError as exc:
-        stop(f"cannot inspect private raw entry {old}: {exc}", 2)
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        stop(f"unsafe private raw entry: {old}", 2)
-    try:
-        retention_path = old / "retention.json"
-        retention_info = os.lstat(retention_path)
-        if stat.S_ISLNK(retention_info.st_mode) or not stat.S_ISREG(retention_info.st_mode):
-            raise ValueError("unsafe retention record")
-        metadata = json.loads(retention_path.read_text(encoding="utf-8"))
-        expires_epoch = int(metadata["expires_epoch"])
-        if expires_epoch > now_epoch:
-            continue
-    except Exception:
-        pass
-    shutil.rmtree(old)
+        stop(f"cannot inspect private reviewer-control entry {old}: {exc}", 2)
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        stop(f"unsafe private reviewer-control entry: {old}", 2)
 
 lock = evidence / f".reviewer-{provider}.lock"
 lock_owner = {"schema_version":1, "pid":os.getpid(), "provider":provider, "run_id":run.name,
@@ -331,7 +333,8 @@ attempt = None
 attempt_path = None
 diagnostic_path = None
 control = None
-private_attempt = None
+guardian = None
+cleanup_failure = False
 
 def make_event_id(kind):
     return f"evt-{kind}-{provider}-g{generation}-{os.getpid()}-{os.urandom(6).hex()}"
@@ -386,19 +389,6 @@ try:
     attempt_path = attempt_dir / "attempt.json"
     diagnostic_path = attempt_dir / "diagnostic.json"
     attempt_rel = str(attempt_path.relative_to(run))
-    private_attempt = None
-    raw_expires_epoch = None
-    if retain_raw_seconds:
-        private_attempt = private_run / attempt_id
-        os.mkdir(private_attempt, 0o700)
-        raw_expires_epoch = now_epoch + retain_raw_seconds
-        retention = {
-            "schema_version":1, "run_id":run.name, "provider":provider,
-            "attempt_id":attempt_id, "candidate_sha":sha, "generation":generation,
-            "retention_seconds":retain_raw_seconds, "expires_epoch":raw_expires_epoch,
-            "package_excluded":True
-        }
-        atomic_write(private_attempt / "retention.json", json_bytes(retention), 0o600)
     canonical = run / f"08-qa-verdict.{provider}.json"
     prior_verdict = None
     try:
@@ -429,14 +419,75 @@ try:
         "model":{"provider":resolver_provider,"tier":resolved_model.get("tier"),"model":model,"display":model_display,"effort":model_effort},
         "started_event_id":started_event_id, "outcome_event_id":None,
         "prior_verdict":str(prior_verdict.relative_to(run)) if prior_verdict else None,
-        "private_raw":str(private_attempt.relative_to(repo)) if private_attempt else None,
-        "raw_expires_epoch":raw_expires_epoch
+        "private_raw":None,"raw_expires_epoch":None
     }
     atomic_write(attempt_path, json_bytes(attempt), 0o600)
     ledger("reviewer_attempt_started", event_id=started_event_id, provider=provider, generation=generation, sha=sha, attempt=attempt_rel, attempt_id=attempt_id)
 
-    control = attempt_dir / "control"
+    control = private_run / attempt_id
     os.mkdir(control, 0o700)
+    failure_marker = private_run / f"cleanup-failure.{attempt_id}.json"
+    guardian_code = r'''
+import json,os,pathlib,shutil,signal,stat,subprocess,sys,time
+control=pathlib.Path(sys.argv[1]); parent_pid=int(sys.argv[2]); failure=pathlib.Path(sys.argv[3]); inject=sys.argv[4]=="1"
+request=control/".cleanup-request"; supervisor=control/".supervisor.pid"
+def alive(pid):
+    try: os.kill(pid,0); return True
+    except ProcessLookupError: return False
+    except PermissionError: return True
+while alive(parent_pid) and not request.exists(): time.sleep(0.05)
+if not alive(parent_pid) and supervisor.exists():
+    try:
+        pid=int(supervisor.read_text().strip())
+        rows=subprocess.check_output(["ps","-eo","pid=,ppid="],text=True).splitlines()
+        children={}
+        for row in rows:
+            child,parent=map(int,row.split()); children.setdefault(parent,[]).append(child)
+        targets=[]; pending=[pid]
+        while pending:
+            current=pending.pop(); targets.append(current); pending.extend(children.get(current,[]))
+        for target in reversed(targets):
+            try: os.killpg(target,signal.SIGTERM)
+            except ProcessLookupError: pass
+            except PermissionError: pass
+        time.sleep(0.2)
+        for target in reversed(targets):
+            try: os.killpg(target,signal.SIGKILL)
+            except ProcessLookupError: pass
+            except PermissionError: pass
+    except Exception: pass
+for path in list(control.glob(".*.raw")):
+    try: path.unlink()
+    except FileNotFoundError: pass
+    except OSError: pass
+if inject and request.exists():
+    payload=(json.dumps({"schema_version":1,"status":"cleanup_failed","attempt_id":control.name},sort_keys=True)+"\n").encode()
+    fd=os.open(failure,os.O_WRONLY|os.O_CREAT|os.O_EXCL|(getattr(os,"O_NOFOLLOW",0)),0o600)
+    with os.fdopen(fd,"wb") as fh: fh.write(payload); fh.flush(); os.fsync(fh.fileno())
+    raise SystemExit(1)
+try:
+    for current,dirs,files in os.walk(control,topdown=False):
+        for name in files:
+            try: os.chmod(pathlib.Path(current)/name,0o600,follow_symlinks=False)
+            except OSError: pass
+        for name in dirs:
+            try: os.chmod(pathlib.Path(current)/name,0o700,follow_symlinks=False)
+            except OSError: pass
+    os.chmod(control,0o700,follow_symlinks=False); shutil.rmtree(control)
+except Exception as exc:
+    payload=(json.dumps({"schema_version":1,"status":"cleanup_failed","attempt_id":control.name,"error":type(exc).__name__},sort_keys=True)+"\n").encode()
+    try:
+        fd=os.open(failure,os.O_WRONLY|os.O_CREAT|os.O_EXCL|(getattr(os,"O_NOFOLLOW",0)),0o600)
+        with os.fdopen(fd,"wb") as fh: fh.write(payload); fh.flush(); os.fsync(fh.fileno())
+    except OSError: pass
+    raise SystemExit(1)
+'''
+    guardian = subprocess.Popen(
+        [sys.executable,"-c",guardian_code,str(control),str(os.getpid()),str(failure_marker),
+         "1" if os.environ.get("FIRM_TEST_RAW_CLEANUP_FAIL")=="1" else "0"],
+        stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+        close_fds=True,start_new_session=True
+    )
     instruction_root = control / "root"
     config_root = control / "config"
     temp_root = control / "tmp"
@@ -550,11 +601,43 @@ try:
 
     required_origins = [
         "01-acceptance-criteria.yaml", "traceability.yaml", "09-test-evidence/qa-candidate.json",
-        "run-metadata.json", "run.jsonl", "07-review-findings.yaml",
+        "run-metadata.json", "run-baseline.json", "run.jsonl", "07-review-findings.yaml",
         "06-implementation-summary.md", "integration-summary.md", "08-qa-verdict.json"
     ]
     for origin in required_origins:
         add_source(origin)
+    try:
+        baseline = json.loads((run / "run-baseline.json").read_text(encoding="utf-8"))
+        if not isinstance(baseline, dict) or set(baseline) != {"default_branch", "default_branch_start_sha"}:
+            raise ValueError("baseline must contain only default_branch and default_branch_start_sha")
+        baseline_branch = baseline["default_branch"]
+        baseline_sha = baseline["default_branch_start_sha"]
+        if (not isinstance(baseline_branch, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", baseline_branch)
+                or ".." in Path(baseline_branch).parts
+                or not isinstance(baseline_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", baseline_sha)):
+            raise ValueError("baseline branch or starting SHA is invalid")
+        started = [
+            item for item in ledger_records
+            if item.get("event") == "run_started"
+            and item.get("run_id") == run.name
+            and item.get("default_branch") == baseline_branch
+            and item.get("default_branch_start_sha") == baseline_sha
+        ]
+        if len(started) != 1:
+            raise ValueError("baseline does not have one exact run_started relation")
+        subprocess.check_call(
+            ["git", "-C", str(repo), "cat-file", "-e", baseline_sha + "^{commit}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", baseline_sha, sha],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode != 0:
+            raise ValueError("candidate does not descend from the recorded run baseline")
+    except Exception as exc:
+        stop(f"run baseline is missing, mutated, or unrelated to this candidate: {exc}", 1)
     normalized_raw = json_bytes(normalized_metadata)
     add_payload("normalized-run-metadata.json", normalized_raw, 0o600, "generated_normalized_metadata")
 
@@ -665,14 +748,21 @@ try:
             "--generation", str(generation), "--output", str(raw_path), "--result", str(result_path),
             "--cwd", str(instruction_root), "--"
         ] + command
-        completed = subprocess.run(invocation, env=phase_environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        completed = subprocess.Popen(
+            invocation, env=phase_environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            start_new_session=True
+        )
+        atomic_write(control / ".supervisor.pid", (str(completed.pid)+"\n").encode("ascii"), 0o600)
+        _, phase_stderr = completed.communicate()
+        try:
+            os.unlink(control / ".supervisor.pid")
+        except FileNotFoundError:
+            pass
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
             raw = raw_path.read_bytes()
         except Exception as exc:
             stop(f"{name} supervisor result is missing or malformed: {exc}", 1)
-        if private_attempt is not None:
-            atomic_write(private_attempt / f"{name}.raw", raw, 0o600)
         attempt["phases"].append({
             "phase":name, "status":result.get("status"), "exit_code":result.get("exit_code"),
             "duration_ms":result.get("duration_ms"), "truncated":result.get("truncated"),
@@ -871,6 +961,17 @@ try:
     if verdict.get("provider") != provider or verdict.get("attempt_id") != attempt_id:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"identity"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("verdict provider/attempt identity is mismatched", 1)
+    blocker_objects = verdict.get("blocker_objects", [])
+    if verdict.get("verdict") == "BLOCK":
+        ids = [item.get("id") for item in blocker_objects if isinstance(item, dict)]
+        texts = [item.get("text") for item in blocker_objects if isinstance(item, dict)]
+        if (len(ids) != len(blocker_objects) or len(ids) != len(set(ids))
+                or texts != verdict.get("blockers")):
+            finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
+            stop("BLOCK verdict blocker objects are missing, duplicated, reordered, or contradict blocker text", 1)
+    elif blocker_objects:
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
+        stop("APPROVE verdict cannot contain blocker objects", 1)
     valid, reason = verify_candidate()
     if not valid:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"promotion"}, diagnostic=str(diagnostic_path.relative_to(run)))
@@ -905,34 +1006,21 @@ except BaseException as exc:
             pass
     raise
 finally:
-    if attempt is not None and attempt_path is not None:
-        for raw_path in list(control.glob(".*.raw")) if control and control.exists() else []:
-            try:
-                os.unlink(raw_path)
-            except OSError:
-                pass
-    if control and control.exists():
+    if guardian is not None and control is not None and control.exists():
         try:
-            for current, dirs, files in os.walk(control, topdown=False):
-                for name in files:
-                    try:
-                        os.chmod(Path(current) / name, 0o600, follow_symlinks=False)
-                    except OSError:
-                        pass
-                for name in dirs:
-                    try:
-                        os.chmod(Path(current) / name, 0o700, follow_symlinks=False)
-                    except OSError:
-                        pass
-            os.chmod(control, 0o700, follow_symlinks=False)
+            atomic_write(control / ".cleanup-request", b"cleanup\n", 0o600)
+            guardian_rc=guardian.wait(timeout=10)
+            if guardian_rc != 0:
+                cleanup_failure=True
+        except Exception:
+            cleanup_failure=True
+            try: guardian.kill()
+            except OSError: pass
+    elif control is not None and control.exists():
+        try:
             shutil.rmtree(control)
         except OSError:
-            pass
-    if private_attempt is not None and private_attempt.exists():
-        try:
-            shutil.rmtree(private_attempt)
-        except OSError:
-            pass
+            cleanup_failure=True
     try:
         owner = lock / "owner.json"
         if owner.exists() and not owner.is_symlink():
@@ -940,4 +1028,7 @@ finally:
         os.rmdir(lock)
     except OSError:
         pass
+    if cleanup_failure:
+        print(f"{label}: transient reviewer-control cleanup failed; BLOCK",file=sys.stderr,flush=True)
+        os._exit(1)
 PY

@@ -25,7 +25,9 @@ For UI-visible work, use `firm-visual-check`; a diff or missing/mismatched requi
 
 After the primary verdict, invoke the opposite-provider wrapper selected by run metadata:
 Claude-primary uses `firm-gpt-qa`; Codex-primary uses `firm-claude-qa`. Record availability and one
-`two_voice_diff` entry per secondary blocker. An unavailable wrapper is readiness evidence only when
+`two_voice_diff` entry per secondary producer blocker id. Copy its exact text, affected criteria, and
+affected paths from the producer object and derive risk from that object; omission, id substitution,
+or contradiction is blocking. An unavailable wrapper is readiness evidence only when
 its matching numbered attempt and explicit-target ledger event identify a trusted CLI/auth/model
 reason; a judge timeout or malformed result is BLOCK, never unavailable. Follow `firm-policy
 gate-matrix`; do not reduce the rule to “both approve.” A provider verdict is usable only when its
@@ -35,5 +37,6 @@ and the recorded disposition state.
 
 If the mechanical Final check returns `decision_required` (exit 4), report that nonpassing state to the
 Lead. It authorizes only a non-ship-ready draft handoff and one exact Final human interaction; it does
-not authorize QA approval, packaging completion, or a manufactured human record. Only a typed matching
-record followed by a fresh mechanical exit 0 clears Final.
+not authorize QA approval, packaging completion, or a manufactured human record. Report the complete
+aggregated producer-id/text set and only its permitted record types. Only one shared typed record
+naming every relevant producer id and text, followed by a fresh mechanical exit 0, clears Final.
