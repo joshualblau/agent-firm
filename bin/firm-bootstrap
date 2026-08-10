@@ -1,74 +1,322 @@
 #!/usr/bin/env bash
 # firm-bootstrap [--with-permissions] [--with-python-deps]
-# Install/update the same checkout for Claude Code and Codex. Both CLIs are mandatory and are
-# preflighted before either installation is changed.
+# Both CLIs are mandatory. Before the first mutation this performs bounded capability, selector/schema,
+# and exact target-state preflight for Claude and Codex. Provider failures trigger compensation to the
+# captured state; failed compensation writes a mode-0600 recovery record and remains BLOCKING.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"; ROOT="$(cd "$SELF/.." && pwd)"
-CODEX_MARKETPLACE_ROOT="$ROOT"
 
 want_permissions=0; want_python_deps=0
 for arg in "$@"; do
   case "$arg" in
     --with-permissions) want_permissions=1 ;;
     --with-python-deps) want_python_deps=1 ;;
-    -h|--help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "firm-bootstrap: unknown arg '$arg'" >&2; exit 2 ;;
   esac
 done
 
 echo "agent-firm dual-provider bootstrap"
 echo "  repo: $ROOT"
-missing=""
-command -v claude >/dev/null 2>&1 || missing="$missing claude"
-command -v codex >/dev/null 2>&1 || missing="$missing codex"
-if [[ -n "$missing" ]]; then
-  echo "ERROR: required CLI(s) missing:$missing. Install both Claude Code and Codex before bootstrap; nothing was installed." >&2
-  exit 1
-fi
-"$SELF/firm-version" --check >/dev/null
 
-# Claude marketplace + plugin.
-if claude plugin marketplace list 2>/dev/null | grep -qF "$ROOT"; then
-  echo "  ✔ Claude marketplace already registered — refreshing"
-  claude plugin marketplace update local >/dev/null
-else
-  claude plugin marketplace add "$ROOT"
-fi
-if claude plugin list 2>/dev/null | grep -q 'agent-firm@local'; then
-  echo "  ✔ Claude plugin already installed — updating"
-  claude plugin update agent-firm@local
-else
-  claude plugin install agent-firm@local
-fi
+# The provider transaction uses only the standard library plus WO-F's bounded-process helper. Tests
+# supply disposable fixture CLIs and recovery roots; production callers must explicitly authorize the
+# resulting provider-store mutations. This is compensation across two stores, never atomicity.
+python3 - "$ROOT" "$SELF/firm-bounded-exec" <<'PY'
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
 
-# Codex repo-local marketplace + root-source plugin. Local marketplaces read the checkout directly;
-# `plugin add` refreshes Codex's cached copy and is idempotent for an installed selector.
-if codex plugin marketplace list 2>/dev/null | grep -qF "$CODEX_MARKETPLACE_ROOT"; then
-  echo "  ✔ Codex marketplace already registered"
-else
-  codex plugin marketplace add "$CODEX_MARKETPLACE_ROOT"
-fi
-echo "  refreshing Codex plugin cache"
-codex plugin add agent-firm@agent-firm-local
+root, bounded = sys.argv[1:]
+selectors = {
+    "claude_marketplace": "local",
+    "claude_plugin": "agent-firm@local",
+    "codex_marketplace": "agent-firm-local",
+    "codex_plugin": "agent-firm@agent-firm-local",
+}
+
+def stop(message, code=1):
+    print(f"firm-bootstrap: BLOCKED: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+if not os.path.isfile(bounded) or not os.access(bounded, os.X_OK):
+    stop(f"bounded provider supervisor unavailable: {bounded}")
+
+commands = {provider: shutil.which(provider) for provider in ("claude", "codex")}
+missing = [provider for provider, path in commands.items() if not path]
+if missing:
+    stop("required CLI(s) missing: " + ", ".join(missing) + ". Install compatible Claude Code and Codex CLIs; no provider mutation ran.")
+
+try:
+    timeout = os.environ.get("FIRM_BOOTSTRAP_TIMEOUT", "30")
+    if not re.fullmatch(r"[0-9]+", timeout) or not 1 <= int(timeout) <= 300:
+        stop("FIRM_BOOTSTRAP_TIMEOUT must be a positive integer from 1 through 300 before provider execution", 2)
+except ValueError:
+    stop("invalid FIRM_BOOTSTRAP_TIMEOUT", 2)
+
+scratch = tempfile.mkdtemp(prefix="firm-bootstrap.")
+counter = 0
+
+def call(provider, phase, argv):
+    global counter
+    counter += 1
+    safe_phase = re.sub(r"[^A-Za-z0-9_.-]", "-", phase)[:64]
+    output = os.path.join(scratch, f"{counter:03d}-{safe_phase}.out")
+    result = os.path.join(scratch, f"{counter:03d}-{safe_phase}.json")
+    cmd = [bounded, "--phase", safe_phase, "--provider", provider,
+           "--timeout", timeout, "--grace", "2", "--max-output", "65536",
+           "--output", output, "--result", result, "--", commands[provider], *argv]
+    completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        raw = open(output, "rb").read() if os.path.exists(output) else b""
+        meta = json.load(open(result, encoding="utf-8")) if os.path.exists(result) else {}
+    except Exception as exc:
+        return {"ok": False, "rc": completed.returncode, "text": "", "raw": b"", "meta": {},
+                "error": f"bounded result unreadable: {type(exc).__name__}: {exc}"}
+    text = raw.decode("utf-8", "replace")
+    return {"ok": completed.returncode == 0 and meta.get("status") == "ok",
+            "rc": completed.returncode, "text": text, "raw": raw, "meta": meta,
+            "error": completed.stderr.decode("utf-8", "replace")[:500]}
+
+def require(provider, phase, argv, tokens=()):
+    result = call(provider, phase, argv)
+    if not result["ok"]:
+        stop(f"{provider} {phase} preflight failed (rc={result['rc']}); update/login to a compatible CLI and retry. No provider mutation ran.")
+    lowered = result["text"].lower()
+    absent = [token for token in tokens if token.lower() not in lowered]
+    if absent:
+        stop(f"{provider} {phase} lacks required capability token(s) {absent}; update that CLI. No provider mutation ran.")
+    return result
+
+def validate_source_schema():
+    version = subprocess.run([os.path.join(root, "bin", "firm-version"), "--check"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if version.returncode != 0:
+        stop("source version/manifest validation failed before provider mutation: " +
+             version.stderr.decode("utf-8", "replace")[:500])
+    expected = (
+        (os.path.join(root, ".claude-plugin", "marketplace.json"), "local", "agent-firm"),
+        (os.path.join(root, ".agents", "plugins", "marketplace.json"), "agent-firm-local", "agent-firm"),
+    )
+    versions = {}
+    for path, marketplace, plugin in expected:
+        try:
+            doc = json.load(open(path, encoding="utf-8"))
+            names = [entry.get("name") for entry in doc.get("plugins", []) if isinstance(entry, dict)]
+        except Exception as exc:
+            stop(f"selector/schema preflight cannot read {path}: {type(exc).__name__}: {exc}")
+        if doc.get("name") != marketplace or names != [plugin]:
+            stop(f"selector/schema preflight mismatch in {path}; expected marketplace={marketplace!r}, plugin={plugin!r}")
+        manifest = os.path.join(root, ".claude-plugin" if marketplace == "local" else ".codex-plugin", "plugin.json")
+        versions["claude" if marketplace == "local" else "codex"] = json.load(open(manifest, encoding="utf-8"))["version"]
+    return versions
+
+def target_lines(text, needles):
+    matches = []
+    for line in text.splitlines():
+        compact = line.strip()
+        low = compact.lower()
+        if compact and any(needle.lower() in low for needle in needles):
+            matches.append(compact)
+    return sorted(set(matches))
+
+def state_from_results(market, plugin, provider):
+    if provider == "claude":
+        market_needles = [root]
+        plugin_needles = [selectors["claude_plugin"]]
+    else:
+        market_needles = [root, selectors["codex_marketplace"]]
+        plugin_needles = [selectors["codex_plugin"]]
+    market_lines = target_lines(market["text"], market_needles)
+    plugin_lines = target_lines(plugin["text"], plugin_needles)
+    return {
+        "marketplace_present": bool(market_lines),
+        "marketplace_state": market_lines,
+        "marketplace_state_sha256": hashlib.sha256("\n".join(market_lines).encode()).hexdigest(),
+        "plugin_present": bool(plugin_lines),
+        "plugin_state": plugin_lines,
+        "plugin_state_sha256": hashlib.sha256("\n".join(plugin_lines).encode()).hexdigest(),
+    }
+
+def capture(provider, phase_prefix, preflight=False):
+    market = call(provider, phase_prefix + "-marketplace-state", ["plugin", "marketplace", "list"])
+    plugin = call(provider, phase_prefix + "-plugin-state", ["plugin", "list"])
+    if not market["ok"] or not plugin["ok"]:
+        if preflight:
+            stop(f"{provider} exact prior-state capture failed; fix CLI readiness and retry. No provider mutation ran.")
+        raise RuntimeError(f"{provider} recovery-state capture failed (market rc={market['rc']}, plugin rc={plugin['rc']})")
+    return state_from_results(market, plugin, provider)
+
+def atomic_record(record):
+    base = os.environ.get("FIRM_BOOTSTRAP_RECOVERY_DIR")
+    if not base:
+        state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        base = os.path.join(state_home, "agent-firm", "recovery")
+    base_input = os.path.abspath(base)
+    if os.path.lexists(base_input) and os.path.islink(base_input):
+        raise OSError(f"recovery directory itself must not be a symlink: {base_input}")
+    # macOS spells its physical /private/var hierarchy through the system /var symlink. Resolve
+    # trusted existing ancestors first, then enforce non-symlink components on the physical path.
+    base = os.path.realpath(base_input)
+    current = os.path.sep
+    for component in base.split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        if os.path.lexists(current):
+            if os.path.islink(current) or not os.path.isdir(current):
+                raise OSError(f"unsafe recovery directory component: {current}")
+        else:
+            os.mkdir(current, 0o700)
+    os.chmod(base, 0o700)
+    name = time.strftime("bootstrap-%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}.json"
+    path = os.path.join(base, name)
+    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(payload); fh.flush(); os.fsync(fh.fileno())
+    os.chmod(path, 0o600)
+    return path
+
+def mutation(provider, phase, argv, reverse):
+    return {"provider": provider, "phase": phase, "argv": argv, "reverse": reverse}
+
+try:
+    # Mandatory dual-CLI capability and exact-state preflight. Every command here is non-mutating.
+    expected_versions = validate_source_schema()
+    require("claude", "version", ["--version"])
+    require("claude", "plugin-help", ["plugin", "--help"],
+            ("marketplace", "list", "install", "update", "uninstall"))
+    require("claude", "marketplace-help", ["plugin", "marketplace", "--help"],
+            ("list", "add", "remove"))
+    require("codex", "version", ["--version"])
+    require("codex", "plugin-help", ["plugin", "--help"],
+            ("marketplace", "list", "add", "remove"))
+    require("codex", "marketplace-help", ["plugin", "marketplace", "--help"],
+            ("list", "add", "remove"))
+    before = {provider: capture(provider, "prior", True) for provider in ("claude", "codex")}
+
+    actions = []
+    if not before["claude"]["marketplace_present"]:
+        actions.append(mutation("claude", "marketplace-add", ["plugin", "marketplace", "add", root],
+                                ["plugin", "marketplace", "remove", selectors["claude_marketplace"]]))
+    if before["claude"]["plugin_present"]:
+        actions.append(mutation("claude", "plugin-update", ["plugin", "update", selectors["claude_plugin"]],
+                                ["plugin", "update", selectors["claude_plugin"]]))
+    else:
+        actions.append(mutation("claude", "plugin-install", ["plugin", "install", selectors["claude_plugin"]],
+                                ["plugin", "uninstall", selectors["claude_plugin"]]))
+    if not before["codex"]["marketplace_present"]:
+        actions.append(mutation("codex", "marketplace-add", ["plugin", "marketplace", "add", root],
+                                ["plugin", "marketplace", "remove", selectors["codex_marketplace"]]))
+    actions.append(mutation("codex", "plugin-refresh", ["plugin", "add", selectors["codex_plugin"]],
+                            ["plugin", "add", selectors["codex_plugin"]] if before["codex"]["plugin_present"]
+                            else ["plugin", "remove", selectors["codex_plugin"]]))
+
+    attempted = []
+    failure = None
+    for action in actions:
+        result = call(action["provider"], action["phase"], action["argv"])
+        attempted.append(action)
+        if not result["ok"]:
+            failure = {"provider": action["provider"], "phase": action["phase"], "exit_code": result["rc"],
+                       "bounded_status": result["meta"].get("status", "missing")}
+            break
+
+    if failure is None:
+        try:
+            after = {provider: capture(provider, "verify", False) for provider in ("claude", "codex")}
+            missing_after = [provider for provider in ("claude", "codex")
+                             if not after[provider]["marketplace_present"] or not after[provider]["plugin_present"]]
+            if missing_after:
+                failure = {"provider": "both", "phase": "post-mutation-verification", "exit_code": 1,
+                           "bounded_status": "state_mismatch", "missing": missing_after}
+            stale_after = [provider for provider in ("claude", "codex")
+                           if not any(expected_versions[provider] in line for line in after[provider]["plugin_state"])]
+            if failure is None and stale_after:
+                failure = {"provider": "both", "phase": "post-mutation-version-verification", "exit_code": 1,
+                           "bounded_status": "state_mismatch", "stale": stale_after}
+        except Exception as exc:
+            failure = {"provider": "both", "phase": "post-mutation-verification", "exit_code": 1,
+                       "bounded_status": "capture_failed", "error": str(exc)}
+
+    if failure is not None:
+        compensation = []
+        for action in reversed(attempted):
+            result = call(action["provider"], "compensate-" + action["phase"], action["reverse"])
+            compensation.append({"provider": action["provider"], "phase": action["phase"],
+                                 "command": action["reverse"], "exit_code": result["rc"],
+                                 "bounded_status": result["meta"].get("status", "missing"),
+                                 "succeeded": result["ok"]})
+        capture_errors = []
+        current = {}
+        for provider in ("claude", "codex"):
+            try:
+                current[provider] = capture(provider, "recovery", False)
+            except Exception as exc:
+                capture_errors.append(f"{provider}: {exc}")
+                current[provider] = {"capture_error": str(exc)}
+        exact = not capture_errors and all(current.get(provider) == before[provider]
+                                           for provider in ("claude", "codex"))
+        comp_ok = all(item["succeeded"] for item in compensation) and exact
+        record = {
+            "schema_version": 1,
+            "status": "recovered" if comp_ok else "BLOCKED_RECOVERY_REQUIRED",
+            "failure": failure,
+            "captured_prior_state": before,
+            "observed_recovery_state": current,
+            "compensation_attempts": compensation,
+            "capture_errors": capture_errors,
+            "exact_prior_state_restored": exact,
+            "safe_corrective_action": (
+                "No provider retry was performed. Inspect the named disposable/active provider stores, "
+                "compare them with captured_prior_state, restore only the agent-firm marketplace/plugin "
+                "entries, then rerun capability preflight before another mutation."
+            ),
+        }
+        try:
+            record_path = atomic_record(record)
+        except Exception as exc:
+            stop(f"provider mutation failed and recovery record could not be written safely: {exc}. Recovery remains BLOCKED.")
+        if comp_ok:
+            print(f"firm-bootstrap: provider mutation failed at {failure['provider']}/{failure['phase']}; compensation restored exact captured state", file=sys.stderr)
+        else:
+            print(f"firm-bootstrap: COMPENSATION BLOCKED at {failure['provider']}/{failure['phase']}; exact recovery is required", file=sys.stderr)
+        print(f"firm-bootstrap: recovery record: {record_path}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print("  provider transaction complete: Claude and Codex marketplace/plugin targets verified")
+finally:
+    shutil.rmtree(scratch, ignore_errors=True)
+PY
 
 if [[ "${FIRM_SKIP_LINK:-0}" != "1" ]]; then "$SELF/firm-link"; else echo "  (skipping shell PATH linking — FIRM_SKIP_LINK=1)"; fi
 
-PIP_CMD="python3 -m pip install --user jsonschema pyyaml"
 missing_py=""
 python3 -c 'import jsonschema' >/dev/null 2>&1 || missing_py="$missing_py jsonschema"
 python3 -c 'import yaml' >/dev/null 2>&1 || missing_py="$missing_py pyyaml"
 if [[ -n "$missing_py" ]]; then
   if [[ "$want_python_deps" == "1" ]]; then
     echo "  installing Python prerequisites:$missing_py"
-    $PIP_CMD || echo "  WARNING: pip install failed — run it yourself: $PIP_CMD" >&2
+    python3 -m pip install --user jsonschema pyyaml || echo "  WARNING: pip install failed — run: python3 -m pip install --user jsonschema pyyaml" >&2
   else
-    echo "  ⚠ missing Python prerequisite(s):$missing_py"
-    echo "    Install with: $PIP_CMD (or re-run with --with-python-deps)"
+    echo "  missing Python prerequisite(s):$missing_py"
+    echo "    Install with: python3 -m pip install --user jsonschema pyyaml (or re-run with --with-python-deps)"
   fi
 else
-  echo "  ✔ Python prerequisites present (jsonschema, pyyaml)"
+  echo "  Python prerequisites present (jsonschema, pyyaml)"
 fi
 
 if [[ "$want_permissions" == "1" ]]; then
@@ -79,7 +327,7 @@ fi
 cat <<'EOF'
 
 Done. Next steps:
-  cd <your project> && firm-install     # Claude permission policy; Codex keeps native sandbox/approval config
+  cd <your project> && firm-install     # permissions only; plugin manifests own runtime hooks
   firm-doctor
   claude                               # /agent-firm:start <goal>
   codex                                # $agent-firm:start <goal>

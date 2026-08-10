@@ -92,6 +92,32 @@ assert_ok "the new deny rules landed"             has_rule "$S" deny  "Bash(cat 
 assert_ok "Read-tool deny rules landed"           has_rule "$S" deny  "Read(./.env)"
 
 # ---------------------------------------------------------------------------
+t_case "permission migration preserves legacy hooks and unrelated configuration for manual review"
+legacy_proj="$(mk_target '{"permissions":{"allow":["Bash(cat:*)"],"ask":[],"deny":[]},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"custom-hook"},{"type":"command","command":"firm-ledger-hook"}]}]},"custom":{"owner":"project","enabled":true}}')"
+t_track "$legacy_proj"
+LS="$legacy_proj/.claude/settings.json"
+legacy_before="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+assert_ok "migration succeeds without claiming hook ownership" install_in "$legacy_proj" --migrate
+legacy_after="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+assert_eq "legacy hook and unrelated config subtrees remain semantically exact" "$legacy_before" "$legacy_after"
+assert_ok "retired permission is still removed" lacks_rule "$LS" allow "Bash(cat:*)"
+assert_ok "canonical permission source no longer embeds plugin-owned hooks" python3 -c \
+  "import json; d=json.load(open('$FIRM_ROOT/.claude/settings.json')); assert 'hooks' not in d"
+legacy_home="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-home.XXXXXX")"; t_track "$legacy_home"
+legacy_stubs="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-stubs.XXXXXX")"; t_track "$legacy_stubs"
+printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 0\n' > "$legacy_stubs/claude"
+printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 0\nexit 0\n' > "$legacy_stubs/codex"
+chmod +x "$legacy_stubs/claude" "$legacy_stubs/codex"
+legacy_hash="$(shasum -a 256 "$LS" | cut -d' ' -f1)"
+legacy_doctor_out="$(cd "$legacy_proj" && HOME="$legacy_home" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"
+assert_output "doctor detects the external Claude duplicate" "project Claude settings contain a legacy duplicate firm hook" \
+  printf '%s\n' "$legacy_doctor_out"
+assert_output "doctor gives config-preserving manual guidance" "preserve unrelated hooks/settings" \
+  printf '%s\n' "$legacy_doctor_out"
+assert_eq "doctor detection leaves the external settings byte-identical" "$legacy_hash" \
+  "$(shasum -a 256 "$LS" | cut -d' ' -f1)"
+
+# ---------------------------------------------------------------------------
 t_case "--migrate is idempotent and settles to a clean install"
 assert_ok "second migrate is a no-op"   install_in "$proj" --migrate
 assert_ok "plain install now exits 0"   install_in "$proj"

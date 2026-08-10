@@ -9,11 +9,17 @@ rm -rf /tmp/firm-live && mkdir -p /tmp/firm-live && cd /tmp/firm-live && git ini
 firm-install
 git add -A && git commit -qm "init: firm config installed"
 ```
-`firm-bootstrap` requires both provider CLIs, preflights them before either install is changed,
-installs both adapters from the same checkout, and links the shared tools.
+`firm-bootstrap` requires both provider CLIs and, before either install is changed, runs bounded
+capability/selector/schema checks and captures the exact matching provider state. It installs both
+adapters from the same checkout and links the shared tools. This changes real provider stores: use it
+only after approving that external action. Failure triggers verified compensation, not atomicity; a
+failed compensation remains BLOCKED and names a mode-0600 recovery record that must be reviewed before
+retry.
 `firm-install` merges Claude's per-project permission policy; it intentionally does not overwrite
-Codex config, rules, or hooks. The firm's own `tests/` and `.github/` remain in the plugin source, not
-the work project. To work on the tooling itself rather than drive it, use the agent-firm repo.
+Claude/Codex config, rules, or hooks. Claude and Codex each receive one hook source from their plugin
+manifest; legacy project/user duplicates are detection-only and require a configuration-preserving
+manual review. The firm's own `tests/` and `.github/` remain in the plugin source, not the work project.
+To work on the tooling itself rather than drive it, use the agent-firm repo.
 
 Run the firm for real and watch the lifecycle engage.
 
@@ -57,6 +63,11 @@ Then invoke the symmetric Codex-first workflow:
 6. **No auto-finish** — the Lead pauses at the **final gate** with a well-formed approval payload
    (decision, context, options, recommendation, default, risk, blocking) and waits for your sign-off.
 
+This smoke is not package-readiness proof by itself. Release evidence must bind to the exact full SHA,
+first exercise both real loaders and repeat cache refreshes in disposable provider homes, and later
+exercise normal and interruption-between-providers rollback with a human-reviewed record. Never use
+active homes/configuration as a substitute when isolation cannot be established.
+
 ## Inspect afterward
 ```bash
 RUN=$(cat /tmp/firm-live/.agent-firm/CURRENT_RUN)
@@ -76,5 +87,6 @@ claude   # /agent-firm:start <goal>
 # or: codex   # $agent-firm:start <goal>
 ```
 This uses the repository root as the single plugin source; updates to that checkout refresh both
-provider caches. A missing provider CLI stops the refresh before either cache is changed. See
+provider caches. A missing or incompatible provider CLI, unreadable prior state, or selector/schema
+mismatch stops the refresh before either cache is changed. See
 [INSTALL.md](INSTALL.md) for lifecycle, safe obsolete-hook migration, and version details.

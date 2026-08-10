@@ -12,8 +12,10 @@ python3 -m pip install --user jsonschema pyyaml
 ```
 
 This is an intentional joint prerequisite: bootstrap, install refresh, and `firm-version
---local-refresh` do not offer a one-provider mode. `firm-bootstrap` checks for both CLIs before it
-invokes either provider, so a missing CLI leaves both provider installations unchanged.
+--local-refresh` do not offer a one-provider mode. Before its first mutation, `firm-bootstrap` uses
+bounded calls to check both executables, required plugin/marketplace subcommands, local selector and
+manifest schemas, and the exact matching marketplace/plugin state reported by both CLIs. A missing,
+old/incompatible, timed-out, or state-unreadable CLI leaves both provider installations unchanged.
 
 - **`jsonschema` is required.** Without it `firm-validate-verdict` cannot schema-check a QA verdict
   and exits **4 (DEGRADED)**, which does not satisfy the Final gate — an unverifiable verdict is not
@@ -36,6 +38,16 @@ cd <your project>
 firm-install                             # merges the firm's permission rules into .claude/settings.json
 ```
 
+Bootstrap changes two independent provider stores; it is **not atomic**. It captures the matching
+Claude/Codex marketplace and plugin state before mutation and, on any provider failure, attempts
+compensation in reverse order and verifies the captured target state. Every failed operation writes a
+mode-`0600` JSON record under `FIRM_BOOTSTRAP_RECOVERY_DIR` when set, otherwise
+`$XDG_STATE_HOME/agent-firm/recovery` or `~/.local/state/agent-firm/recovery`. A successful
+compensation still leaves that bootstrap attempt
+failed and safe to inspect. Failed or unverifiable compensation is `BLOCKED_RECOVERY_REQUIRED`: do not
+rerun or claim “nothing changed”; compare the record's `captured_prior_state` and
+`observed_recovery_state`, restore only the named agent-firm entries, and repeat preflight.
+
 **Migrating a project installed before this fix:** `firm-install` only ever *adds* rules, so a project
 set up before the fix that retired `Bash(cat:*)` / `Bash(jq:*)` (they read straight around the
 `Read(./.env)` / `Read(~/.ssh/**)` deny rules) still grants them — no version number reliably tells you
@@ -47,10 +59,13 @@ firm-install --user --migrate            # same, for user-scope settings
 ```
 See `agent-firm/policy/retired-permissions.json` for the full list of retired rules and why.
 
-**Migrating an obsolete project Codex hook.** `firm-doctor` warns when `.codex/hooks.json` still
-registers `firm-ledger-hook`, because the installed plugin now owns that hook. Bootstrap and doctor do
-not delete or rewrite project configuration. Review the file for project-specific hooks, remove only
-the duplicate ledger registration (or the file if that is all it contains), then rerun `firm-doctor`.
+**Migrating obsolete project hooks.** Each runtime now has one plugin-owned source: Claude selects
+`hooks/claude.json`; Codex discovers `hooks/hooks.json`. The tracked `.claude/settings.json` contains
+permissions only. `firm-doctor` detects legacy firm commands in project/user Claude settings and the
+obsolete project `.codex/hooks.json`. Bootstrap, doctor, and `firm-install --migrate` never delete or
+rewrite those external hook/configuration trees. Preserve unrelated settings and custom hooks, remove
+only confirmed duplicate firm command objects (or a prototype file if that is all it contains), then
+rerun `firm-doctor`.
 The repository ignores `.codex/` and timestamped `.claude/settings.json.*.bak` files; those local
 configuration/backup artifacts must never be copied into a plugin package or deleted as cleanup.
 
@@ -149,10 +164,14 @@ After local development changes:
 git -C ~/agent-firm pull                                    # if using a remote
 firm-version --local-refresh
 ```
-For a release, `firm-version --release X.Y.Z` updates both manifests to the same base, then
-`firm-bootstrap` refreshes both caches. Both CLIs are required before any refresh mutation. Codex
-build metadata may carry a provider-specific cachebuster;
-`firm-version --check` compares base versions in CI.
+For a release, `firm-version --release X.Y.Z` validates complete SemVer and updates `VERSION` plus both
+provider manifests as one recoverable three-target source transaction. `--local-refresh <token>`
+requires non-empty dot-separated SemVer build identifiers and writes provider-prefixed
+`+claude.<token>` / `+codex.<token>` cachebusters. All three original files are loaded, staged, and
+validated before replacement; a write/rename or paired-bootstrap failure restores all original bytes
+and reports recovery before any cache refresh is called complete. Both CLIs are required before the
+paired refresh mutation. `firm-version --check` validates the full versions and provider prefixes in
+CI.
 
 ## Per-project version pinning (optional)
 Default install is user scope (one version everywhere). To pin a project:
@@ -176,6 +195,24 @@ firm-version --check
 - A `firm-*` tool can't find its policies/templates → you have a stale hand-made symlink or copy from
   before `firm-link`; re-run `firm-link` to repoint it at the repo.
 - Unrelated MCP startup errors → `claude --strict-mcp-config` runs with no MCP servers (the firm needs none).
+
+## Isolated loader proof and rollback
+
+Unit tests use fixture CLIs only. They do not prove a real Claude/Codex loader, provider cache format,
+or rollback. Release readiness therefore uses a separately approved disposable exercise, bound to one
+full commit SHA: snapshot isolated provider homes and disposable project settings; install from a clean
+archive; validate both real loaders; repeat refresh and compare byte/semantic cache state; prove one
+effective ledger event and one guard decision per runtime tool call; then exercise normal rollback and
+an interruption between providers. Active user homes, credentials, projects, and caches are never the
+fallback.
+
+For repair rollback, revert only the reviewed successor delta to its recorded base. For product
+rollback, use the recorded last Claude-first baseline and remove/disable only the intended agent-firm
+provider entries. In both cases preserve run history, project configuration, permissions, unrelated
+hooks/plugins, and readable inert provider metadata. Compare before/after inventories and the bootstrap
+recovery record; if state is ambiguous or compensation failed, stop for human review. Do not describe
+either cross-provider procedure as atomic. A real human reviews the isolated rollback record before it
+can count as release evidence.
 
 ## Uninstall
 ```bash
