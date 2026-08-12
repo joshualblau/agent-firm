@@ -142,12 +142,18 @@ for role in [r for r in roles if r != "lead"]:
     assert front["name"] == role
     assert (front["model"], front["effort"]) == (got["model"], got["effort"]), (role, front, got)
 PY
-assert_ok "both provider adapters reject every resolver and apply mutation" python3 - "$FIRM_ROOT" "$W" <<'PY'
-import json, pathlib, re, shutil, subprocess, sys, yaml
+assert_ok "both provider adapters reject every resolver, role-start, and apply mutation" python3 - "$FIRM_ROOT" "$W" <<'PY'
+import copy, json, pathlib, re, shutil, subprocess, sys, yaml
 
 root, workspace = map(pathlib.Path, sys.argv[1:])
 sources = {"claude": "commands/start.md", "codex": "codex-skills/start/SKILL.md"}
 instruction = "apply_exact_model_display_effort_immediately_before_native_launch"
+native_launches = {"claude": "claude_native_agent", "codex": "codex_native_subagent"}
+additive_fields = (
+    "resolve_timing", "role_start_argv", "role_start_optional_argv",
+    "result_required_fields", "result_optional_fields", "native_launch",
+    "native_launch_fields", "retain_result_field", "failure_conditions",
+)
 
 def run(root_dir, provider, output_format):
     return subprocess.run(
@@ -192,6 +198,19 @@ def copied_root(provider, mutation):
         shutil.copy2(root / relative, destination)
     return target
 
+def load_adapter(root_dir, provider):
+    text = (root_dir / sources[provider]).read_text()
+    matches = re.findall(r"^```firm-native-role-adapter\n(.*?)^```$", text, re.M | re.S)
+    assert len(matches) == 1, (provider, len(matches))
+    return yaml.safe_load(matches[0])
+
+def provider_neutral(adapter):
+    normalized = copy.deepcopy(adapter)
+    normalized["provider"] = "<provider>"
+    normalized["resolver_argv"][2] = "<provider>"
+    normalized["native_launch"] = "<provider-native-launch>"
+    return normalized
+
 def mutate_adapter(target, provider, mutation):
     adapter_path = target / sources[provider]
     text = adapter_path.read_text()
@@ -208,6 +227,12 @@ def mutate_adapter(target, provider, mutation):
         adapter["apply_instruction"] = "inherit_or_guess"
     elif mutation.startswith("apply-field-"):
         adapter["apply_fields"].remove(mutation.removeprefix("apply-field-"))
+    elif mutation.startswith("additive-removed-"):
+        adapter.pop(mutation.removeprefix("additive-removed-"))
+    elif mutation.startswith("additive-changed-"):
+        field = mutation.removeprefix("additive-changed-")
+        value = adapter[field]
+        adapter[field] = value + ["MUTATED"] if isinstance(value, list) else "MUTATED"
     else:
         raise AssertionError(mutation)
     rendered = "```firm-native-role-adapter\n" + yaml.safe_dump(adapter, sort_keys=False) + "```"
@@ -231,6 +256,11 @@ def require_rejection(provider, mutation, mutate):
         return
     raise AssertionError((provider, mutation, "mutation survived"))
 
+adapters = {provider: load_adapter(root, provider) for provider in sources}
+assert adapters["claude"]["native_launch"] == native_launches["claude"]
+assert adapters["codex"]["native_launch"] == native_launches["codex"]
+assert provider_neutral(adapters["claude"]) == provider_neutral(adapters["codex"]), adapters
+
 for provider in sources:
     baseline = verify(root, provider)
     print(f"ACTIVATION_PASS provider={provider} adapter={baseline['adapter_source']}")
@@ -239,6 +269,11 @@ for provider in sources:
                      "apply-field-effort"):
         require_rejection(provider, mutation,
                           lambda target, mutation=mutation: mutate_adapter(target, provider, mutation))
+    for field in additive_fields:
+        for kind in ("removed", "changed"):
+            mutation = f"additive-{kind}-{field}"
+            require_rejection(provider, mutation,
+                              lambda target, mutation=mutation: mutate_adapter(target, provider, mutation))
     for field in ("model", "display", "effort"):
         require_rejection(provider, "output-" + field,
                           lambda target, field=field: mutate_activation_output(target, field))

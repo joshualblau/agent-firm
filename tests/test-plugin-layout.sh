@@ -244,6 +244,138 @@ done
 assert_output "Codex start uses Codex-primary run metadata" "--primary codex" cat "$FIRM_ROOT/codex-skills/start/SKILL.md"
 assert_output "Claude start uses Claude-primary run metadata" "--primary claude" cat "$FIRM_ROOT/commands/start.md"
 
+t_case "provider adapters share one resolver-bound role-start boundary"
+assert_ok "adapter blocks, call sites, lifecycle, and inventory preserve provider parity" \
+  python3 - "$FIRM_ROOT" <<'PY'
+import copy, pathlib, re, sys, yaml
+
+root = pathlib.Path(sys.argv[1])
+sources = {"claude": root / "commands/start.md", "codex": root / "codex-skills/start/SKILL.md"}
+native = {"claude": "claude_native_agent", "codex": "codex_native_subagent"}
+
+def flat(text):
+    return " ".join(text.split())
+
+def adapter(text):
+    matches = re.findall(r"^```firm-native-role-adapter\n(.*?)^```$", text, re.M | re.S)
+    assert len(matches) == 1, len(matches)
+    return yaml.safe_load(matches[0])
+
+def neutral(value):
+    value = copy.deepcopy(value)
+    value["provider"] = "<provider>"
+    value["resolver_argv"][2] = "<provider>"
+    value["native_launch"] = "<provider-native-launch>"
+    return value
+
+def required_callsite(provider):
+    provider_launch = "Claude native agent launch" if provider == "claude" else "Codex native subagent launch"
+    return [
+        f"firm-model-resolve --provider {provider} --role <role> --format activation",
+        "firm-ledger-log --run <run> --strict --role-start",
+        "--stage <stage-instance> --role <role> --contract <run-relative-contract>",
+        "--event <expected-start-event> --authority-json <authority-json>",
+        "--agent <native-agent-id> --activation-json <exact-resolver-activation-json>",
+        "[--activation-justification <text>]",
+        "Parse success stdout only as the closed proved result",
+        "activation.apply.model", "activation.apply.display", "activation.apply.effort",
+        provider_launch,
+        "retains the exact returned `event_id` from the same parsed result",
+        "The producer validates and records; it does not invoke a provider",
+        "perform a second model resolution",
+        "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+    ]
+
+blocks = {}
+for provider, path in sources.items():
+    text = path.read_text()
+    flattened = flat(text)
+    for phrase in required_callsite(provider):
+        assert flat(phrase) in flattened, (provider, phrase)
+    blocks[provider] = adapter(text)
+    assert blocks[provider]["provider"] == provider
+    assert blocks[provider]["resolver_argv"][2] == provider
+    assert blocks[provider]["native_launch"] == native[provider]
+
+assert neutral(blocks["claude"]) == neutral(blocks["codex"]), blocks
+
+lifecycle = flat((root / "agent-firm/contracts/lifecycle.md").read_text())
+for phrase in (
+    "firm-ledger-log --run <run> --strict --role-start",
+    "--agent <native-agent-id> --activation-json <exact-resolver-activation-json>",
+    "All contextual identity is explicit",
+    "applies its exact `activation.apply.model`",
+    "retains its exact `event_id` for downstream start, stop, block, and completion records",
+    "The producer validates and records; it does not invoke or simulate either provider",
+    "`firm-model-resolve` remains the sole role-to-tier/model authority",
+    "Record ordinary non-role milestones through ordinary `firm-ledger-log`",
+):
+    assert flat(phrase) in lifecycle, phrase
+
+readme = flat((root / "README.md").read_text())
+for phrase in (
+    "single canonical `firm-ledger-log --run <run> --strict --role-start` producer",
+    "does not invoke a provider",
+    "retains the same returned `event_id`",
+    "a second model resolution are not valid paths",
+    "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+):
+    assert flat(phrase) in readme, phrase
+
+for path in (*sources.values(), root / "agent-firm/contracts/lifecycle.md", root / "README.md"):
+    text = path.read_text()
+    assert "firm-role-start" not in text, path
+    assert "--print-event-id" not in text, path
+    assert not re.search(r"firm-ledger-log(?:\s+--[^\s`]+(?:\s+[^\s`]+)?)*\s+[a-z0-9_]+_started\b", text), path
+
+# The producer may run the canonical resolver, but no literal Claude/Codex executable may be a
+# process-launch target. Native provider launch belongs exclusively to the Lead adapter.
+producer = (root / "bin/firm-ledger-log").read_text()
+launcher_forms = (
+    r"\b(?:subprocess\.)?(?:run|Popen|call|check_call|check_output)\s*\(\s*[\[(]\s*['\"](?:claude|codex)['\"]",
+    r"\bos\.(?:system|execl|execlp|execv|execvp)\s*\(\s*['\"](?:claude|codex)['\"]",
+    r"(?m)^\s*(?:claude|codex)(?:\s|$)",
+)
+for pattern in launcher_forms:
+    assert not re.search(pattern, producer), pattern
+PY
+assert_ok "independent mutations kill both provider call patterns" python3 - "$FIRM_ROOT" <<'PY'
+import pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+sources = {"claude": root / "commands/start.md", "codex": root / "codex-skills/start/SKILL.md"}
+
+def flat(text):
+    return " ".join(text.split())
+
+def required(provider):
+    native = "Claude native agent launch" if provider == "claude" else "Codex native subagent launch"
+    return [
+        f"firm-model-resolve --provider {provider} --role <role> --format activation",
+        "firm-ledger-log --run <run> --strict --role-start",
+        "--stage <stage-instance> --role <role> --contract <run-relative-contract>",
+        "--event <expected-start-event> --authority-json <authority-json>",
+        "--agent <native-agent-id> --activation-json <exact-resolver-activation-json>",
+        "Parse success stdout only as the closed proved result",
+        "activation.apply.model", "activation.apply.display", "activation.apply.effort",
+        native,
+        "retains the exact returned `event_id` from the same parsed result",
+        "The producer validates and records; it does not invoke a provider",
+        "perform a second model resolution",
+        "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+    ]
+
+for provider, path in sources.items():
+    baseline = flat(path.read_text().split("```firm-native-role-adapter", 1)[0])
+    phrases = required(provider)
+    for phrase in phrases:
+        needle = flat(phrase)
+        assert needle in baseline, (provider, phrase)
+        mutant = baseline.replace(needle, "MUTATED", 1)
+        missing = [candidate for candidate in phrases if flat(candidate) not in mutant]
+        assert phrase in missing, (provider, phrase, missing)
+PY
+
 t_case "current docs reject readiness, recovery, duplicate, loader, and Final-handoff contradictions"
 assert_ok "reference and historical docs preserve one candidate-readiness story" python3 - "$FIRM_ROOT" <<'PY'
 import pathlib,re,sys

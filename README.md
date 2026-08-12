@@ -57,6 +57,16 @@ also supported. The canonical cells are: ceiling = Fable 5 (`fable`, `max`) / GP
 (`gpt-5.6-terra`, `low`). Unknown roles, tiers, aliases, models, displays, or efforts block; there is
 no fallback downgrade.
 
+For delegated role starts, each Lead resolves once immediately before calling the single canonical
+`firm-ledger-log --run <run> --strict --role-start` producer with explicit stage, role, contract,
+event, authority, agent, and exact resolver activation JSON. The producer validates and records but
+does not invoke a provider. The Lead parses only its proved result, launches the provider-native agent
+with the returned activation and agent fields, and retains the same returned `event_id` for later
+lifecycle records. Manual contract hash/stat, ambient run or authority selection, direct ordinary
+role-start logging, event-id transcription or ledger scraping, and a second model resolution are not
+valid paths. Ordinary non-role milestones continue through ordinary `firm-ledger-log`; see the
+[delegated role-start boundary](agent-firm/contracts/lifecycle.md#delegated-role-start-boundary).
+
 To update both caches from local changes, run `firm-version --local-refresh`. For a release, run
 `firm-version --release X.Y.Z`, then `firm-bootstrap`. Start a new Codex task and restart/reload the
 Claude session after either refresh.
