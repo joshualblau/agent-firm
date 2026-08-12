@@ -138,4 +138,31 @@ assert_rc "malformed existing target ledger is rejected" 1 \
 assert_eq "malformed target remains byte-identical" "$malformed_before" \
   "$(shasum -a 256 "$repo9/.agent-firm/runs/malformed/run.jsonl" | awk '{print $1}')"
 
+t_case "ordinary writers share the stable lock and atomic replace without partial or lost JSONL records"
+repo10="$(mk_repo)"; mk_run "$repo10" concurrent
+ordinary_race="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-race.XXXXXX")"; t_track "$ordinary_race"
+for n in 1 2 3 4 5 6 7 8 9 10; do
+  ( "$LOG" --run "$repo10/.agent-firm/runs/concurrent" --strict \
+      --event-id "evt-ordinary-concurrent-$n" ordinary_event "sequence=$n" \
+      > "$ordinary_race/$n.out" 2> "$ordinary_race/$n.err"; printf '%s' "$?" > "$ordinary_race/$n.rc" ) &
+done
+wait
+ordinary_successes=0
+for n in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(cat "$ordinary_race/$n.rc")" -eq 0 ] && ordinary_successes=$((ordinary_successes+1))
+done
+assert_eq "all non-conflicting ordinary writers succeed" 10 "$ordinary_successes"
+assert_ok "every ordinary race record is complete, unique JSON" python3 - \
+  "$repo10/.agent-firm/runs/concurrent/run.jsonl" <<'PY'
+import json,sys
+rows=[json.loads(line) for line in open(sys.argv[1],encoding="utf-8") if line.strip()]
+assert len(rows)==10, rows
+assert len({row["event_id"] for row in rows})==10
+assert {row["sequence"] for row in rows}=={str(n) for n in range(1,11)}
+PY
+assert_eq "ordinary sidecar lock mode is 600" 600 \
+  "$(stat -f '%Lp' "$repo10/.agent-firm/runs/concurrent/run.jsonl.lock" 2>/dev/null || stat -c '%a' "$repo10/.agent-firm/runs/concurrent/run.jsonl.lock")"
+assert_eq "ordinary transaction leaves no private temp" 0 \
+  "$(find "$repo10/.agent-firm/runs/concurrent" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+
 t_summary

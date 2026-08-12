@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# firm-ledger-log [--run <run-dir>] [--strict] <event> [key=value ...]
-# An explicit run is authoritative and never consults CURRENT_RUN. Default mode remains best-effort.
+# firm-ledger-log [--run RUN] [--strict] [--event-id ID] [--print-event-id] EVENT [key=value ...]
+# firm-ledger-log --run RUN --strict --role-start ...
+#
+# Ordinary logging remains best-effort by default. Role starts are an explicit, fail-closed mode.
 set -uo pipefail
-exec python3 - "$@" <<'PY'
+
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do
+  __dir="$(cd -P "$(dirname "$__src")" && pwd)"
+  __src="$(readlink "$__src")"
+  case $__src in /*) ;; *) __src="$__dir/$__src" ;; esac
+done
+__root="$(cd -P "$(dirname "$__src")/.." && pwd)"
+
+exec python3 - "$__root" "$@" <<'PY'
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,133 +25,1034 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 
-argv = sys.argv[1:]
-target = None
-strict = False
-requested_event_id = None
-print_event_id = False
-while argv and argv[0].startswith("--"):
-    flag = argv.pop(0)
-    if flag == "--run":
-        if not argv:
-            print("firm-ledger-log: --run needs a path", file=sys.stderr)
-            raise SystemExit(2)
-        target = argv.pop(0)
-    elif flag == "--strict":
-        strict = True
-    elif flag == "--event-id":
-        if not argv:
-            print("firm-ledger-log: --event-id needs a value", file=sys.stderr)
-            raise SystemExit(2)
-        requested_event_id = argv.pop(0)
-    elif flag == "--print-event-id":
-        print_event_id = True
-    else:
-        print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
-        raise SystemExit(2)
-event = argv.pop(0) if argv else "event"
+TOOL_ROOT = Path(sys.argv[1])
+ARGS = sys.argv[2:]
+SAFE_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SAFE_EVENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+SAFE_EVENT_ID = re.compile(r"evt-[A-Za-z0-9._:-]{1,128}\Z")
+SAFE_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+SAFE_ROLE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
+SAFE_STAGE_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+CHUNK = 64 * 1024
+MAX_JSON_OPERAND = 128 * 1024
+MAX_LEDGER_LINE = 1024 * 1024
+MAX_AUTHORITY = 16
+MAX_AUTHORITY_FIELDS = 32
+PRODUCER_RESERVED = {
+    "ts", "event", "event_id", "run_id", "stage", "role", "agent", "contract",
+    "authority", "activation", "activation_justification",
+}
+FAILPOINTS = {
+    "before_contract_read", "during_drift_validation", "contract_replace",
+    "contract_truncate", "contract_grow", "contract_mutate", "contract_mode",
+    "before_temp_write", "partial_temp_write", "temp_fsync", "pre_rename",
+    "post_rename", "directory_fsync", "post_append_pre_proof", "proof_read",
+    "proof_compare",
+}
 
-def fail(message):
+
+class RoleFailure(Exception):
+    def __init__(self, code, category, identity="request"):
+        super().__init__(category)
+        self.code = code
+        self.category = category
+        self.identity = identity
+
+
+class ValidationError(Exception):
+    pass
+
+
+class LedgerError(Exception):
+    pass
+
+
+class DuplicateEvent(LedgerError):
+    pass
+
+
+class DuplicateActivation(LedgerError):
+    pass
+
+
+class ContractDrift(Exception):
+    pass
+
+
+class CommitError(Exception):
+    def __init__(self, phase):
+        super().__init__(phase)
+        self.phase = phase
+
+
+def role_fail(code, category, identity="request"):
+    raise RoleFailure(code, category, safe_identity(identity))
+
+
+def safe_identity(value):
+    value = str(value)
+    if len(value) > 160 or not value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return "request"
+    if not re.fullmatch(r"[A-Za-z0-9_./:@+-]+", value):
+        return "request"
+    return value
+
+
+def ordinary_fail(strict, message):
     if strict:
         print(f"firm-ledger-log: {message}", file=sys.stderr)
         raise SystemExit(1)
     raise SystemExit(0)
 
-if target is None:
-    current = Path.cwd() / ".agent-firm" / "CURRENT_RUN"
-    try:
-        target = current.read_text(encoding="utf-8").strip()
-    except OSError:
-        raise SystemExit(0)
-if not target:
-    raise SystemExit(0)
-if any(ord(ch) < 32 or ord(ch) == 127 for ch in target):
-    fail("run path contains a control character")
-if ".." in Path(target).parts:
-    fail("run path contains traversal")
 
-run = Path(target)
-if not run.is_absolute():
-    run = Path.cwd() / run
-run = Path(os.path.abspath(str(run)))
-if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run.name) or run.name in (".", ".."):
-    fail("unsafe run id")
-if run.parent.name != "runs" or run.parent.parent.name != ".agent-firm":
-    fail("target is not <repo>/.agent-firm/runs/<safe-id>")
-repo = run.parent.parent.parent
-try:
-    for component in (repo, repo / ".agent-firm", run.parent, run):
-        st = os.lstat(component)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            fail(f"unsafe run component: {component}")
-        if st.st_uid != os.getuid():
-            fail(f"run component is not owned by the current user: {component}")
-    top = subprocess.check_output(
-        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-        stderr=subprocess.DEVNULL, text=True
-    ).strip()
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def parse_json_unique(raw):
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def printable(value, maximum=4096, allow_empty=False):
+    return (
+        isinstance(value, str)
+        and (allow_empty or bool(value))
+        and len(value.encode("utf-8")) <= maximum
+        and all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
+    )
+
+
+def exact_keys(value, keys):
+    return isinstance(value, dict) and set(value) == set(keys)
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def format_ts(value):
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def parse_ts(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp is not a string")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def stat_identity(st):
+    return (
+        st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid,
+        st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+    )
+
+
+def require_owned_directory(path, label):
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"missing {label}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ValidationError(f"unsafe {label}")
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o022:
+        raise ValidationError(f"unsafe ownership or mode for {label}")
+
+
+def validate_run(target, require_eligible):
+    if not isinstance(target, str) or not target:
+        raise ValidationError("empty run path")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in target):
+        raise ValidationError("run path contains a control character")
+    if ".." in Path(target).parts:
+        raise ValidationError("run path contains traversal")
+    run = Path(target)
+    if not run.is_absolute():
+        run = Path.cwd() / run
+    run = Path(os.path.abspath(str(run)))
+    if not SAFE_RUN.fullmatch(run.name) or run.name in (".", ".."):
+        raise ValidationError("unsafe run id")
+    if run.parent.name != "runs" or run.parent.parent.name != ".agent-firm":
+        raise ValidationError("target is not <repo>/.agent-firm/runs/<safe-id>")
+    repo = run.parent.parent.parent
+    for component, label in (
+        (repo, "repository"),
+        (repo / ".agent-firm", ".agent-firm"),
+        (run.parent, "runs directory"),
+        (run, "run directory"),
+    ):
+        require_owned_directory(component, label)
+    try:
+        top = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError("run is not in a validated repository") from exc
     if os.path.realpath(top) != os.path.realpath(repo):
-        fail("run is not owned through the expected repository root")
-except (OSError, subprocess.SubprocessError):
-    fail("run target is not a validated repository run")
+        raise ValidationError("unexpected repository root")
+    if require_eligible:
+        metadata = read_owned_json(run / "run-metadata.json", (0o600, 0o644), "run metadata")
+        if not isinstance(metadata, dict):
+            raise ValidationError("run metadata is not an object")
+        if metadata.get("run_id") != run.name:
+            raise ValidationError("run metadata identity mismatch")
+        if metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+            raise ValidationError("run is not current and approval eligible")
+    return repo, run
 
-if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", event):
-    fail("event contains unsafe characters")
-event_id = requested_event_id or (
-    "evt-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") +
-    f"-{os.getpid()}-{secrets.token_hex(8)}"
-)
-if not re.fullmatch(r"evt-[A-Za-z0-9._:-]{1,128}", event_id):
-    fail("event id contains unsafe characters")
-record = {
-    "ts": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "event": event,
-    "event_id": event_id
-}
-for item in argv:
-    if "=" not in item:
-        fail(f"field is not key=value: {item}")
-    key, value = item.split("=", 1)
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
-        fail(f"unsafe field name: {key}")
-    if key in ("ts", "event", "event_id", "run_id"):
-        fail(f"reserved field cannot be overridden: {key}")
-    record[key] = value
-record["run_id"] = run.name
 
-ledger = run / "run.jsonl"
-try:
-    try:
-        st = os.lstat(ledger)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            fail("run.jsonl is not a regular no-follow target")
-    except FileNotFoundError:
-        pass
-    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+def read_owned_json(path, modes, label):
+    flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(ledger, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        os.lseek(fd, 0, os.SEEK_SET)
-        existing = os.read(fd, os.fstat(fd).st_size).decode("utf-8", "strict")
-        for number, line in enumerate(existing.splitlines(), 1):
-            try:
-                prior = json.loads(line)
-            except Exception as exc:
-                fail(f"existing run.jsonl line {number} is malformed: {exc}")
-            if isinstance(prior, dict) and prior.get("event_id") == event_id:
-                fail(f"duplicate event id: {event_id}")
-        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
-        os.write(fd, payload)
-        os.fsync(fd)
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValidationError(f"cannot open {label}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) not in modes:
+            raise ValidationError(f"unsafe {label}")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_JSON_OPERAND:
+                raise ValidationError(f"oversized {label}")
+            chunks.append(chunk)
+        return parse_json_unique(b"".join(chunks).decode("utf-8", "strict"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"malformed {label}") from exc
     finally:
         os.close(fd)
-except (OSError, ValueError) as exc:
-    fail(f"could not append target ledger: {exc}")
-if print_event_id:
-    print(event_id)
-raise SystemExit(0)
+
+
+def validate_relative_path(value, prefix=None):
+    if not printable(value, 512):
+        raise ValidationError("unsafe relative path")
+    path = Path(value)
+    parts = path.parts
+    if path.is_absolute() or not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValidationError("unsafe relative path")
+    if str(path) != value or (prefix is not None and (not parts or parts[0] != prefix)):
+        raise ValidationError("non-canonical relative path")
+    for part in parts:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part):
+            raise ValidationError("unsafe relative path component")
+    return parts
+
+
+def open_contract(run, relative, failpoint):
+    parts = validate_relative_path(relative, "role-contracts")
+    dir_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        dir_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        dir_flags |= os.O_NOFOLLOW
+    fds = []
+    try:
+        current = os.open(run, dir_flags)
+        fds.append(current)
+        for part in parts[:-1]:
+            nxt = os.open(part, dir_flags, dir_fd=current)
+            st = os.fstat(nxt)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o022:
+                raise ValidationError("unsafe contract directory")
+            fds.append(nxt)
+            current = nxt
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(parts[-1], flags, dir_fd=current)
+    except (OSError, ValidationError) as exc:
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("cannot open sealed contract") from exc
+    for item in reversed(fds):
+        os.close(item)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o644:
+        os.close(fd)
+        raise ValidationError("sealed contract must be an owned mode-0644 regular file")
+    initial = stat_identity(st)
+    if failpoint == "before_contract_read":
+        os.close(fd)
+        raise ValidationError("injected contract read failure")
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            count += len(chunk)
+            digest.update(chunk)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        os.close(fd)
+        raise ValidationError("sealed contract read failed") from exc
+    if failpoint == "during_drift_validation" or after != initial or count != initial[5]:
+        os.close(fd)
+        raise ValidationError("sealed contract drifted during its stable read")
+    return fd, initial, {
+        "path": relative,
+        "bytes": count,
+        "sha256": digest.hexdigest(),
+        "mode": "0644",
+    }
+
+
+def reopen_contract(run, relative):
+    parts = validate_relative_path(relative, "role-contracts")
+    dir_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        dir_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        dir_flags |= os.O_NOFOLLOW
+    opened = []
+    try:
+        current = os.open(run, dir_flags)
+        opened.append(current)
+        for part in parts[:-1]:
+            current = os.open(part, dir_flags, dir_fd=current)
+            opened.append(current)
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(parts[-1], flags, dir_fd=current)
+        identity = stat_identity(os.fstat(fd))
+        os.close(fd)
+        return identity
+    except OSError as exc:
+        raise ValidationError("sealed contract path changed") from exc
+    finally:
+        for item in reversed(opened):
+            os.close(item)
+
+
+def prove_contract(fd, identity, run, relative):
+    if stat_identity(os.fstat(fd)) != identity or reopen_contract(run, relative) != identity:
+        raise ValidationError("sealed contract identity or metadata drifted")
+
+
+def maybe_mutate_contract(failpoint, run, relative):
+    path = run / relative
+    if failpoint == "contract_replace":
+        replacement = path.with_name(path.name + ".firm-test-replacement")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(replacement, flags, 0o644)
+        try:
+            os.write(fd, b"replacement\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(replacement, path)
+    elif failpoint == "contract_truncate":
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | (getattr(os, "O_NOFOLLOW", 0)))
+        os.close(fd)
+    elif failpoint == "contract_grow":
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | (getattr(os, "O_NOFOLLOW", 0)))
+        try:
+            os.write(fd, b"growth")
+        finally:
+            os.close(fd)
+    elif failpoint == "contract_mutate":
+        fd = os.open(path, os.O_WRONLY | (getattr(os, "O_NOFOLLOW", 0)))
+        try:
+            os.write(fd, b"X")
+        finally:
+            os.close(fd)
+    elif failpoint == "contract_mode":
+        os.chmod(path, 0o600, follow_symlinks=False)
+
+
+def parse_role_options(argv):
+    values = {}
+    booleans = set()
+    takes_value = {
+        "--run": "run", "--stage": "stage", "--role": "role", "--contract": "contract",
+        "--event": "event", "--authority-json": "authority_json", "--agent": "agent",
+        "--activation-json": "activation_json",
+        "--activation-justification": "activation_justification",
+    }
+    index = 0
+    while index < len(argv):
+        flag = argv[index]
+        if flag in ("--strict", "--role-start"):
+            if flag in booleans:
+                role_fail(2, "INPUT_INVALID", "duplicate-option")
+            booleans.add(flag)
+            index += 1
+            continue
+        if flag in takes_value:
+            key = takes_value[flag]
+            if key in values or index + 1 >= len(argv):
+                role_fail(2, "INPUT_INVALID", "option")
+            values[key] = argv[index + 1]
+            index += 2
+            continue
+        role_fail(2, "INPUT_INVALID", "option")
+    required = {"run", "stage", "role", "contract", "event", "authority_json", "agent", "activation_json"}
+    if booleans != {"--strict", "--role-start"} or set(values) - (required | {"activation_justification"}) or not required.issubset(values):
+        role_fail(2, "INPUT_INVALID", "required-options")
+    return values
+
+
+def validate_stage(value):
+    if not printable(value, 256):
+        role_fail(2, "INPUT_INVALID", "stage")
+    parts = value.split("/")
+    if not parts or any(not SAFE_STAGE_PART.fullmatch(part) for part in parts):
+        role_fail(2, "INPUT_INVALID", "stage")
+
+
+def validate_authority_json(raw, repo):
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_JSON_OPERAND:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    try:
+        value = parse_json_unique(raw)
+    except Exception:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    if not isinstance(value, list) or not value or len(value) > MAX_AUTHORITY:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    seen = set()
+    validated = []
+    for item in value:
+        if not exact_keys(item, {"source_run", "event_id", "expect"}):
+            role_fail(2, "INPUT_INVALID", "authority-schema")
+        source = item["source_run"]
+        if not printable(source, 256) or Path(source).parts != (".agent-firm", "runs", Path(source).name):
+            role_fail(2, "INPUT_INVALID", "authority-source")
+        source_id = Path(source).name
+        if not SAFE_RUN.fullmatch(source_id) or source != f".agent-firm/runs/{source_id}":
+            role_fail(2, "INPUT_INVALID", "authority-source")
+        event_id = item["event_id"]
+        if not isinstance(event_id, str) or not SAFE_EVENT_ID.fullmatch(event_id):
+            role_fail(2, "INPUT_INVALID", "authority-event-id")
+        marker = (source_id, event_id)
+        if marker in seen:
+            role_fail(2, "INPUT_INVALID", "authority-duplicate")
+        seen.add(marker)
+        expect = item["expect"]
+        if not exact_keys(expect, {"event", "run_id", "fields"}):
+            role_fail(2, "INPUT_INVALID", "authority-expect")
+        if not isinstance(expect["event"], str) or not SAFE_EVENT.fullmatch(expect["event"]):
+            role_fail(2, "INPUT_INVALID", "authority-event")
+        if expect["run_id"] != source_id:
+            role_fail(2, "INPUT_INVALID", "authority-run-id")
+        fields = expect["fields"]
+        if not isinstance(fields, dict) or not fields or len(fields) > MAX_AUTHORITY_FIELDS:
+            role_fail(2, "INPUT_INVALID", "authority-fields")
+        for key, field_value in fields.items():
+            if not isinstance(key, str) or not SAFE_FIELD.fullmatch(key) or key in PRODUCER_RESERVED:
+                role_fail(2, "INPUT_INVALID", "authority-field")
+            if not printable(field_value, 4096):
+                role_fail(2, "INPUT_INVALID", "authority-value")
+        try:
+            source_repo, source_run = validate_run(str(repo / source), False)
+        except ValidationError:
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        if source_repo != repo:
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        validated.append((source_run, source_id, event_id, expect))
+    return validated
+
+
+def validate_activation_json(raw, role, justification):
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_JSON_OPERAND:
+        role_fail(2, "INPUT_INVALID", "activation-json")
+    try:
+        activation = parse_json_unique(raw)
+    except Exception:
+        role_fail(2, "INPUT_INVALID", "activation-json")
+    expected = {
+        "schema_version", "action", "provider", "selected_by", "selector", "tier",
+        "policy_sha256", "adapter_source", "resolver_argv", "apply", "apply_instruction", "failure",
+    }
+    if not exact_keys(activation, expected):
+        role_fail(2, "INPUT_INVALID", "activation-schema")
+    if activation["schema_version"] != 1 or activation["action"] != "native_role_launch":
+        role_fail(2, "INPUT_INVALID", "activation-schema")
+    provider = activation["provider"]
+    selected_by = activation["selected_by"]
+    selector = activation["selector"]
+    if provider not in ("claude", "codex") or selected_by not in ("role", "tier", "alias"):
+        role_fail(2, "INPUT_INVALID", "activation-selector")
+    if not printable(selector, 128) or not SAFE_ROLE.fullmatch(activation["tier"]):
+        role_fail(2, "INPUT_INVALID", "activation-selector")
+    if selected_by == "role":
+        if selector != role or justification is not None:
+            role_fail(2, "INPUT_INVALID", "activation-role")
+    elif not printable(justification, 2048):
+        role_fail(2, "INPUT_INVALID", "activation-justification")
+    if not re.fullmatch(r"[0-9a-f]{64}", activation["policy_sha256"] if isinstance(activation["policy_sha256"], str) else ""):
+        role_fail(2, "INPUT_INVALID", "activation-policy")
+    expected_adapter = "commands/start.md" if provider == "claude" else "codex-skills/start/SKILL.md"
+    if activation["adapter_source"] != expected_adapter:
+        role_fail(2, "INPUT_INVALID", "activation-adapter")
+    resolver_argv = activation["resolver_argv"]
+    expected_argv = [
+        "firm-model-resolve", "--provider", provider, f"--{selected_by}", selector,
+        "--format", "activation",
+    ]
+    if resolver_argv != expected_argv:
+        role_fail(2, "INPUT_INVALID", "activation-resolver")
+    apply = activation["apply"]
+    if not exact_keys(apply, {"model", "display", "effort"}) or not all(printable(apply.get(key), 256) for key in ("model", "display", "effort")):
+        role_fail(2, "INPUT_INVALID", "activation-apply")
+    if activation["apply_instruction"] != "apply_exact_model_display_effort_immediately_before_native_launch" or activation["failure"] != "block":
+        role_fail(2, "INPUT_INVALID", "activation-contract")
+    command = [str(TOOL_ROOT / "bin" / "firm-model-resolve")] + resolver_argv[1:]
+    try:
+        result = subprocess.run(
+            command, cwd=TOOL_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=15, check=False,
+        )
+        fresh = parse_json_unique(result.stdout.strip()) if result.returncode == 0 else None
+    except Exception:
+        fresh = None
+    if fresh != activation:
+        role_fail(2, "INPUT_INVALID", "activation-revalidation")
+    return activation
+
+
+def active_failpoint(run):
+    requested = os.environ.get("FIRM_LEDGER_FAILPOINT", "")
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    if not requested and not guard:
+        return None
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run)
+    inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    if guard != "1" or not inside_temp:
+        if guard:
+            role_fail(2, "INPUT_INVALID", "test-guard")
+        return None
+    if requested not in FAILPOINTS:
+        role_fail(2, "INPUT_INVALID", "failpoint")
+    return requested
+
+
+def open_lock(run):
+    path = run / "run.jsonl.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise LedgerError("lock open failed") from exc
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        os.close(fd)
+        raise LedgerError("unsafe lock")
+    return fd, stat_identity(st)
+
+
+def prove_lock(run, fd, identity):
+    path = run / "run.jsonl.lock"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        check_fd = os.open(path, flags)
+    except OSError as exc:
+        raise LedgerError("lock path changed") from exc
+    try:
+        if stat_identity(os.fstat(fd)) != identity or stat_identity(os.fstat(check_fd)) != identity:
+            raise LedgerError("lock identity changed")
+    finally:
+        os.close(check_fd)
+
+
+def acquire_locks(target_run, authority_runs):
+    modes = {str(target_run): fcntl.LOCK_EX}
+    for run in authority_runs:
+        modes.setdefault(str(run), fcntl.LOCK_SH)
+    held = []
+    try:
+        for run_text in sorted(modes):
+            run = Path(run_text)
+            fd, identity = open_lock(run)
+            try:
+                fcntl.flock(fd, modes[run_text])
+            except OSError:
+                os.close(fd)
+                raise
+            held.append((run, fd, identity))
+        for run, fd, identity in held:
+            prove_lock(run, fd, identity)
+        return held
+    except (OSError, LedgerError) as exc:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        raise LedgerError("lock failed") from exc
+
+
+def prove_locks(held):
+    for run, fd, identity in held:
+        prove_lock(run, fd, identity)
+
+
+def open_ledger(run):
+    path = run / "run.jsonl"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        raise LedgerError("ledger open failed") from exc
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        os.close(fd)
+        raise LedgerError("unsafe ledger")
+    return fd, stat_identity(st)
+
+
+def ledger_records(fd, copy_fd=None):
+    pending = b""
+    while True:
+        try:
+            chunk = os.read(fd, CHUNK)
+        except OSError as exc:
+            raise LedgerError("ledger read failed") from exc
+        if not chunk:
+            break
+        if copy_fd is not None:
+            write_all(copy_fd, chunk)
+        pending += chunk
+        while b"\n" in pending:
+            raw, pending = pending.split(b"\n", 1)
+            if not raw or len(raw) > MAX_LEDGER_LINE:
+                raise LedgerError("malformed ledger line")
+            try:
+                record = parse_json_unique(raw.decode("utf-8", "strict"))
+            except Exception as exc:
+                raise LedgerError("malformed ledger line") from exc
+            if not isinstance(record, dict):
+                raise LedgerError("ledger line is not an object")
+            yield record
+        if len(pending) > MAX_LEDGER_LINE:
+            raise LedgerError("oversized ledger line")
+    if pending:
+        raise LedgerError("incomplete ledger line")
+
+
+def validate_authorities(items, start_time):
+    projections = []
+    descriptors = []
+    for source_run, source_id, event_id, expect in items:
+        fd, identity = open_ledger(source_run)
+        if fd is None:
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        hits = []
+        try:
+            for record in ledger_records(fd):
+                if record.get("event_id") == event_id:
+                    hits.append(record)
+                    if len(hits) > 1:
+                        break
+        except LedgerError:
+            os.close(fd)
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", source_id)
+        if len(hits) != 1:
+            os.close(fd)
+            role_fail(11, "AUTHORITY_INVALID", event_id)
+        record = hits[0]
+        try:
+            earlier = parse_ts(record.get("ts")) < start_time
+        except Exception:
+            earlier = False
+        if not earlier or record.get("event") != expect["event"] or record.get("run_id") != expect["run_id"]:
+            os.close(fd)
+            role_fail(11, "AUTHORITY_INVALID", event_id)
+        for key, value in expect["fields"].items():
+            if record.get(key) != value:
+                os.close(fd)
+                role_fail(11, "AUTHORITY_INVALID", event_id)
+        projections.append({
+            "source_run_id": source_id,
+            "event_id": event_id,
+            "event": expect["event"],
+            "matched": {key: expect["fields"][key] for key in sorted(expect["fields"])},
+        })
+        descriptors.append((source_run, fd, identity))
+    return projections, descriptors
+
+
+def prove_authority_descriptors(descriptors):
+    for run, fd, identity in descriptors:
+        if stat_identity(os.fstat(fd)) != identity or not same_open_ledger(run, identity):
+            raise LedgerError("authority ledger identity changed")
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        if written <= 0:
+            raise CommitError("append")
+        view = view[written:]
+
+
+def same_open_ledger(run, expected):
+    fd, identity = open_ledger(run)
+    if fd is not None:
+        os.close(fd)
+    return identity == expected
+
+
+def atomic_commit(
+    run, record, event_id, role_key=None, failpoint=None, contract_check=None,
+    lock_check=None, precommit_check=None,
+):
+    ledger = run / "run.jsonl"
+    temp_name = f".run.jsonl.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    temp_path = run / temp_name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    temp_fd = None
+    old_fd = None
+    old_identity = None
+    renamed = False
+    try:
+        if failpoint == "before_temp_write":
+            raise CommitError("append")
+        try:
+            temp_fd = os.open(temp_path, flags, 0o600)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        if stat.S_IMODE(os.fstat(temp_fd).st_mode) != 0o600:
+            raise CommitError("append")
+        old_fd, old_identity = open_ledger(run)
+        duplicate_event = 0
+        duplicate_activation = 0
+        if old_fd is not None:
+            for prior in ledger_records(old_fd, temp_fd):
+                if prior.get("event_id") == event_id:
+                    duplicate_event += 1
+                if role_key is not None and prior.get("stage") == role_key[0] and prior.get("role") == role_key[1]:
+                    prior_event = prior.get("event")
+                    if "activation" in prior or (isinstance(prior_event, str) and prior_event.endswith("_started")):
+                        duplicate_activation += 1
+        if duplicate_event:
+            raise DuplicateEvent("duplicate event id")
+        if duplicate_activation:
+            raise DuplicateActivation("duplicate activation")
+        payload = (json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        if failpoint == "partial_temp_write":
+            write_all(temp_fd, payload[:max(1, len(payload) // 2)])
+            raise CommitError("append")
+        write_all(temp_fd, payload)
+        if failpoint == "temp_fsync":
+            raise CommitError("append")
+        try:
+            os.fsync(temp_fd)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        if lock_check is not None:
+            lock_check()
+        if precommit_check is not None:
+            precommit_check()
+        if contract_check is not None:
+            contract_check()
+        if old_fd is None:
+            try:
+                os.lstat(ledger)
+            except FileNotFoundError:
+                pass
+            else:
+                raise CommitError("append")
+        elif not same_open_ledger(run, old_identity):
+            raise CommitError("append")
+        if failpoint == "pre_rename":
+            raise CommitError("append")
+        os.close(temp_fd)
+        temp_fd = None
+        try:
+            os.replace(temp_path, ledger)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        renamed = True
+        if failpoint == "post_rename":
+            raise CommitError("append")
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            dir_fd = os.open(run, dir_flags)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        try:
+            if failpoint == "directory_fsync":
+                raise CommitError("append")
+            os.fsync(dir_fd)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        finally:
+            os.close(dir_fd)
+        if contract_check is not None:
+            contract_check()
+        if lock_check is not None:
+            lock_check()
+        if failpoint == "post_append_pre_proof":
+            raise CommitError("proof")
+        if failpoint == "proof_read":
+            raise CommitError("proof")
+        try:
+            proof_fd, _ = open_ledger(run)
+        except LedgerError as exc:
+            raise CommitError("proof") from exc
+        if proof_fd is None:
+            raise CommitError("proof")
+        event_hits = 0
+        activation_hits = 0
+        exact = False
+        try:
+            for proven in ledger_records(proof_fd):
+                if proven.get("event_id") == event_id:
+                    event_hits += 1
+                    exact = exact or proven == record
+                if role_key is not None and proven.get("stage") == role_key[0] and proven.get("role") == role_key[1]:
+                    proven_event = proven.get("event")
+                    if "activation" in proven or (isinstance(proven_event, str) and proven_event.endswith("_started")):
+                        activation_hits += 1
+        except LedgerError as exc:
+            raise CommitError("proof") from exc
+        finally:
+            os.close(proof_fd)
+        if failpoint == "proof_compare" or event_hits != 1 or not exact or (role_key is not None and activation_hits != 1):
+            raise CommitError("proof")
+        if contract_check is not None:
+            contract_check()
+        if lock_check is not None:
+            lock_check()
+    except (DuplicateEvent, DuplicateActivation, LedgerError, ContractDrift, CommitError):
+        raise
+    except OSError as exc:
+        raise CommitError("proof" if renamed else "append") from exc
+    finally:
+        if old_fd is not None:
+            os.close(old_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if not renamed:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def ordinary_main(argv):
+    target = None
+    strict = False
+    requested_event_id = None
+    print_event_id = False
+    while argv and argv[0].startswith("--"):
+        flag = argv.pop(0)
+        if flag == "--run":
+            if not argv:
+                print("firm-ledger-log: --run needs a path", file=sys.stderr)
+                raise SystemExit(2)
+            target = argv.pop(0)
+        elif flag == "--strict":
+            strict = True
+        elif flag == "--event-id":
+            if not argv:
+                print("firm-ledger-log: --event-id needs a value", file=sys.stderr)
+                raise SystemExit(2)
+            requested_event_id = argv.pop(0)
+        elif flag == "--print-event-id":
+            print_event_id = True
+        else:
+            print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
+            raise SystemExit(2)
+    event = argv.pop(0) if argv else "event"
+    if target is None:
+        current = Path.cwd() / ".agent-firm" / "CURRENT_RUN"
+        try:
+            target = current.read_text(encoding="utf-8").strip()
+        except OSError:
+            raise SystemExit(0)
+    if not target:
+        raise SystemExit(0)
+    try:
+        _, run = validate_run(target, False)
+    except ValidationError as exc:
+        ordinary_fail(strict, str(exc))
+    if not SAFE_EVENT.fullmatch(event):
+        ordinary_fail(strict, "event contains unsafe characters")
+    event_id = requested_event_id or (
+        "evt-" + utc_now().strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    if not isinstance(event_id, str) or not SAFE_EVENT_ID.fullmatch(event_id):
+        ordinary_fail(strict, "event id contains unsafe characters")
+    record = {"ts": format_ts(utc_now()), "event": event, "event_id": event_id}
+    for item in argv:
+        if "=" not in item:
+            ordinary_fail(strict, f"field is not key=value: {item}")
+        key, value = item.split("=", 1)
+        if not SAFE_FIELD.fullmatch(key):
+            ordinary_fail(strict, f"unsafe field name: {key}")
+        if key in ("ts", "event", "event_id", "run_id"):
+            ordinary_fail(strict, f"reserved field cannot be overridden: {key}")
+        record[key] = value
+    record["run_id"] = run.name
+    held = []
+    try:
+        held = acquire_locks(run, [])
+        atomic_commit(run, record, event_id, lock_check=lambda: prove_locks(held))
+    except DuplicateEvent:
+        ordinary_fail(strict, f"duplicate event id: {event_id}")
+    except (LedgerError, CommitError):
+        ordinary_fail(strict, "could not append target ledger")
+    finally:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+    if print_event_id:
+        print(event_id)
+    raise SystemExit(0)
+
+
+def role_main(argv):
+    values = parse_role_options(argv)
+    role = values["role"]
+    stage = values["stage"]
+    event = values["event"]
+    agent = values["agent"]
+    validate_stage(stage)
+    if not SAFE_ROLE.fullmatch(role):
+        role_fail(2, "INPUT_INVALID", "role")
+    if not SAFE_EVENT.fullmatch(event) or not event.endswith("_started"):
+        role_fail(2, "INPUT_INVALID", "event")
+    if not printable(agent, 256) or not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_./:-]{0,254}", agent) or ".." in Path(agent).parts:
+        role_fail(2, "INPUT_INVALID", "agent")
+    try:
+        repo, run = validate_run(values["run"], True)
+    except ValidationError:
+        role_fail(10, "RUN_INVALID", Path(values["run"]).name)
+    failpoint = active_failpoint(run)
+    justification = values.get("activation_justification")
+    activation = validate_activation_json(values["activation_json"], role, justification)
+    authority_items = validate_authority_json(values["authority_json"], repo)
+    contract_fd = None
+    held = []
+    authority_descriptors = []
+    try:
+        try:
+            contract_fd, contract_identity, contract = open_contract(run, values["contract"], failpoint)
+        except ValidationError:
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        maybe_mutate_contract(failpoint, run, values["contract"])
+        try:
+            prove_contract(contract_fd, contract_identity, run, values["contract"])
+        except (OSError, ValidationError):
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        try:
+            held = acquire_locks(run, [item[0] for item in authority_items])
+        except LedgerError:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
+        start_time = utc_now()
+        authority, authority_descriptors = validate_authorities(authority_items, start_time)
+        event_id = (
+            "evt-" + start_time.strftime("%Y%m%dT%H%M%S") +
+            f"-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        record = {
+            "ts": format_ts(start_time),
+            "event": event,
+            "event_id": event_id,
+            "run_id": run.name,
+            "stage": stage,
+            "role": role,
+            "agent": agent,
+            "contract": contract,
+            "authority": authority,
+            "activation": activation,
+        }
+        if justification is not None:
+            record["activation_justification"] = justification
+
+        def contract_check():
+            try:
+                prove_contract(contract_fd, contract_identity, run, values["contract"])
+            except (OSError, ValidationError) as exc:
+                raise ContractDrift() from exc
+
+        try:
+            atomic_commit(
+                run, record, event_id, role_key=(stage, role), failpoint=failpoint,
+                contract_check=contract_check, lock_check=lambda: prove_locks(held),
+                precommit_check=lambda: prove_authority_descriptors(authority_descriptors),
+            )
+        except DuplicateActivation:
+            role_fail(13, "DUPLICATE_ACTIVATION", f"{stage}:{role}")
+        except DuplicateEvent:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", event_id)
+        except LedgerError:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
+        except ContractDrift:
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        except CommitError as exc:
+            if exc.phase == "proof":
+                role_fail(16, "POST_APPEND_PROOF_FAILED", event_id)
+            role_fail(15, "APPEND_OR_DURABILITY_FAILED", event_id)
+        result = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "run_id": run.name,
+            "event": event,
+            "stage": stage,
+            "role": role,
+            "agent": agent,
+            "contract": contract,
+            "authority": authority,
+            "activation": activation,
+        }
+        if justification is not None:
+            result["activation_justification"] = justification
+        print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
+    finally:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        for _, fd, _ in reversed(authority_descriptors):
+            os.close(fd)
+        if contract_fd is not None:
+            os.close(contract_fd)
+    raise SystemExit(0)
+
+
+try:
+    if "--role-start" in ARGS:
+        role_main(list(ARGS))
+    ordinary_main(list(ARGS))
+except RoleFailure as exc:
+    print(f"firm-ledger-log: {exc.category}: {exc.identity}", file=sys.stderr)
+    raise SystemExit(exc.code)
+except KeyboardInterrupt:
+    raise SystemExit(130)
 PY
