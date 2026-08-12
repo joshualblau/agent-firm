@@ -88,6 +88,21 @@ ACTIVATION_SOURCES = {
     "codex": "codex-skills/start/SKILL.md",
 }
 ACTIVATION_INSTRUCTION = "apply_exact_model_display_effort_immediately_before_native_launch"
+ROLE_START_ARGV = [
+    "firm-ledger-log", "--run", "<run>", "--strict", "--role-start",
+    "--stage", "<stage-instance>", "--role", "<role>",
+    "--contract", "<run-relative-contract>", "--event", "<expected-start-event>",
+    "--authority-json", "<authority-json>", "--agent", "<native-agent-id>",
+    "--activation-json", "<exact-resolver-activation-json>",
+]
+ROLE_START_RESULT_REQUIRED_FIELDS = [
+    "schema_version", "event_id", "run_id", "event", "stage", "role", "agent",
+    "contract", "authority", "activation",
+]
+NATIVE_LAUNCHES = {
+    "claude": "claude_native_agent",
+    "codex": "codex_native_subagent",
+}
 
 if not isinstance(policy, dict) or set(policy) != EXPECTED_ROOT_KEYS:
     fail("policy root must contain exactly principle, tiers, role_tiers, legacy_aliases, and quota_discipline")
@@ -182,8 +197,22 @@ def load_native_adapter(provider):
             "firm-model-resolve", "--provider", provider, "<selector-flag>", "<selector>",
             "--format", "activation",
         ],
+        "resolve_timing": "immediately_before_role_start",
+        "role_start_argv": ROLE_START_ARGV,
+        "role_start_optional_argv": ["--activation-justification", "<text>"],
+        "result_required_fields": ROLE_START_RESULT_REQUIRED_FIELDS,
+        "result_optional_fields": ["activation_justification"],
+        "native_launch": NATIVE_LAUNCHES[provider],
+        "native_launch_fields": [
+            "activation.apply.model", "activation.apply.display", "activation.apply.effort", "agent",
+        ],
+        "retain_result_field": "event_id",
         "apply_fields": ["model", "display", "effort"],
         "apply_instruction": ACTIVATION_INSTRUCTION,
+        "failure_conditions": [
+            "resolver_nonzero", "producer_nonzero", "missing_result_field",
+            "result_schema_mismatch", "result_value_mismatch",
+        ],
         "failure": "block",
     }
     if adapter != expected:

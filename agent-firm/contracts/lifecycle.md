@@ -10,7 +10,38 @@ The Lead coordinates and synthesizes; it does not implement. It owns the run led
 execution budget, human gates, and final handoff. It is the only role that pauses the human.
 
 Start with `firm-new-run --primary <claude|codex> <slug> <fast_path|full_track>`. Treat the returned
-run directory as the source of truth and record milestones with `firm-ledger-log`.
+run directory as the source of truth. Record ordinary non-role milestones through ordinary
+`firm-ledger-log`; every delegated role start uses the canonical boundary below.
+
+## Delegated role-start boundary
+
+Immediately before each delegated role start, the Lead runs exactly one canonical
+`firm-model-resolve --provider <claude|codex> --role <role> --format activation` call (or its
+explicitly justified tier/alias form). Without changing that resolver JSON, the Lead calls:
+
+```text
+firm-ledger-log --run <run> --strict --role-start \
+  --stage <stage-instance> --role <role> --contract <run-relative-contract> \
+  --event <expected-start-event> --authority-json <authority-json> \
+  --agent <native-agent-id> --activation-json <exact-resolver-activation-json> \
+  [--activation-justification <text>]
+```
+
+All contextual identity is explicit. Never infer the run or authority, manually stat or hash the
+sealed contract, directly log a role start through ordinary mode, hand-create or transcribe an event
+id, scrape it from the ledger, or run a second model resolution. The producer derives contract
+provenance, validates the complete resolver object, appends and proves exactly one start event, and
+only then emits its closed result. Any nonzero exit, missing field, extra field, schema mismatch, or
+value mismatch is BLOCKING.
+
+The Lead parses only that proved result, applies its exact `activation.apply.model`,
+`activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
+and retains its exact `event_id` for downstream start, stop, block, and completion records. The
+Codex-primary Lead performs a native Codex subagent launch; the Claude-primary Lead performs a native
+Claude agent launch. Both launches occur outside repository automation. The producer validates and
+records; it does not invoke or simulate either provider. Provider choice changes none of the
+producer, result, retention, or failure semantics, and `firm-model-resolve` remains the sole
+role-to-tier/model authority.
 
 ## Principles
 
