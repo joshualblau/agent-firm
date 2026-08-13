@@ -58,7 +58,10 @@ FAILPOINTS = {
     "post_rename", "directory_fsync", "post_append_pre_proof", "proof_read",
     "proof_compare",
 }
-BARRIER_PHASES = {"after_lock", "after_source_open", "after_temp_fsync", "before_replace", "after_replace"}
+BARRIER_PHASES = {
+    "after_contract_open", "after_lock", "after_source_open", "after_temp_fsync",
+    "before_replace", "after_replace", "after_result_scan",
+}
 
 
 class RoleFailure(Exception):
@@ -183,7 +186,9 @@ def validate_observation(record, family):
     if family == "shell_observation":
         if not exact_keys(record, {"ts", "event", "cmd"}) or record["event"] != "bash":
             raise LedgerError("invalid shell observation")
-        values = (record["cmd"],)
+        if not isinstance(record["cmd"], str):
+            raise LedgerError("invalid observation value")
+        return
     else:
         if not exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) or record["event"] != "merge_guard_block":
             raise LedgerError("invalid merge observation")
@@ -266,8 +271,6 @@ def validate_native_record(record, ledger_run_id):
         validate_relative_path(contract["path"], "role-contracts")
     except ValidationError as exc:
         raise LedgerError("invalid native contract path") from exc
-    if not Path(contract["path"]).name.endswith("-" + role + ".md"):
-        raise LedgerError("native contract role mismatch")
     if isinstance(contract["bytes"], bool) or not isinstance(contract["bytes"], int) or contract["bytes"] < 0:
         raise LedgerError("invalid native contract size")
     if not isinstance(contract["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", contract["sha256"]):
@@ -585,15 +588,17 @@ def open_contract(run, relative, failpoint):
         for item in reversed(fds):
             os.close(item)
         raise ValidationError("cannot open sealed contract") from exc
-    for item in reversed(fds):
-        os.close(item)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o644:
         os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
         raise ValidationError("sealed contract must be an owned mode-0644 regular file")
     initial = stat_identity(st)
     if failpoint == "before_contract_read":
         os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
         raise ValidationError("injected contract read failure")
     digest = hashlib.sha256()
     count = 0
@@ -607,11 +612,16 @@ def open_contract(run, relative, failpoint):
         after = stat_identity(os.fstat(fd))
     except OSError as exc:
         os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
         raise ValidationError("sealed contract read failed") from exc
     if failpoint == "during_drift_validation" or after != initial or count != initial[5]:
         os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
         raise ValidationError("sealed contract drifted during its stable read")
-    return fd, initial, {
+    chain = tuple((item, object_identity(os.fstat(item))) for item in fds)
+    return fd, initial, chain, {
         "path": relative,
         "bytes": count,
         "sha256": digest.hexdigest(),
@@ -619,8 +629,10 @@ def open_contract(run, relative, failpoint):
     }
 
 
-def reopen_contract(run, relative):
+def reopen_contract(run, relative, chain):
     parts = validate_relative_path(relative, "role-contracts")
+    if len(chain) != len(parts):
+        raise ValidationError("sealed contract path changed")
     dir_flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         dir_flags |= os.O_DIRECTORY
@@ -629,11 +641,24 @@ def reopen_contract(run, relative):
     opened = []
     try:
         run.prove()
-        current = os.dup(run.run_fd)
-        opened.append(current)
-        for part in parts[:-1]:
+        for held_fd, expected in chain:
+            held = os.fstat(held_fd)
+            if (
+                object_identity(held) != expected or not stat.S_ISDIR(held.st_mode)
+                or held.st_uid != os.getuid() or stat.S_IMODE(held.st_mode) & 0o022
+            ):
+                raise ValidationError("sealed contract path changed")
+        current = run.run_fd
+        for index, part in enumerate(parts[:-1]):
             current = os.open(part, dir_flags, dir_fd=current)
             opened.append(current)
+            live = os.fstat(current)
+            expected = chain[index + 1][1]
+            if (
+                object_identity(live) != expected or not stat.S_ISDIR(live.st_mode)
+                or live.st_uid != os.getuid() or stat.S_IMODE(live.st_mode) & 0o022
+            ):
+                raise ValidationError("sealed contract path changed")
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -641,16 +666,16 @@ def reopen_contract(run, relative):
         identity = stat_identity(os.fstat(fd))
         os.close(fd)
         return identity
-    except OSError as exc:
+    except (OSError, ValidationError) as exc:
         raise ValidationError("sealed contract path changed") from exc
     finally:
         for item in reversed(opened):
             os.close(item)
 
 
-def prove_contract(fd, identity, run, relative):
+def prove_contract(fd, identity, chain, run, relative):
     run.prove()
-    if stat_identity(os.fstat(fd)) != identity or reopen_contract(run, relative) != identity:
+    if stat_identity(os.fstat(fd)) != identity or reopen_contract(run, relative, chain) != identity:
         raise ValidationError("sealed contract identity or metadata drifted")
 
 
@@ -842,7 +867,15 @@ def validate_activation_json(raw, role, justification):
 def active_failpoint(run):
     requested = os.environ.get("FIRM_LEDGER_FAILPOINT", "")
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    barrier = os.environ.get("FIRM_LEDGER_BARRIER_PHASE", "")
     if not requested and not guard:
+        return None
+    if not requested and barrier:
+        phases = barrier.split(",")
+        if guard != "1" or not phases or len(set(phases)) != len(phases) or any(
+            phase not in BARRIER_PHASES for phase in phases
+        ):
+            role_fail(2, "INPUT_INVALID", "test-barrier")
         return None
     temp_root = os.path.realpath(tempfile.gettempdir())
     run_path = os.path.realpath(run)
@@ -858,12 +891,17 @@ def active_failpoint(run):
 
 def ledger_barrier(run, phase, detail=""):
     requested = os.environ.get("FIRM_LEDGER_BARRIER_PHASE", "")
-    if not requested or requested != phase:
+    phases = requested.split(",") if requested else []
+    if phase not in phases:
         return
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
     barrier_dir = os.environ.get("FIRM_LEDGER_BARRIER_DIR", "")
     token = os.environ.get("FIRM_LEDGER_BARRIER_TOKEN", "writer")
-    if guard != "1" or requested not in BARRIER_PHASES or not SAFE_FIELD.fullmatch(token):
+    if (
+        guard != "1" or not phases or len(set(phases)) != len(phases)
+        or any(item not in BARRIER_PHASES for item in phases)
+        or not SAFE_FIELD.fullmatch(token)
+    ):
         role_fail(2, "INPUT_INVALID", "test-barrier")
     temp_root = os.path.realpath(tempfile.gettempdir())
     run_path = os.path.realpath(run.path)
@@ -876,8 +914,9 @@ def ledger_barrier(run, phase, detail=""):
         role_fail(2, "INPUT_INVALID", "test-barrier")
     try:
         require_owned_directory(Path(barrier_path), "test barrier")
-        ready = os.path.join(barrier_path, token + ".ready")
-        release = os.path.join(barrier_path, token + ".release")
+        suffix = "." + phase if len(phases) > 1 else ""
+        ready = os.path.join(barrier_path, token + suffix + ".ready")
+        release = os.path.join(barrier_path, token + suffix + ".release")
         fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             write_all(fd, (phase + (":" + detail if detail else "") + "\n").encode("utf-8"))
@@ -1094,6 +1133,59 @@ def write_all(fd, data):
         view = view[written:]
 
 
+def descriptor_digest(fd, phase):
+    try:
+        before = stat_identity(os.fstat(fd))
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        count = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            count += len(chunk)
+            digest.update(chunk)
+        os.lseek(fd, position, os.SEEK_SET)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        raise CommitError(phase) from exc
+    if before != after or count != after[5]:
+        raise CommitError(phase)
+    return count, digest
+
+
+def prove_exact_append(fd, prefix_length, prefix_digest, payload):
+    try:
+        before = stat_identity(os.fstat(fd))
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, 0, os.SEEK_SET)
+        remaining = prefix_length
+        digest = hashlib.sha256()
+        while remaining:
+            chunk = os.read(fd, min(CHUNK, remaining))
+            if not chunk:
+                raise CommitError("proof")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        appended = bytearray()
+        while len(appended) < len(payload):
+            chunk = os.read(fd, len(payload) - len(appended))
+            if not chunk:
+                raise CommitError("proof")
+            appended.extend(chunk)
+        trailing = os.read(fd, 1)
+        os.lseek(fd, position, os.SEEK_SET)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        raise CommitError("proof") from exc
+    if (
+        before != after or after[5] != prefix_length + len(payload) or trailing
+        or digest.digest() != prefix_digest.digest() or bytes(appended) != payload
+    ):
+        raise CommitError("proof")
+
+
 def same_open_ledger(run, expected):
     fd, identity = open_ledger(run)
     if fd is not None:
@@ -1106,7 +1198,7 @@ def atomic_commit(
     lock_check=None, precommit_check=None,
 ):
     temp_name = f".run.jsonl.tmp.{os.getpid()}.{secrets.token_hex(8)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     temp_fd = None
     temp_identity = None
     old_fd = None
@@ -1126,6 +1218,10 @@ def atomic_commit(
             raise CommitError("append")
         old_fd, old_identity = open_ledger(run)
         ledger_barrier(run, "after_source_open")
+        if old_fd is None:
+            old_length, old_digest = 0, hashlib.sha256()
+        else:
+            old_length, old_digest = descriptor_digest(old_fd, "append")
         scan = {"event_ids": set(), "activation_ids": set()}
         if old_fd is not None:
             scan = scan_ledger(old_fd, run.name, copy_fd=temp_fd)
@@ -1144,6 +1240,24 @@ def atomic_commit(
             os.fsync(temp_fd)
         except OSError as exc:
             raise CommitError("append") from exc
+        expected_digest = old_digest.copy()
+        expected_digest.update(payload)
+
+        def prove_temp():
+            run.prove()
+            try:
+                if (
+                    object_identity(os.fstat(temp_fd)) != temp_identity
+                    or run.entry_identity(temp_name)[:5] != temp_identity
+                ):
+                    raise CommitError("append")
+            except OSError as exc:
+                raise CommitError("append") from exc
+            count, digest = descriptor_digest(temp_fd, "append")
+            if count != old_length + len(payload) or digest.digest() != expected_digest.digest():
+                raise CommitError("append")
+
+        prove_temp()
         run.prove()
         ledger_barrier(run, "after_temp_fsync", temp_name)
         if lock_check is not None:
@@ -1161,11 +1275,7 @@ def atomic_commit(
                 raise CommitError("append")
         elif not same_open_ledger(run, old_identity):
             raise CommitError("append")
-        try:
-            if run.entry_identity(temp_name)[:5] != temp_identity:
-                raise CommitError("append")
-        except OSError as exc:
-            raise CommitError("append") from exc
+        prove_temp()
         ledger_barrier(run, "before_replace", temp_name)
         run.prove()
         if lock_check is not None:
@@ -1183,15 +1293,9 @@ def atomic_commit(
                 raise CommitError("append")
         elif not same_open_ledger(run, old_identity):
             raise CommitError("append")
-        try:
-            if run.entry_identity(temp_name)[:5] != temp_identity:
-                raise CommitError("append")
-        except OSError as exc:
-            raise CommitError("append") from exc
+        prove_temp()
         if failpoint == "pre_rename":
             raise CommitError("append")
-        os.close(temp_fd)
-        temp_fd = None
         try:
             os.replace(temp_name, "run.jsonl", src_dir_fd=run.run_fd, dst_dir_fd=run.run_fd)
         except OSError as exc:
@@ -1222,7 +1326,10 @@ def atomic_commit(
         if proof_fd is None:
             raise CommitError("proof")
         try:
+            prove_exact_append(proof_fd, old_length, old_digest, payload)
             proven_scan = scan_ledger(proof_fd, run.name, wanted_event_ids=(event_id,))
+            ledger_barrier(run, "after_result_scan")
+            prove_exact_append(proof_fd, old_length, old_digest, payload)
         except LedgerError as exc:
             raise CommitError("proof") from exc
         finally:
@@ -1354,6 +1461,7 @@ def role_main(argv):
     activation = validate_activation_json(values["activation_json"], role, justification)
     authority_items = validate_authority_json(values["authority_json"], repo)
     contract_fd = None
+    contract_chain = ()
     metadata_fd = None
     held = []
     authority_descriptors = []
@@ -1369,14 +1477,17 @@ def role_main(argv):
         except ValidationError:
             role_fail(10, "RUN_INVALID", run.name)
         try:
-            contract_fd, contract_identity, contract = open_contract(run, values["contract"], failpoint)
+            contract_fd, contract_identity, contract_chain, contract = open_contract(
+                run, values["contract"], failpoint,
+            )
         except ValidationError:
             role_fail(12, "CONTRACT_INVALID", values["contract"])
         maybe_mutate_contract(failpoint, run, values["contract"])
         try:
-            prove_contract(contract_fd, contract_identity, run, values["contract"])
+            prove_contract(contract_fd, contract_identity, contract_chain, run, values["contract"])
         except (OSError, ValidationError):
             role_fail(12, "CONTRACT_INVALID", values["contract"])
+        ledger_barrier(run, "after_contract_open")
         try:
             held = acquire_locks(run, [item[0] for item in authority_items])
             ledger_barrier(run, "after_lock")
@@ -1406,7 +1517,9 @@ def role_main(argv):
         def contract_check():
             try:
                 prove_held_file(run, "run-metadata.json", metadata_fd, metadata_identity, "run metadata")
-                prove_contract(contract_fd, contract_identity, run, values["contract"])
+                prove_contract(
+                    contract_fd, contract_identity, contract_chain, run, values["contract"],
+                )
             except (OSError, ValidationError) as exc:
                 raise ContractDrift() from exc
 
@@ -1450,6 +1563,8 @@ def role_main(argv):
             os.close(fd)
         if contract_fd is not None:
             os.close(contract_fd)
+        for directory_fd, _ in reversed(contract_chain):
+            os.close(directory_fd)
         if metadata_fd is not None:
             os.close(metadata_fd)
         for source_run, _, _, _ in authority_items:
