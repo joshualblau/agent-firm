@@ -235,14 +235,30 @@ def validate_observation(record, family):
         if not isinstance(record["cmd"], str):
             raise LedgerError("invalid observation value")
         return
-    else:
+    if family == "merge_observation":
         if not exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) or record["event"] != "merge_guard_block":
             raise LedgerError("invalid merge observation")
         if not isinstance(record["cmd"], str):
             raise LedgerError("invalid observation value")
         values = (record["decision"], record["reason"])
-    if not all(printable(value, 4096) for value in values):
-        raise LedgerError("invalid observation value")
+        if not all(printable(value, 4096) for value in values):
+            raise LedgerError("invalid observation value")
+        return
+    expected = {"ts", "event", "cmd", "decision", "matched", "gh_login", "git_email"}
+    if not exact_keys(record, expected) or record["event"] != "merge_guard_permit":
+        raise LedgerError("invalid merge permit observation")
+    if record["decision"] != "permitted" or not isinstance(record["cmd"], str):
+        raise LedgerError("invalid merge permit decision")
+    if not printable(record["matched"], 256):
+        raise LedgerError("invalid merge permit match")
+    login = record["gh_login"]
+    if not isinstance(login, str) or re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}", login
+    ) is None:
+        raise LedgerError("invalid merge permit login")
+    email = record["git_email"]
+    if not printable(email, 4096) or "@" not in email:
+        raise LedgerError("invalid merge permit email")
 
 
 def validate_stored_activation(activation, role, justification):
@@ -366,6 +382,9 @@ def classify_record(record, ledger_run_id):
     elif exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) and record.get("event") == "merge_guard_block":
         validate_observation(record, "merge_observation")
         families.append("merge_observation")
+    elif record.get("event") == "merge_guard_permit":
+        validate_observation(record, "merge_permit_observation")
+        families.append("merge_permit_observation")
     else:
         validate_common_record(record, ledger_run_id)
         for key, value in record.items():

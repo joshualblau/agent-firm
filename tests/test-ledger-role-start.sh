@@ -204,6 +204,37 @@ t_case "representative descriptor cap and cleanup failures fail closed before na
 assert_native_descriptor_rejection bytes_plus cap_257
 assert_native_descriptor_rejection wait_error wait_error
 
+t_case "exact merge permit observation remains a byte-identical predecessor of native role start"
+repo_permit_native="$(mk_repo)"; mk_role_fixture "$repo_permit_native" target source
+run_permit_native="$repo_permit_native/.agent-firm/runs/target"
+python3 - "$run_permit_native/run.jsonl" <<'PY'
+import json,sys
+row={"ts":"2026-08-13T18:00:00Z","event":"merge_guard_permit",
+     "cmd":"git -C /tmp/firm merge --ff-only topic \u2603\nstatus=$?\r\t\v",
+     "decision":"permitted","matched":"operator-entry",
+     "gh_login":"operator-1","git_email":"operator@example.test"}
+open(sys.argv[1],"wb").write(json.dumps(
+    row,separators=(",",":"),ensure_ascii=False).encode("utf-8")+b"\n")
+PY
+chmod 600 "$run_permit_native/run.jsonl"
+cp "$run_permit_native/run.jsonl" "$repo_permit_native/permit-prefix.bin"
+permit_native_result="$(invoke_start "$repo_permit_native" target build/permit-compat \
+  "$(authority_for target)")"; permit_native_rc=$?
+assert_eq "merge permit predecessor permits native append" 0 "$permit_native_rc"
+assert_ok "native append preserves every merge permit prefix byte and observation identity boundary" \
+  python3 - "$repo_permit_native/permit-prefix.bin" "$run_permit_native/run.jsonl" \
+  "$permit_native_result" <<'PY'
+import json,sys
+before=open(sys.argv[1],"rb").read(); after=open(sys.argv[2],"rb").read(); result=json.loads(sys.argv[3])
+assert after.startswith(before) and len(after)>len(before)
+permit=json.loads(before); appended=json.loads(after[len(before):])
+assert set(permit)=={"ts","event","cmd","decision","matched","gh_login","git_email"}
+assert permit["event"]=="merge_guard_permit" and permit["decision"]=="permitted"
+assert "\n" in permit["cmd"] and "\r" in permit["cmd"] and "\t" in permit["cmd"] and "\v" in permit["cmd"]
+assert "event_id" not in permit and "run_id" not in permit
+assert result["event_id"]==appended["event_id"] and appended["event"]=="build_started"
+PY
+
 t_case "valid role start derives one exact contract tuple and emits only the proof-instant receipt"
 repo1="$(mk_repo)"; mk_role_fixture "$repo1" target source
 auth1="$(authority_for target)"

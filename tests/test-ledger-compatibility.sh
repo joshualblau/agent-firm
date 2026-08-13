@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/test-ledger-compatibility.sh — independently derived four-family grammar and transaction.
+# tests/test-ledger-compatibility.sh — independently derived closed-family grammar and transaction.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -135,6 +135,108 @@ if kind=="oversized":
 ending=b"" if kind=="incomplete" else b"\n"
 with open(path,"wb") as fh: fh.write(raw+ending)
 PY
+}
+
+write_merge_permit_case() {
+  local path="$1" kind="$2"
+  python3 - "$path" "$kind" <<'PY'
+import json,sys
+path,kind=sys.argv[1:]
+row={"ts":"2026-08-13T18:00:00Z","event":"merge_guard_permit",
+     "cmd":"git -C /tmp/firm merge --ff-only topic \u2603\nstatus=$?\r\t\v",
+     "decision":"permitted","matched":"operator-entry",
+     "gh_login":"operator-1","git_email":"operator@example.test"}
+
+if kind=="login_one": row["gh_login"]="a"
+elif kind=="login_digit": row["gh_login"]="9"
+elif kind=="login_hyphen": row["gh_login"]="a-b9"
+elif kind=="login_39": row["gh_login"]="a"+"b"*38
+elif kind=="matched_256": row["matched"]="m"*256
+elif kind=="email_4096": row["git_email"]="e"*4094+"@x"
+elif kind=="unicode_values":
+    row["matched"]="operator-\u2603"; row["git_email"]="\u2603@example.test"
+elif kind=="typed_cmd": row["cmd"]=["git","merge"]
+elif kind=="decision_other": row["decision"]="allowed"
+elif kind=="decision_typed": row["decision"]=True
+elif kind=="matched_typed": row["matched"]=7
+elif kind=="matched_empty": row["matched"]=""
+elif kind=="matched_control": row["matched"]="operator\nentry"
+elif kind=="matched_257": row["matched"]="m"*257
+elif kind=="login_typed": row["gh_login"]=False
+elif kind=="login_empty": row["gh_login"]=""
+elif kind=="login_control": row["gh_login"]="operator\t1"
+elif kind=="login_leading_hyphen": row["gh_login"]="-operator"
+elif kind=="login_trailing_hyphen": row["gh_login"]="operator-"
+elif kind=="login_double_hyphen": row["gh_login"]="operator--one"
+elif kind=="login_underscore": row["gh_login"]="operator_one"
+elif kind=="login_unicode": row["gh_login"]="op\u00e9rator"
+elif kind=="login_40": row["gh_login"]="a"+"b"*39
+elif kind=="email_typed": row["git_email"]={"address":"operator@example.test"}
+elif kind=="email_empty": row["git_email"]=""
+elif kind=="email_control": row["git_email"]="operator\n@example.test"
+elif kind=="email_no_at": row["git_email"]="operator.example.test"
+elif kind=="email_4097": row["git_email"]="e"*4095+"@x"
+elif kind=="missing": del row["matched"]
+elif kind=="extra": row["gh_status"]="ok"
+elif kind=="renamed": row["login"]=row.pop("gh_login")
+elif kind=="wrong_event": row["event"]="merge_guard_allow"
+elif kind=="invalid_timestamp": row["ts"]="not-a-time"
+elif kind=="ambiguous_identity":
+    row["event_id"]="evt-ambiguous-permit"; row["run_id"]="target"
+
+raw=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+if kind in ("row_exact","row_plus"):
+    target=1_048_576 if kind=="row_exact" else 1_048_577
+    row["cmd"]="x"
+    base=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+    row["cmd"]="c"*(target-len(base)+1)
+    raw=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+    assert len(raw)==target
+elif kind=="invalid_utf8":
+    raw=raw.replace(b"operator@example.test",b"operator@exam\xffple.test")
+elif kind=="duplicate":
+    raw=raw[:-1]+b',"matched":"second"}'
+ending=b"" if kind=="incomplete" else b"\n"
+open(path,"wb").write(raw+ending)
+PY
+}
+
+assert_merge_permit_accept() {
+  local label="$1" kind="$2" repo run ledger prefix out rc
+  repo="$(mk_repo)"; mk_run "$repo" target; run="$repo/.agent-firm/runs/target"
+  ledger="$run/run.jsonl"; prefix="$repo/permit-$label-prefix.bin"
+  write_merge_permit_case "$ledger" "$kind"; chmod 600 "$ledger"; cp "$ledger" "$prefix"
+  out="$($LOG --run "$run" --strict --print-event-id --event-id "evt-permit-$label" \
+    compatibility_followed "case=$label" 2> "$repo/permit.err")"; rc=$?
+  assert_eq "$label merge permit predecessor appends successfully" 0 "$rc"
+  assert_eq "$label merge permit append returns its exact id" "evt-permit-$label" "$out"
+  assert_eq "$label merge permit append emits no diagnostic" "" "$(cat "$repo/permit.err")"
+  assert_ok "$label merge permit preserves its exact observation prefix" python3 - \
+    "$prefix" "$ledger" "$kind" <<'PY'
+import json,sys
+before=open(sys.argv[1],"rb").read(); after=open(sys.argv[2],"rb").read(); kind=sys.argv[3]
+assert after.startswith(before) and len(after)>len(before)
+row=json.loads(before)
+assert set(row)=={"ts","event","cmd","decision","matched","gh_login","git_email"}
+assert row["event"]=="merge_guard_permit" and row["decision"]=="permitted"
+assert "event_id" not in row and "run_id" not in row
+if kind=="matched_256": assert len(row["matched"].encode())==256
+if kind=="email_4096": assert len(row["git_email"].encode())==4096
+if kind=="row_exact": assert len(before)-1==1_048_576
+PY
+}
+
+assert_merge_permit_rejection() {
+  local label="$1" kind="$2" repo run ledger before out rc
+  repo="$(mk_repo)"; mk_run "$repo" target; run="$repo/.agent-firm/runs/target"
+  ledger="$run/run.jsonl"; write_merge_permit_case "$ledger" "$kind"; chmod 600 "$ledger"
+  before="$(sha_or_absent "$ledger")"
+  out="$($LOG --run "$run" --strict --print-event-id compatibility_followed \
+    2> "$repo/permit.err")"; rc=$?
+  assert_eq "$label merge permit negative fails closed" 1 "$rc"
+  assert_eq "$label merge permit negative emits no id" "" "$out"
+  assert_eq "$label merge permit negative leaves bytes unchanged" "$before" \
+    "$(sha_or_absent "$ledger")"
 }
 
 seed_and_follow() {
@@ -462,6 +564,8 @@ seed_and_follow shell_observation \
   '{"cmd":"git status --short","event":"bash","ts":"2026-08-12T00:00:00Z"}'
 seed_and_follow merge_observation \
   '{"reason":"protected","decision":"block","cmd":"git merge topic","ts":"2026-08-12T00:00:00Z","event":"merge_guard_block"}'
+seed_and_follow merge_permit_observation \
+  '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_permit","cmd":"git merge topic","decision":"permitted","matched":"operator-entry","gh_login":"operator-1","git_email":"operator@example.test"}'
 
 catalog="$(mktemp "${TMPDIR:-/tmp}/firm-ledger-catalog.XXXXXX")"; t_track "$catalog"
 cat > "$catalog" <<'EOF'
@@ -487,6 +591,37 @@ final_gate_pending|{"gate":"Final","event":"final_gate_pending","event_id":"evt-
 empty_extension|{"note":"","custom":"safe value","event":"arbitrary_safe_event","event_id":"evt-catalog-empty","ts":"2026-08-12T00:00:00Z","run_id":"target"}
 EOF
 while IFS='|' read label raw; do seed_and_follow "$label" "$raw"; done < "$catalog"
+
+t_case "exact merge permit observations accept the frozen shape and identity/row boundaries"
+for spec in \
+  line950_analogue:valid login_one:login_one login_digit:login_digit \
+  login_hyphen:login_hyphen login_39:login_39 matched_256:matched_256 \
+  email_4096:email_4096 unicode_values:unicode_values row_exact:row_exact; do
+  permit_label="${spec%%:*}"; permit_kind="${spec#*:}"
+  assert_merge_permit_accept "$permit_label" "$permit_kind"
+done
+
+t_case "merge permit decision, identity, key, encoding, duplicate, incomplete, and row bounds fail closed"
+for permit_kind in \
+  typed_cmd decision_other decision_typed \
+  matched_typed matched_empty matched_control matched_257 \
+  login_typed login_empty login_control login_leading_hyphen login_trailing_hyphen \
+  login_double_hyphen login_underscore login_unicode login_40 \
+  email_typed email_empty email_control email_no_at email_4097 \
+  missing extra renamed wrong_event invalid_timestamp ambiguous_identity \
+  invalid_utf8 duplicate incomplete row_plus; do
+  assert_merge_permit_rejection "$permit_kind" "$permit_kind"
+done
+
+t_case "the two excluded merge block variants remain rejected without widening the five-key family"
+reject_seed merge_block_matched_excluded \
+  '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"git merge topic","decision":"refused","reason":"protected","matched":"operator-entry"}\n'
+reject_seed merge_block_identity_status_excluded \
+  '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"git merge topic","decision":"cannot_evaluate","matched":"operator-entry","gh_login":"operator-1","gh_status":"ok","git_email":"operator@example.test","git_status":"ok","exit":2}\n'
+seed_and_follow merge_block_five_key_multiline \
+  '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"git merge topic\nstatus=$?","decision":"cannot_evaluate","reason":"tokenization preserved"}'
+seed_and_follow shell_control_whitespace \
+  '{"ts":"2026-08-12T00:00:00Z","event":"bash","cmd":"printf one\nprintf two\tthree"}'
 
 t_case "shell observation JSON strings span controls, Unicode, field size, and exact row boundaries"
 for kind in empty unicode newline carriage tab control bytes4096 over4096 line_below line_at; do
@@ -897,7 +1032,7 @@ assert_eq "forced first identical id wins" 0 "$(cat "$dup_barrier/a.rc")"
 assert_eq "forced duplicate loser is strict failure" 1 "$(cat "$dup_barrier/b.rc")"
 assert_eq "duplicate loser stdout is empty" "" "$(cat "$dup_barrier/b.out")"
 
-t_case "all four seeded families and a decision row survive a forced mixed ordinary/native schedule"
+t_case "all exact seeded families including merge permit survive a forced mixed ordinary/native schedule"
 repo_mix="$(mk_repo)"; mk_eligible_run "$repo_mix" target; mkdir -p "$repo_mix/.agent-firm/runs/source"
 printf '%s\n' '{"proof":"accepted","event":"architecture_completed","event_id":"evt-compat-authority-0001","ts":"2020-01-01T00:00:00Z","run_id":"source"}' \
   > "$repo_mix/.agent-firm/runs/source/run.jsonl"; chmod 600 "$repo_mix/.agent-firm/runs/source/run.jsonl"
@@ -906,6 +1041,7 @@ invoke_native "$repo_mix" target build/seed "$mix_auth" "$CODEX_ACTIVATION" >/de
 printf '%s\n' \
   '{"ts":"2020-01-02T00:00:00Z","event":"bash","cmd":"true"}' \
   '{"ts":"2020-01-02T00:00:01Z","event":"merge_guard_block","cmd":"git merge x","decision":"block","reason":"protected"}' \
+  '{"ts":"2020-01-02T00:00:02Z","event":"merge_guard_permit","cmd":"git merge y","decision":"permitted","matched":"operator-entry","gh_login":"operator-1","git_email":"operator@example.test"}' \
   >> "$repo_mix/.agent-firm/runs/target/run.jsonl"
 "$LOG" --run "$repo_mix/.agent-firm/runs/target" --strict --event-id evt-mix-decision \
   final_decision_required path=09-test-evidence/decision.json sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null
@@ -929,9 +1065,10 @@ assert {"evt-mix-decision","evt-mix-ordinary"}.issubset(ids)
 assert sum(r.get("event")=="build_started" and "activation" in r for r in rows)==2
 assert sum(r.get("event")=="bash" and set(r)=={"ts","event","cmd"} for r in rows)==1
 assert sum(r.get("event")=="merge_guard_block" and "event_id" not in r for r in rows)==1
+assert sum(r.get("event")=="merge_guard_permit" and "event_id" not in r for r in rows)==1
 PY
 
-t_case "sanitized representative ledger preserves its exact four-family prefix across two append kinds"
+t_case "sanitized representative ledger preserves its exact closed-family prefix across two append kinds"
 repo_rep="$(mk_repo)"; mk_eligible_run "$repo_rep" source; mk_eligible_run "$repo_rep" target
 make_contract "$repo_rep" target role-contracts/I-00-intake.md
 printf '%s\n' \
@@ -952,6 +1089,9 @@ rows=[
  {"ts":"2026-08-12T00:00:01Z","event":"bash","cmd":"s"*5000+"\rterminal"},
  {"ts":"2026-08-12T00:00:02Z","event":"merge_guard_block","cmd":"synthetic merge observation",
   "decision":"block","reason":"protected"},
+ {"ts":"2026-08-12T00:00:03Z","event":"merge_guard_permit","cmd":"synthetic permit\ncommand",
+  "decision":"permitted","matched":"operator-entry","gh_login":"operator-1",
+  "git_email":"operator@example.test"},
 ]
 with open(path,"ab") as fh:
     for row in rows:
@@ -967,9 +1107,10 @@ def family(row):
     if "activation" in row: return "native"
     if row.get("event")=="bash" and set(row)=={"ts","event","cmd"}: return "shell"
     if row.get("event")=="merge_guard_block" and "event_id" not in row: return "merge"
+    if row.get("event")=="merge_guard_permit" and "event_id" not in row: return "permit"
     return "ordinary"
 counts=collections.Counter(map(family,rows))
-assert counts=={"native":1,"ordinary":1,"shell":2,"merge":1}
+assert counts=={"native":1,"ordinary":1,"shell":2,"merge":1,"permit":1}
 manifest={"bytes":len(raw),"rows":len(rows),"counts":dict(sorted(counts.items())),
           "family_sha256":{name:hashlib.sha256(b"".join(
               line for line,row in zip(lines,rows) if family(row)==name)).hexdigest()
@@ -1021,6 +1162,7 @@ activations={(r["run_id"],r["stage"],r["role"]) for r in rows if "activation" in
 assert activations=={("target","intake/seed","intake-analyst"),("target","intake/I-01","intake-analyst")}
 assert sum(r.get("event")=="bash" and "event_id" not in r for r in rows)==2
 assert sum(r.get("event")=="merge_guard_block" and "event_id" not in r for r in rows)==1
+assert sum(r.get("event")=="merge_guard_permit" and "event_id" not in r for r in rows)==1
 PY
 
 t_case "descriptor barriers detect lock, target-ledger, and private-temp entry substitution"
