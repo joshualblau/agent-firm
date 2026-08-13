@@ -107,46 +107,43 @@ assert_native_binding_namespace_control() {
   assert_no_file "namespace-family binding error creates no native lock" "$run/run.jsonl.lock"
 }
 
-assert_native_mount_rejection() {
-  local label="$1" behavior="$2" repo run fixture sentinel out rc started elapsed
+assert_native_descriptor_rejection() {
+  local label="$1" behavior="$2" repo run state sentinel out rc
   repo="$(mk_repo)"; mk_role_fixture "$repo" target source
-  run="$repo/.agent-firm/runs/target"; fixture=""
-  if [ "$behavior" = output ]; then
-    fixture="$repo/mount-$label.bin"
-    python3 - "$fixture" "$run" <<'PY'
-import os,sys
-fixture,run=sys.argv[1:]
-run=os.path.realpath(run); unrelated="/dev"
-assert os.stat(unrelated).st_dev != os.stat(run).st_dev
-def row(point):
-    suffix=(" on %s (apfs, local)\n"%point).encode(); source=b"fixture"
-    return source+b"x"*(4096-len(source)-len(suffix))+suffix
-body=b"".join([row(unrelated) for _ in range(15)]+[row(run)])+b"x"
-assert len(body)==65537
-with open(fixture,"wb") as handle: handle.write(body)
-os.chmod(fixture,0o600)
-PY
-  fi
-  sentinel="$repo/native-mount-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
-  started=$SECONDS
-  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
-    FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" invoke_start "$repo" target \
-    "build/mount-$label" "$(authority_for target)" 2> "$repo/mount.err")"; rc=$?
-  elapsed=$((SECONDS-started))
-  assert_eq "$label native mount rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
-  assert_eq "$label native mount rejection emits no result" "" "$out"
-  assert_output "$label native mount diagnostic is sanitized" \
-    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/mount.err"
-  assert_no_file "$label native mount rejection creates no ledger" "$run/run.jsonl"
-  assert_no_file "$label native mount rejection creates no lock" "$run/run.jsonl.lock"
-  assert_eq "$label native mount rejection creates no transaction temp" 0 \
+  run="$repo/.agent-firm/runs/target"; state="$repo/descriptor-$label.json"
+  sentinel="$repo/native-descriptor-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR="$behavior" \
+    FIRM_LEDGER_DESCRIPTOR_TEST_STATE="$state" invoke_start "$repo" target \
+    "build/descriptor-$label" "$(authority_for target)" 2> "$repo/descriptor.err")"; rc=$?
+  assert_eq "$label native descriptor rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label native descriptor rejection emits no result" "" "$out"
+  assert_output "$label native descriptor diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/descriptor.err"
+  assert_no_file "$label native descriptor rejection creates no ledger" "$run/run.jsonl"
+  assert_no_file "$label native descriptor rejection creates no lock" "$run/run.jsonl.lock"
+  assert_eq "$label native descriptor rejection creates no transaction temp" 0 \
     "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
-  assert_eq "$label native mount rejection leaves unrelated sentinels unchanged" \
+  assert_eq "$label native descriptor rejection leaves unrelated sentinels unchanged" \
     "outside sentinel" "$(cat "$sentinel")"
-  if [ "$behavior" = timeout ]; then
-    assert_ok "$label native mount child is terminated and reaped under the bounded deadline" \
-      test "$elapsed" -le 7
-  fi
+  assert_ok "$label native descriptor helper is eventually absent after bounded cleanup" python3 - \
+    "$state" "$behavior" <<'PY'
+import json,os,sys
+state=json.load(open(sys.argv[1],encoding="utf-8")); behavior=sys.argv[2]
+assert state["status"]=="failed" and state["retained_stdout_bytes"]<=256
+assert state["process_deadline_ns"]-state["started_ns"]==5_000_000_000
+assert state["cleanup_deadline_ns"]-state["started_ns"]==6_000_000_000
+if behavior in {"timeout","ignore_term","terminate_error","wait_error","clock_deadlines","pipe_error"}:
+    assert state["eventual_reaped"] is True
+if state["eventual_reaped"]: assert state["second_wait_unavailable"] is True
+if behavior in {"terminate_error","wait_error"}: assert state["cleanup_uncertain"] is True
+if state["pid"] is not None:
+    try: os.kill(state["pid"],0)
+    except ProcessLookupError: pass
+    else: raise AssertionError("descriptor helper PID survived")
+    try: os.waitpid(state["pid"],os.WNOHANG)
+    except ChildProcessError: pass
+    else: raise AssertionError("descriptor helper remained waitable")
+PY
 }
 
 t_case "the centralized exact-P2 support gate accepts the local row before native mutation"
@@ -203,9 +200,9 @@ done
 t_case "the pre-bind adapter preserves the native namespace error family"
 assert_native_binding_namespace_control
 
-t_case "representative mount overflow and timeout fail closed before native mutation"
-assert_native_mount_rejection bytes_plus output
-assert_native_mount_rejection timeout timeout
+t_case "representative descriptor cap and cleanup failures fail closed before native mutation"
+assert_native_descriptor_rejection bytes_plus cap_257
+assert_native_descriptor_rejection wait_error wait_error
 
 t_case "valid role start derives one exact contract tuple and emits only the proof-instant receipt"
 repo1="$(mk_repo)"; mk_role_fixture "$repo1" target source

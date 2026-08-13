@@ -193,121 +193,126 @@ assert_prewrite_support_rejection() {
     "outside sentinel" "$(cat "$sentinel")"
 }
 
-write_mount_fixture() {
-  local fixture="$1" run="$2" kind="$3"
-  python3 - "$fixture" "$run" "$kind" <<'PY'
-import os
-from pathlib import Path
-import sys
-
-fixture,run,kind=sys.argv[1:]
-run=os.path.realpath(run)
-device=os.stat(run).st_dev
-unrelated="/dev"
-assert os.stat(unrelated).st_dev != device
-
-def row(point, size=None, filesystem="apfs", options="local"):
-    suffix=(" on %s (%s, %s)\n"%(point,filesystem,options)).encode("utf-8")
-    source=b"fixture"
-    if size is not None:
-        assert size >= len(source)+len(suffix)
-        source += b"x"*(size-len(source)-len(suffix))
-    return source+suffix
-
-if kind == "valid":
-    body=row(run)
-elif kind in ("bytes_exact", "bytes_plus"):
-    body=b"".join([row(unrelated,4096) for _ in range(15)]+[row(run,4096)])
-    assert len(body)==65536
-    if kind == "bytes_plus": body+=b"x"
-elif kind == "line_exact":
-    body=row(run,4096)
-elif kind == "line_plus":
-    body=row(run,4097)
-elif kind in ("lines_exact", "lines_plus"):
-    count=255 if kind=="lines_exact" else 256
-    body=b"".join(row(unrelated) for _ in range(count))+row(run)
-elif kind in ("matches_exact", "matches_plus"):
-    points=[]
-    for point in (Path(run),*Path(run).parents):
-        value=os.path.realpath(str(point))
-        if value not in points and os.stat(value).st_dev==device: points.append(value)
-    count=8 if kind=="matches_exact" else 9
-    assert len(points)>=count
-    body=b"".join(row(point) for point in points[:count])
-elif kind == "invalid_utf8":
-    body=b"\xff on "+run.encode()+b" (apfs, local)\n"
-elif kind == "nul":
-    body=b"bad\0source on "+run.encode()+b" (apfs, local)\n"
-elif kind == "unterminated":
-    body=row(run)[:-1]
-elif kind == "malformed":
-    body=b"malformed mount row\n"
-elif kind == "stat_failure":
-    body=row("/definitely/not/a/mount/point")
-elif kind == "duplicate":
-    body=row(run)+row(run)
-elif kind == "conflict":
-    body=row(run)+row(run,filesystem="hfs")
-else:
-    raise AssertionError(kind)
-with open(fixture,"wb") as handle: handle.write(body)
-os.chmod(fixture,0o600)
+assert_descriptor_probe_pass() {
+  local label="$1" behavior="$2" expected_bytes="$3" repo run state out rc
+  repo="$(mk_repo)"; mk_run "$repo" target
+  run="$repo/.agent-firm/runs/target"; state="$repo/descriptor-$label.json"
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR="$behavior" \
+    FIRM_LEDGER_DESCRIPTOR_TEST_STATE="$state" "$LOG" --run "$run" --strict \
+    --print-event-id --event-id "evt-descriptor-$label" descriptor_probe class=synthetic \
+    2> "$repo/descriptor.err")"; rc=$?
+  assert_eq "$label descriptor response permits the exact supported fact" 0 "$rc"
+  assert_eq "$label descriptor response retains the ordinary receipt" "evt-descriptor-$label" "$out"
+  assert_eq "$label descriptor response emits no diagnostic" "" "$(cat "$repo/descriptor.err")"
+  assert_ok "$label descriptor helper is exact, reaped, and bounded" python3 - \
+    "$state" "$expected_bytes" <<'PY'
+import json,os,sys
+state=json.load(open(sys.argv[1],encoding="utf-8")); expected=int(sys.argv[2])
+assert state["status"]=="success" and state["eventual_reaped"] is True
+assert state["second_wait_unavailable"] is True
+assert oct(os.stat(sys.argv[1]).st_mode & 0o777)=="0o600"
+assert isinstance(state["pid"],int) and state["pid"]>0
+assert state["process_deadline_ns"]-state["started_ns"]==5_000_000_000
+assert state["cleanup_deadline_ns"]-state["started_ns"]==6_000_000_000
+assert state["retained_stdout_bytes"]<=256
+if expected >= 0: assert state["retained_stdout_bytes"]==expected
+try: os.kill(state["pid"],0)
+except ProcessLookupError: pass
+else: raise AssertionError("descriptor helper PID survived")
+try: os.waitpid(state["pid"],os.WNOHANG)
+except ChildProcessError: pass
+else: raise AssertionError("descriptor helper remained waitable")
 PY
 }
 
-assert_mount_probe_pass() {
-  local label="$1" kind="$2" repo run fixture out rc
-  repo="$(mk_repo)"; mk_run "$repo" target
-  run="$repo/.agent-firm/runs/target"; fixture="$repo/mount-$label.bin"
-  write_mount_fixture "$fixture" "$run" "$kind"
-  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR=output \
-    FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" --strict \
-    --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
-    2> "$repo/mount.err")"; rc=$?
-  assert_eq "$label mount boundary permits the exact supported probe" 0 "$rc"
-  assert_eq "$label mount boundary retains the ordinary receipt" "evt-mount-$label" "$out"
-  assert_eq "$label mount boundary emits no diagnostic" "" "$(cat "$repo/mount.err")"
-}
-
-assert_mount_probe_rejection() {
-  local label="$1" behavior="$2" kind="$3" mode="$4" repo run ledger before fixture sentinel out rc started elapsed
+assert_descriptor_probe_rejection() {
+  local label="$1" behavior="$2" mode="$3" timing="$4" repo run ledger before state sentinel out rc elapsed_ns
   repo="$(mk_repo)"; mk_run "$repo" target
   run="$repo/.agent-firm/runs/target"; ledger="$run/run.jsonl"
   printf '%s\n' \
-    '{"ts":"2026-08-13T00:00:00Z","event":"mount_predecessor","event_id":"evt-mount-predecessor","run_id":"target","class":"synthetic"}' \
+    '{"ts":"2026-08-13T00:00:00Z","event":"descriptor_predecessor","event_id":"evt-descriptor-predecessor","run_id":"target","class":"synthetic"}' \
     > "$ledger"; chmod 600 "$ledger"; before="$(sha_or_absent "$ledger")"
-  fixture="$repo/mount-$label.bin"
-  if [ "$behavior" = output ]; then write_mount_fixture "$fixture" "$run" "$kind"; else fixture=""; fi
-  sentinel="$repo/mount-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
-  started=$SECONDS
-  if [ "$mode" = strict ]; then
-    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
-      FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" --strict \
-      --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
-      2> "$repo/mount.err")"; rc=$?
+  state="$repo/descriptor-$label.json"
+  sentinel="$repo/descriptor-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  if [ "$timing" = real ]; then
+    assert_ok "$label production child is measured by one monotonic clock process" python3 - \
+      "$LOG" "$run" "$state" "$repo/descriptor.out" "$repo/descriptor.err" \
+      "$repo/descriptor.rc" "$repo/descriptor.elapsed-ns" "$label" <<'PY'
+import os,subprocess,sys,time
+log,run,state,out_path,err_path,rc_path,elapsed_path,label=sys.argv[1:]
+env=os.environ.copy()
+env.update(FIRM_LEDGER_TEST_GUARD="1",FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR="timeout",
+           FIRM_LEDGER_DESCRIPTOR_TEST_STATE=state)
+args=[log,"--run",run,"--strict","--print-event-id","--event-id",
+      "evt-descriptor-"+label,"descriptor_probe","class=synthetic"]
+started=time.monotonic_ns()
+with open(out_path,"wb") as out,open(err_path,"wb") as err:
+    result=subprocess.run(args,env=env,stdin=subprocess.DEVNULL,stdout=out,stderr=err,check=False)
+elapsed=time.monotonic_ns()-started
+open(rc_path,"w",encoding="ascii").write(str(result.returncode))
+open(elapsed_path,"w",encoding="ascii").write(str(elapsed))
+PY
+    out="$(cat "$repo/descriptor.out")"; rc="$(cat "$repo/descriptor.rc")"
+    elapsed_ns="$(cat "$repo/descriptor.elapsed-ns")"
+  elif [ "$mode" = strict ]; then
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR="$behavior" \
+      FIRM_LEDGER_DESCRIPTOR_TEST_STATE="$state" "$LOG" --run "$run" --strict \
+      --print-event-id --event-id "evt-descriptor-$label" descriptor_probe class=synthetic \
+      2> "$repo/descriptor.err")"; rc=$?
   else
-    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
-      FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" \
-      --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
-      2> "$repo/mount.err")"; rc=$?
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR="$behavior" \
+      FIRM_LEDGER_DESCRIPTOR_TEST_STATE="$state" "$LOG" --run "$run" \
+      --print-event-id --event-id "evt-descriptor-$label" descriptor_probe class=synthetic \
+      2> "$repo/descriptor.err")"; rc=$?
   fi
-  elapsed=$((SECONDS-started))
-  assert_eq "$label $mode mount rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
-  assert_eq "$label $mode mount rejection emits no success" "" "$out"
-  assert_output "$label $mode mount diagnostic is sanitized" \
-    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/mount.err"
-  assert_eq "$label $mode mount rejection leaves the ledger byte-identical" \
+  if [ "$timing" != real ]; then elapsed_ns=0; fi
+  assert_eq "$label $mode descriptor rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label $mode descriptor rejection emits no success" "" "$out"
+  assert_output "$label $mode descriptor diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/descriptor.err"
+  assert_eq "$label $mode descriptor rejection leaves the ledger byte-identical" \
     "$before" "$(sha_or_absent "$ledger")"
-  assert_no_file "$label $mode mount rejection creates no coordination lock" "$run/run.jsonl.lock"
-  assert_eq "$label $mode mount rejection creates no transaction temp" 0 \
+  assert_no_file "$label $mode descriptor rejection creates no coordination lock" "$run/run.jsonl.lock"
+  assert_eq "$label $mode descriptor rejection creates no transaction temp" 0 \
     "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
-  assert_eq "$label $mode mount rejection leaves unrelated sentinels unchanged" \
+  assert_eq "$label $mode descriptor rejection leaves unrelated sentinels unchanged" \
     "outside sentinel" "$(cat "$sentinel")"
-  if [ "$behavior" = timeout ] || [ "$behavior" = ignore_term ]; then
-    assert_ok "$label $mode mount child is terminated and reaped under the bounded deadline" \
-      test "$elapsed" -le 7
-  fi
+  assert_ok "$label $mode descriptor state proves exact deadlines, bounded retention, and PID absence" \
+    python3 - "$state" "$behavior" "$elapsed_ns" "$timing" <<'PY'
+import json,os,sys
+path,behavior,elapsed,timing=sys.argv[1:]; elapsed=int(elapsed)
+state=json.load(open(path,encoding="utf-8"))
+assert state["status"]=="failed"
+assert state["process_deadline_ns"]-state["started_ns"]==5_000_000_000
+assert state["cleanup_deadline_ns"]-state["started_ns"]==6_000_000_000
+assert state["retained_stdout_bytes"]<=256
+if timing=="real": assert 5_000_000_000 <= elapsed <= 6_500_000_000, elapsed
+if behavior in {"ignore_term","terminate_error","wait_error","clock_deadlines"}:
+    points=state["controlled_clock_observations_ns"]
+    assert points[1]-points[0]==5_000_000_000
+    assert points[2]-points[0]==6_000_000_000
+if behavior=="ignore_term":
+    assert state["cleanup_operations"]==[
+        "terminate:success","wait_after_terminate:timeout","kill:success","final_wait:success"]
+    assert state["cleanup_uncertain"] is False
+if behavior=="terminate_error":
+    assert state["cleanup_operations"]==["terminate:error","kill:success","final_wait:success"]
+    assert state["cleanup_uncertain"] is True
+if behavior=="wait_error":
+    assert state["cleanup_operations"][0:2]==["terminate:success","wait_after_terminate:error"]
+    assert state["cleanup_operations"][-1]=="final_wait:success"
+    assert state["cleanup_uncertain"] is True
+if behavior in {"timeout","ignore_term","terminate_error","wait_error","clock_deadlines","pipe_error"}:
+    assert state["eventual_reaped"] is True
+if state["eventual_reaped"]: assert state["second_wait_unavailable"] is True
+if state["pid"] is not None:
+    try: os.kill(state["pid"],0)
+    except ProcessLookupError: pass
+    else: raise AssertionError("descriptor helper PID survived")
+    try: os.waitpid(state["pid"],os.WNOHANG)
+    except ChildProcessError: pass
+    else: raise AssertionError("descriptor helper remained waitable")
+PY
 }
 
 assert_binding_namespace_control() {
@@ -421,35 +426,36 @@ assert_no_file "positive-support seam value creates no ledger" "$run_p2_seam/run
 assert_no_file "negative-only seam creates no coordination lock" "$run_p2_seam/run.jsonl.lock"
 assert_eq "negative-only seam creates no transaction temp" 0 \
   "$(find "$run_p2_seam" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
-mount_seam_out="$(FIRM_LEDGER_MOUNT_TEST_BEHAVIOR=nonzero \
-  "$LOG" --run "$run_p2_seam" --strict mount_seam 2> "$repo_p2_seam/mount-unguarded.err")"
-assert_eq "unguarded mount probe seam is INPUT_INVALID" 2 "$?"
-assert_eq "unguarded mount probe seam emits no success" "" "$mount_seam_out"
-assert_no_file "unguarded mount probe seam creates no ledger" "$run_p2_seam/run.jsonl"
+descriptor_seam_out="$(FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR=nonzero \
+  "$LOG" --run "$run_p2_seam" --strict descriptor_seam 2> "$repo_p2_seam/descriptor-unguarded.err")"
+assert_eq "unguarded descriptor probe seam is INPUT_INVALID" 2 "$?"
+assert_eq "unguarded descriptor probe seam emits no success" "" "$descriptor_seam_out"
+assert_no_file "unguarded descriptor probe seam creates no ledger" "$run_p2_seam/run.jsonl"
 
-t_case "incremental mount discovery accepts every exact frozen ceiling"
-for spec in \
-  bytes_exact:bytes_exact line_exact:line_exact lines_exact:lines_exact \
-  matches_exact:matches_exact; do
-  mount_label="${spec%%:*}"; mount_kind="${spec#*:}"
-  assert_mount_probe_pass "$mount_label" "$mount_kind"
+t_case "descriptor helper proves the production ABI/local APFS fact and exact 256-byte response boundary"
+assert_descriptor_probe_pass production success -1
+assert_descriptor_probe_pass response_256 cap_256 256
+assert_descriptor_probe_rejection response_257 cap_257 strict instant
+
+t_case "descriptor helper rejects ABI, syscall, schema, type, encoding, duplicate, trailing, exit, and P2 ambiguity"
+for behavior in \
+  abi_size abi_flags_offset abi_fstypename_offset symbol syscall \
+  schema_missing schema_extra schema_version_type filesystem_type flags_type \
+  invalid_utf8 duplicate trailing nonzero filesystem_mismatch locality_mismatch \
+  flags_negative flags_overflow popen_error pass_fds_error pipe_error; do
+  assert_descriptor_probe_rejection "$behavior" "$behavior" strict instant
 done
 
-t_case "incremental mount discovery rejects each cap plus one and every malformed or ambiguous state"
-for spec in \
-  bytes_plus:bytes_plus line_plus:line_plus lines_plus:lines_plus matches_plus:matches_plus \
-  invalid_utf8:invalid_utf8 nul:nul unterminated:unterminated malformed:malformed \
-  stat_failure:stat_failure duplicate:duplicate conflict:conflict; do
-  mount_label="${spec%%:*}"; mount_kind="${spec#*:}"
-  assert_mount_probe_rejection "$mount_label" output "$mount_kind" strict
-done
-assert_mount_probe_rejection nonzero nonzero none strict
-assert_mount_probe_rejection timeout timeout none strict
-assert_mount_probe_rejection ignore_term ignore_term none strict
+t_case "one 5+1-second lifetime reaps blocked, TERM-ignored, and cleanup-operation-failure helpers"
+assert_descriptor_probe_rejection timeout timeout strict real
+assert_descriptor_probe_rejection ignore_term ignore_term strict controlled
+assert_descriptor_probe_rejection terminate_error terminate_error best_effort controlled
+assert_descriptor_probe_rejection wait_error wait_error strict controlled
+assert_descriptor_probe_rejection clock_deadlines clock_deadlines strict controlled
 
-t_case "representative mount overflow and timeout reject before ordinary best-effort fallback"
-assert_mount_probe_rejection best_bytes_plus output bytes_plus best_effort
-assert_mount_probe_rejection best_timeout timeout none best_effort
+t_case "representative descriptor cap and cleanup failures reject before ordinary best-effort fallback"
+assert_descriptor_probe_rejection best_response_257 cap_257 best_effort instant
+assert_descriptor_probe_rejection best_terminate_error terminate_error best_effort controlled
 
 t_case "accepted-base catalog: exact observations and ordinary producer shapes are readable predecessors"
 seed_and_follow shell_observation \
@@ -538,24 +544,119 @@ for kind in typed_null typed_bool typed_number typed_list typed_object missing_t
     "$(sha_or_absent "$repo_shell_bad/.agent-firm/runs/source/run.jsonl")"
 done
 
-t_case "shell cmd widening does not widen merge observations or ordinary extension values"
-reject_seed merge_control \
-  '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"synthetic\ncontrol","decision":"block","reason":"protected"}\n'
+t_case "merge cmd preserves shell-string control whitespace and exact prefix in ordinary and native appends"
+repo_merge_ordinary="$(mk_repo)"; mk_run "$repo_merge_ordinary" target
+ledger_merge_ordinary="$repo_merge_ordinary/.agent-firm/runs/target/run.jsonl"
+python3 - "$ledger_merge_ordinary" <<'PY'
+import json,sys
+row={"ts":"2026-08-13T17:58:49Z","event":"merge_guard_block",
+     "cmd":"git -C /tmp/firm merge --ff-only topic \u2603\nstatus=$?\nprintf 'decision=%s\\n' cannot_evaluate\r\t\v",
+     "decision":"cannot_evaluate",
+     "reason":"tokenization preserved; repository observation unavailable"}
+open(sys.argv[1],"wb").write(json.dumps(row,separators=(",",":"),ensure_ascii=False).encode()+b"\n")
+PY
+chmod 600 "$ledger_merge_ordinary"; cp "$ledger_merge_ordinary" "$repo_merge_ordinary/prefix.bin"
+merge_ordinary_out="$($LOG --run "$repo_merge_ordinary/.agent-firm/runs/target" --strict \
+  --print-event-id --event-id evt-merge-multiline-ordinary merge_followed class=synthetic)"
+assert_eq "multiline merge cmd permits ordinary append" evt-merge-multiline-ordinary "$merge_ordinary_out"
+assert_ok "ordinary append preserves every multiline-merge prefix byte" python3 - \
+  "$repo_merge_ordinary/prefix.bin" "$ledger_merge_ordinary" <<'PY'
+import json,sys
+before=open(sys.argv[1],"rb").read(); after=open(sys.argv[2],"rb").read()
+assert after.startswith(before) and len(after)>len(before)
+row=json.loads(before)
+assert "\n" in row["cmd"] and "\r" in row["cmd"] and "\t" in row["cmd"] and "\v" in row["cmd"]
+assert "\u2603" in row["cmd"]
+assert row["decision"]=="cannot_evaluate"
+PY
+
+repo_merge_native="$(mk_repo)"; mk_eligible_run "$repo_merge_native" target
+mkdir -p "$repo_merge_native/.agent-firm/runs/source"
+printf '%s\n' '{"proof":"accepted","event":"architecture_completed","event_id":"evt-compat-authority-0001","ts":"2020-01-01T00:00:00Z","run_id":"source"}' \
+  > "$repo_merge_native/.agent-firm/runs/source/run.jsonl"
+chmod 600 "$repo_merge_native/.agent-firm/runs/source/run.jsonl"
+ledger_merge_native="$repo_merge_native/.agent-firm/runs/target/run.jsonl"
+cp "$repo_merge_ordinary/prefix.bin" "$ledger_merge_native"; chmod 600 "$ledger_merge_native"
+cp "$ledger_merge_native" "$repo_merge_native/native-prefix.bin"
+merge_native_auth="$(authority_json source "$AUTH_ID" architecture_completed '{"proof":"accepted"}')"
+merge_native_out="$(invoke_native "$repo_merge_native" target build/R-01 \
+  "$merge_native_auth" "$CODEX_ACTIVATION")"
+assert_ok "multiline merge cmd permits native append with exact prefix" python3 - \
+  "$repo_merge_native/native-prefix.bin" "$ledger_merge_native" "$merge_native_out" <<'PY'
+import json,sys
+before=open(sys.argv[1],"rb").read(); after=open(sys.argv[2],"rb").read(); result=json.loads(sys.argv[3])
+assert after.startswith(before) and len(after)>len(before)
+assert json.loads(before)["cmd"].startswith("git -C ")
+assert result["event_id"]==json.loads(after[len(before):])["event_id"]
+PY
+
+repo_merge_max="$(mk_repo)"; mk_run "$repo_merge_max" target
+ledger_merge_max="$repo_merge_max/.agent-firm/runs/target/run.jsonl"
+python3 - "$ledger_merge_max" <<'PY'
+import json,sys
+row={"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"\u2603",
+     "decision":"cannot_evaluate","reason":"printable reason"}
+base=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+row["cmd"]="\u2603"+"m"*(1_048_576-len(base))
+raw=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+assert len(raw)==1_048_576 and len(row["cmd"].encode("utf-8"))>4096
+open(sys.argv[1],"wb").write(raw+b"\n")
+PY
+chmod 600 "$ledger_merge_max"; cp "$ledger_merge_max" "$repo_merge_max/prefix.bin"
+merge_max_out="$($LOG --run "$repo_merge_max/.agent-firm/runs/target" --strict \
+  --print-event-id --event-id evt-merge-cmd-max merge_followed class=synthetic)"
+assert_eq "Unicode merge cmd at the exact complete-row ceiling permits append" \
+  evt-merge-cmd-max "$merge_max_out"
+assert_ok "exact-ceiling merge append preserves all predecessor bytes" python3 - \
+  "$repo_merge_max/prefix.bin" "$ledger_merge_max" <<'PY'
+import sys
+before=open(sys.argv[1],"rb").read(); after=open(sys.argv[2],"rb").read()
+assert after.startswith(before) and len(after)>len(before)
+PY
+
+t_case "merge cmd widening remains confined to cmd, exact keys, and the complete encoded-row cap"
 reject_seed merge_typed_cmd \
   '{"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":3,"decision":"block","reason":"protected"}\n'
-repo_bound="$(mk_repo)"; mk_run "$repo_bound" target; ledger_bound="$repo_bound/.agent-firm/runs/target/run.jsonl"
-python3 - "$ledger_bound" <<'PY'
+for merge_negative in decision_control reason_control empty_decision empty_reason typed_decision typed_reason \
+  extra missing renamed wrong_event invalid_timestamp duplicate invalid_utf8 incomplete oversized; do
+  repo_merge_bad="$(mk_repo)"; mk_run "$repo_merge_bad" target
+  ledger_merge_bad="$repo_merge_bad/.agent-firm/runs/target/run.jsonl"
+  python3 - "$ledger_merge_bad" "$merge_negative" <<'PY'
 import json,sys
-row={"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"m"*4097,
-     "decision":"block","reason":"protected"}
-open(sys.argv[1],"w",encoding="utf-8").write(json.dumps(row,separators=(",",":"))+"\n")
+path,kind=sys.argv[1:]
+row={"ts":"2026-08-12T00:00:00Z","event":"merge_guard_block","cmd":"synthetic\ncmd",
+     "decision":"cannot_evaluate","reason":"protected"}
+if kind=="decision_control": row["decision"]="cannot\nevaluate"
+elif kind=="reason_control": row["reason"]="pro\ttected"
+elif kind=="empty_decision": row["decision"]=""
+elif kind=="empty_reason": row["reason"]=""
+elif kind=="typed_decision": row["decision"]=False
+elif kind=="typed_reason": row["reason"]=["protected"]
+elif kind=="extra": row["matched"]=False
+elif kind=="missing": del row["reason"]
+elif kind=="renamed": row["rationale"]=row.pop("reason")
+elif kind=="wrong_event": row["event"]="merge_guard_allow"
+elif kind=="invalid_timestamp": row["ts"]="not-a-time"
+raw=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode()
+if kind=="duplicate": raw=raw[:-1]+b',"cmd":"second"}'
+elif kind=="invalid_utf8": raw=raw.replace(b"protected",b"pro\xfftected")
+elif kind=="oversized":
+    row["cmd"]="x"
+    base=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode()
+    row["cmd"]="m"*(1_048_577-len(base)+1)
+    raw=json.dumps(row,separators=(",",":"),ensure_ascii=False).encode()
+    assert len(raw)==1_048_577
+ending=b"" if kind=="incomplete" else b"\n"
+open(path,"wb").write(raw+ending)
 PY
-chmod 600 "$ledger_bound"; before_bound="$(sha_or_absent "$ledger_bound")"
-bound_out="$($LOG --run "$repo_bound/.agent-firm/runs/target" --strict --print-event-id \
-  compatibility_followed 2>/dev/null)"; bound_rc=$?
-assert_eq "over-4096 merge cmd remains rejected" 1 "$bound_rc"
-assert_eq "over-4096 merge cmd emits no id" "" "$bound_out"
-assert_eq "over-4096 merge cmd leaves bytes unchanged" "$before_bound" "$(sha_or_absent "$ledger_bound")"
+  chmod 600 "$ledger_merge_bad"; before_merge_bad="$(sha_or_absent "$ledger_merge_bad")"
+  merge_bad_out="$($LOG --run "$repo_merge_bad/.agent-firm/runs/target" --strict \
+    --print-event-id compatibility_followed 2>/dev/null)"; merge_bad_rc=$?
+  assert_eq "$merge_negative merge negative fails closed" 1 "$merge_bad_rc"
+  assert_eq "$merge_negative merge negative emits no id" "" "$merge_bad_out"
+  assert_eq "$merge_negative merge negative leaves bytes unchanged" "$before_merge_bad" \
+    "$(sha_or_absent "$ledger_merge_bad")"
+done
 ordinary_long="$(python3 -c 'print("o"*4097,end="")')"
 repo_ordinary_bound="$(mk_repo)"; mk_run "$repo_ordinary_bound" target
 ordinary_out="$($LOG --run "$repo_ordinary_bound/.agent-firm/runs/target" --strict --print-event-id \

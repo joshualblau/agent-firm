@@ -45,13 +45,12 @@ MAX_JSON_OPERAND = 128 * 1024
 MAX_LEDGER_LINE = 1024 * 1024
 MAX_AUTHORITY = 16
 MAX_AUTHORITY_FIELDS = 32
-MOUNT_PROBE_MAX_BYTES = 65_536
-MOUNT_PROBE_MAX_LINE_BYTES = 4_096
-MOUNT_PROBE_MAX_LINES = 256
-MOUNT_PROBE_MAX_MATCHING_ROWS = 8
-MOUNT_PROBE_READ_CHUNK = 4_096
-MOUNT_PROBE_TIMEOUT_SECONDS = 5.0
-MOUNT_PROBE_REAP_GRACE_SECONDS = 1.0
+P2_DESCRIPTOR_MAX_STDOUT_BYTES = 256
+P2_DESCRIPTOR_READ_CHUNK = 256
+P2_DESCRIPTOR_PROCESS_NS = 5_000_000_000
+P2_DESCRIPTOR_CLEANUP_NS = 6_000_000_000
+P2_DESCRIPTOR_KILL_RESERVE_NS = 100_000_000
+P2_MNT_LOCAL = 0x1000
 PRODUCER_RESERVED = {
     "ts", "event", "event_id", "run_id", "stage", "role", "agent", "contract",
     "authority", "activation", "activation_justification",
@@ -96,7 +95,15 @@ CAPABILITY_BIND_ERRNOS = frozenset(
         getattr(errno, "EOPNOTSUPP", None), getattr(errno, "EINVAL", None),
     ) if isinstance(value, int)
 )
-MOUNT_TEST_BEHAVIORS = {"output", "timeout", "ignore_term", "nonzero"}
+DESCRIPTOR_TEST_BEHAVIORS = {
+    "success", "abi_size", "abi_flags_offset", "abi_fstypename_offset",
+    "symbol", "syscall", "schema_missing", "schema_extra",
+    "schema_version_type", "filesystem_type", "flags_type", "invalid_utf8",
+    "duplicate", "trailing", "cap_256", "cap_257", "nonzero",
+    "filesystem_mismatch", "locality_mismatch", "flags_negative", "flags_overflow",
+    "timeout", "ignore_term", "terminate_error", "wait_error", "clock_deadlines",
+    "popen_error", "pass_fds_error", "pipe_error",
+}
 
 
 class RoleFailure(Exception):
@@ -231,8 +238,10 @@ def validate_observation(record, family):
     else:
         if not exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) or record["event"] != "merge_guard_block":
             raise LedgerError("invalid merge observation")
-        values = (record["cmd"], record["decision"], record["reason"])
-    if not all(printable(value, 4096, allow_empty=True) for value in values):
+        if not isinstance(record["cmd"], str):
+            raise LedgerError("invalid observation value")
+        values = (record["decision"], record["reason"])
+    if not all(printable(value, 4096) for value in values):
         raise LedgerError("invalid observation value")
 
 
@@ -925,6 +934,7 @@ def preflight_write_environment(run_path):
         architecture = platform.machine()
         python = tuple(sys.version_info[:3])
         implementation = getattr(sys.implementation, "name", "")
+        python_executable = sys.executable
         if reject == "linux":
             system = "Linux"
         elif reject == "unknown_platform":
@@ -948,6 +958,8 @@ def preflight_write_environment(run_path):
         if (
             system != "Darwin" or macos != "26.5.1" or kernel != "25.5.0"
             or architecture != "arm64" or python != (3, 9, 6) or implementation != "cpython"
+            or not isinstance(python_executable, str) or not os.path.isabs(python_executable)
+            or not python_executable
         ):
             unsupported_write_configuration()
 
@@ -975,6 +987,7 @@ def preflight_write_environment(run_path):
             unsupported_write_configuration()
         return {
             "reject": reject, "nofollow": nofollow, "directory": directory,
+            "python_executable": python_executable,
         }
     except RoleFailure:
         raise
@@ -1003,200 +1016,352 @@ def bind_write_run(repo, run_path, preflight):
         raise ValidationError("cannot bind run namespace") from exc
 
 
-def mount_probe_command(run):
-    behavior = os.environ.get("FIRM_LEDGER_MOUNT_TEST_BEHAVIOR", "")
-    fixture = os.environ.get("FIRM_LEDGER_MOUNT_TEST_FIXTURE", "")
-    if not behavior and not fixture:
-        return ["/sbin/mount"]
+DESCRIPTOR_HELPER_CODE = r'''import ctypes
+import json
+import os
+import sys
+
+EXPECTED_SIZE = 2168
+EXPECTED_FLAGS_OFFSET = 64
+EXPECTED_FSTYPENAME_OFFSET = 72
+
+class Fsid(ctypes.Structure):
+    _fields_ = [("value", ctypes.c_int32 * 2)]
+
+class StatFs(ctypes.Structure):
+    _fields_ = [
+        ("f_bsize", ctypes.c_uint32), ("f_iosize", ctypes.c_int32),
+        ("f_blocks", ctypes.c_uint64), ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64), ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64), ("f_fsid", Fsid),
+        ("f_owner", ctypes.c_uint32), ("f_type", ctypes.c_uint32),
+        ("f_flags", ctypes.c_uint32), ("f_fssubtype", ctypes.c_uint32),
+        ("f_fstypename", ctypes.c_char * 16),
+        ("f_mntonname", ctypes.c_char * 1024),
+        ("f_mntfromname", ctypes.c_char * 1024),
+        ("f_flags_ext", ctypes.c_uint32), ("f_reserved", ctypes.c_uint32 * 7),
+    ]
+
+if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdigit():
+    raise SystemExit(21)
+if (ctypes.sizeof(StatFs) != EXPECTED_SIZE
+        or StatFs.f_flags.offset != EXPECTED_FLAGS_OFFSET
+        or StatFs.f_fstypename.offset != EXPECTED_FSTYPENAME_OFFSET):
+    raise SystemExit(22)
+fd = int(sys.argv[1], 10)
+libc = ctypes.CDLL(None, use_errno=True)
+fstatfs = getattr(libc, "fstatfs")
+fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(StatFs)]
+fstatfs.restype = ctypes.c_int
+value = StatFs()
+result = fstatfs(fd, ctypes.byref(value))
+if result != 0:
+    raise SystemExit(23)
+filesystem = bytes(value.f_fstypename).split(b"\0", 1)[0].decode("ascii", "strict")
+payload = {"schema_version": 1, "filesystem": filesystem, "flags": int(value.f_flags)}
+os.write(1, (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+'''
+
+
+class DescriptorProbeClock:
+    """Production monotonic clock with one guarded exact-boundary test schedule."""
+    def __init__(self, controlled):
+        self.controlled = controlled
+        self.origin = 100_000_000_000 if controlled else None
+        self.process_calls = 0
+
+    def now_ns(self, phase):
+        if not self.controlled:
+            return time.monotonic_ns()
+        if phase == "start":
+            return self.origin
+        if phase == "cleanup_boundary":
+            return self.origin + P2_DESCRIPTOR_CLEANUP_NS
+        if phase == "process":
+            self.process_calls += 1
+            if self.process_calls == 1:
+                return self.origin
+        return self.origin + P2_DESCRIPTOR_PROCESS_NS
+
+
+def guarded_descriptor_test_configuration(run):
+    behavior = os.environ.get("FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR", "")
+    state_path = os.environ.get("FIRM_LEDGER_DESCRIPTOR_TEST_STATE", "")
+    if not behavior and not state_path:
+        return {"behavior": "", "state_path": ""}
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
     temp_root = os.path.realpath(tempfile.gettempdir())
     run_path = os.path.realpath(run.path)
+    state_parent = os.path.realpath(os.path.dirname(state_path)) if state_path else ""
     try:
-        inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
-    except ValueError:
-        inside_temp = False
-    if guard != "1" or not inside_temp or behavior not in MOUNT_TEST_BEHAVIORS:
-        role_fail(2, "INPUT_INVALID", "test-support")
-    if behavior == "output":
-        fixture_path = os.path.realpath(fixture) if fixture else ""
-        try:
-            inside_fixture = (
-                fixture_path != temp_root
-                and os.path.commonpath((temp_root, fixture_path)) == temp_root
-            )
-            fixture_stat = os.lstat(fixture_path)
-        except (OSError, ValueError):
-            role_fail(2, "INPUT_INVALID", "test-support")
-        if (
-            not inside_fixture or stat.S_ISLNK(fixture_stat.st_mode)
-            or not stat.S_ISREG(fixture_stat.st_mode) or fixture_stat.st_uid != os.getuid()
-            or stat.S_IMODE(fixture_stat.st_mode) & 0o022
-        ):
-            role_fail(2, "INPUT_INVALID", "test-support")
-        return [
-            sys.executable, "-c",
-            (
-                "import shutil,sys; source=open(sys.argv[1],'rb'); target=sys.stdout.buffer; "
-                "shutil.copyfileobj(source,target,4096); target.flush()"
-            ),
-            fixture_path,
-        ]
-    if fixture:
-        role_fail(2, "INPUT_INVALID", "test-support")
-    if behavior == "nonzero":
-        return [sys.executable, "-c", "raise SystemExit(7)"]
-    if behavior == "ignore_term":
-        return [
-            sys.executable, "-c",
-            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
-        ]
-    return [sys.executable, "-c", "import time; time.sleep(30)"]
-
-
-def terminate_mount_probe(process, absolute_deadline=None):
-    """Bound cleanup to one second, escalating to kill while time remains for reap."""
-    cleanup_deadline = time.monotonic() + MOUNT_PROBE_REAP_GRACE_SECONDS
-    if absolute_deadline is not None:
-        cleanup_deadline = min(cleanup_deadline, absolute_deadline)
-    try:
-        if process.poll() is None:
-            process.terminate()
-            terminate_budget = max(0.0, cleanup_deadline - time.monotonic() - 0.1)
-            try:
-                process.wait(timeout=terminate_budget)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        remaining = max(0.0, cleanup_deadline - time.monotonic())
-        process.wait(timeout=remaining)
-        return True
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def parse_mount_line(raw_line, device, rows):
-    if b"\0" in raw_line:
-        raise ValidationError("mount state unavailable")
-    try:
-        line = raw_line[:-1].decode("utf-8", "strict")
-        source, mounted = line.rsplit(" on ", 1)
-        mount_point, options_raw = mounted.rsplit(" (", 1)
-        if not source or not mount_point or not options_raw.endswith(")"):
-            raise ValueError("malformed mount row")
-        options = tuple(item.strip() for item in options_raw[:-1].split(","))
-        if not options or any(not item for item in options):
-            raise ValueError("malformed mount options")
-        mount_stat = os.stat(mount_point)
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise ValidationError("mount state unavailable") from exc
-    if mount_stat.st_dev != device:
-        return
-    if len(rows) >= MOUNT_PROBE_MAX_MATCHING_ROWS:
-        raise ValidationError("mount state unavailable")
-    rows.append((os.path.realpath(mount_point), options[0], options[1:]))
-
-
-def mounted_filesystem_rows(run, device):
-    """Incrementally retain only bounded device matches from one bounded mount probe."""
-    started = time.monotonic()
-    absolute_cleanup_deadline = (
-        started + MOUNT_PROBE_TIMEOUT_SECONDS + MOUNT_PROBE_REAP_GRACE_SECONDS
-    )
-    try:
-        process = subprocess.Popen(
-            mount_probe_command(run), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0, close_fds=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
+        run_inside = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+        state_inside = (
+            state_parent != temp_root
+            and os.path.commonpath((temp_root, state_parent)) == temp_root
         )
-    except RoleFailure:
-        raise
-    except Exception as exc:
-        raise ValidationError("mount state unavailable") from exc
-    if process.stdout is None:
-        terminate_mount_probe(process, absolute_cleanup_deadline)
-        raise ValidationError("mount state unavailable")
-    deadline = started + MOUNT_PROBE_TIMEOUT_SECONDS
-    fd = process.stdout.fileno()
-    current = bytearray()
-    total = 0
-    lines = 0
-    rows = []
-    failed = False
+        run_stat = os.lstat(run_path)
+        state_parent_stat = os.lstat(state_parent)
+        owned_directories = all(
+            stat.S_ISDIR(item.st_mode) and item.st_uid == os.getuid()
+            and stat.S_IMODE(item.st_mode) & 0o022 == 0
+            for item in (run_stat, state_parent_stat)
+        )
+    except (OSError, ValueError):
+        run_inside = state_inside = False
+        owned_directories = False
+    if (
+        guard != "1" or not run_inside or behavior not in DESCRIPTOR_TEST_BEHAVIORS
+        or not state_path or not state_inside or os.path.lexists(state_path)
+        or not os.path.isabs(state_path) or not owned_directories
+    ):
+        role_fail(2, "INPUT_INVALID", "test-support")
+    return {"behavior": behavior, "state_path": state_path}
+
+
+def write_descriptor_test_state(configuration, state):
+    path = configuration["state_path"]
+    if not path:
+        return
+    payload = (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
+        fd = os.open(path, flags, 0o600)
+        try:
+            write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        role_fail(2, "INPUT_INVALID", "test-support")
+
+
+def descriptor_fixture_payload(behavior):
+    values = {
+        "schema_missing": b'{"filesystem":"apfs","flags":4096}\n',
+        "schema_extra": b'{"schema_version":1,"filesystem":"apfs","flags":4096,"extra":0}\n',
+        "schema_version_type": b'{"schema_version":"1","filesystem":"apfs","flags":4096}\n',
+        "filesystem_type": b'{"schema_version":1,"filesystem":7,"flags":4096}\n',
+        "flags_type": b'{"schema_version":1,"filesystem":"apfs","flags":true}\n',
+        "invalid_utf8": b'{"schema_version":1,"filesystem":"apfs\xff","flags":4096}\n',
+        "duplicate": b'{"schema_version":1,"filesystem":"apfs","flags":4096,"flags":4096}\n',
+        "trailing": b'{"schema_version":1,"filesystem":"apfs","flags":4096}\ntrailing',
+        "filesystem_mismatch": b'{"schema_version":1,"filesystem":"hfs","flags":4096}\n',
+        "locality_mismatch": b'{"schema_version":1,"filesystem":"apfs","flags":0}\n',
+        "flags_negative": b'{"schema_version":1,"filesystem":"apfs","flags":-1}\n',
+        "flags_overflow": b'{"schema_version":1,"filesystem":"apfs","flags":4294967296}\n',
+    }
+    if behavior in ("cap_256", "cap_257"):
+        size = 256 if behavior == "cap_256" else 257
+        compact = b'{"schema_version":1,"filesystem":"apfs","flags":4096}\n'
+        return b"{" + b" " * (size - len(compact)) + compact[1:]
+    return values.get(behavior)
+
+
+def descriptor_helper_code(behavior):
+    if behavior == "abi_size":
+        return DESCRIPTOR_HELPER_CODE.replace("EXPECTED_SIZE = 2168", "EXPECTED_SIZE = 2169")
+    if behavior == "abi_flags_offset":
+        return DESCRIPTOR_HELPER_CODE.replace("EXPECTED_FLAGS_OFFSET = 64", "EXPECTED_FLAGS_OFFSET = 65")
+    if behavior == "abi_fstypename_offset":
+        return DESCRIPTOR_HELPER_CODE.replace(
+            "EXPECTED_FSTYPENAME_OFFSET = 72", "EXPECTED_FSTYPENAME_OFFSET = 73"
+        )
+    if behavior == "symbol":
+        return DESCRIPTOR_HELPER_CODE.replace('getattr(libc, "fstatfs")', 'getattr(libc, "firm_missing_fstatfs")')
+    if behavior == "syscall":
+        return DESCRIPTOR_HELPER_CODE.replace("fstatfs(fd, ctypes.byref(value))", "fstatfs(-1, ctypes.byref(value))")
+    payload = descriptor_fixture_payload(behavior)
+    if payload is not None:
+        return "import os,sys; int(sys.argv[1]); os.write(1,%r)" % payload
+    if behavior == "nonzero":
+        return "import sys; int(sys.argv[1]); raise SystemExit(7)"
+    if behavior == "ignore_term":
+        return (
+            "import os,signal,sys,time; int(sys.argv[1]); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); os.write(1,b'R'); time.sleep(30)"
+        )
+    if behavior in ("terminate_error", "wait_error", "clock_deadlines"):
+        return "import os,sys,time; int(sys.argv[1]); os.write(1,b'R'); time.sleep(30)"
+    if behavior == "timeout":
+        return "import sys,time; int(sys.argv[1]); time.sleep(30)"
+    return DESCRIPTOR_HELPER_CODE
+
+
+def parse_descriptor_fact(output):
+    if not output or len(output) > P2_DESCRIPTOR_MAX_STDOUT_BYTES or not output.endswith(b"\n"):
+        raise ValidationError("descriptor filesystem state unavailable")
+    body = output[:-1]
+    if b"\n" in body or b"\r" in body or not body:
+        raise ValidationError("descriptor filesystem state unavailable")
+    try:
+        text = body.decode("utf-8", "strict")
+        decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+        record, end = decoder.raw_decode(text)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError("descriptor filesystem state unavailable") from exc
+    if end != len(text) or not exact_keys(record, {"schema_version", "filesystem", "flags"}):
+        raise ValidationError("descriptor filesystem state unavailable")
+    schema = record["schema_version"]
+    filesystem = record["filesystem"]
+    flags = record["flags"]
+    if (
+        not isinstance(schema, int) or isinstance(schema, bool) or schema != 1
+        or not isinstance(filesystem, str)
+        or not isinstance(flags, int) or isinstance(flags, bool)
+        or flags < 0 or flags > 0xFFFF_FFFF
+    ):
+        raise ValidationError("descriptor filesystem state unavailable")
+    if filesystem != "apfs" or flags & P2_MNT_LOCAL == 0:
+        raise ValidationError("descriptor filesystem state unavailable")
+    return {"filesystem": filesystem, "flags": flags}
+
+
+def cleanup_descriptor_helper(process, clock, cleanup_deadline_ns, behavior, state):
+    """Continue bounded fallback cleanup after operation errors, but retain uncertainty."""
+    uncertain = False
+    reaped = False
+    operations = state.setdefault("cleanup_operations", [])
+    try:
+        if behavior == "terminate_error":
+            raise OSError(errno.EIO, "injected terminate operation error")
+        process.terminate()
+        operations.append("terminate:success")
+    except (OSError, subprocess.SubprocessError):
+        operations.append("terminate:error")
+        uncertain = True
+
+    if not uncertain or behavior == "wait_error":
+        try:
+            if behavior == "wait_error":
+                raise OSError(errno.EIO, "injected wait operation error")
+            terminate_deadline = cleanup_deadline_ns - P2_DESCRIPTOR_KILL_RESERVE_NS
+            remaining = max(0.0, (terminate_deadline - clock.now_ns("cleanup")) / 1e9)
+            process.wait(timeout=remaining)
+            operations.append("wait_after_terminate:success")
+            reaped = True
+        except subprocess.TimeoutExpired:
+            operations.append("wait_after_terminate:timeout")
+        except (OSError, subprocess.SubprocessError):
+            operations.append("wait_after_terminate:error")
+            uncertain = True
+
+    if not reaped:
+        try:
+            process.kill()
+            operations.append("kill:success")
+        except (OSError, subprocess.SubprocessError):
+            operations.append("kill:error")
+            uncertain = True
+        try:
+            remaining = max(0.0, (cleanup_deadline_ns - clock.now_ns("cleanup")) / 1e9)
+            process.wait(timeout=remaining)
+            operations.append("final_wait:success")
+            reaped = True
+        except (OSError, subprocess.SubprocessError):
+            operations.append("final_wait:error")
+            uncertain = True
+
+    state["cleanup_uncertain"] = uncertain
+    state["eventual_reaped"] = reaped
+    state["cleanup_boundary_observed_ns"] = clock.now_ns("cleanup_boundary")
+    return reaped and not uncertain
+
+
+def descriptor_filesystem_fact(run, python_executable):
+    """Resolve APFS/local on the held run descriptor in one bounded helper lifetime."""
+    configuration = guarded_descriptor_test_configuration(run)
+    behavior = configuration["behavior"]
+    controlled = behavior in {"ignore_term", "terminate_error", "wait_error", "clock_deadlines"}
+    clock = DescriptorProbeClock(controlled)
+    started_ns = clock.now_ns("start")
+    process_deadline_ns = started_ns + P2_DESCRIPTOR_PROCESS_NS
+    cleanup_deadline_ns = started_ns + P2_DESCRIPTOR_CLEANUP_NS
+    state = {
+        "schema_version": 1, "behavior": behavior or "production",
+        "started_ns": started_ns, "process_deadline_ns": process_deadline_ns,
+        "cleanup_deadline_ns": cleanup_deadline_ns, "pid": None,
+        "retained_stdout_bytes": 0, "status": "failed", "eventual_reaped": False,
+    }
+    process = None
+    stdout = None
+    reaped = False
+    try:
+        helper_executable = (
+            python_executable + ".firm-missing" if behavior == "popen_error"
+            else python_executable
+        )
+        inherited_fds = (run.run_fd, -1) if behavior == "pass_fds_error" else (run.run_fd,)
+        process = subprocess.Popen(
+            [helper_executable, "-I", "-S", "-B", "-c", descriptor_helper_code(behavior), str(run.run_fd)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0, close_fds=True, pass_fds=inherited_fds, env={"LC_ALL": "C"},
+        )
+        state["pid"] = process.pid
+        stdout = process.stdout
+        if behavior == "pipe_error" and stdout is not None:
+            stdout.close()
+            stdout = None
+        if stdout is None:
+            raise ValidationError("descriptor filesystem state unavailable")
+        fd = stdout.fileno()
+        output = bytearray()
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ValidationError("mount state unavailable")
+            remaining_ns = process_deadline_ns - clock.now_ns("process")
+            if remaining_ns <= 0:
+                raise ValidationError("descriptor filesystem state unavailable")
             try:
-                readable, _, _ = select.select([fd], [], [], remaining)
+                readable, _, _ = select.select([fd], [], [], remaining_ns / 1e9)
             except InterruptedError:
                 continue
             if not readable:
-                raise ValidationError("mount state unavailable")
-            chunk = os.read(fd, MOUNT_PROBE_READ_CHUNK)
+                raise ValidationError("descriptor filesystem state unavailable")
+            read_size = min(
+                P2_DESCRIPTOR_READ_CHUNK,
+                P2_DESCRIPTOR_MAX_STDOUT_BYTES - len(output) + 1,
+            )
+            chunk = os.read(fd, read_size)
             if not chunk:
                 break
-            total += len(chunk)
-            if total > MOUNT_PROBE_MAX_BYTES:
-                raise ValidationError("mount state unavailable")
-            offset = 0
-            while offset < len(chunk):
-                newline = chunk.find(b"\n", offset)
-                if newline < 0:
-                    tail = chunk[offset:]
-                    if len(current) + len(tail) > MOUNT_PROBE_MAX_LINE_BYTES:
-                        raise ValidationError("mount state unavailable")
-                    current.extend(tail)
-                    break
-                segment = chunk[offset:newline + 1]
-                if len(current) + len(segment) > MOUNT_PROBE_MAX_LINE_BYTES:
-                    raise ValidationError("mount state unavailable")
-                lines += 1
-                if lines > MOUNT_PROBE_MAX_LINES:
-                    raise ValidationError("mount state unavailable")
-                raw_line = bytes(current) + segment
-                current.clear()
-                parse_mount_line(raw_line, device, rows)
-                offset = newline + 1
-        if current:
-            raise ValidationError("mount state unavailable")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ValidationError("mount state unavailable")
+            if len(output) + len(chunk) > P2_DESCRIPTOR_MAX_STDOUT_BYTES:
+                raise ValidationError("descriptor filesystem state unavailable")
+            output.extend(chunk)
+            state["retained_stdout_bytes"] = len(output)
+        remaining_ns = process_deadline_ns - clock.now_ns("process")
+        if remaining_ns <= 0:
+            raise ValidationError("descriptor filesystem state unavailable")
         try:
-            returncode = process.wait(timeout=remaining)
+            returncode = process.wait(timeout=remaining_ns / 1e9)
         except subprocess.TimeoutExpired as exc:
-            raise ValidationError("mount state unavailable") from exc
-        if returncode != 0 or not rows:
-            raise ValidationError("mount state unavailable")
-    except BaseException:
-        failed = True
-        if not terminate_mount_probe(process, absolute_cleanup_deadline):
-            raise ValidationError("mount state unavailable")
+            raise ValidationError("descriptor filesystem state unavailable") from exc
+        reaped = True
+        state["eventual_reaped"] = True
+        state["returncode"] = returncode
+        if returncode != 0:
+            raise ValidationError("descriptor filesystem state unavailable")
+        fact = parse_descriptor_fact(bytes(output))
+        state["status"] = "success"
+        return fact
+    except RoleFailure:
         raise
+    except BaseException as exc:
+        state["failure_type"] = type(exc).__name__
+        if process is not None and not reaped:
+            cleanup_descriptor_helper(process, clock, cleanup_deadline_ns, behavior, state)
+        raise ValidationError("descriptor filesystem state unavailable") from exc
     finally:
-        process.stdout.close()
-        if not failed and process.poll() is None:
-            terminate_mount_probe(process, absolute_cleanup_deadline)
-
-    seen_points = set()
-    for mount_point, _, _ in rows:
-        if mount_point in seen_points:
-            raise ValidationError("mount state unavailable")
-        seen_points.add(mount_point)
-    target = os.path.realpath(run.path)
-    related = []
-    for row in rows:
-        try:
-            if os.path.commonpath((target, row[0])) == row[0]:
-                related.append(row)
-        except ValueError as exc:
-            raise ValidationError("mount state unavailable") from exc
-    if not related:
-        raise ValidationError("mount state unavailable")
-    related.sort(key=lambda item: len(Path(item[0]).parts), reverse=True)
-    if len(related) > 1 and len(Path(related[0][0]).parts) == len(Path(related[1][0]).parts):
-        raise ValidationError("mount state unavailable")
-    return [(related[0][1], related[0][2])]
+        if stdout is not None:
+            stdout.close()
+        if process is not None and state["eventual_reaped"]:
+            try:
+                os.waitpid(process.pid, os.WNOHANG)
+                state["second_wait_unavailable"] = False
+            except ChildProcessError:
+                state["second_wait_unavailable"] = True
+        if controlled:
+            state["controlled_clock_observations_ns"] = [
+                clock.now_ns("start"), clock.now_ns("process"), clock.now_ns("cleanup_boundary")
+            ]
+        write_descriptor_test_state(configuration, state)
 
 
 def require_supported_write_environment(run, preflight):
@@ -1239,22 +1404,23 @@ def require_supported_write_environment(run, preflight):
 
         run.prove()
         held_stats = tuple(os.fstat(fd) for fd in run.fds)
-        os.statvfs(run.run_fd)
         same_filesystem = len({item.st_dev for item in held_stats}) == 1
         if reject == "same_filesystem_mismatch":
             same_filesystem = False
         if not same_filesystem:
             unsupported_write_configuration()
         device = held_stats[0].st_dev
-        rows = mounted_filesystem_rows(run, device)
+        filesystem = descriptor_filesystem_fact(run, preflight["python_executable"])
         if reject == "filesystem_unverifiable":
-            rows = []
+            filesystem = None
         elif reject == "filesystem_type_mismatch":
-            rows = [("hfs", options) for _, options in rows]
+            filesystem = {"filesystem": "hfs", "flags": filesystem["flags"]}
         elif reject == "filesystem_locality_mismatch":
-            rows = [(kind, tuple(item for item in options if item != "local") + ("network",))
-                    for kind, options in rows]
-        if not rows or any(kind != "apfs" or "local" not in options for kind, options in rows):
+            filesystem = {"filesystem": filesystem["filesystem"], "flags": 0}
+        if (
+            filesystem is None or filesystem["filesystem"] != "apfs"
+            or filesystem["flags"] & P2_MNT_LOCAL == 0
+        ):
             unsupported_write_configuration()
 
         file_probe_fd = None
