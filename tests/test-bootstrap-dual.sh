@@ -272,7 +272,7 @@ assert_eq "early failure invokes Claude update exactly once" "1" \
 assert_output "early failure leaves observed bytes old" "version=0.7.0" cat "$STATE/claude-plugin"
 rf="$(recovery_file)"
 assert_eq "early failure recovery record is private" 600 \
-  "$(stat -f '%Lp' "$rf" 2>/dev/null || stat -c '%a' "$rf")"
+  "$(t_file_mode "$rf")"
 assert_ok "early failure records inverse-unavailable despite exact observed state" python3 -c \
   "import json; d=json.load(open('$rf')); assert d['status']=='BLOCKED_RECOVERY_REQUIRED'; assert d['exact_prior_state_restored'] is True; assert d['unavailable_reverses'][0]['phase']=='plugin-update'; assert d['completed_mutations']==[]"
 

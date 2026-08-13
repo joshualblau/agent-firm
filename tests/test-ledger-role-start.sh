@@ -261,9 +261,9 @@ assert event["authority"][0]["event_id"]=="evt-20260812T034028-89411-f034d7a01fd
 assert event["activation"]["apply"]=={"display":"GPT-5.6 sol","effort":"xhigh","model":"gpt-5.6-sol"}
 PY
 assert_eq "ledger lock is stable mode 0600" 600 \
-  "$(stat -f '%Lp' "$repo1/.agent-firm/runs/target/run.jsonl.lock" 2>/dev/null || stat -c '%a' "$repo1/.agent-firm/runs/target/run.jsonl.lock")"
+  "$(t_file_mode "$repo1/.agent-firm/runs/target/run.jsonl.lock")"
 assert_eq "ledger is mode 0600" 600 \
-  "$(stat -f '%Lp' "$repo1/.agent-firm/runs/target/run.jsonl" 2>/dev/null || stat -c '%a' "$repo1/.agent-firm/runs/target/run.jsonl")"
+  "$(t_file_mode "$repo1/.agent-firm/runs/target/run.jsonl")"
 assert_eq "no private transaction file remains" 0 \
   "$(find "$repo1/.agent-firm/runs/target" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 

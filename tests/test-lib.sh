@@ -53,6 +53,21 @@ sandbox() {
 }
 
 # ---------------------------------------------------------------------------
+t_case "permission probes are portable and discard output from a failed dialect"
+mode_case="$(mktemp -d "${TMPDIR:-/tmp}/firm-mode.XXXXXX")"; t_track "$mode_case"
+mode_file="$mode_case/probe"; : > "$mode_file"
+chmod 600 "$mode_file"
+assert_eq "the host stat dialect reports only the octal mode" 600 "$(t_file_mode "$mode_file")"
+mode_stub="$mode_case/bin"; mkdir "$mode_stub"
+printf '%s\n' '#!/bin/sh' \
+  'if [ "$1" = "-c" ]; then printf "incompatible probe output\\n"; exit 1; fi' \
+  'if [ "$1" = "-f" ]; then printf "640\\n"; exit 0; fi' \
+  'exit 2' > "$mode_stub/stat"
+chmod +x "$mode_stub/stat"
+assert_eq "failed probe output cannot contaminate the fallback mode" 640 \
+  "$(PATH="$mode_stub:$PATH" t_file_mode "$mode_file")"
+
+# ---------------------------------------------------------------------------
 t_case "teardown removes a fixture created inside a \$(mk_repo) subshell"
 sb="$(mk_repo)"; mkdir -p "$sb/tmp"
 made="$(child "$sb" "$sb/tmp/" 'd="$(mk_repo)"; printf "%s" "$d"')"

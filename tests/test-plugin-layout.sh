@@ -128,7 +128,7 @@ python_exe="$(python3 -c 'import sys; print(sys.executable)')"
 hook_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
 ln -s "$python_exe" "$HOOK_PROJECT/provider-stubs/python3"
 hook_before="$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
-hook_mode="$(stat -f '%Lp' "$HOOK_PROJECT/.codex/hooks.json" 2>/dev/null || stat -c '%a' "$HOOK_PROJECT/.codex/hooks.json")"
+hook_mode="$(t_file_mode "$HOOK_PROJECT/.codex/hooks.json")"
 doctor_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
   FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
   "$BIN/firm-doctor" 2>&1)"; doctor_rc=$?
@@ -140,7 +140,7 @@ assert_output "doctor gives a human-reviewed removal action" \
 assert_eq "doctor does not rewrite the prototype" "$hook_before" \
   "$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
 assert_eq "doctor preserves prototype mode" "$hook_mode" \
-  "$(stat -f '%Lp' "$HOOK_PROJECT/.codex/hooks.json" 2>/dev/null || stat -c '%a' "$HOOK_PROJECT/.codex/hooks.json")"
+  "$(t_file_mode "$HOOK_PROJECT/.codex/hooks.json")"
 assert_eq "confirmed Codex duplicate blocks readiness" "1" "$doctor_rc"
 rm -f "$HOOK_PROJECT/.codex/hooks.json"
 doctor_clean_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \

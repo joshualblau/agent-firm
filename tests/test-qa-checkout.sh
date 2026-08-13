@@ -60,7 +60,7 @@ candidate="$repo2/.agent-firm/runs/$run_id2/09-test-evidence/qa-candidate.json"
 assert_file "candidate identity is persisted" "$candidate"
 assert_eq "candidate SHA is full and exact" "$int_sha" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$candidate")"
 assert_eq "candidate generation starts at one" 1 "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$candidate")"
-assert_eq "candidate metadata mode is 600" 600 "$(stat -f '%Lp' "$candidate" 2>/dev/null || stat -c '%a' "$candidate")"
+assert_eq "candidate metadata mode is 600" 600 "$(t_file_mode "$candidate")"
 assert_eq "QA checkout is detached" "" "$(git -C "$qa_dir" branch --show-current)"
 
 t_case "the checkout is truly a worktree of THIS repo, not a disconnected clone"

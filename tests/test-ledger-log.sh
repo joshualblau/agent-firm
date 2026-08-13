@@ -77,7 +77,7 @@ done
 ambient_after="$(shasum -a 256 "$repo5/.agent-firm/runs/ambient/run.jsonl" | awk '{print $1}')"
 assert_eq "ambient ledger is byte-identical" "$ambient_before" "$ambient_after"
 assert_eq "all five outcomes landed only in target" 5 "$(wc -l < "$repo5/.agent-firm/runs/target/run.jsonl" | tr -d ' ')"
-assert_eq "target ledger mode is 600" 600 "$(stat -f '%Lp' "$repo5/.agent-firm/runs/target/run.jsonl" 2>/dev/null || stat -c '%a' "$repo5/.agent-firm/runs/target/run.jsonl")"
+assert_eq "target ledger mode is 600" 600 "$(t_file_mode "$repo5/.agent-firm/runs/target/run.jsonl")"
 
 t_case "strict explicit targets reject outside, symlinked, and redirected writes"
 outside="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-outside.XXXXXX")"; t_track "$outside"
@@ -161,7 +161,7 @@ assert len({row["event_id"] for row in rows})==10
 assert {row["sequence"] for row in rows}=={str(n) for n in range(1,11)}
 PY
 assert_eq "ordinary sidecar lock mode is 600" 600 \
-  "$(stat -f '%Lp' "$repo10/.agent-firm/runs/concurrent/run.jsonl.lock" 2>/dev/null || stat -c '%a' "$repo10/.agent-firm/runs/concurrent/run.jsonl.lock")"
+  "$(t_file_mode "$repo10/.agent-firm/runs/concurrent/run.jsonl.lock")"
 assert_eq "ordinary transaction leaves no private temp" 0 \
   "$(find "$repo10/.agent-firm/runs/concurrent" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 

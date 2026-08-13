@@ -126,6 +126,27 @@ assert_ne() {
 assert_file()    { if [ -e "$2" ]; then _t_ok "$1"; else _t_no "$1" "missing file: $2"; fi; }
 assert_no_file() { if [ ! -e "$2" ]; then _t_ok "$1"; else _t_no "$1" "file should not exist: $2"; fi; }
 
+# t_file_mode <path> — print the permission bits on GNU or BSD stat.
+#
+# Probe GNU first. GNU `stat -f '%Lp' <path>` treats -f as "filesystem status", emits a complete
+# filesystem report for <path>, and then exits nonzero because '%Lp' was parsed as another operand.
+# Appending `|| stat -c ...` therefore captures BOTH the report and the fallback's mode. Keep each
+# probe isolated and accept only an octal result so a partially successful incompatible probe can
+# never contaminate an assertion.
+t_file_mode() {
+  local _path="$1" _mode
+  _mode="$(stat -c '%a' "$_path" 2>/dev/null)" || _mode=""
+  case "$_mode" in
+    ''|*[!0-7]*) ;;
+    *) printf '%s' "$_mode"; return 0 ;;
+  esac
+  _mode="$(stat -f '%Lp' "$_path" 2>/dev/null)" || _mode=""
+  case "$_mode" in
+    ''|*[!0-7]*) return 1 ;;
+    *) printf '%s' "$_mode" ;;
+  esac
+}
+
 # ---- fixtures ------------------------------------------------------------
 # mk_repo — a throwaway git repo with one seed commit on `main`. Echoes its path.
 mk_repo() {

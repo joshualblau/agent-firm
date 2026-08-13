@@ -90,6 +90,12 @@ they test `bin/` inside this repo. So don't expect `tests/run-tests.sh` or a `ci
 `<repo>`; that's the design, not a broken install. To change the firm's tooling, work in this repo,
 where CI runs.
 
+Hosted CI runs `tests/run-tests.sh --unsupported-p2`: it exercises modern GNU and macOS Bash 3.2/BSD
+behavior, plus the production gate's real-host fail-closed result, while omitting suites that require
+successful ledger mutation. The complete `tests/run-tests.sh` write-path proof runs locally on the
+exact P2 row or through the manual `run_exact_p2` workflow dispatch on a trusted self-hosted runner
+labelled `agent-firm-p2`. Pull-request code cannot schedule that runner.
+
 ## Layout
 ```
 .claude-plugin/plugin.json    # plugin manifest (name, version) — drives the versioned install
@@ -121,9 +127,9 @@ agent-firm/templates/*        # run-ledger artifact templates
 agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
 agent-firm/evals/*            # golden-task evals that guard firm changes
 tests/*                       # bash+git regression suite for bin/ (tests/run-tests.sh). Also needs
-                              #   python3, plus jsonschema (test-validate-verdict) and pyyaml
+                              #   python3 and Node, plus jsonschema (test-validate-verdict) and pyyaml
                               #   (test-policy-yaml-valid) — the same prerequisites the firm itself has
-.github/workflows/ci.yml      # bash -n + the tests/ suite (ubuntu+macOS) + firm-run-evals --structural
+.github/workflows/ci.yml      # hosted unsupported-P2 matrix + manual exact-P2 suite + structural evals
 .claude/settings.json         # permission rules (copy-mode + the source firm-install merges)
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
 docs/README.md                # doc index; docs/PHASE*.md — dated build record per phase, not reference docs
@@ -147,8 +153,9 @@ bench/registry.yaml           # durable specialist bench (governance, tracked). 
 - **Phase 5 implementation:** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
 - **Hardening and measurement implementation:** the firm's OWN tooling gets the same evidence-not-
   confidence bar it holds the deliverable to — a `bin/` regression suite + CI
-  (`.github/workflows/ci.yml`; bash + git + the firm's own python3/jsonschema/pyyaml prerequisites, no
-  test framework), a fail-closed `run-baseline.json` SHA comparison replacing the old
+  (`.github/workflows/ci.yml`; hosted unsupported-P2 coverage plus a manual trusted exact-P2 job,
+  bash + git + the firm's own python3/Node/jsonschema/pyyaml prerequisites, no test framework), a
+  fail-closed `run-baseline.json` SHA comparison replacing the old
   commit-count heuristic for `no_default_branch_merge`/`final_gate_pending`, a negative golden eval
   (`qa-blocks-broken-build`) proving QA will actually **BLOCK**, `firm-qa-clean-check` (Lead-run, not
   self-certified), and a per-project bench usage log (`firm-bench-record`). See the system-change
@@ -180,7 +187,9 @@ The historical phase labels above describe shipped predecessor milestones, not a
 current repair candidate. Readiness requires evidence from the exact candidate SHA: the full suite
 and security/final-gate matrices on macOS Bash 3.2 and a genuinely modern Bash, isolated real loader
 checks, exactly one bounded live smoke in each primary orientation, and the gated rollback exercise.
-No modern-Bash run or live provider smoke is performed by the ordinary build tests. Until those
+Hosted unsupported-P2 CI is useful portability and fail-closed evidence, but is not a substitute for
+that full-suite exact-P2 record. No modern-Bash run or live provider smoke is performed by the
+ordinary build tests. Until those
 records exist and Final QA passes, report the candidate as BLOCKED/unproved rather than “done” or
 ready. A trusted secondary exit 3 is unavailable—not APPROVE—and must retain the target-run attempt,
 matching ledger event, traceability state, and provider-specific verdict presence/absence. The Final

@@ -20,8 +20,8 @@ assert_eq "provider is retained" gpt "$(result_field "$WORK/ok.json" provider)"
 assert_eq "generation is retained" 7 "$(result_field "$WORK/ok.json" generation)"
 assert_eq "status is ok" ok "$(result_field "$WORK/ok.json" status)"
 assert_eq "child output retained" hello "$(cat "$WORK/ok.out")"
-assert_eq "output mode is 600" 600 "$(stat -f '%Lp' "$WORK/ok.out" 2>/dev/null || stat -c '%a' "$WORK/ok.out")"
-assert_eq "result mode is 600" 600 "$(stat -f '%Lp' "$WORK/ok.json" 2>/dev/null || stat -c '%a' "$WORK/ok.json")"
+assert_eq "output mode is 600" 600 "$(t_file_mode "$WORK/ok.out")"
+assert_eq "result mode is 600" 600 "$(t_file_mode "$WORK/ok.json")"
 
 t_case "every invalid caller bound is rejected before provider execution"
 for spec in \

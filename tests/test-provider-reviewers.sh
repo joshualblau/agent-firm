@@ -443,7 +443,7 @@ t_case "canonical lifecycle archives stale approval, generation-guards promotion
 assert_rc "fresh GPT approval promotes" 0 review_env approve "$GPT"
 canonical="$RUN/08-qa-verdict.gpt.json"
 approved_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
-assert_eq "canonical mode is 600" 600 "$(stat -f '%Lp' "$canonical" 2>/dev/null || stat -c '%a' "$canonical")"
+assert_eq "canonical mode is 600" 600 "$(t_file_mode "$canonical")"
 assert_rc "failed rerun cannot leave stale approval current" 1 review_env malformed "$GPT"
 assert_no_file "stale canonical approval is absent after failure" "$canonical"
 assert_file "prior immutable approval remains recoverable" "$RUN/09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json"
@@ -513,7 +513,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_rc "$provider rejects a canonical promotion target replaced during execution" 1 review_env promotion_symlink "$wrapper"
   test -L "$canonical" && rm "$canonical"
   assert_eq "$provider redirect target stayed byte-identical" "$REDIRECT_SHA" "$(shasum -a 256 "$WORK/redirect-target" | awk '{print $1}')"
-  assert_eq "$provider state mode remains 600" 600 "$(stat -f '%Lp' "$state" 2>/dev/null || stat -c '%a' "$state")"
+  assert_eq "$provider state mode remains 600" 600 "$(t_file_mode "$state")"
 done
 
 t_case "a live concurrent attempt serializes promotion and a provably dead matching lock recovers"
@@ -595,7 +595,7 @@ done
 t_case "diagnostics retain allowlisted metadata only and raw output is not retained"
 diag="$(find "$RUN/09-test-evidence/reviewer-attempts" -name diagnostic.json -type f | tail -1)"
 assert_file "redacted diagnostic exists" "$diag"
-assert_eq "diagnostic mode is 600" 600 "$(stat -f '%Lp' "$diag" 2>/dev/null || stat -c '%a' "$diag")"
+assert_eq "diagnostic mode is 600" 600 "$(t_file_mode "$diag")"
 assert_ok "diagnostic is capped" python3 -c 'import os,sys; assert os.path.getsize(sys.argv[1]) <= 16384' "$diag"
 assert_output "diagnostic declares allowlisted metadata policy" '"content_policy": "allowlisted_metadata_only"' cat "$diag"
 assert_ok "credential/cookie/account/device/request values are absent" sh -c \
@@ -635,7 +635,7 @@ assert_rc "injected cleanup failure blocks the wrapper" 1 review_env approve "$G
 unset FIRM_TEST_RAW_CLEANUP_FAIL
 failure_marker="$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name 'cleanup-failure.gpt-*.json' -type f | tail -1)"
 assert_file "cleanup failure marker is visible" "$failure_marker"
-assert_eq "cleanup failure marker is mode 600" 600 "$(stat -f '%Lp' "$failure_marker" 2>/dev/null || stat -c '%a' "$failure_marker")"
+assert_eq "cleanup failure marker is mode 600" 600 "$(t_file_mode "$failure_marker")"
 assert_eq "cleanup failure retains no raw file" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '*.raw' -print)"
 assert_ok "cleanup-failure surface contains no provider secret" sh -c \
   "! grep -R 'super-secret\|HARD-KILL-RAW-SECRET-91b7' '$REPO/.agent-firm/private-reviewer-control/$RUN_ID' 2>/dev/null"
