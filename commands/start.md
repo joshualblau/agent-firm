@@ -21,7 +21,11 @@ firm-ledger-log --run <run> --strict --role-start \
   [--activation-justification <text>]
 ```
 
-Parse success stdout only as the closed proved result declared below. Require its exact field set,
+Parse success stdout only as the closed proof-instant receipt declared below. The native result and
+zero return mean the final same-inode exact-byte proof observed exactly the accepted prefix plus its
+one complete record at that instant; they do not attest later byte stability during result handling,
+output, cleanup, or return, and the direct writer provides no seal against a same-UID retained writer.
+Require its exact field set,
 require its request-bound values and complete `activation` object to match the call, and block on any
 nonzero exit, missing field, schema mismatch, or value mismatch. Apply that result's
 `activation.apply.model`, `activation.apply.display`, `activation.apply.effort`, and `agent` directly

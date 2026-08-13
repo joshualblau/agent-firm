@@ -60,12 +60,18 @@ no fallback downgrade.
 For delegated role starts, each Lead resolves once immediately before calling the single canonical
 `firm-ledger-log --run <run> --strict --role-start` producer with explicit stage, role, contract,
 event, authority, agent, and exact resolver activation JSON. The producer validates and records but
-does not invoke a provider. The Lead parses only its proved result, launches the provider-native agent
+does not invoke a provider. The Lead parses only its proof-instant receipt result, launches the
+provider-native agent
 with the returned activation and agent fields, and retains the same returned `event_id` for later
 lifecycle records. Manual contract hash/stat, ambient run or authority selection, direct ordinary
 role-start logging, event-id transcription or ledger scraping, and a second model resolution are not
 valid paths. Ordinary non-role milestones continue through ordinary `firm-ledger-log`; see the
 [delegated role-start boundary](agent-firm/contracts/lifecycle.md#delegated-role-start-boundary).
+
+A printed ordinary event ID or native result followed by exit zero means the producer completed its
+final same-inode exact-byte proof and observed exactly the accepted prefix plus its one complete record
+at that proof instant. It does not attest that those bytes remain stable during later result handling,
+output, cleanup, or return, and the direct writer provides no seal against a same-UID retained writer.
 
 To update both caches from local changes, run `firm-version --local-refresh`. For a release, run
 `firm-version --release X.Y.Z`, then `firm-bootstrap`. Start a new Codex task and restart/reload the

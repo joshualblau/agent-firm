@@ -31,10 +31,13 @@ All contextual identity is explicit. Never infer the run or authority, manually 
 sealed contract, directly log a role start through ordinary mode, hand-create or transcribe an event
 id, scrape it from the ledger, or run a second model resolution. The producer derives contract
 provenance, validates the complete resolver object, appends and proves exactly one start event, and
-only then emits its closed result. Any nonzero exit, missing field, extra field, schema mismatch, or
-value mismatch is BLOCKING.
+only then emits its closed proof-instant receipt. The native result and zero return mean that the final
+same-inode exact-byte proof observed exactly the accepted prefix plus its one complete record at that
+instant; they do not attest later byte stability during result handling, output, cleanup, or return,
+and the direct writer has no seal against a same-UID retained writer. Any nonzero exit, missing field,
+extra field, schema mismatch, or value mismatch is BLOCKING.
 
-The Lead parses only that proved result, applies its exact `activation.apply.model`,
+The Lead parses only that proof-instant receipt result, applies its exact `activation.apply.model`,
 `activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
 and retains its exact `event_id` for downstream start, stop, block, and completion records. The
 Codex-primary Lead performs a native Codex subagent launch; the Claude-primary Lead performs a native

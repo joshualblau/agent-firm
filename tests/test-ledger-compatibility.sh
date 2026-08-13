@@ -739,7 +739,7 @@ PY
     "$(cat "$temp_content_barrier/outside-sentinel")"
 done
 
-t_case "retained writable temp descriptor cannot cross the proof-to-success boundary"
+t_case "retained writable temp descriptor mutation during the final exact proof remains fail closed"
 repo_retained_temp="$(mk_repo)"; mk_run "$repo_retained_temp" target
 run_retained_temp="$repo_retained_temp/.agent-firm/runs/target"
 "$LOG" --run "$run_retained_temp" --strict --event-id evt-retained-seed \
@@ -791,7 +791,7 @@ retained_holder_pid=$!
 assert_ok "the harness retains the writable populated-temp descriptor without mutation" \
   wait_ready "$retained_barrier/holder.open"
 printf 'release\n' > "$retained_barrier/writer.after_temp_fsync.release"
-assert_ok "writer reaches the post-exact-proof and post-result-scan boundary" \
+assert_ok "writer reaches the deterministic boundary between scan and the final exact proof" \
   wait_ready "$retained_barrier/writer.after_result_scan.ready"
 retained_committed_identity="$(stat -f '%d:%i' "$run_retained_temp/run.jsonl" 2>/dev/null || \
   stat -c '%d:%i' "$run_retained_temp/run.jsonl")"
@@ -803,11 +803,11 @@ assert_ok "retained descriptor injects only at the controlled post-scan boundary
 wait "$retained_holder_pid"
 printf 'release\n' > "$retained_barrier/writer.after_result_scan.release"
 wait "$retained_writer_pid"
-assert_eq "post-scan retained-descriptor mutation fails before success" 1 \
+assert_eq "during-proof retained-descriptor mutation fails before success" 1 \
   "$(cat "$retained_barrier/rc")"
-assert_eq "post-scan retained-descriptor mutation emits no success stdout" "" \
+assert_eq "during-proof retained-descriptor mutation emits no success stdout" "" \
   "$(cat "$retained_barrier/out")"
-assert_output "post-scan retained-descriptor mutation reports only the stable failure" \
+assert_output "during-proof retained-descriptor mutation reports only the stable failure" \
   "could not append target ledger" cat "$retained_barrier/err"
 assert_ok "postcommit external mutation leaves one explicit complete allowed state" \
   python3 - "$run_retained_temp/run.jsonl" <<'PY'
@@ -823,6 +823,137 @@ assert [row["event_id"] for row in rows] == [
 PY
 assert_eq "retained-descriptor schedule leaves unrelated sentinels unchanged" \
   "outside sentinel" "$(cat "$retained_barrier/outside-sentinel")"
+
+run_ordinary_admitted_post_proof_case() {
+  local phase="$1" interval="$2" repo run barrier seed_path temp_name temp_path
+  local writer_pid holder_pid committed_identity output_before
+  repo="$(mk_repo)"; mk_run "$repo" target
+  run="$repo/.agent-firm/runs/target"
+  "$LOG" --run "$run" --strict --event-id "evt-admitted-seed-$interval" \
+    admitted_seed class=synthetic >/dev/null
+  barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-admitted-$interval.XXXXXX")"
+  t_track "$barrier"
+  seed_path="$barrier/seed.bytes"
+  cp "$run/run.jsonl" "$seed_path"
+  printf 'outside sentinel\n' > "$barrier/outside-sentinel"
+  ( FIRM_LEDGER_TEST_GUARD=1 \
+      FIRM_LEDGER_BARRIER_PHASE="after_temp_fsync,after_final_proof,$phase" \
+      FIRM_LEDGER_BARRIER_DIR="$barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+      "$LOG" --run "$run" --strict --print-event-id \
+      --event-id "evt-admitted-writer-$interval" admitted_writer class=synthetic \
+      > "$barrier/out" 2> "$barrier/err"; \
+      printf '%s' "$?" > "$barrier/rc" ) & writer_pid=$!
+  assert_ok "$interval counterexample reaches the populated-temp custody boundary" \
+    wait_ready "$barrier/writer.after_temp_fsync.ready"
+  temp_name="$(sed 's/^[^:]*://' \
+    "$barrier/writer.after_temp_fsync.ready" | tr -d '\n')"
+  temp_path="$run/$temp_name"
+  python3 - "$temp_path" "$barrier" "$interval" <<'PY' &
+import json, os, sys, time
+
+path, barrier, interval = sys.argv[1:]
+fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+try:
+    st = os.fstat(fd)
+    with open(os.path.join(barrier, "holder.identity"), "w", encoding="ascii") as handle:
+        handle.write(f"{st.st_dev}:{st.st_ino}\n")
+    with open(os.path.join(barrier, "holder.open"), "w", encoding="ascii") as handle:
+        handle.write("open\n")
+    deadline = time.monotonic() + 20
+    while not os.path.exists(os.path.join(barrier, "holder.inject")):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("inject signal")
+        time.sleep(0.01)
+    row = {
+        "ts": "2026-08-13T00:00:00Z", "event": "admitted_injection",
+        "event_id": f"evt-admitted-injected-{interval}", "run_id": "target",
+        "class": "synthetic",
+    }
+    payload = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        assert written > 0
+        view = view[written:]
+    os.fsync(fd)
+    with open(os.path.join(barrier, "holder.injected"), "w", encoding="ascii") as handle:
+        handle.write("injected\n")
+finally:
+    os.close(fd)
+PY
+  holder_pid=$!
+  assert_ok "$interval helper retains the writable populated-temp descriptor without mutation" \
+    wait_ready "$barrier/holder.open"
+  printf 'release\n' > "$barrier/writer.after_temp_fsync.release"
+  assert_ok "$interval schedule reaches completion of final same-inode exact-byte proof P" \
+    wait_ready "$barrier/writer.after_final_proof.ready"
+  assert_ok "$interval schedule proves exact old-plus-one bytes at P" python3 - \
+    "$seed_path" "$run/run.jsonl" "$barrier/proof-at-p.bytes" \
+    "evt-admitted-writer-$interval" <<'PY'
+import json, sys
+seed_path, ledger_path, proof_path, event_id = sys.argv[1:]
+seed = open(seed_path, "rb").read()
+raw = open(ledger_path, "rb").read()
+assert raw.startswith(seed)
+appended = raw[len(seed):]
+assert appended.endswith(b"\n") and appended.count(b"\n") == 1
+row = json.loads(appended)
+assert row["event_id"] == event_id and row["event"] == "admitted_writer"
+assert row["run_id"] == "target" and row["class"] == "synthetic"
+open(proof_path, "wb").write(raw)
+PY
+  printf 'release\n' > "$barrier/writer.after_final_proof.release"
+  assert_ok "$interval schedule reaches the selected admitted post-proof interval" \
+    wait_ready "$barrier/writer.$phase.ready"
+  committed_identity="$(stat -f '%d:%i' "$run/run.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$run/run.jsonl")"
+  assert_eq "$interval retained descriptor still names the installed inode after P" \
+    "$(tr -d '\n' < "$barrier/holder.identity")" "$committed_identity"
+  assert_ok "$interval bytes remain the proved old-plus-one receipt before mutation" \
+    cmp "$barrier/proof-at-p.bytes" "$run/run.jsonl"
+  if [ "$phase" = after_result_construction ]; then
+    output_before="$(cat "$barrier/out")"
+    assert_eq "$interval result-construction interval precedes success output" "" "$output_before"
+  else
+    output_before="$(cat "$barrier/out")"
+    assert_eq "$interval success output is already flushed before mutation" \
+      "evt-admitted-writer-$interval" "$output_before"
+  fi
+  assert_eq "$interval exact producer temp entry is already installed, not leaked" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  printf 'inject\n' > "$barrier/holder.inject"
+  assert_ok "$interval retained descriptor performs admitted_post_proof_mutation" \
+    wait_ready "$barrier/holder.injected"
+  wait "$holder_pid"
+  assert_ok "$interval admitted mutation changes only the same inode after the proved bytes" \
+    python3 - "$barrier/proof-at-p.bytes" "$run/run.jsonl" "$interval" <<'PY'
+import json, os, sys
+proof_path, ledger_path, interval = sys.argv[1:]
+proof = open(proof_path, "rb").read()
+raw = open(ledger_path, "rb").read()
+assert raw.startswith(proof)
+appended = raw[len(proof):]
+assert appended.endswith(b"\n") and appended.count(b"\n") == 1
+row = json.loads(appended)
+assert row["event_id"] == f"evt-admitted-injected-{interval}"
+assert row["event"] == "admitted_injection" and row["run_id"] == "target"
+PY
+  printf 'release\n' > "$barrier/writer.$phase.release"
+  wait "$writer_pid"
+  assert_eq "$interval proof-instant receipt returns zero under the authority-bound concession" \
+    0 "$(cat "$barrier/rc")"
+  assert_eq "$interval ordinary event-id receipt retains its exact public bytes" \
+    "evt-admitted-writer-$interval" "$(cat "$barrier/out")"
+  assert_eq "$interval admitted window emits no misleading producer diagnostic" \
+    "" "$(cat "$barrier/err")"
+  assert_eq "$interval return stability is waived_by_evt-20260813T140309-96805-1cf299b00bb3a1df" \
+    "outside sentinel" "$(cat "$barrier/outside-sentinel")"
+}
+
+t_case "ordinary receipt matrix demonstrates admitted_post_proof_mutation under the exact human waiver"
+run_ordinary_admitted_post_proof_case after_result_construction result_construction
+run_ordinary_admitted_post_proof_case after_success_output success_output
+run_ordinary_admitted_post_proof_case before_return observed_return
 
 t_case "contract ancestor replacement cannot borrow the originally held leaf"
 for replacement in role_root_safe nested_unsafe; do

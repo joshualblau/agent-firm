@@ -60,7 +60,8 @@ FAILPOINTS = {
 }
 BARRIER_PHASES = {
     "after_contract_open", "after_lock", "after_source_open", "after_temp_fsync",
-    "before_replace", "after_replace", "after_result_scan",
+    "before_replace", "after_replace", "after_result_scan", "after_final_proof",
+    "after_result_construction", "after_success_output", "before_return",
 }
 
 
@@ -914,6 +915,8 @@ def ledger_barrier(run, phase, detail=""):
         role_fail(2, "INPUT_INVALID", "test-barrier")
     try:
         require_owned_directory(Path(barrier_path), "test barrier")
+        if phase in ("after_success_output", "before_return"):
+            sys.stdout.flush()
         suffix = "." + phase if len(phases) > 1 else ""
         ready = os.path.join(barrier_path, token + suffix + ".ready")
         release = os.path.join(barrier_path, token + suffix + ".release")
@@ -1330,6 +1333,7 @@ def atomic_commit(
             proven_scan = scan_ledger(proof_fd, run.name, wanted_event_ids=(event_id,))
             ledger_barrier(run, "after_result_scan")
             prove_exact_append(proof_fd, old_length, old_digest, payload)
+            ledger_barrier(run, "after_final_proof")
         except LedgerError as exc:
             raise CommitError("proof") from exc
         finally:
@@ -1425,6 +1429,8 @@ def ordinary_main(argv):
         held = acquire_locks(run, [])
         ledger_barrier(run, "after_lock")
         atomic_commit(run, record, event_id, lock_check=lambda: prove_locks(held))
+        result = event_id if print_event_id else None
+        ledger_barrier(run, "after_result_construction")
     except DuplicateEvent:
         ordinary_fail(strict, f"duplicate event id: {event_id}")
     except (LedgerError, CommitError):
@@ -1433,8 +1439,10 @@ def ordinary_main(argv):
         for _, fd, _ in reversed(held):
             os.close(fd)
         run.close()
-    if print_event_id:
-        print(event_id)
+    if result is not None:
+        print(result)
+        ledger_barrier(run, "after_success_output")
+    ledger_barrier(run, "before_return")
     raise SystemExit(0)
 
 
@@ -1555,7 +1563,9 @@ def role_main(argv):
         }
         if justification is not None:
             result["activation_justification"] = justification
+        ledger_barrier(run, "after_result_construction")
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
+        ledger_barrier(run, "after_success_output")
     finally:
         for _, fd, _ in reversed(held):
             os.close(fd)
@@ -1570,6 +1580,7 @@ def role_main(argv):
         for source_run, _, _, _ in authority_items:
             source_run.close()
         run.close()
+    ledger_barrier(run, "before_return")
     raise SystemExit(0)
 
 

@@ -66,7 +66,13 @@ else:
 PY
 }
 
-t_case "valid role start derives one exact contract tuple and emits only the proved closed result"
+wait_ready() {
+  local ready="$1" n=0
+  while [ ! -f "$ready" ] && [ "$n" -lt 1000 ]; do n=$((n+1)); sleep 0.01; done
+  [ -f "$ready" ]
+}
+
+t_case "valid role start derives one exact contract tuple and emits only the proof-instant receipt"
 repo1="$(mk_repo)"; mk_role_fixture "$repo1" target source
 auth1="$(authority_for target)"
 result1="$(invoke_start "$repo1" target build/R-03 "$auth1")"; rc1=$?
@@ -350,6 +356,148 @@ unguarded="$(FIRM_LEDGER_FAILPOINT=pre_rename invoke_start "$repo10b" target bui
 assert_eq "unguarded failpoint cannot alter production-shaped behavior" 0 "$unguarded_rc"
 assert_ok "unguarded call returns the ordinary closed success schema" python3 -c \
   'import json,sys; d=json.loads(sys.argv[1]); assert d["schema_version"]==1 and d["event"]=="build_started"' "$unguarded"
+
+run_native_admitted_post_proof_case() {
+  local phase="$1" interval="$2" repo run auth stage barrier seed_path temp_name temp_path
+  local writer_pid holder_pid committed_identity
+  repo="$(mk_repo)"; mk_role_fixture "$repo" target source
+  run="$repo/.agent-firm/runs/target"
+  auth="$(authority_for target)"
+  stage="build/admitted-$interval"
+  "$LOG" --run "$run" --strict --event-id "evt-native-seed-$interval" \
+    native_seed class=synthetic >/dev/null
+  barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-native-admitted-$interval.XXXXXX")"
+  t_track "$barrier"
+  seed_path="$barrier/seed.bytes"
+  cp "$run/run.jsonl" "$seed_path"
+  printf 'outside sentinel\n' > "$barrier/outside-sentinel"
+  ( FIRM_LEDGER_TEST_GUARD=1 \
+      FIRM_LEDGER_BARRIER_PHASE="after_temp_fsync,after_final_proof,$phase" \
+      FIRM_LEDGER_BARRIER_DIR="$barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+      invoke_start "$repo" target "$stage" "$auth" \
+      > "$barrier/out" 2> "$barrier/err"; \
+      printf '%s' "$?" > "$barrier/rc" ) & writer_pid=$!
+  assert_ok "$interval native counterexample reaches the populated-temp custody boundary" \
+    wait_ready "$barrier/writer.after_temp_fsync.ready"
+  temp_name="$(sed 's/^[^:]*://' \
+    "$barrier/writer.after_temp_fsync.ready" | tr -d '\n')"
+  temp_path="$run/$temp_name"
+  python3 - "$temp_path" "$barrier" "$interval" <<'PY' &
+import json, os, sys, time
+
+path, barrier, interval = sys.argv[1:]
+fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+try:
+    st = os.fstat(fd)
+    with open(os.path.join(barrier, "holder.identity"), "w", encoding="ascii") as handle:
+        handle.write(f"{st.st_dev}:{st.st_ino}\n")
+    with open(os.path.join(barrier, "holder.open"), "w", encoding="ascii") as handle:
+        handle.write("open\n")
+    deadline = time.monotonic() + 20
+    while not os.path.exists(os.path.join(barrier, "holder.inject")):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("inject signal")
+        time.sleep(0.01)
+    row = {
+        "ts": "2026-08-13T00:00:00Z", "event": "native_admitted_injection",
+        "event_id": f"evt-native-injected-{interval}", "run_id": "target",
+        "class": "synthetic",
+    }
+    payload = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        assert written > 0
+        view = view[written:]
+    os.fsync(fd)
+    with open(os.path.join(barrier, "holder.injected"), "w", encoding="ascii") as handle:
+        handle.write("injected\n")
+finally:
+    os.close(fd)
+PY
+  holder_pid=$!
+  assert_ok "$interval native helper retains the writable populated-temp descriptor without mutation" \
+    wait_ready "$barrier/holder.open"
+  printf 'release\n' > "$barrier/writer.after_temp_fsync.release"
+  assert_ok "$interval native schedule reaches completion of final same-inode exact-byte proof P" \
+    wait_ready "$barrier/writer.after_final_proof.ready"
+  assert_ok "$interval native schedule proves exact old-plus-one bytes at P" python3 - \
+    "$seed_path" "$run/run.jsonl" "$barrier/proof-at-p.bytes" "$stage" <<'PY'
+import json, sys
+seed_path, ledger_path, proof_path, stage = sys.argv[1:]
+seed = open(seed_path, "rb").read()
+raw = open(ledger_path, "rb").read()
+assert raw.startswith(seed)
+appended = raw[len(seed):]
+assert appended.endswith(b"\n") and appended.count(b"\n") == 1
+row = json.loads(appended)
+assert row["event"] == "build_started" and row["stage"] == stage
+assert row["run_id"] == "target" and row["role"] == "implementer"
+assert row["agent"] == "/root/implementer"
+open(proof_path, "wb").write(raw)
+PY
+  printf 'release\n' > "$barrier/writer.after_final_proof.release"
+  assert_ok "$interval native schedule reaches the selected admitted post-proof interval" \
+    wait_ready "$barrier/writer.$phase.ready"
+  committed_identity="$(stat -f '%d:%i' "$run/run.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$run/run.jsonl")"
+  assert_eq "$interval native retained descriptor still names the installed inode after P" \
+    "$(tr -d '\n' < "$barrier/holder.identity")" "$committed_identity"
+  assert_ok "$interval native bytes remain the proved old-plus-one receipt before mutation" \
+    cmp "$barrier/proof-at-p.bytes" "$run/run.jsonl"
+  if [ "$phase" = after_result_construction ]; then
+    assert_eq "$interval native result-construction interval precedes success output" \
+      "" "$(cat "$barrier/out")"
+  else
+    assert_ok "$interval native success result is already flushed before mutation" \
+      test -s "$barrier/out"
+  fi
+  assert_eq "$interval native exact producer temp entry is already installed, not leaked" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  printf 'inject\n' > "$barrier/holder.inject"
+  assert_ok "$interval native retained descriptor performs admitted_post_proof_mutation" \
+    wait_ready "$barrier/holder.injected"
+  wait "$holder_pid"
+  assert_ok "$interval native admitted mutation changes only the same inode after the proved bytes" \
+    python3 - "$barrier/proof-at-p.bytes" "$run/run.jsonl" "$interval" <<'PY'
+import json, sys
+proof_path, ledger_path, interval = sys.argv[1:]
+proof = open(proof_path, "rb").read()
+raw = open(ledger_path, "rb").read()
+assert raw.startswith(proof)
+appended = raw[len(proof):]
+assert appended.endswith(b"\n") and appended.count(b"\n") == 1
+row = json.loads(appended)
+assert row["event_id"] == f"evt-native-injected-{interval}"
+assert row["event"] == "native_admitted_injection" and row["run_id"] == "target"
+PY
+  printf 'release\n' > "$barrier/writer.$phase.release"
+  wait "$writer_pid"
+  assert_eq "$interval native proof-instant receipt returns zero under the authority-bound concession" \
+    0 "$(cat "$barrier/rc")"
+  assert_eq "$interval native admitted window emits no misleading producer diagnostic" \
+    "" "$(cat "$barrier/err")"
+  assert_ok "$interval native result remains an exact projection of its proved row" python3 - \
+    "$run/run.jsonl" "$barrier/out" "$stage" <<'PY'
+import json, sys
+ledger_path, result_path, stage = sys.argv[1:]
+rows = [json.loads(line) for line in open(ledger_path, encoding="utf-8")]
+native = next(row for row in rows if row.get("stage") == stage)
+result = json.load(open(result_path, encoding="utf-8"))
+keys = {"schema_version", "event_id", "run_id", "event", "stage", "role", "agent",
+        "contract", "authority", "activation"}
+assert set(result) == keys and result["schema_version"] == 1
+for key in keys - {"schema_version"}:
+    assert result[key] == native[key]
+PY
+  assert_eq "$interval native return stability is waived_by_evt-20260813T140309-96805-1cf299b00bb3a1df" \
+    "outside sentinel" "$(cat "$barrier/outside-sentinel")"
+}
+
+t_case "native receipt matrix demonstrates admitted_post_proof_mutation under the exact human waiver"
+run_native_admitted_post_proof_case after_result_construction result_construction
+run_native_admitted_post_proof_case after_success_output success_output
+run_native_admitted_post_proof_case before_return observed_return
 
 t_case "large contracts are streamed into a small derived result without body retention"
 repo10c="$(mk_repo)"; mk_role_fixture "$repo10c" target source; auth10c="$(authority_for target)"
