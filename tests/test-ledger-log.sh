@@ -165,4 +165,20 @@ assert_eq "ordinary sidecar lock mode is 600" 600 \
 assert_eq "ordinary transaction leaves no private temp" 0 \
   "$(find "$repo10/.agent-firm/runs/concurrent" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 
+t_case "ordinary extensions stay string-only and native-only names cannot enter the ordinary family"
+repo11="$(mk_repo)"; mk_run "$repo11" closed
+for field in contract authority activation activation_justification; do
+  assert_rc "native-only $field is rejected at the ordinary CLI boundary" 1 \
+    "$LOG" --run "$repo11/.agent-firm/runs/closed" --strict ordinary_event "$field=forged"
+done
+assert_rc "duplicate extension names are rejected rather than overwritten" 1 \
+  "$LOG" --run "$repo11/.agent-firm/runs/closed" --strict ordinary_event note=first note=second
+assert_rc "empty ordinary extension values remain accepted" 0 \
+  "$LOG" --run "$repo11/.agent-firm/runs/closed" --strict --event-id evt-empty-extension ordinary_event note=
+assert_ok "empty extension is retained as a string" python3 - "$repo11/.agent-firm/runs/closed/run.jsonl" <<'PY'
+import json,sys
+row=json.loads(open(sys.argv[1],encoding="utf-8").read())
+assert row["event_id"]=="evt-empty-extension" and row["note"]==""
+PY
+
 t_summary

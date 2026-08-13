@@ -13,8 +13,12 @@ run_rel="$(cat "$repo/.agent-firm/CURRENT_RUN")"; run="$repo/$run_rel"; run_id="
 ( cd "$repo" && "$QAC" >/dev/null )
 printf 'proof\n' > "$run/09-test-evidence/proof.log"
 printf 'round\n' > "$run/09-test-evidence/round.log"
+ledger_baseline="$(mktemp "${TMPDIR:-/tmp}/firm-final-qa-ledger.XXXXXX")"; t_track "$ledger_baseline"
+cp "$run/run.jsonl" "$ledger_baseline"
 
 reset_case() { # primary provider
+  cp "$ledger_baseline" "$run/run.jsonl"
+  chmod 600 "$run/run.jsonl"
   python3 - "$run" "$1" <<'PY'
 import hashlib,json,os,secrets,shutil,sys,yaml
 run,primary=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]

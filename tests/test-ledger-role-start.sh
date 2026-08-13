@@ -267,6 +267,23 @@ mv "$repo7b/.agent-firm/runs/target" "$repo7b/.agent-firm/runs/real-target"
 ln -s real-target "$repo7b/.agent-firm/runs/target"
 assert_rc "symlinked run component" 10 invoke_start "$repo7b" target build/R-03 "$auth7b"
 
+t_case "ordinary legacy _started and scalar stage-role-agent rows never occupy native activation identity"
+repo7c="$(mk_repo)"; mk_role_fixture "$repo7c" target source; auth7c="$(authority_for target)"
+printf '%s\n' \
+  '{"ts":"2020-01-02T00:00:00Z","event":"build_started","event_id":"evt-ordinary-scalar-start","run_id":"target","stage":"build/R-03","role":"implementer","agent":"/root/legacy"}' \
+  > "$repo7c/.agent-firm/runs/target/run.jsonl"
+chmod 600 "$repo7c/.agent-firm/runs/target/run.jsonl"
+assert_rc "complete native activation may follow matching ordinary scalar row" 0 \
+  invoke_start "$repo7c" target build/R-03 "$auth7c"
+assert_eq "ordinary and native rows both remain complete" 2 \
+  "$(jsonl_count "$repo7c/.agent-firm/runs/target/run.jsonl")"
+assert_ok "only the complete envelope is native" python3 - "$repo7c/.agent-firm/runs/target/run.jsonl" <<'PY'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1],encoding="utf-8")]
+assert sum("activation" in row for row in rows)==1
+assert sum("activation" not in row and row.get("role")=="implementer" for row in rows)==1
+PY
+
 t_case "same activation is exactly-once sequentially and under a concurrent race"
 repo8="$(mk_repo)"; mk_role_fixture "$repo8" target source; auth8="$(authority_for target)"
 assert_rc "first activation wins" 0 invoke_start "$repo8" target build/R-03 "$auth8"
