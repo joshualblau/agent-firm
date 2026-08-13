@@ -79,6 +79,8 @@ assert_eq "HEAD is the integration branch" "integration/$RUN_ID" "$( (cd "$repo"
 assert_file "wo1 content present" "$repo/alpha.txt"
 assert_file "wo2 content present" "$repo/beta.txt"
 assert_eq "main SHA unchanged by a successful integration" "$before" "$(sha_of "$repo" main)"
+assert_output "handoff names immutable stage-summary publisher" \
+  "firm-integration-summary --stage integrate/<stage-instance>" integrate "$repo"
 
 # ---------------------------------------------------------------------------
 t_case "conflict path: reports the conflict, aborts the merge, leaves the tree clean"

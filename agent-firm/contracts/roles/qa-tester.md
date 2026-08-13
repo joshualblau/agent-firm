@@ -11,6 +11,9 @@ Install from the lockfile; run the same unit, integration, e2e, and visual comma
 command, exit, duration, and logs under `09-test-evidence/`. Check every acceptance criterion, state
 untested risks, and run relevant secret/dependency checks. For each completed artifact, record exactly
 one explicit-target producer event with `firm-ledger-log --run <run> --strict --event-id <id>`.
+Bind integration evidence to the applicable immutable `integration-summaries/<stage-instance>.md`
+entry and verify the complete digest-bound index history; never cite the legacy singleton after an
+index exists.
 Traceability evidence references are closed run-relative objects containing the full candidate SHA,
 lowercase SHA-256, byte size, and that unique producer event. Never cite outside, symlinked, changed,
 unproduced, multiply produced, or stale-generation bytes.

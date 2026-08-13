@@ -104,7 +104,8 @@ hooks/claude.json             # Claude PreToolUse + Notification hooks
 hooks/hooks.json              # Codex default PreToolUse + PermissionRequest hooks
 AGENTS.md                     # Codex primary/judge mode selection; FIRM_QA_JUDGE=1 wins
 bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-verdict, firm-new-worktree,
-                              #   firm-integrate, firm-qa-checkout, firm-qa-clean-check, firm-traceability-check,
+                              #   firm-integrate, firm-integration-summary, firm-qa-checkout,
+                              #   firm-qa-clean-check, firm-traceability-check,
                               #   firm-policy, firm-hire, firm-bench-record, firm-gpt-qa, firm-claude-qa,
                               #   firm-final-qa-check, firm-version, firm-model-resolve,
                               #   firm-propose-system-change, firm-run-evals, firm-check-assertions,

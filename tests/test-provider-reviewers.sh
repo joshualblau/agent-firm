@@ -6,6 +6,7 @@ GPT="$BIN/firm-gpt-qa"
 CLAUDE="$BIN/firm-claude-qa"
 NEW="$BIN/firm-new-run"
 QAC="$BIN/firm-qa-checkout"
+PUBLISH="$BIN/firm-integration-summary"
 
 REPO="$(mk_repo)"
 ( cd "$REPO" && "$NEW" --primary claude reviewer-fixture fast_path >/dev/null )
@@ -48,7 +49,8 @@ with open(run+"/traceability.yaml","w") as fh:
 with open(run+"/07-review-findings.yaml","w") as fh:
     yaml.safe_dump({"schema_version":1,"findings":[{"id":"fixture-review","severity":"blocker","status":"resolved"}]},fh,sort_keys=False)
 open(run+"/06-implementation-summary.md","w").write("# Implementation summary\n\nFixture implementation.\n")
-open(run+"/integration-summary.md","w").write("# Integration summary\n\nFixture integration.\n")
+open(run+"/integration-draft-1.md","w").write("# Integration summary\n\nFixture integration one.\n")
+open(run+"/integration-draft-2.md","w").write("# Integration summary\n\nFixture integration two.\n")
 primary={"commit_sha":sha,"run_id":run_id,"generation":gen,"provider":"claude","attempt_id":"primary-c1-a0001",
          "environment":"test","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/nested/proof.log"},
          "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
@@ -56,6 +58,13 @@ primary={"commit_sha":sha,"run_id":run_id,"generation":gen,"provider":"claude","
          "warnings":[],"artifacts":["09-test-evidence/nested/proof.log"],"verdict":"APPROVE","blockers":[],"summary":"fixture"}
 json.dump(primary,open(run+"/08-qa-verdict.json","w"),indent=2)
 PY
+( cd "$REPO" && "$PUBLISH" --run "$RUN" --stage integrate/INT-01 \
+    --source "$RUN/integration-draft-1.md" >/dev/null && \
+  "$PUBLISH" --run "$RUN" --stage integrate/INT-02 \
+    --source "$RUN/integration-draft-2.md" >/dev/null )
+rm "$RUN/integration-draft-1.md" "$RUN/integration-draft-2.md"
+INT_HISTORY="$RUN/integration-summaries/INT-01.md"
+INT_SUMMARY="$RUN/integration-summaries/INT-02.md"
 
 python3 - "$WORK" "$RUN_ID" "$SHA" "$GEN" <<'PY'
 import json,os,sys
@@ -217,6 +226,13 @@ review_env() { # mode wrapper [extra args]
     FIRM_QA_KILL_GRACE=1 "$wrapper" "$@" "$RUN"
 }
 
+t_case "pre-index runs retain legacy singleton compatibility"
+mv "$RUN/integration-summaries" "$WORK/indexed-integration-summaries"
+printf '# Integration summary\n\nLegacy fixture.\n' > "$RUN/integration-summary.md"
+assert_rc "legacy singleton remains a valid required judge input" 0 review_env approve "$GPT"
+rm "$RUN/integration-summary.md"
+mv "$WORK/indexed-integration-summaries" "$RUN/integration-summaries"
+
 t_case "both adapters share the exact approve, BLOCK, invalid, timeout, and unavailable contract"
 for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   provider="${pair%%:*}"; wrapper="${pair#*:}"
@@ -363,7 +379,9 @@ import hashlib,json,os,sys
 manifest,run=sys.argv[1:]; d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
 required={"01-acceptance-criteria.yaml","traceability.yaml","09-test-evidence/qa-candidate.json","run-metadata.json",
           "run-baseline.json","normalized-run-metadata.json","run.jsonl","07-review-findings.yaml","06-implementation-summary.md",
-          "integration-summary.md","08-qa-verdict.json","09-test-evidence/nested/proof.log","candidate.diff"}
+          "integration-summaries/index.json","integration-summaries/INT-01.md","integration-summaries/INT-02.md",
+          "08-qa-verdict.json",
+          "09-test-evidence/nested/proof.log","candidate.diff"}
 assert required <= set(entries), required-set(entries)
 for origin,item in entries.items():
     if origin in ("normalized-run-metadata.json","candidate.diff","run.jsonl"): continue
@@ -396,10 +414,15 @@ PY
 : > "$CALLS"; assert_rc "mutated run baseline blocks" 1 review_env approve "$GPT"
 assert_eq "provider did not run for mutated baseline" "" "$(cat "$CALLS")"
 mv "$WORK/run-baseline.json" "$RUN/run-baseline.json"
-mv "$RUN/integration-summary.md" "$WORK/integration-summary.md"
+mv "$INT_SUMMARY" "$WORK/integration-summary.md"
 : > "$CALLS"; assert_rc "missing required integration summary blocks" 1 review_env approve "$GPT"
 assert_eq "provider did not run for manifest omission" "" "$(cat "$CALLS")"
-mv "$WORK/integration-summary.md" "$RUN/integration-summary.md"
+mv "$WORK/integration-summary.md" "$INT_SUMMARY"
+cp "$INT_HISTORY" "$WORK/integration-summary-pristine.md"
+printf '# Integration summary\n\nOverwritten historical cycle.\n' > "$INT_HISTORY"
+: > "$CALLS"; assert_rc "digest-mismatched noncurrent integration history blocks" 1 review_env approve "$GPT"
+assert_eq "provider did not run for overwritten history" "" "$(cat "$CALLS")"
+mv "$WORK/integration-summary-pristine.md" "$INT_HISTORY"
 cp "$RUN/08-qa-verdict.json" "$WORK/primary.json"
 python3 - "$RUN" <<'PY'
 import json,os,sys

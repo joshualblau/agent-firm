@@ -72,7 +72,7 @@ role-to-tier/model authority.
 | Plan | architect | `02-architecture-options.md` | crit + Architecture when non-obvious |
 | Staff | recruiter | `04-staffing-plan.yaml`, specialist specs | none |
 | Build | implementer(s), specialists | `05-work-orders/*`, `06-implementation-summary.md` | none |
-| Integrate | integrator | `integration-summary.md`, integration branch | none |
+| Integrate | integrator | immutable `integration-summaries/<stage-instance>.md` + digest-bound index, integration branch | none |
 | Review | reviewer panel | `07-review-findings.yaml` | crit; human when risky |
 | Test | primary qa-tester | `08-qa-verdict.json`, `09-test-evidence/` | none |
 | Cross-provider QA | opposite provider | `.gpt.json` or `.claude.json` verdict | two-voice rule |
@@ -82,6 +82,13 @@ role-to-tier/model authority.
 Fast path collapses planning, integration, and panel overhead only when risk and dependency shape
 permit it. It never waives clean QA, cross-provider disposition, traceability, merge authority, or
 the Final gate.
+
+Each integration cycle publishes through `firm-integration-summary`; it never reuses the legacy
+singleton path. `integration-summaries/index.json` is append-only by stage and binds every summary's
+path, byte count, and SHA-256. Review, QA, traceability, and packaging reference the immutable stage
+path returned by the publisher. Existing runs without an index remain readable through their legacy
+`integration-summary.md`; once indexed state exists, missing or mismatched history fails closed and
+may not fall back to the singleton.
 
 ## Staffing and models
 

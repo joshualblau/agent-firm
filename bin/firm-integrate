@@ -67,5 +67,6 @@ done <<< "$branches"
 echo "integration branch: $intb"
 echo "merged: $merged   conflicts: $conflicts"
 [[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
-echo "NEXT: reconcile lockfiles/migrations/ports/fixtures, run the COMBINED suite, write integration-summary.md."
+echo "NEXT: reconcile shared state, run the COMBINED suite, write a draft, then publish it immutably:"
+echo "  firm-integration-summary --stage integrate/<stage-instance> --source <draft.md>"
 [[ $conflicts -eq 0 ]]

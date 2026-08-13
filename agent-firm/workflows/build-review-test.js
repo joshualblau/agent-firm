@@ -219,7 +219,10 @@ if (needIntegrator) {
   const integrationSettled = await settledAgent(() => agent(
     `You are the Integrator. Run \`firm-integrate\` to merge this run's worktree branches into the integration ` +
     `branch. Resolve any reported conflicts by hand (never drop a change), reconcile lockfiles/migrations/ports/` +
-    `fixtures, run the COMBINED test suite, and write integration-summary.md into ${runDir}. ` +
+    `fixtures, run the COMBINED test suite, write a summary draft, then publish it with ` +
+    `\`firm-integration-summary --run ${runDir} --stage integrate/INT-01 --source <draft.md>\`. ` +
+    `Use the returned immutable stage-specific path in every evidence reference; never overwrite the ` +
+    `legacy integration-summary.md singleton. ` +
     `Return the exact structured status: green/red/blocked status, branch name, conflicts resolved, ` +
     `green/red/blocked combined-suite test_result, and summary.`,
     { label: 'integrate', phase: 'Integrate', agentType: 'integrator', schema: INTEGRATION_SCHEMA }
