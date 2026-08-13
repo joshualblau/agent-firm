@@ -284,6 +284,8 @@ def required_callsite(provider):
         "The producer validates and records; it does not invoke a provider",
         "perform a second model resolution",
         "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+        "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+        "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
     ]
 
 blocks = {}
@@ -309,6 +311,8 @@ for phrase in (
     "The producer validates and records; it does not invoke or simulate either provider",
     "`firm-model-resolve` remains the sole role-to-tier/model authority",
     "Record ordinary non-role milestones through ordinary `firm-ledger-log`",
+    "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+    "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
 ):
     assert flat(phrase) in lifecycle, phrase
 
@@ -319,6 +323,8 @@ for phrase in (
     "retains the same returned `event_id`",
     "a second model resolution are not valid paths",
     "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+    "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+    "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
 ):
     assert flat(phrase) in readme, phrase
 
@@ -363,6 +369,8 @@ def required(provider):
         "The producer validates and records; it does not invoke a provider",
         "perform a second model resolution",
         "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
+        "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+        "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
     ]
 
 for provider, path in sources.items():

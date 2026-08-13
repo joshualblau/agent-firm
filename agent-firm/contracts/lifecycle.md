@@ -37,6 +37,13 @@ instant; they do not attest later byte stability during result handling, output,
 and the direct writer has no seal against a same-UID retained writer. Any nonzero exit, missing field,
 extra field, schema mismatch, or value mismatch is BLOCKING.
 
+Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0,
+arm64, local APFS, and CPython 3.9.6. The ordinary and native producers use the same centralized gate
+before any ledger mutation or creation of a coordination lock or transaction temp. Linux and every
+other mismatched or unverifiable environment are unsupported and fail closed without a success
+result; ordinary best-effort mode is not a fallback. Expanding support requires new Architecture
+approval and proving evidence.
+
 The Lead parses only that proof-instant receipt result, applies its exact `activation.apply.model`,
 `activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
 and retains its exact `event_id` for downstream start, stop, block, and completion records. The

@@ -160,11 +160,106 @@ reject_seed() {
   assert_eq "$label leaves target bytes unchanged" "$before" "$(sha_or_absent "$ledger")"
 }
 
+assert_prewrite_support_rejection() {
+  local label="$1" rejection="$2" mode="$3" repo run ledger before sentinel out rc
+  repo="$(mk_repo)"; mk_run "$repo" target
+  run="$repo/.agent-firm/runs/target"; ledger="$run/run.jsonl"
+  printf '%s\n' \
+    '{"ts":"2026-08-13T00:00:00Z","event":"p2_predecessor","event_id":"evt-p2-predecessor","run_id":"target","class":"synthetic"}' \
+    > "$ledger"
+  chmod 600 "$ledger"
+  before="$(sha_or_absent "$ledger")"
+  sentinel="$repo/p2-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  if [ "$mode" = strict ]; then
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT="$rejection" \
+      "$LOG" --run "$run" --strict --print-event-id --event-id "evt-p2-$label" \
+      p2_rejected class=synthetic 2> "$repo/p2.err")"; rc=$?
+  else
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT="$rejection" \
+      "$LOG" --run "$run" --print-event-id --event-id "evt-p2-$label" \
+      p2_rejected class=synthetic 2> "$repo/p2.err")"; rc=$?
+  fi
+  assert_eq "$label $mode rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label $mode rejection emits no success-shaped stdout" "" "$out"
+  assert_output "$label $mode rejection diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/p2.err"
+  assert_eq "$label $mode rejection leaves the ledger byte-identical" \
+    "$before" "$(sha_or_absent "$ledger")"
+  assert_eq "$label $mode rejection creates no transaction temp" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  assert_eq "$label $mode rejection does not create the coordination lock" 0 \
+    "$(find "$run" -maxdepth 1 -name 'run.jsonl.lock' | wc -l | tr -d ' ')"
+  assert_eq "$label $mode rejection leaves unrelated sentinels unchanged" \
+    "outside sentinel" "$(cat "$sentinel")"
+}
+
 wait_ready() {
   local ready="$1" n=0
   while [ ! -f "$ready" ] && [ "$n" -lt 1000 ]; do n=$((n+1)); sleep 0.01; done
   [ -f "$ready" ]
 }
+
+t_case "the centralized exact-P2 support gate accepts the local row before ordinary mutation"
+repo_p2_positive="$(mk_repo)"; mk_run "$repo_p2_positive" target
+run_p2_positive="$repo_p2_positive/.agent-firm/runs/target"
+p2_positive_barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-p2-positive.XXXXXX")"
+t_track "$p2_positive_barrier"
+( FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_BARRIER_PHASE=after_support_gate \
+    FIRM_LEDGER_BARRIER_DIR="$p2_positive_barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+    "$LOG" --run "$run_p2_positive" --strict --print-event-id \
+    --event-id evt-p2-positive p2_positive class=synthetic \
+    > "$p2_positive_barrier/out" 2> "$p2_positive_barrier/err"; \
+    printf '%s' "$?" > "$p2_positive_barrier/rc" ) & p2_positive_pid=$!
+assert_ok "ordinary writer reaches the shared support gate on the exact local P2 row" \
+  wait_ready "$p2_positive_barrier/writer.ready"
+assert_no_file "support-gate boundary precedes ledger creation" "$run_p2_positive/run.jsonl"
+assert_no_file "support-gate boundary precedes coordination-lock creation" "$run_p2_positive/run.jsonl.lock"
+assert_eq "support-gate boundary precedes transaction-temp creation" 0 \
+  "$(find "$run_p2_positive" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+printf 'release\n' > "$p2_positive_barrier/writer.release"; wait "$p2_positive_pid"
+assert_eq "exact local P2 row permits the unchanged ordinary receipt" 0 \
+  "$(cat "$p2_positive_barrier/rc")"
+assert_eq "exact local P2 row returns the requested ordinary id" evt-p2-positive \
+  "$(cat "$p2_positive_barrier/out")"
+
+t_case "every unsupported or unverifiable P2 dimension and capability fails before ordinary writes"
+for spec in \
+  linux:linux unknown:unknown_platform \
+  macos_mismatch:macos_version_mismatch macos_unknown:macos_version_unverifiable \
+  kernel_mismatch:kernel_version_mismatch kernel_unknown:kernel_version_unverifiable \
+  arch_mismatch:architecture_mismatch arch_unknown:architecture_unverifiable \
+  python_mismatch:python_version_mismatch python_unknown:python_version_unverifiable \
+  fs_type:filesystem_type_mismatch fs_network:filesystem_locality_mismatch \
+  fs_unknown:filesystem_unverifiable nofollow_missing:nofollow_missing \
+  nofollow_zero:nofollow_invalid directory_missing:directory_missing \
+  directory_zero:directory_invalid nonblock_missing:nonblock_missing \
+  nonblock_zero:nonblock_invalid open_dir_fd:open_dir_fd_missing \
+  stat_dir_fd:stat_dir_fd_missing stat_nofollow:stat_nofollow_missing \
+  statvfs_fd:statvfs_fd_missing unlink_dir_fd:unlink_dir_fd_missing \
+  replace:replace_missing replace_dir_fd:replace_dir_fd_missing \
+  same_filesystem:same_filesystem_mismatch regular_file:regular_file_check_missing \
+  file_fsync:file_fsync_missing directory_fsync:directory_fsync_missing flock:flock_missing; do
+  p2_label="${spec%%:*}"; p2_rejection="${spec#*:}"
+  assert_prewrite_support_rejection "$p2_label" "$p2_rejection" strict
+done
+assert_prewrite_support_rejection best_effort_linux linux best_effort
+
+t_case "the P2 test seam is negative-only, guarded, and cannot broaden positive support"
+repo_p2_seam="$(mk_repo)"; mk_run "$repo_p2_seam" target
+run_p2_seam="$repo_p2_seam/.agent-firm/runs/target"
+p2_seam_out="$(FIRM_LEDGER_P2_TEST_REJECT=linux \
+  "$LOG" --run "$run_p2_seam" --strict p2_seam 2> "$repo_p2_seam/unguarded.err")"
+assert_eq "unguarded P2 rejection seam is INPUT_INVALID" 2 "$?"
+assert_eq "unguarded P2 rejection seam emits no success" "" "$p2_seam_out"
+assert_no_file "unguarded P2 rejection seam creates no ledger" "$run_p2_seam/run.jsonl"
+p2_seam_out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=supported \
+  "$LOG" --run "$run_p2_seam" --strict p2_seam 2> "$repo_p2_seam/broaden.err")"
+assert_eq "positive-support seam value is outside the closed vocabulary" 2 "$?"
+assert_eq "positive-support seam value emits no success" "" "$p2_seam_out"
+assert_no_file "positive-support seam value creates no ledger" "$run_p2_seam/run.jsonl"
+assert_no_file "negative-only seam creates no coordination lock" "$run_p2_seam/run.jsonl.lock"
+assert_eq "negative-only seam creates no transaction temp" 0 \
+  "$(find "$run_p2_seam" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 
 t_case "accepted-base catalog: exact observations and ordinary producer shapes are readable predecessors"
 seed_and_follow shell_observation \
@@ -823,6 +918,53 @@ assert [row["event_id"] for row in rows] == [
 PY
 assert_eq "retained-descriptor schedule leaves unrelated sentinels unchanged" \
   "outside sentinel" "$(cat "$retained_barrier/outside-sentinel")"
+
+t_case "distinct owned inode replacement during final proof fails without redirected mutation"
+repo_live_replace="$(mk_repo)"; mk_run "$repo_live_replace" target
+run_live_replace="$repo_live_replace/.agent-firm/runs/target"
+"$LOG" --run "$run_live_replace" --strict --event-id evt-live-seed \
+  live_seed class=synthetic >/dev/null
+live_replace_barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-live-replace.XXXXXX")"
+t_track "$live_replace_barrier"
+printf 'outside sentinel\n' > "$live_replace_barrier/outside-sentinel"
+( FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_BARRIER_PHASE=after_result_scan \
+    FIRM_LEDGER_BARRIER_DIR="$live_replace_barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+    "$LOG" --run "$run_live_replace" --strict --print-event-id \
+    --event-id evt-live-writer live_writer class=synthetic \
+    > "$live_replace_barrier/out" 2> "$live_replace_barrier/err"; \
+    printf '%s' "$?" > "$live_replace_barrier/rc" ) & live_replace_pid=$!
+assert_ok "ordinary writer reaches the during-P path replacement boundary" \
+  wait_ready "$live_replace_barrier/writer.ready"
+mv "$run_live_replace/run.jsonl" "$live_replace_barrier/proved-original.jsonl"
+cp "$live_replace_barrier/proved-original.jsonl" "$run_live_replace/run.jsonl"
+chmod 600 "$run_live_replace/run.jsonl"
+live_original_identity="$(stat -f '%d:%i' "$live_replace_barrier/proved-original.jsonl" 2>/dev/null || \
+  stat -c '%d:%i' "$live_replace_barrier/proved-original.jsonl")"
+live_replacement_identity="$(stat -f '%d:%i' "$run_live_replace/run.jsonl" 2>/dev/null || \
+  stat -c '%d:%i' "$run_live_replace/run.jsonl")"
+assert_ne "during-P replacement installs a distinct owned inode" \
+  "$live_original_identity" "$live_replacement_identity"
+live_original_before="$(sha_or_absent "$live_replace_barrier/proved-original.jsonl")"
+live_replacement_before="$(sha_or_absent "$run_live_replace/run.jsonl")"
+printf 'release\n' > "$live_replace_barrier/writer.release"; wait "$live_replace_pid"
+assert_eq "distinct-inode during-P replacement fails strict ordinary success" 1 \
+  "$(cat "$live_replace_barrier/rc")"
+assert_eq "distinct-inode during-P replacement emits no success stdout" "" \
+  "$(cat "$live_replace_barrier/out")"
+assert_output "distinct-inode during-P replacement reports only the stable failure" \
+  "could not append target ledger" cat "$live_replace_barrier/err"
+assert_eq "failed proof does not mutate the moved proved inode" "$live_original_before" \
+  "$(sha_or_absent "$live_replace_barrier/proved-original.jsonl")"
+assert_eq "failed proof does not mutate the live replacement inode" "$live_replacement_before" \
+  "$(sha_or_absent "$run_live_replace/run.jsonl")"
+assert_eq "failed proof preserves moved-original identity" "$live_original_identity" \
+  "$(stat -f '%d:%i' "$live_replace_barrier/proved-original.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$live_replace_barrier/proved-original.jsonl")"
+assert_eq "failed proof preserves replacement identity" "$live_replacement_identity" \
+  "$(stat -f '%d:%i' "$run_live_replace/run.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$run_live_replace/run.jsonl")"
+assert_eq "distinct-inode schedule leaves unrelated sentinels unchanged" \
+  "outside sentinel" "$(cat "$live_replace_barrier/outside-sentinel")"
 
 run_ordinary_admitted_post_proof_case() {
   local phase="$1" interval="$2" repo run barrier seed_path temp_name temp_path

@@ -18,9 +18,11 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import secrets
 import stat
@@ -62,6 +64,22 @@ BARRIER_PHASES = {
     "after_contract_open", "after_lock", "after_source_open", "after_temp_fsync",
     "before_replace", "after_replace", "after_result_scan", "after_final_proof",
     "after_result_construction", "after_success_output", "before_return",
+    "after_support_gate",
+}
+P2_TEST_REJECTIONS = {
+    "linux", "unknown_platform",
+    "macos_version_mismatch", "macos_version_unverifiable",
+    "kernel_version_mismatch", "kernel_version_unverifiable",
+    "architecture_mismatch", "architecture_unverifiable",
+    "python_version_mismatch", "python_version_unverifiable",
+    "filesystem_type_mismatch", "filesystem_locality_mismatch", "filesystem_unverifiable",
+    "statvfs_fd_missing",
+    "nofollow_missing", "nofollow_invalid", "directory_missing", "directory_invalid",
+    "nonblock_missing", "nonblock_invalid",
+    "open_dir_fd_missing", "stat_dir_fd_missing", "stat_nofollow_missing",
+    "unlink_dir_fd_missing", "replace_missing", "replace_dir_fd_missing",
+    "same_filesystem_mismatch", "regular_file_check_missing", "file_fsync_missing",
+    "directory_fsync_missing", "flock_missing",
 }
 
 
@@ -117,6 +135,10 @@ def ordinary_fail(strict, message):
         print(f"firm-ledger-log: {message}", file=sys.stderr)
         raise SystemExit(1)
     raise SystemExit(0)
+
+
+def unsupported_write_configuration():
+    role_fail(17, "WRITE_CONFIGURATION_UNSUPPORTED", "p2")
 
 
 def unique_object(pairs):
@@ -346,7 +368,14 @@ def object_identity(st):
 
 
 def directory_flags():
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory = os.O_DIRECTORY
+        nofollow = os.O_NOFOLLOW
+    except AttributeError:
+        unsupported_write_configuration()
+    if not isinstance(directory, int) or directory <= 0 or not isinstance(nofollow, int) or nofollow <= 0:
+        unsupported_write_configuration()
+    return os.O_RDONLY | directory | nofollow
 
 
 class RunBinding:
@@ -399,7 +428,7 @@ class RunBinding:
             raise ValidationError("bound run namespace changed") from exc
 
     def open(self, name, flags, mode=None):
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NOFOLLOW
         if mode is None:
             return os.open(name, flags, dir_fd=self.run_fd)
         return os.open(name, flags, mode, dir_fd=self.run_fd)
@@ -481,9 +510,7 @@ def validate_run(target, require_eligible):
 
 
 def read_owned_json(path, modes, label):
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -564,11 +591,7 @@ def validate_relative_path(value, prefix=None):
 
 def open_contract(run, relative, failpoint):
     parts = validate_relative_path(relative, "role-contracts")
-    dir_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        dir_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        dir_flags |= os.O_NOFOLLOW
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fds = []
     try:
         run.prove()
@@ -581,9 +604,7 @@ def open_contract(run, relative, failpoint):
                 raise ValidationError("unsafe contract directory")
             fds.append(nxt)
             current = nxt
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
         fd = os.open(parts[-1], flags, dir_fd=current)
     except (OSError, ValidationError) as exc:
         for item in reversed(fds):
@@ -634,11 +655,7 @@ def reopen_contract(run, relative, chain):
     parts = validate_relative_path(relative, "role-contracts")
     if len(chain) != len(parts):
         raise ValidationError("sealed contract path changed")
-    dir_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        dir_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        dir_flags |= os.O_NOFOLLOW
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     opened = []
     try:
         run.prove()
@@ -660,9 +677,7 @@ def reopen_contract(run, relative, chain):
                 or live.st_uid != os.getuid() or stat.S_IMODE(live.st_mode) & 0o022
             ):
                 raise ValidationError("sealed contract path changed")
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
         fd = os.open(parts[-1], flags, dir_fd=current)
         identity = stat_identity(os.fstat(fd))
         os.close(fd)
@@ -685,8 +700,7 @@ def maybe_mutate_contract(failpoint, run, relative):
     if failpoint == "contract_replace":
         replacement = path.with_name(path.name + ".firm-test-replacement")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags |= os.O_NOFOLLOW
         fd = os.open(replacement, flags, 0o644)
         try:
             os.write(fd, b"replacement\n")
@@ -695,16 +709,16 @@ def maybe_mutate_contract(failpoint, run, relative):
             os.close(fd)
         os.replace(replacement, path)
     elif failpoint == "contract_truncate":
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | (getattr(os, "O_NOFOLLOW", 0)))
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
         os.close(fd)
     elif failpoint == "contract_grow":
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | (getattr(os, "O_NOFOLLOW", 0)))
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
         try:
             os.write(fd, b"growth")
         finally:
             os.close(fd)
     elif failpoint == "contract_mutate":
-        fd = os.open(path, os.O_WRONLY | (getattr(os, "O_NOFOLLOW", 0)))
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
         try:
             os.write(fd, b"X")
         finally:
@@ -865,6 +879,195 @@ def validate_activation_json(raw, role, justification):
     return activation
 
 
+def guarded_p2_test_rejection(run):
+    requested = os.environ.get("FIRM_LEDGER_P2_TEST_REJECT", "")
+    if not requested:
+        return None
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run.path)
+    inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    if guard != "1" or not inside_temp or requested not in P2_TEST_REJECTIONS:
+        role_fail(2, "INPUT_INVALID", "test-support")
+    return requested
+
+
+def mounted_filesystem_rows(device):
+    try:
+        result = subprocess.run(
+            ["/sbin/mount"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=5, check=False,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
+        )
+    except Exception as exc:
+        raise ValidationError("mount state unavailable") from exc
+    if result.returncode != 0 or not result.stdout:
+        raise ValidationError("mount state unavailable")
+    rows = []
+    for line in result.stdout.splitlines():
+        try:
+            _, mounted = line.rsplit(" on ", 1)
+            mount_point, options_raw = mounted.rsplit(" (", 1)
+            if not options_raw.endswith(")"):
+                continue
+            options = tuple(item.strip() for item in options_raw[:-1].split(","))
+            if not options or os.stat(mount_point).st_dev != device:
+                continue
+            rows.append((options[0], options[1:]))
+        except (OSError, ValueError):
+            continue
+    if not rows:
+        raise ValidationError("mount state unavailable")
+    return rows
+
+
+def require_supported_write_environment(run):
+    """Fail closed before either producer opens/creates a lock or transaction temp."""
+    reject = guarded_p2_test_rejection(run)
+    try:
+        system = platform.system()
+        macos = platform.mac_ver()[0]
+        kernel = platform.release()
+        architecture = platform.machine()
+        python = tuple(sys.version_info[:3])
+        implementation = getattr(sys.implementation, "name", "")
+        if reject == "linux":
+            system = "Linux"
+        elif reject == "unknown_platform":
+            system = "Unknown"
+        if reject == "macos_version_mismatch":
+            macos = "26.5.0"
+        elif reject == "macos_version_unverifiable":
+            macos = ""
+        if reject == "kernel_version_mismatch":
+            kernel = "25.4.0"
+        elif reject == "kernel_version_unverifiable":
+            kernel = ""
+        if reject == "architecture_mismatch":
+            architecture = "x86_64"
+        elif reject == "architecture_unverifiable":
+            architecture = ""
+        if reject == "python_version_mismatch":
+            python = (3, 9, 5)
+        elif reject == "python_version_unverifiable":
+            implementation = ""
+        if (
+            system != "Darwin" or macos != "26.5.1" or kernel != "25.5.0"
+            or architecture != "arm64" or python != (3, 9, 6) or implementation != "cpython"
+        ):
+            unsupported_write_configuration()
+
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        nonblock = getattr(os, "O_NONBLOCK", None)
+        if reject == "nofollow_missing":
+            nofollow = None
+        elif reject == "nofollow_invalid":
+            nofollow = 0
+        if reject == "directory_missing":
+            directory = None
+        elif reject == "directory_invalid":
+            directory = 0
+        if reject == "nonblock_missing":
+            nonblock = None
+        elif reject == "nonblock_invalid":
+            nonblock = 0
+        if (
+            not isinstance(nofollow, int) or nofollow <= 0
+            or not isinstance(directory, int) or directory <= 0
+            or not isinstance(nonblock, int) or nonblock <= 0
+        ):
+            unsupported_write_configuration()
+
+        replace_parameters = inspect.signature(os.replace).parameters if callable(os.replace) else {}
+        capabilities = {
+            "open_dir_fd_missing": os.open in os.supports_dir_fd,
+            "stat_dir_fd_missing": os.stat in os.supports_dir_fd,
+            "stat_nofollow_missing": os.stat in os.supports_follow_symlinks,
+            "statvfs_fd_missing": os.statvfs in os.supports_fd,
+            "unlink_dir_fd_missing": os.unlink in os.supports_dir_fd,
+            "replace_missing": callable(os.replace),
+            "replace_dir_fd_missing": (
+                "src_dir_fd" in replace_parameters and "dst_dir_fd" in replace_parameters
+            ),
+            "regular_file_check_missing": callable(stat.S_ISREG) and callable(stat.S_ISDIR),
+            "file_fsync_missing": callable(os.fsync),
+            "directory_fsync_missing": callable(os.fsync),
+            "flock_missing": callable(fcntl.flock),
+        }
+        if reject in capabilities:
+            capabilities[reject] = False
+        if not all(capabilities.values()):
+            unsupported_write_configuration()
+
+        run.prove()
+        held_stats = tuple(os.fstat(fd) for fd in run.fds)
+        os.statvfs(run.run_fd)
+        same_filesystem = len({item.st_dev for item in held_stats}) == 1
+        if reject == "same_filesystem_mismatch":
+            same_filesystem = False
+        if not same_filesystem:
+            unsupported_write_configuration()
+        device = held_stats[0].st_dev
+        rows = mounted_filesystem_rows(device)
+        if reject == "filesystem_unverifiable":
+            rows = []
+        elif reject == "filesystem_type_mismatch":
+            rows = [("hfs", options) for _, options in rows]
+        elif reject == "filesystem_locality_mismatch":
+            rows = [(kind, tuple(item for item in options if item != "local") + ("network",))
+                    for kind, options in rows]
+        if not rows or any(kind != "apfs" or "local" not in options for kind, options in rows):
+            unsupported_write_configuration()
+
+        file_probe_fd = None
+        git_dir_fd = None
+        try:
+            git_control_stat = os.stat(".git", dir_fd=run.repo_fd, follow_symlinks=False)
+            if stat.S_ISREG(git_control_stat.st_mode):
+                file_probe_fd = os.open(
+                    ".git", os.O_RDONLY | nofollow | nonblock, dir_fd=run.repo_fd
+                )
+            elif stat.S_ISDIR(git_control_stat.st_mode):
+                git_dir_fd = os.open(
+                    ".git", os.O_RDONLY | directory | nofollow, dir_fd=run.repo_fd
+                )
+                file_probe_fd = os.open(
+                    "HEAD", os.O_RDONLY | nofollow | nonblock, dir_fd=git_dir_fd
+                )
+            else:
+                unsupported_write_configuration()
+            file_probe_stat = os.fstat(file_probe_fd)
+            if (
+                not stat.S_ISREG(file_probe_stat.st_mode)
+                or file_probe_stat.st_uid != os.getuid()
+                or file_probe_stat.st_dev != device
+            ):
+                unsupported_write_configuration()
+            os.fsync(file_probe_fd)
+        finally:
+            if file_probe_fd is not None:
+                os.close(file_probe_fd)
+            if git_dir_fd is not None:
+                os.close(git_dir_fd)
+
+        if reject == "directory_fsync_missing":
+            unsupported_write_configuration()
+        os.fsync(run.run_fd)
+        if reject == "flock_missing":
+            unsupported_write_configuration()
+        probe_fd = os.dup(run.run_fd)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
+    except RoleFailure:
+        raise
+    except Exception:
+        unsupported_write_configuration()
+
+
 def active_failpoint(run):
     requested = os.environ.get("FIRM_LEDGER_FAILPOINT", "")
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
@@ -920,7 +1123,7 @@ def ledger_barrier(run, phase, detail=""):
         suffix = "." + phase if len(phases) > 1 else ""
         ready = os.path.join(barrier_path, token + suffix + ".ready")
         release = os.path.join(barrier_path, token + suffix + ".release")
-        fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             write_all(fd, (phase + (":" + detail if detail else "") + "\n").encode("utf-8"))
             os.fsync(fd)
@@ -929,7 +1132,7 @@ def ledger_barrier(run, phase, detail=""):
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
-                release_fd = os.open(release, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                release_fd = os.open(release, os.O_RDONLY | os.O_NOFOLLOW)
             except FileNotFoundError:
                 time.sleep(0.01)
                 continue
@@ -1196,6 +1399,23 @@ def same_open_ledger(run, expected):
     return identity == expected
 
 
+def prove_live_ledger_identity(run, proof_fd, proof_identity):
+    try:
+        run.prove()
+        if stat_identity(os.fstat(proof_fd)) != proof_identity:
+            raise CommitError("proof")
+        live_fd, live_identity = open_ledger(run)
+        if live_fd is None:
+            raise CommitError("proof")
+        try:
+            if live_identity != proof_identity:
+                raise CommitError("proof")
+        finally:
+            os.close(live_fd)
+    except (OSError, LedgerError, ValidationError) as exc:
+        raise CommitError("proof") from exc
+
+
 def atomic_commit(
     run, record, event_id, role_key=None, failpoint=None, contract_check=None,
     lock_check=None, precommit_check=None,
@@ -1323,7 +1543,7 @@ def atomic_commit(
         if failpoint == "proof_read":
             raise CommitError("proof")
         try:
-            proof_fd, _ = open_ledger(run)
+            proof_fd, proof_identity = open_ledger(run)
         except LedgerError as exc:
             raise CommitError("proof") from exc
         if proof_fd is None:
@@ -1332,7 +1552,9 @@ def atomic_commit(
             prove_exact_append(proof_fd, old_length, old_digest, payload)
             proven_scan = scan_ledger(proof_fd, run.name, wanted_event_ids=(event_id,))
             ledger_barrier(run, "after_result_scan")
+            prove_live_ledger_identity(run, proof_fd, proof_identity)
             prove_exact_append(proof_fd, old_length, old_digest, payload)
+            prove_live_ledger_identity(run, proof_fd, proof_identity)
             ledger_barrier(run, "after_final_proof")
         except LedgerError as exc:
             raise CommitError("proof") from exc
@@ -1402,6 +1624,15 @@ def ordinary_main(argv):
         run = bind_run(repo, run_path)
     except ValidationError as exc:
         ordinary_fail(strict, str(exc))
+    try:
+        require_supported_write_environment(run)
+        ledger_barrier(run, "after_support_gate")
+    except RoleFailure:
+        run.close()
+        raise
+    except LedgerError:
+        run.close()
+        role_fail(2, "INPUT_INVALID", "test-barrier")
     if not SAFE_EVENT.fullmatch(event):
         ordinary_fail(strict, "event contains unsafe characters")
     event_id = requested_event_id or (
@@ -1460,10 +1691,19 @@ def role_main(argv):
     if not printable(agent, 256) or not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_./:-]{0,254}", agent) or ".." in Path(agent).parts:
         role_fail(2, "INPUT_INVALID", "agent")
     try:
-        repo, run_path = validate_run(values["run"], True)
+        repo, run_path = validate_run(values["run"], False)
         run = bind_run(repo, run_path)
     except ValidationError:
         role_fail(10, "RUN_INVALID", Path(values["run"]).name)
+    try:
+        require_supported_write_environment(run)
+        ledger_barrier(run, "after_support_gate")
+    except RoleFailure:
+        run.close()
+        raise
+    except LedgerError:
+        run.close()
+        role_fail(2, "INPUT_INVALID", "test-barrier")
     failpoint = active_failpoint(run.path)
     justification = values.get("activation_justification")
     activation = validate_activation_json(values["activation_json"], role, justification)

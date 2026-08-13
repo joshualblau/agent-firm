@@ -72,6 +72,75 @@ wait_ready() {
   [ -f "$ready" ]
 }
 
+assert_native_prewrite_support_rejection() {
+  local label="$1" rejection="$2" repo run sentinel out rc
+  repo="$(mk_repo)"; mk_role_fixture "$repo" target source
+  run="$repo/.agent-firm/runs/target"
+  sentinel="$repo/native-p2-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT="$rejection" \
+    invoke_start "$repo" target "build/p2-$label" "$(authority_for target)" \
+    2> "$repo/p2.err")"; rc=$?
+  assert_eq "$label native rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label native rejection emits no success result" "" "$out"
+  assert_output "$label native rejection diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/p2.err"
+  assert_no_file "$label native rejection creates no ledger" "$run/run.jsonl"
+  assert_no_file "$label native rejection creates no lock" "$run/run.jsonl.lock"
+  assert_eq "$label native rejection creates no transaction temp" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  assert_eq "$label native rejection leaves unrelated sentinels unchanged" \
+    "outside sentinel" "$(cat "$sentinel")"
+}
+
+t_case "the centralized exact-P2 support gate accepts the local row before native mutation"
+repo_p2_native="$(mk_repo)"; mk_role_fixture "$repo_p2_native" target source
+run_p2_native="$repo_p2_native/.agent-firm/runs/target"
+p2_native_barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-native-p2.XXXXXX")"
+t_track "$p2_native_barrier"
+( FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_BARRIER_PHASE=after_support_gate \
+    FIRM_LEDGER_BARRIER_DIR="$p2_native_barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+    invoke_start "$repo_p2_native" target build/p2-positive "$(authority_for target)" \
+    > "$p2_native_barrier/out" 2> "$p2_native_barrier/err"; \
+    printf '%s' "$?" > "$p2_native_barrier/rc" ) & p2_native_pid=$!
+assert_ok "native writer reaches the shared support gate on the exact local P2 row" \
+  wait_ready "$p2_native_barrier/writer.ready"
+assert_no_file "native support-gate boundary precedes ledger creation" "$run_p2_native/run.jsonl"
+assert_no_file "native support-gate boundary precedes coordination-lock creation" \
+  "$run_p2_native/run.jsonl.lock"
+assert_eq "native support-gate boundary precedes transaction-temp creation" 0 \
+  "$(find "$run_p2_native" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+printf 'release\n' > "$p2_native_barrier/writer.release"; wait "$p2_native_pid"
+assert_eq "exact local P2 row permits the unchanged native receipt" 0 \
+  "$(cat "$p2_native_barrier/rc")"
+assert_ok "exact local P2 native result retains the closed schema" python3 - \
+  "$p2_native_barrier/out" <<'PY'
+import json,sys
+result=json.load(open(sys.argv[1],encoding="utf-8"))
+assert result["schema_version"]==1 and result["event"]=="build_started"
+assert result["stage"]=="build/p2-positive" and result["role"]=="implementer"
+PY
+
+t_case "every unsupported or unverifiable P2 dimension and capability fails before native writes"
+for spec in \
+  linux:linux unknown:unknown_platform \
+  macos_mismatch:macos_version_mismatch macos_unknown:macos_version_unverifiable \
+  kernel_mismatch:kernel_version_mismatch kernel_unknown:kernel_version_unverifiable \
+  arch_mismatch:architecture_mismatch arch_unknown:architecture_unverifiable \
+  python_mismatch:python_version_mismatch python_unknown:python_version_unverifiable \
+  fs_type:filesystem_type_mismatch fs_network:filesystem_locality_mismatch \
+  fs_unknown:filesystem_unverifiable nofollow_missing:nofollow_missing \
+  nofollow_zero:nofollow_invalid directory_missing:directory_missing \
+  directory_zero:directory_invalid nonblock_missing:nonblock_missing \
+  nonblock_zero:nonblock_invalid open_dir_fd:open_dir_fd_missing \
+  stat_dir_fd:stat_dir_fd_missing stat_nofollow:stat_nofollow_missing \
+  statvfs_fd:statvfs_fd_missing unlink_dir_fd:unlink_dir_fd_missing \
+  replace:replace_missing replace_dir_fd:replace_dir_fd_missing \
+  same_filesystem:same_filesystem_mismatch regular_file:regular_file_check_missing \
+  file_fsync:file_fsync_missing directory_fsync:directory_fsync_missing flock:flock_missing; do
+  p2_label="${spec%%:*}"; p2_rejection="${spec#*:}"
+  assert_native_prewrite_support_rejection "$p2_label" "$p2_rejection"
+done
+
 t_case "valid role start derives one exact contract tuple and emits only the proof-instant receipt"
 repo1="$(mk_repo)"; mk_role_fixture "$repo1" target source
 auth1="$(authority_for target)"
@@ -498,6 +567,52 @@ t_case "native receipt matrix demonstrates admitted_post_proof_mutation under th
 run_native_admitted_post_proof_case after_result_construction result_construction
 run_native_admitted_post_proof_case after_success_output success_output
 run_native_admitted_post_proof_case before_return observed_return
+
+t_case "native distinct owned inode replacement during final proof fails without redirected mutation"
+repo_native_live="$(mk_repo)"; mk_role_fixture "$repo_native_live" target source
+run_native_live="$repo_native_live/.agent-firm/runs/target"
+"$LOG" --run "$run_native_live" --strict --event-id evt-native-live-seed \
+  native_live_seed class=synthetic >/dev/null
+native_live_barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-ledger-native-live.XXXXXX")"
+t_track "$native_live_barrier"
+printf 'outside sentinel\n' > "$native_live_barrier/outside-sentinel"
+( FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_BARRIER_PHASE=after_result_scan \
+    FIRM_LEDGER_BARRIER_DIR="$native_live_barrier" FIRM_LEDGER_BARRIER_TOKEN=writer \
+    invoke_start "$repo_native_live" target build/live-replacement "$(authority_for target)" \
+    > "$native_live_barrier/out" 2> "$native_live_barrier/err"; \
+    printf '%s' "$?" > "$native_live_barrier/rc" ) & native_live_pid=$!
+assert_ok "native writer reaches the during-P path replacement boundary" \
+  wait_ready "$native_live_barrier/writer.ready"
+mv "$run_native_live/run.jsonl" "$native_live_barrier/proved-original.jsonl"
+cp "$native_live_barrier/proved-original.jsonl" "$run_native_live/run.jsonl"
+chmod 600 "$run_native_live/run.jsonl"
+native_original_identity="$(stat -f '%d:%i' "$native_live_barrier/proved-original.jsonl" 2>/dev/null || \
+  stat -c '%d:%i' "$native_live_barrier/proved-original.jsonl")"
+native_replacement_identity="$(stat -f '%d:%i' "$run_native_live/run.jsonl" 2>/dev/null || \
+  stat -c '%d:%i' "$run_native_live/run.jsonl")"
+assert_ne "native during-P replacement installs a distinct owned inode" \
+  "$native_original_identity" "$native_replacement_identity"
+native_original_before="$(ledger_sha_or_absent "$native_live_barrier/proved-original.jsonl")"
+native_replacement_before="$(ledger_sha_or_absent "$run_native_live/run.jsonl")"
+printf 'release\n' > "$native_live_barrier/writer.release"; wait "$native_live_pid"
+assert_eq "native distinct-inode during-P replacement returns POST_APPEND_PROOF_FAILED" 16 \
+  "$(cat "$native_live_barrier/rc")"
+assert_eq "native distinct-inode during-P replacement emits no result" "" \
+  "$(cat "$native_live_barrier/out")"
+assert_output "native distinct-inode during-P diagnostic is sanitized" \
+  "POST_APPEND_PROOF_FAILED" cat "$native_live_barrier/err"
+assert_eq "native failed proof leaves the moved proved inode byte-identical" \
+  "$native_original_before" "$(ledger_sha_or_absent "$native_live_barrier/proved-original.jsonl")"
+assert_eq "native failed proof leaves the replacement inode byte-identical" \
+  "$native_replacement_before" "$(ledger_sha_or_absent "$run_native_live/run.jsonl")"
+assert_eq "native failed proof preserves moved-original identity" "$native_original_identity" \
+  "$(stat -f '%d:%i' "$native_live_barrier/proved-original.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$native_live_barrier/proved-original.jsonl")"
+assert_eq "native failed proof preserves replacement identity" "$native_replacement_identity" \
+  "$(stat -f '%d:%i' "$run_native_live/run.jsonl" 2>/dev/null || \
+    stat -c '%d:%i' "$run_native_live/run.jsonl")"
+assert_eq "native distinct-inode schedule leaves unrelated sentinels unchanged" \
+  "outside sentinel" "$(cat "$native_live_barrier/outside-sentinel")"
 
 t_case "large contracts are streamed into a small derived result without body retention"
 repo10c="$(mk_repo)"; mk_role_fixture "$repo10c" target source; auth10c="$(authority_for target)"

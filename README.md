@@ -68,6 +68,13 @@ role-start logging, event-id transcription or ledger scraping, and a second mode
 valid paths. Ordinary non-role milestones continue through ordinary `firm-ledger-log`; see the
 [delegated role-start boundary](agent-firm/contracts/lifecycle.md#delegated-role-start-boundary).
 
+Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0,
+arm64, local APFS, and CPython 3.9.6. The ordinary and native producers use the same centralized gate
+before any ledger mutation or creation of a coordination lock or transaction temp. Linux and every
+other mismatched or unverifiable environment are unsupported and fail closed without a success
+result; ordinary best-effort mode is not a fallback. Expanding support requires new Architecture
+approval and proving evidence.
+
 A printed ordinary event ID or native result followed by exit zero means the producer completed its
 final same-inode exact-byte proof and observed exactly the accepted prefix plus its one complete record
 at that proof instant. It does not attest that those bytes remain stable during later result handling,
