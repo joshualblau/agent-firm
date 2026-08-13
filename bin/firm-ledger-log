@@ -25,6 +25,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import select
 import stat
 import subprocess
 import sys
@@ -44,6 +45,13 @@ MAX_JSON_OPERAND = 128 * 1024
 MAX_LEDGER_LINE = 1024 * 1024
 MAX_AUTHORITY = 16
 MAX_AUTHORITY_FIELDS = 32
+MOUNT_PROBE_MAX_BYTES = 65_536
+MOUNT_PROBE_MAX_LINE_BYTES = 4_096
+MOUNT_PROBE_MAX_LINES = 256
+MOUNT_PROBE_MAX_MATCHING_ROWS = 8
+MOUNT_PROBE_READ_CHUNK = 4_096
+MOUNT_PROBE_TIMEOUT_SECONDS = 5.0
+MOUNT_PROBE_REAP_GRACE_SECONDS = 1.0
 PRODUCER_RESERVED = {
     "ts", "event", "event_id", "run_id", "stage", "role", "agent", "contract",
     "authority", "activation", "activation_justification",
@@ -80,7 +88,15 @@ P2_TEST_REJECTIONS = {
     "unlink_dir_fd_missing", "replace_missing", "replace_dir_fd_missing",
     "same_filesystem_mismatch", "regular_file_check_missing", "file_fsync_missing",
     "directory_fsync_missing", "flock_missing",
+    "bind_type_error", "bind_not_implemented", "bind_enotsup", "bind_enoent",
 }
+CAPABILITY_BIND_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, "ENOSYS", None), getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None), getattr(errno, "EINVAL", None),
+    ) if isinstance(value, int)
+)
+MOUNT_TEST_BEHAVIORS = {"output", "timeout", "ignore_term", "nonzero"}
 
 
 class RoleFailure(Exception):
@@ -394,16 +410,15 @@ class RunBinding:
             self.fds.append(runs_fd)
             run_fd = os.open(self.name, directory_flags(), dir_fd=runs_fd)
             self.fds.append(run_fd)
-        except OSError as exc:
+            self.repo_fd, self.agent_fd, self.runs_fd, self.run_fd = self.fds
+            self.identities = tuple(object_identity(os.fstat(fd)) for fd in self.fds)
+            for identity in self.identities:
+                if identity[4] != os.getuid() or identity[3] & 0o022:
+                    raise ValidationError("unsafe bound run namespace")
+            self.prove(initial_binding=True)
+        except Exception:
             self.close()
-            raise ValidationError("cannot bind run namespace") from exc
-        self.repo_fd, self.agent_fd, self.runs_fd, self.run_fd = self.fds
-        self.identities = tuple(object_identity(os.fstat(fd)) for fd in self.fds)
-        for identity in self.identities:
-            if identity[4] != os.getuid() or identity[3] & 0o022:
-                self.close()
-                raise ValidationError("unsafe bound run namespace")
-        self.prove()
+            raise
 
     def _entry_identity(self, parent_fd, name):
         check = os.open(name, directory_flags(), dir_fd=parent_fd)
@@ -412,7 +427,7 @@ class RunBinding:
         finally:
             os.close(check)
 
-    def prove(self):
+    def prove(self, initial_binding=False):
         try:
             if tuple(object_identity(os.fstat(fd)) for fd in self.fds) != self.identities:
                 raise ValidationError("bound run descriptor drift")
@@ -425,6 +440,8 @@ class RunBinding:
             if self._entry_identity(self.runs_fd, self.name) != self.identities[3]:
                 raise ValidationError("run entry drift")
         except OSError as exc:
+            if initial_binding:
+                raise
             raise ValidationError("bound run namespace changed") from exc
 
     def open(self, name, flags, mode=None):
@@ -450,7 +467,10 @@ class RunBinding:
 
 
 def bind_run(repo, run):
-    return RunBinding(repo, run)
+    try:
+        return RunBinding(repo, run)
+    except (TypeError, NotImplementedError, OSError) as exc:
+        raise ValidationError("cannot bind run namespace") from exc
 
 
 def require_owned_directory(path, label):
@@ -879,51 +899,25 @@ def validate_activation_json(raw, role, justification):
     return activation
 
 
-def guarded_p2_test_rejection(run):
+def guarded_p2_test_rejection(run_path):
     requested = os.environ.get("FIRM_LEDGER_P2_TEST_REJECT", "")
     if not requested:
         return None
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
     temp_root = os.path.realpath(tempfile.gettempdir())
-    run_path = os.path.realpath(run.path)
-    inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    run_path = os.path.realpath(run_path)
+    try:
+        inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    except ValueError:
+        inside_temp = False
     if guard != "1" or not inside_temp or requested not in P2_TEST_REJECTIONS:
         role_fail(2, "INPUT_INVALID", "test-support")
     return requested
 
 
-def mounted_filesystem_rows(device):
-    try:
-        result = subprocess.run(
-            ["/sbin/mount"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, timeout=5, check=False,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
-        )
-    except Exception as exc:
-        raise ValidationError("mount state unavailable") from exc
-    if result.returncode != 0 or not result.stdout:
-        raise ValidationError("mount state unavailable")
-    rows = []
-    for line in result.stdout.splitlines():
-        try:
-            _, mounted = line.rsplit(" on ", 1)
-            mount_point, options_raw = mounted.rsplit(" (", 1)
-            if not options_raw.endswith(")"):
-                continue
-            options = tuple(item.strip() for item in options_raw[:-1].split(","))
-            if not options or os.stat(mount_point).st_dev != device:
-                continue
-            rows.append((options[0], options[1:]))
-        except (OSError, ValueError):
-            continue
-    if not rows:
-        raise ValidationError("mount state unavailable")
-    return rows
-
-
-def require_supported_write_environment(run):
-    """Fail closed before either producer opens/creates a lock or transaction temp."""
-    reject = guarded_p2_test_rejection(run)
+def preflight_write_environment(run_path):
+    """Pure process/capability classification before RunBinding consumes security primitives."""
+    reject = guarded_p2_test_rejection(run_path)
     try:
         system = platform.system()
         macos = platform.mac_ver()[0]
@@ -959,7 +953,6 @@ def require_supported_write_environment(run):
 
         nofollow = getattr(os, "O_NOFOLLOW", None)
         directory = getattr(os, "O_DIRECTORY", None)
-        nonblock = getattr(os, "O_NONBLOCK", None)
         if reject == "nofollow_missing":
             nofollow = None
         elif reject == "nofollow_invalid":
@@ -968,6 +961,251 @@ def require_supported_write_environment(run):
             directory = None
         elif reject == "directory_invalid":
             directory = 0
+        declared_dir_fd = (
+            callable(os.open) and isinstance(os.supports_dir_fd, set)
+            and os.open in os.supports_dir_fd
+        )
+        if reject == "open_dir_fd_missing":
+            declared_dir_fd = False
+        if (
+            not isinstance(nofollow, int) or nofollow <= 0
+            or not isinstance(directory, int) or directory <= 0
+            or not callable(os.open) or not declared_dir_fd
+        ):
+            unsupported_write_configuration()
+        return {
+            "reject": reject, "nofollow": nofollow, "directory": directory,
+        }
+    except RoleFailure:
+        raise
+    except Exception:
+        unsupported_write_configuration()
+
+
+def bind_write_run(repo, run_path, preflight):
+    """Bind once, mapping only unavailable primitive failures to the P2 support class."""
+    reject = preflight["reject"]
+    try:
+        if reject == "bind_type_error":
+            raise TypeError("forced binding primitive failure")
+        if reject == "bind_not_implemented":
+            raise NotImplementedError("forced binding primitive failure")
+        if reject == "bind_enotsup":
+            raise OSError(errno.ENOTSUP, "forced binding primitive failure")
+        if reject == "bind_enoent":
+            raise OSError(errno.ENOENT, "forced namespace failure")
+        return RunBinding(repo, run_path)
+    except (TypeError, NotImplementedError):
+        unsupported_write_configuration()
+    except OSError as exc:
+        if exc.errno in CAPABILITY_BIND_ERRNOS:
+            unsupported_write_configuration()
+        raise ValidationError("cannot bind run namespace") from exc
+
+
+def mount_probe_command(run):
+    behavior = os.environ.get("FIRM_LEDGER_MOUNT_TEST_BEHAVIOR", "")
+    fixture = os.environ.get("FIRM_LEDGER_MOUNT_TEST_FIXTURE", "")
+    if not behavior and not fixture:
+        return ["/sbin/mount"]
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run.path)
+    try:
+        inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    except ValueError:
+        inside_temp = False
+    if guard != "1" or not inside_temp or behavior not in MOUNT_TEST_BEHAVIORS:
+        role_fail(2, "INPUT_INVALID", "test-support")
+    if behavior == "output":
+        fixture_path = os.path.realpath(fixture) if fixture else ""
+        try:
+            inside_fixture = (
+                fixture_path != temp_root
+                and os.path.commonpath((temp_root, fixture_path)) == temp_root
+            )
+            fixture_stat = os.lstat(fixture_path)
+        except (OSError, ValueError):
+            role_fail(2, "INPUT_INVALID", "test-support")
+        if (
+            not inside_fixture or stat.S_ISLNK(fixture_stat.st_mode)
+            or not stat.S_ISREG(fixture_stat.st_mode) or fixture_stat.st_uid != os.getuid()
+            or stat.S_IMODE(fixture_stat.st_mode) & 0o022
+        ):
+            role_fail(2, "INPUT_INVALID", "test-support")
+        return [
+            sys.executable, "-c",
+            (
+                "import shutil,sys; source=open(sys.argv[1],'rb'); target=sys.stdout.buffer; "
+                "shutil.copyfileobj(source,target,4096); target.flush()"
+            ),
+            fixture_path,
+        ]
+    if fixture:
+        role_fail(2, "INPUT_INVALID", "test-support")
+    if behavior == "nonzero":
+        return [sys.executable, "-c", "raise SystemExit(7)"]
+    if behavior == "ignore_term":
+        return [
+            sys.executable, "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+        ]
+    return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+
+def terminate_mount_probe(process, absolute_deadline=None):
+    """Bound cleanup to one second, escalating to kill while time remains for reap."""
+    cleanup_deadline = time.monotonic() + MOUNT_PROBE_REAP_GRACE_SECONDS
+    if absolute_deadline is not None:
+        cleanup_deadline = min(cleanup_deadline, absolute_deadline)
+    try:
+        if process.poll() is None:
+            process.terminate()
+            terminate_budget = max(0.0, cleanup_deadline - time.monotonic() - 0.1)
+            try:
+                process.wait(timeout=terminate_budget)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        remaining = max(0.0, cleanup_deadline - time.monotonic())
+        process.wait(timeout=remaining)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def parse_mount_line(raw_line, device, rows):
+    if b"\0" in raw_line:
+        raise ValidationError("mount state unavailable")
+    try:
+        line = raw_line[:-1].decode("utf-8", "strict")
+        source, mounted = line.rsplit(" on ", 1)
+        mount_point, options_raw = mounted.rsplit(" (", 1)
+        if not source or not mount_point or not options_raw.endswith(")"):
+            raise ValueError("malformed mount row")
+        options = tuple(item.strip() for item in options_raw[:-1].split(","))
+        if not options or any(not item for item in options):
+            raise ValueError("malformed mount options")
+        mount_stat = os.stat(mount_point)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValidationError("mount state unavailable") from exc
+    if mount_stat.st_dev != device:
+        return
+    if len(rows) >= MOUNT_PROBE_MAX_MATCHING_ROWS:
+        raise ValidationError("mount state unavailable")
+    rows.append((os.path.realpath(mount_point), options[0], options[1:]))
+
+
+def mounted_filesystem_rows(run, device):
+    """Incrementally retain only bounded device matches from one bounded mount probe."""
+    started = time.monotonic()
+    absolute_cleanup_deadline = (
+        started + MOUNT_PROBE_TIMEOUT_SECONDS + MOUNT_PROBE_REAP_GRACE_SECONDS
+    )
+    try:
+        process = subprocess.Popen(
+            mount_probe_command(run), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0, close_fds=True,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
+        )
+    except RoleFailure:
+        raise
+    except Exception as exc:
+        raise ValidationError("mount state unavailable") from exc
+    if process.stdout is None:
+        terminate_mount_probe(process, absolute_cleanup_deadline)
+        raise ValidationError("mount state unavailable")
+    deadline = started + MOUNT_PROBE_TIMEOUT_SECONDS
+    fd = process.stdout.fileno()
+    current = bytearray()
+    total = 0
+    lines = 0
+    rows = []
+    failed = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValidationError("mount state unavailable")
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except InterruptedError:
+                continue
+            if not readable:
+                raise ValidationError("mount state unavailable")
+            chunk = os.read(fd, MOUNT_PROBE_READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MOUNT_PROBE_MAX_BYTES:
+                raise ValidationError("mount state unavailable")
+            offset = 0
+            while offset < len(chunk):
+                newline = chunk.find(b"\n", offset)
+                if newline < 0:
+                    tail = chunk[offset:]
+                    if len(current) + len(tail) > MOUNT_PROBE_MAX_LINE_BYTES:
+                        raise ValidationError("mount state unavailable")
+                    current.extend(tail)
+                    break
+                segment = chunk[offset:newline + 1]
+                if len(current) + len(segment) > MOUNT_PROBE_MAX_LINE_BYTES:
+                    raise ValidationError("mount state unavailable")
+                lines += 1
+                if lines > MOUNT_PROBE_MAX_LINES:
+                    raise ValidationError("mount state unavailable")
+                raw_line = bytes(current) + segment
+                current.clear()
+                parse_mount_line(raw_line, device, rows)
+                offset = newline + 1
+        if current:
+            raise ValidationError("mount state unavailable")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("mount state unavailable")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise ValidationError("mount state unavailable") from exc
+        if returncode != 0 or not rows:
+            raise ValidationError("mount state unavailable")
+    except BaseException:
+        failed = True
+        if not terminate_mount_probe(process, absolute_cleanup_deadline):
+            raise ValidationError("mount state unavailable")
+        raise
+    finally:
+        process.stdout.close()
+        if not failed and process.poll() is None:
+            terminate_mount_probe(process, absolute_cleanup_deadline)
+
+    seen_points = set()
+    for mount_point, _, _ in rows:
+        if mount_point in seen_points:
+            raise ValidationError("mount state unavailable")
+        seen_points.add(mount_point)
+    target = os.path.realpath(run.path)
+    related = []
+    for row in rows:
+        try:
+            if os.path.commonpath((target, row[0])) == row[0]:
+                related.append(row)
+        except ValueError as exc:
+            raise ValidationError("mount state unavailable") from exc
+    if not related:
+        raise ValidationError("mount state unavailable")
+    related.sort(key=lambda item: len(Path(item[0]).parts), reverse=True)
+    if len(related) > 1 and len(Path(related[0][0]).parts) == len(Path(related[1][0]).parts):
+        raise ValidationError("mount state unavailable")
+    return [(related[0][1], related[0][2])]
+
+
+def require_supported_write_environment(run, preflight):
+    """Fail closed before either producer opens/creates a lock or transaction temp."""
+    reject = preflight["reject"]
+    try:
+        nofollow = preflight["nofollow"]
+        directory = preflight["directory"]
+        nonblock = getattr(os, "O_NONBLOCK", None)
         if reject == "nonblock_missing":
             nonblock = None
         elif reject == "nonblock_invalid":
@@ -981,7 +1219,6 @@ def require_supported_write_environment(run):
 
         replace_parameters = inspect.signature(os.replace).parameters if callable(os.replace) else {}
         capabilities = {
-            "open_dir_fd_missing": os.open in os.supports_dir_fd,
             "stat_dir_fd_missing": os.stat in os.supports_dir_fd,
             "stat_nofollow_missing": os.stat in os.supports_follow_symlinks,
             "statvfs_fd_missing": os.statvfs in os.supports_fd,
@@ -1009,7 +1246,7 @@ def require_supported_write_environment(run):
         if not same_filesystem:
             unsupported_write_configuration()
         device = held_stats[0].st_dev
-        rows = mounted_filesystem_rows(device)
+        rows = mounted_filesystem_rows(run, device)
         if reject == "filesystem_unverifiable":
             rows = []
         elif reject == "filesystem_type_mismatch":
@@ -1066,6 +1303,18 @@ def require_supported_write_environment(run):
         raise
     except Exception:
         unsupported_write_configuration()
+
+
+def prepare_write_run(repo, run_path):
+    """One shared preflight, typed binding, and post-bind P2 verification sequence."""
+    preflight = preflight_write_environment(run_path)
+    run = bind_write_run(repo, run_path, preflight)
+    try:
+        require_supported_write_environment(run, preflight)
+    except BaseException:
+        run.close()
+        raise
+    return run
 
 
 def active_failpoint(run):
@@ -1621,11 +1870,12 @@ def ordinary_main(argv):
         raise SystemExit(0)
     try:
         repo, run_path = validate_run(target, False)
-        run = bind_run(repo, run_path)
+        run = prepare_write_run(repo, run_path)
+    except RoleFailure:
+        raise
     except ValidationError as exc:
         ordinary_fail(strict, str(exc))
     try:
-        require_supported_write_environment(run)
         ledger_barrier(run, "after_support_gate")
     except RoleFailure:
         run.close()
@@ -1692,11 +1942,12 @@ def role_main(argv):
         role_fail(2, "INPUT_INVALID", "agent")
     try:
         repo, run_path = validate_run(values["run"], False)
-        run = bind_run(repo, run_path)
+        run = prepare_write_run(repo, run_path)
+    except RoleFailure:
+        raise
     except ValidationError:
         role_fail(10, "RUN_INVALID", Path(values["run"]).name)
     try:
-        require_supported_write_environment(run)
         ledger_barrier(run, "after_support_gate")
     except RoleFailure:
         run.close()

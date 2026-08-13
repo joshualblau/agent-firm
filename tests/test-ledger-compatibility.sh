@@ -193,6 +193,150 @@ assert_prewrite_support_rejection() {
     "outside sentinel" "$(cat "$sentinel")"
 }
 
+write_mount_fixture() {
+  local fixture="$1" run="$2" kind="$3"
+  python3 - "$fixture" "$run" "$kind" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+fixture,run,kind=sys.argv[1:]
+run=os.path.realpath(run)
+device=os.stat(run).st_dev
+unrelated="/dev"
+assert os.stat(unrelated).st_dev != device
+
+def row(point, size=None, filesystem="apfs", options="local"):
+    suffix=(" on %s (%s, %s)\n"%(point,filesystem,options)).encode("utf-8")
+    source=b"fixture"
+    if size is not None:
+        assert size >= len(source)+len(suffix)
+        source += b"x"*(size-len(source)-len(suffix))
+    return source+suffix
+
+if kind == "valid":
+    body=row(run)
+elif kind in ("bytes_exact", "bytes_plus"):
+    body=b"".join([row(unrelated,4096) for _ in range(15)]+[row(run,4096)])
+    assert len(body)==65536
+    if kind == "bytes_plus": body+=b"x"
+elif kind == "line_exact":
+    body=row(run,4096)
+elif kind == "line_plus":
+    body=row(run,4097)
+elif kind in ("lines_exact", "lines_plus"):
+    count=255 if kind=="lines_exact" else 256
+    body=b"".join(row(unrelated) for _ in range(count))+row(run)
+elif kind in ("matches_exact", "matches_plus"):
+    points=[]
+    for point in (Path(run),*Path(run).parents):
+        value=os.path.realpath(str(point))
+        if value not in points and os.stat(value).st_dev==device: points.append(value)
+    count=8 if kind=="matches_exact" else 9
+    assert len(points)>=count
+    body=b"".join(row(point) for point in points[:count])
+elif kind == "invalid_utf8":
+    body=b"\xff on "+run.encode()+b" (apfs, local)\n"
+elif kind == "nul":
+    body=b"bad\0source on "+run.encode()+b" (apfs, local)\n"
+elif kind == "unterminated":
+    body=row(run)[:-1]
+elif kind == "malformed":
+    body=b"malformed mount row\n"
+elif kind == "stat_failure":
+    body=row("/definitely/not/a/mount/point")
+elif kind == "duplicate":
+    body=row(run)+row(run)
+elif kind == "conflict":
+    body=row(run)+row(run,filesystem="hfs")
+else:
+    raise AssertionError(kind)
+with open(fixture,"wb") as handle: handle.write(body)
+os.chmod(fixture,0o600)
+PY
+}
+
+assert_mount_probe_pass() {
+  local label="$1" kind="$2" repo run fixture out rc
+  repo="$(mk_repo)"; mk_run "$repo" target
+  run="$repo/.agent-firm/runs/target"; fixture="$repo/mount-$label.bin"
+  write_mount_fixture "$fixture" "$run" "$kind"
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR=output \
+    FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" --strict \
+    --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
+    2> "$repo/mount.err")"; rc=$?
+  assert_eq "$label mount boundary permits the exact supported probe" 0 "$rc"
+  assert_eq "$label mount boundary retains the ordinary receipt" "evt-mount-$label" "$out"
+  assert_eq "$label mount boundary emits no diagnostic" "" "$(cat "$repo/mount.err")"
+}
+
+assert_mount_probe_rejection() {
+  local label="$1" behavior="$2" kind="$3" mode="$4" repo run ledger before fixture sentinel out rc started elapsed
+  repo="$(mk_repo)"; mk_run "$repo" target
+  run="$repo/.agent-firm/runs/target"; ledger="$run/run.jsonl"
+  printf '%s\n' \
+    '{"ts":"2026-08-13T00:00:00Z","event":"mount_predecessor","event_id":"evt-mount-predecessor","run_id":"target","class":"synthetic"}' \
+    > "$ledger"; chmod 600 "$ledger"; before="$(sha_or_absent "$ledger")"
+  fixture="$repo/mount-$label.bin"
+  if [ "$behavior" = output ]; then write_mount_fixture "$fixture" "$run" "$kind"; else fixture=""; fi
+  sentinel="$repo/mount-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  started=$SECONDS
+  if [ "$mode" = strict ]; then
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
+      FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" --strict \
+      --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
+      2> "$repo/mount.err")"; rc=$?
+  else
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
+      FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" "$LOG" --run "$run" \
+      --print-event-id --event-id "evt-mount-$label" mount_probe class=synthetic \
+      2> "$repo/mount.err")"; rc=$?
+  fi
+  elapsed=$((SECONDS-started))
+  assert_eq "$label $mode mount rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label $mode mount rejection emits no success" "" "$out"
+  assert_output "$label $mode mount diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/mount.err"
+  assert_eq "$label $mode mount rejection leaves the ledger byte-identical" \
+    "$before" "$(sha_or_absent "$ledger")"
+  assert_no_file "$label $mode mount rejection creates no coordination lock" "$run/run.jsonl.lock"
+  assert_eq "$label $mode mount rejection creates no transaction temp" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  assert_eq "$label $mode mount rejection leaves unrelated sentinels unchanged" \
+    "outside sentinel" "$(cat "$sentinel")"
+  if [ "$behavior" = timeout ] || [ "$behavior" = ignore_term ]; then
+    assert_ok "$label $mode mount child is terminated and reaped under the bounded deadline" \
+      test "$elapsed" -le 7
+  fi
+}
+
+assert_binding_namespace_control() {
+  local mode="$1" repo run out rc expected
+  repo="$(mk_repo)"; mk_run "$repo" target; run="$repo/.agent-firm/runs/target"
+  if [ "$mode" = strict ]; then
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=bind_enoent \
+      "$LOG" --run "$run" --strict --print-event-id namespace_control 2> "$repo/bind.err")"; rc=$?
+    expected=1
+  else
+    out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=bind_enoent \
+      "$LOG" --run "$run" --print-event-id namespace_control 2> "$repo/bind.err")"; rc=$?
+    expected=0
+  fi
+  assert_eq "$mode namespace-family binding error retains ordinary invalid-run behavior" "$expected" "$rc"
+  assert_eq "$mode namespace-family binding error emits no success" "" "$out"
+  if [ "$mode" = strict ]; then
+    assert_output "$mode namespace-family binding error retains the invalid-run diagnostic" \
+      "cannot bind run namespace" cat "$repo/bind.err"
+  else
+    assert_eq "$mode namespace-family binding error retains silent fallback" "" \
+      "$(cat "$repo/bind.err")"
+  fi
+  assert_no_file "$mode namespace-family binding error creates no ledger" "$run/run.jsonl"
+  assert_no_file "$mode namespace-family binding error creates no lock" "$run/run.jsonl.lock"
+  assert_eq "$mode namespace-family binding error creates no transaction temp" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+}
+
 wait_ready() {
   local ready="$1" n=0
   while [ ! -f "$ready" ] && [ "$n" -lt 1000 ]; do n=$((n+1)); sleep 0.01; done
@@ -244,6 +388,23 @@ for spec in \
 done
 assert_prewrite_support_rejection best_effort_linux linux best_effort
 
+t_case "actual pre-bind primitive failures share the narrow support taxonomy in both ordinary modes"
+for spec in \
+  best_nofollow:nofollow_missing best_directory:directory_missing \
+  best_open_dir_fd:open_dir_fd_missing best_type_error:bind_type_error \
+  best_not_implemented:bind_not_implemented best_enotsup:bind_enotsup; do
+  p2_label="${spec%%:*}"; p2_rejection="${spec#*:}"
+  assert_prewrite_support_rejection "$p2_label" "$p2_rejection" best_effort
+done
+for spec in \
+  bind_type_error:bind_type_error bind_not_implemented:bind_not_implemented \
+  bind_enotsup:bind_enotsup; do
+  p2_label="${spec%%:*}"; p2_rejection="${spec#*:}"
+  assert_prewrite_support_rejection "$p2_label" "$p2_rejection" strict
+done
+assert_binding_namespace_control strict
+assert_binding_namespace_control best_effort
+
 t_case "the P2 test seam is negative-only, guarded, and cannot broaden positive support"
 repo_p2_seam="$(mk_repo)"; mk_run "$repo_p2_seam" target
 run_p2_seam="$repo_p2_seam/.agent-firm/runs/target"
@@ -260,6 +421,35 @@ assert_no_file "positive-support seam value creates no ledger" "$run_p2_seam/run
 assert_no_file "negative-only seam creates no coordination lock" "$run_p2_seam/run.jsonl.lock"
 assert_eq "negative-only seam creates no transaction temp" 0 \
   "$(find "$run_p2_seam" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+mount_seam_out="$(FIRM_LEDGER_MOUNT_TEST_BEHAVIOR=nonzero \
+  "$LOG" --run "$run_p2_seam" --strict mount_seam 2> "$repo_p2_seam/mount-unguarded.err")"
+assert_eq "unguarded mount probe seam is INPUT_INVALID" 2 "$?"
+assert_eq "unguarded mount probe seam emits no success" "" "$mount_seam_out"
+assert_no_file "unguarded mount probe seam creates no ledger" "$run_p2_seam/run.jsonl"
+
+t_case "incremental mount discovery accepts every exact frozen ceiling"
+for spec in \
+  bytes_exact:bytes_exact line_exact:line_exact lines_exact:lines_exact \
+  matches_exact:matches_exact; do
+  mount_label="${spec%%:*}"; mount_kind="${spec#*:}"
+  assert_mount_probe_pass "$mount_label" "$mount_kind"
+done
+
+t_case "incremental mount discovery rejects each cap plus one and every malformed or ambiguous state"
+for spec in \
+  bytes_plus:bytes_plus line_plus:line_plus lines_plus:lines_plus matches_plus:matches_plus \
+  invalid_utf8:invalid_utf8 nul:nul unterminated:unterminated malformed:malformed \
+  stat_failure:stat_failure duplicate:duplicate conflict:conflict; do
+  mount_label="${spec%%:*}"; mount_kind="${spec#*:}"
+  assert_mount_probe_rejection "$mount_label" output "$mount_kind" strict
+done
+assert_mount_probe_rejection nonzero nonzero none strict
+assert_mount_probe_rejection timeout timeout none strict
+assert_mount_probe_rejection ignore_term ignore_term none strict
+
+t_case "representative mount overflow and timeout reject before ordinary best-effort fallback"
+assert_mount_probe_rejection best_bytes_plus output bytes_plus best_effort
+assert_mount_probe_rejection best_timeout timeout none best_effort
 
 t_case "accepted-base catalog: exact observations and ordinary producer shapes are readable predecessors"
 seed_and_follow shell_observation \

@@ -92,6 +92,63 @@ assert_native_prewrite_support_rejection() {
     "outside sentinel" "$(cat "$sentinel")"
 }
 
+assert_native_binding_namespace_control() {
+  local repo run out rc
+  repo="$(mk_repo)"; mk_role_fixture "$repo" target source
+  run="$repo/.agent-firm/runs/target"
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=bind_enoent \
+    invoke_start "$repo" target build/namespace-control "$(authority_for target)" \
+    2> "$repo/bind.err")"; rc=$?
+  assert_eq "namespace-family binding error retains native RUN_INVALID" 10 "$rc"
+  assert_eq "namespace-family binding error emits no native result" "" "$out"
+  assert_output "namespace-family binding error has the sanitized native class" \
+    "RUN_INVALID: target" cat "$repo/bind.err"
+  assert_no_file "namespace-family binding error creates no native ledger" "$run/run.jsonl"
+  assert_no_file "namespace-family binding error creates no native lock" "$run/run.jsonl.lock"
+}
+
+assert_native_mount_rejection() {
+  local label="$1" behavior="$2" repo run fixture sentinel out rc started elapsed
+  repo="$(mk_repo)"; mk_role_fixture "$repo" target source
+  run="$repo/.agent-firm/runs/target"; fixture=""
+  if [ "$behavior" = output ]; then
+    fixture="$repo/mount-$label.bin"
+    python3 - "$fixture" "$run" <<'PY'
+import os,sys
+fixture,run=sys.argv[1:]
+run=os.path.realpath(run); unrelated="/dev"
+assert os.stat(unrelated).st_dev != os.stat(run).st_dev
+def row(point):
+    suffix=(" on %s (apfs, local)\n"%point).encode(); source=b"fixture"
+    return source+b"x"*(4096-len(source)-len(suffix))+suffix
+body=b"".join([row(unrelated) for _ in range(15)]+[row(run)])+b"x"
+assert len(body)==65537
+with open(fixture,"wb") as handle: handle.write(body)
+os.chmod(fixture,0o600)
+PY
+  fi
+  sentinel="$repo/native-mount-sentinel-$label"; printf 'outside sentinel\n' > "$sentinel"
+  started=$SECONDS
+  out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_MOUNT_TEST_BEHAVIOR="$behavior" \
+    FIRM_LEDGER_MOUNT_TEST_FIXTURE="$fixture" invoke_start "$repo" target \
+    "build/mount-$label" "$(authority_for target)" 2> "$repo/mount.err")"; rc=$?
+  elapsed=$((SECONDS-started))
+  assert_eq "$label native mount rejection is stable WRITE_CONFIGURATION_UNSUPPORTED" 17 "$rc"
+  assert_eq "$label native mount rejection emits no result" "" "$out"
+  assert_output "$label native mount diagnostic is sanitized" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$repo/mount.err"
+  assert_no_file "$label native mount rejection creates no ledger" "$run/run.jsonl"
+  assert_no_file "$label native mount rejection creates no lock" "$run/run.jsonl.lock"
+  assert_eq "$label native mount rejection creates no transaction temp" 0 \
+    "$(find "$run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  assert_eq "$label native mount rejection leaves unrelated sentinels unchanged" \
+    "outside sentinel" "$(cat "$sentinel")"
+  if [ "$behavior" = timeout ]; then
+    assert_ok "$label native mount child is terminated and reaped under the bounded deadline" \
+      test "$elapsed" -le 7
+  fi
+}
+
 t_case "the centralized exact-P2 support gate accepts the local row before native mutation"
 repo_p2_native="$(mk_repo)"; mk_role_fixture "$repo_p2_native" target source
 run_p2_native="$repo_p2_native/.agent-firm/runs/target"
@@ -136,10 +193,19 @@ for spec in \
   statvfs_fd:statvfs_fd_missing unlink_dir_fd:unlink_dir_fd_missing \
   replace:replace_missing replace_dir_fd:replace_dir_fd_missing \
   same_filesystem:same_filesystem_mismatch regular_file:regular_file_check_missing \
-  file_fsync:file_fsync_missing directory_fsync:directory_fsync_missing flock:flock_missing; do
+  file_fsync:file_fsync_missing directory_fsync:directory_fsync_missing flock:flock_missing \
+  bind_type_error:bind_type_error bind_not_implemented:bind_not_implemented \
+  bind_enotsup:bind_enotsup; do
   p2_label="${spec%%:*}"; p2_rejection="${spec#*:}"
   assert_native_prewrite_support_rejection "$p2_label" "$p2_rejection"
 done
+
+t_case "the pre-bind adapter preserves the native namespace error family"
+assert_native_binding_namespace_control
+
+t_case "representative mount overflow and timeout fail closed before native mutation"
+assert_native_mount_rejection bytes_plus output
+assert_native_mount_rejection timeout timeout
 
 t_case "valid role start derives one exact contract tuple and emits only the proof-instant receipt"
 repo1="$(mk_repo)"; mk_role_fixture "$repo1" target source
