@@ -5,9 +5,11 @@ The handoff states delivered behavior, criteria status or waivers, primary and s
 two-voice dispositions, Definition-of-Done status, known limitations, untested risks, and the pending
 Final decision.
 
-List integration evidence by immutable `integration-summaries/<stage-instance>.md` path and digest.
-If indexed history is missing or mismatched, packaging is blocked; do not reconstruct an overwritten
-summary or fall back to `integration-summary.md`.
+For indexed runs, list integration evidence by immutable `integration-summaries/<stage-instance>.md`
+path and digest. Missing or mismatched indexed history blocks packaging; do not reconstruct an
+overwritten summary or fall back to `integration-summary.md` once indexed state exists. Existing
+pre-index runs with no `integration-summaries/index.json` remain packageable from their legacy
+`integration-summary.md`; a missing legacy summary blocks packaging.
 
 Do not merge, tag, publish, or deploy. Verify every applicable Definition-of-Done item or record a
 human-approved waiver with a reason.

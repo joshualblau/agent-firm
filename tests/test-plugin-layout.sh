@@ -384,6 +384,31 @@ for provider, path in sources.items():
         assert phrase in missing, (provider, phrase, missing)
 PY
 
+t_case "Packager compatibility and reviewer raw-retention docs match the lifecycle contract"
+assert_ok "pre-index fallback remains bounded and persistent raw retention stays unsupported" python3 - "$FIRM_ROOT" <<'PY'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+flat=lambda value:' '.join(value.split())
+packager=flat((root/'agent-firm/contracts/roles/packager.md').read_text())
+for phrase in (
+    'once indexed state exists',
+    'pre-index runs with no `integration-summaries/index.json`',
+    'from their legacy `integration-summary.md`',
+    'a missing legacy summary blocks packaging',
+):
+    assert phrase in packager, phrase
+for rel in ('docs/PHASE3.md','docs/ENFORCEMENT.md'):
+    body=flat((root/rel).read_text())
+    for phrase in (
+        'Persistent raw retention is unsupported',
+        'every nonzero `--retain-raw-seconds` request is rejected before provider execution',
+        '.agent-firm/private-reviewer-control/',
+    ):
+        assert phrase in body,(rel,phrase)
+    for forbidden in ('.agent-firm/private-reviewer-raw/','raw retention is opt-in','purges expired records'):
+        assert forbidden not in body,(rel,forbidden)
+PY
+
 t_case "current docs reject readiness, recovery, duplicate, loader, and Final-handoff contradictions"
 assert_ok "reference and historical docs preserve one candidate-readiness story" python3 - "$FIRM_ROOT" <<'PY'
 import pathlib,re,sys

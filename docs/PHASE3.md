@@ -71,10 +71,12 @@ firm-final-qa-check .agent-firm/runs/<run>  # 0 satisfied · 1 blocked · 2 cann
 Both wrappers close stdin, bound and kill whole process trees, and persist phase/result metadata. By
 default they retain only capped redacted diagnostics: authorization headers, cookies, tokens, secrets,
 device/account identifiers, request ids, URLs, JWTs, and email-like identifiers are removed or
-masked. `--retain-raw-seconds N` is an explicit diagnostic opt-in bounded to one hour; it writes
-mode-0600 output under `.agent-firm/private-reviewer-raw/`, outside the transferable run, records an
-expiry, and purges expired records on the next reviewer invocation. GPT uses Codex's read-only sandbox; Claude receives
-only Read/Grep/Glob and is explicitly denied Edit/Write/Bash and network tools. Neither OS ownership
-nor mode bits are represented as a complete sandbox boundary; the provider-native controls and the
-disposable bounded input are the enforcement boundary. The judge cannot execute tests and must
-evaluate evidence captured first in the same pinned toolchain CI uses.
+masked. Persistent raw retention is unsupported: every nonzero `--retain-raw-seconds` request is
+rejected before provider execution. Transient raw bytes exist only below the owned,
+package-excluded `.agent-firm/private-reviewer-control/` attempt tree, which an independent guardian
+removes after normal exit or wrapper death; a cleanup failure creates a mode-0600 marker and makes the
+wrapper BLOCK. GPT uses Codex's read-only sandbox; Claude receives only Read/Grep/Glob and is
+explicitly denied Edit/Write/Bash and network tools. Neither OS ownership nor mode bits are represented
+as a complete sandbox boundary; the provider-native controls and the disposable bounded input are the
+enforcement boundary. The judge cannot execute tests and must evaluate evidence captured first in the
+same pinned toolchain CI uses.

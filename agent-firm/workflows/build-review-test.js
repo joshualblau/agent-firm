@@ -5,6 +5,7 @@
 //   Workflow({ scriptPath: "agent-firm/workflows/build-review-test.js", args: {
 //     run_dir: ".agent-firm/runs/<ts>-<slug>",
 //     track: "full_track",                         // or "fast_path"
+//     integration_stage: "integrate/INT-02",       // sealed stage for this invocation
 //     work_orders: [ { id: "wo1", brief: "..." }, { id: "wo2", brief: "..." } ],
 //     review_lenses: ["correctness","security_privacy","acceptance_fit"],
 //     ci_command: "npm test"                        // the exact command QA must run
@@ -31,9 +32,11 @@ const a = args || {}
 const runDir = a.run_dir || '.agent-firm/runs/current'
 const track = a.track || 'full_track'
 const workOrders = a.work_orders === undefined ? [{ id: 'wo1', brief: 'implement the task' }] : a.work_orders
+const integrationStage = a.integration_stage
 const lenses = (track === 'fast_path') ? ['correctness'] :
   (a.review_lenses === undefined ? ['correctness', 'security_privacy', 'acceptance_fit'] : a.review_lenses)
 const ciCommand = a.ci_command || 'npm test'
+const needIntegrator = Array.isArray(workOrders) && (workOrders.length > 1 || track === 'full_track')
 
 const IMPL_SCHEMA = {
   type: 'object', additionalProperties: false,
@@ -172,6 +175,10 @@ if (!Array.isArray(lenses) || lenses.length === 0) {
     names.add(lens)
   })
 }
+if (needIntegrator && (typeof integrationStage !== 'string' ||
+    !/^integrate\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(integrationStage))) {
+  inputErrors.push('integration_stage: expected sealed integrate/<safe-instance> identifier')
+}
 if (inputErrors.length) return stageBlocked('build_blocked', 'Build', inputErrors)
 
 log(`Building ${workOrders.length} work-order(s) in parallel worktrees...`)
@@ -213,14 +220,13 @@ if (buildErrors.length || built.length !== workOrders.length) {
 
 // ---------- Integrate: single integrator merges worktrees into the integration branch ----------
 let integration = null
-const needIntegrator = built.length > 1 || track === 'full_track'
 if (needIntegrator) {
   phase('Integrate')
   const integrationSettled = await settledAgent(() => agent(
     `You are the Integrator. Run \`firm-integrate\` to merge this run's worktree branches into the integration ` +
     `branch. Resolve any reported conflicts by hand (never drop a change), reconcile lockfiles/migrations/ports/` +
     `fixtures, run the COMBINED test suite, write a summary draft, then publish it with ` +
-    `\`firm-integration-summary --run ${runDir} --stage integrate/INT-01 --source <draft.md>\`. ` +
+    `\`firm-integration-summary --run ${runDir} --stage ${integrationStage} --source <draft.md>\`. ` +
     `Use the returned immutable stage-specific path in every evidence reference; never overwrite the ` +
     `legacy integration-summary.md singleton. ` +
     `Return the exact structured status: green/red/blocked status, branch name, conflicts resolved, ` +

@@ -222,10 +222,11 @@ const source=fs.readFileSync(process.argv[2],'utf8').replaceAll('export const ',
 const implementation=(id,result='green')=>({work_order:id,branch:`wt/${id}`,files_changed:[],tests_added:[],test_result:result,summary:'ok'})
 const integration=(result='green')=>({status:result,branch:'integration/fixture',conflicts_resolved:[],test_result:result,summary:'ok'})
 const review=(lens,verdict='approved')=>({lens,verdict,findings:verdict==='approved'?[]:[{severity:'medium',confidence:'high',location:'x:1',issue:'change',suggested_fix:'fix',status:'open'}]})
-async function run(track,scenario='clean',single=false) {
-  const state={phases:[],build:0,integrate:0,review:0,qa:0}
+async function run(track,scenario='clean',single=false,integrationStage='integrate/INT-02') {
+  const state={phases:[],build:0,integrate:0,integrationPrompts:[],review:0,qa:0}
   const work_orders=single?[{id:'wo1',brief:'fixture'}]:[{id:'wo1',brief:'fixture'},{id:'wo2',brief:'fixture'}]
   const args={run_dir:'.agent-firm/runs/fixture',task_slug:'fixture',track,work_orders,review_lenses:['correctness','security_privacy']}
+  if (integrationStage!==null) args.integration_stage=integrationStage
   if (scenario==='build-empty') args.work_orders=[]
   if (scenario==='review-empty-input') args.review_lenses=[]
   if (scenario==='review-duplicate-input') args.review_lenses=['correctness','correctness']
@@ -251,6 +252,7 @@ async function run(track,scenario='clean',single=false) {
     }
     if (options.agentType==='integrator') {
       state.integrate+=1
+      state.integrationPrompts.push(_prompt)
       if (scenario==='integration-rejected') throw new Error('fixture rejection')
       if (scenario==='integration-null') return null
       if (scenario==='integration-malformed') return {status:'green'}
@@ -290,13 +292,19 @@ async function run(track,scenario='clean',single=false) {
       if (blocked.result.status!=='review_blocked' || blocked.result.failed_stage!=='Review' || blocked.result.qa!==null || blocked.state.qa!==0 || blocked.state.phases.includes('Test')) throw new Error(JSON.stringify({track,scenario,blocked}))
     }
     const clean=await run(track)
-    if (clean.result.status!=='qa_complete' || clean.state.qa!==1 || clean.state.phases.filter(x=>x==='Test').length!==1) throw new Error(JSON.stringify({track,clean}))
+    if (clean.result.status!=='qa_complete' || clean.state.qa!==1 || clean.state.phases.filter(x=>x==='Test').length!==1 || clean.state.integrationPrompts.length!==1 || !clean.state.integrationPrompts[0].includes('--stage integrate/INT-02') || clean.state.integrationPrompts[0].includes('--stage integrate/INT-01')) throw new Error(JSON.stringify({track,clean}))
   }
   for (const scenario of ['review-empty-input','review-duplicate-input']) {
     const blocked=await run('full_track',scenario)
     if (blocked.result.status!=='build_blocked' || blocked.result.qa!==null || blocked.state.build!==0 || blocked.state.qa!==0) throw new Error(JSON.stringify({scenario,blocked}))
   }
-  const fastSingle=await run('fast_path','clean',true)
+  for (const integrationStage of [null,'integrate/../INT-02','integrate/']) {
+    const blocked=await run('full_track','clean',false,integrationStage)
+    if (blocked.result.status!=='build_blocked' || blocked.result.failed_stage!=='Build' || blocked.state.build!==0 || blocked.state.integrate!==0 || blocked.state.qa!==0) throw new Error(JSON.stringify({integrationStage,blocked}))
+  }
+  const customStage=await run('full_track','clean',false,'integrate/cycle-42')
+  if (customStage.result.status!=='qa_complete' || customStage.state.integrationPrompts.length!==1 || !customStage.state.integrationPrompts[0].includes('--stage integrate/cycle-42')) throw new Error(JSON.stringify({customStage}))
+  const fastSingle=await run('fast_path','clean',true,null)
   if (fastSingle.result.status!=='qa_complete' || fastSingle.state.integrate!==0 || fastSingle.state.qa!==1) throw new Error(JSON.stringify({fastSingle}))
   const fullSingle=await run('full_track','clean',true)
   if (fullSingle.result.status!=='qa_complete' || fullSingle.state.integrate!==1 || fullSingle.state.qa!==1) throw new Error(JSON.stringify({fullSingle}))
