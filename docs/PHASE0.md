@@ -2,7 +2,7 @@
 
 > **This is a dated build-journal entry, not reference documentation.** It records what shipped
 > and why, at the time it shipped. For current behavior, read the actual code/docs it describes —
-> `CLAUDE.md`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
+> `agent-firm/contracts/*`, `agent-firm/policy/*`, `bin/firm-*` — not this file. See [docs/README.md](README.md).
 
 Goal: a working, bounded, evidence-producing firm with the core roles — **before** any dynamic staffing
 (Phase 2) or the GPT teammate (Phase 3), so blast radius is small while the lifecycle is proven.
@@ -10,7 +10,7 @@ Goal: a working, bounded, evidence-producing firm with the core roles — **befo
 ## What's built
 - **Core roles** (`agents/`): intake-analyst, architect, implementer, integrator, reviewer,
   qa-tester, packager — each with scoped tools, a model, a mandate, a durable-artifact contract, and
-  role-specific never-rules. The **Lead** is the main session, driven by `CLAUDE.md`.
+  role-specific never-rules. The **Lead** is the main session, driven by the lifecycle contract.
 - **Run ledger** (`firm-new-run`, `firm-ledger-log`, `ledger-hook`): per-run directory with numbered
   artifacts + an append-only `run.jsonl`. This is the source of truth.
 - **Policies** (`agent-firm/policy/`): layered action-scopes, the gate matrix + approval-payload format,

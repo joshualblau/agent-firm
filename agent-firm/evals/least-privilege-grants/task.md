@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). GATED on: the project has a relational DB with role separation
+Operate the firm through the installed provider adapter. GATED on: the project has a relational DB with role separation
 (this fixture does — see `grants.json` and `db/schema.sql`). If a project has no relational DB with
 role separation, this check is not applicable and the firm should mark it so.
 

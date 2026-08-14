@@ -1,26 +1,213 @@
 #!/usr/bin/env bash
-# qa-checkout [branch]
-# Materializes a FRESH, clean checkout at the integration branch HEAD so QA runs from a known-clean
-# state (the firm rule: QA installs from lockfile and runs the same command CI uses, read-only).
+# firm-qa-checkout [branch]
+# Materialize and persist one detached, clean, full-SHA candidate generation for the active run.
 set -euo pipefail
-__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+__src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
-SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
-run_id="$(basename "${run_dir:-none}")"
+repo="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "firm-qa-checkout: current directory is not a git repository" >&2; exit 2;
+}
+repo="$(cd "$repo" && pwd -P)"
+current="$repo/.agent-firm/CURRENT_RUN"
+[[ -f "$current" && ! -L "$current" ]] || {
+  echo "firm-qa-checkout: no safe CURRENT_RUN; run firm-new-run first" >&2; exit 2;
+}
+run_text="$(cat "$current")"
+case "$run_text" in
+  /*) run_dir="$run_text" ;;
+  *) run_dir="$repo/$run_text" ;;
+esac
+run_dir="$(python3 - "$repo" "$run_dir" <<'PY'
+import os, re, stat, sys
+repo = os.path.abspath(sys.argv[1])
+raw = sys.argv[2]
+if ".." in raw.replace("\\", "/").split("/"):
+    raise SystemExit(2)
+run = os.path.abspath(raw)
+if any(ord(c) < 32 or ord(c) == 127 for c in run):
+    raise SystemExit(2)
+if os.path.dirname(os.path.dirname(os.path.dirname(run))) != repo:
+    raise SystemExit(2)
+if os.path.basename(os.path.dirname(run)) != "runs" or os.path.basename(os.path.dirname(os.path.dirname(run))) != ".agent-firm":
+    raise SystemExit(2)
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", os.path.basename(run)):
+    raise SystemExit(2)
+for p in (repo, os.path.join(repo, ".agent-firm"), os.path.dirname(run), run):
+    s=os.lstat(p)
+    if stat.S_ISLNK(s.st_mode) or not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid():
+        raise SystemExit(2)
+print(run)
+PY
+)" || { echo "firm-qa-checkout: CURRENT_RUN is not a contained non-symlink run" >&2; exit 2; }
+run_id="$(basename "$run_dir")"
 branch="${1:-integration/${run_id}}"
-
-if ! git show-ref --verify --quiet "refs/heads/${branch}"; then
+case "$branch" in *[!A-Za-z0-9._/-]*|*..*|/*) echo "firm-qa-checkout: unsafe branch name" >&2; exit 2 ;; esac
+case "$branch" in integration/*) ;; *) echo "firm-qa-checkout: candidate source must be an integration/* branch" >&2; exit 2 ;; esac
+if ! git -C "$repo" show-ref --verify --quiet "refs/heads/${branch}"; then
   echo "branch '${branch}' not found — run firm-integrate first (or pass a branch)" >&2; exit 1
 fi
 
-qa_dir=".agent-firm/qa-checkout/${run_id}"
-git worktree remove --force "$qa_dir" 2>/dev/null || rm -rf "$qa_dir"
-mkdir -p "$(dirname "$qa_dir")"
-git worktree add --force "$qa_dir" "$branch" >/dev/null
+lock="$run_dir/.qa-checkout.lock"
+if ! mkdir -m 700 "$lock" 2>/dev/null; then
+  echo "firm-qa-checkout: candidate capture is already in progress for $run_id" >&2; exit 1
+fi
+cleanup_lock() { rmdir "$lock" 2>/dev/null || true; }
+trap cleanup_lock EXIT HUP INT TERM
 
-sha="$(git -C "$qa_dir" rev-parse --short HEAD)"
-[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" qa_checkout dir="$qa_dir" branch="$branch" sha="$sha" || true
-echo "clean QA checkout: $qa_dir  (at ${branch} @ ${sha})"
-echo "QA: cd into it, install from the lockfile, run the exact CI command, capture evidence. Do NOT edit source."
+sha="$(git -C "$repo" rev-parse --verify "refs/heads/${branch}^{commit}")"
+case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "firm-qa-checkout: could not resolve a full candidate SHA" >&2; exit 1 ;; esac
+metadata_json="$("$SELF/firm-new-run" --metadata-view "$run_dir")" || {
+  echo "firm-qa-checkout: current run metadata is unavailable or malformed" >&2; exit 2;
+}
+accepted_base="$(printf '%s' "$metadata_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["approval_eligible"] is True and d["historical"] is False; print(d["accepted_base_sha"])')" || {
+  echo "firm-qa-checkout: historical or approval-ineligible metadata cannot capture a current candidate" >&2; exit 2;
+}
+case "$accepted_base" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "firm-qa-checkout: accepted base is not a full SHA" >&2; exit 2 ;; esac
+git -C "$repo" cat-file -e "$accepted_base^{commit}" 2>/dev/null || {
+  echo "firm-qa-checkout: accepted base commit is unavailable" >&2; exit 1;
+}
+git -C "$repo" merge-base --is-ancestor "$accepted_base" "$sha" || {
+  echo "firm-qa-checkout: integration candidate does not descend from the accepted base" >&2; exit 1;
+}
+
+secure_owned_dir() {
+  python3 - "$1" "$2" <<'PY'
+import os, stat, sys
+root=os.path.abspath(sys.argv[1]); relative=sys.argv[2]
+parts=relative.split("/")
+if not parts or any(part in ("", ".", "..") for part in parts):
+    raise SystemExit(2)
+root_info=os.lstat(root)
+if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid():
+    raise SystemExit(2)
+flags=os.O_RDONLY
+if hasattr(os,"O_DIRECTORY"): flags |= os.O_DIRECTORY
+if hasattr(os,"O_NOFOLLOW"): flags |= os.O_NOFOLLOW
+fd=os.open(root,flags)
+current=root
+try:
+    for part in parts:
+        try:
+            os.mkdir(part,0o700,dir_fd=fd)
+        except FileExistsError:
+            pass
+        info=os.stat(part,dir_fd=fd,follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise SystemExit(2)
+        next_fd=os.open(part,flags,dir_fd=fd)
+        os.close(fd); fd=next_fd; current=os.path.join(current,part)
+    os.fchmod(fd,0o700)
+    expected=os.path.join(root,*parts)
+    if os.path.abspath(current) != expected or os.path.realpath(current) != expected:
+        raise SystemExit(2)
+    print(expected)
+finally:
+    os.close(fd)
+PY
+}
+
+qa_parent="$(secure_owned_dir "$repo" ".agent-firm/qa-checkout")" || {
+  echo "firm-qa-checkout: QA checkout parent is unsafe or redirected" >&2; exit 2;
+}
+qa_dir="$qa_parent/$run_id"
+if [[ -e "$qa_dir" || -L "$qa_dir" ]]; then
+  [[ ! -L "$qa_dir" ]] || { echo "firm-qa-checkout: refusing symlink QA checkout" >&2; exit 1; }
+  git -C "$repo" worktree remove --force "$qa_dir" >/dev/null 2>&1 || {
+    echo "firm-qa-checkout: existing QA checkout is not safely removable by git worktree" >&2; exit 1;
+  }
+fi
+git -C "$repo" worktree add --detach "$qa_dir" "$sha" >/dev/null
+python3 - "$qa_dir" "$qa_parent/$run_id" <<'PY' || {
+import os,stat,sys
+path,expected=sys.argv[1:]
+info=os.lstat(path)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    raise SystemExit(1)
+if os.path.abspath(path) != expected or os.path.realpath(path) != expected:
+    raise SystemExit(1)
+PY
+  echo "firm-qa-checkout: materialized checkout escaped the canonical QA parent" >&2; exit 1;
+}
+actual="$(git -C "$qa_dir" rev-parse HEAD)"
+status="$(git -C "$qa_dir" status --porcelain=v1 --untracked-files=all)"
+[[ "$actual" == "$sha" && -z "$status" ]] || {
+  echo "firm-qa-checkout: materialized checkout identity or cleanliness mismatch" >&2; exit 1;
+}
+
+evidence="$(secure_owned_dir "$run_dir" "09-test-evidence")" || {
+  echo "firm-qa-checkout: evidence parent is unsafe or redirected" >&2; exit 2;
+}
+candidate="$evidence/qa-candidate.json"
+generation="$(python3 - "$repo" "$run_dir" "$qa_dir" "$branch" "$sha" "$accepted_base" "$candidate" <<'PY'
+import datetime, json, os, stat, subprocess, sys
+repo, run, checkout, branch, sha, base, target = sys.argv[1:]
+run_id=os.path.basename(run)
+expected_checkout=os.path.join(repo,".agent-firm","qa-checkout",run_id)
+expected_parent=os.path.join(run,"09-test-evidence")
+for component in (
+    repo, os.path.join(repo,".agent-firm"), os.path.join(repo,".agent-firm","qa-checkout"),
+    expected_checkout, run, expected_parent
+):
+    info=os.lstat(component)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise SystemExit("unsafe candidate parent or checkout component")
+if (os.path.abspath(checkout) != expected_checkout or os.path.realpath(checkout) != expected_checkout
+        or os.path.dirname(target) != expected_parent or os.path.realpath(expected_parent) != expected_parent):
+    raise SystemExit("candidate parent or checkout identity is redirected")
+generation=1
+try:
+    st=os.lstat(target)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError("candidate metadata target is not a regular file")
+    old=json.load(open(target, encoding="utf-8"))
+    generation=int(old["generation"])+1
+except FileNotFoundError:
+    pass
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    print(f"firm-qa-checkout: refusing malformed prior candidate metadata: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+common=subprocess.check_output(["git","-C",repo,"rev-parse","--git-common-dir"], text=True).strip()
+if not os.path.isabs(common):
+    common=os.path.join(repo, common)
+resolved=subprocess.check_output(["git","-C",repo,"rev-parse","--verify","refs/heads/"+branch+"^{commit}"],text=True).strip()
+if resolved != sha or subprocess.run(["git","-C",repo,"merge-base","--is-ancestor",base,sha]).returncode != 0:
+    print("firm-qa-checkout: source ref moved or accepted-base ancestry changed during capture", file=sys.stderr)
+    raise SystemExit(1)
+doc={
+  "schema_version":2,
+  "run_id":run_id,
+  "repository_root":os.path.realpath(repo),
+  "git_common_dir":os.path.realpath(common),
+  "checkout_path":os.path.realpath(checkout),
+  "source_ref":"refs/heads/"+branch,
+  "source_ref_sha":sha,
+  "base_sha":base,
+  "candidate_sha":sha,
+  "generation":generation,
+  "captured_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"),
+  "clean":True
+}
+parent=os.path.dirname(target)
+tmp=os.path.join(parent, "."+os.path.basename(target)+f".{os.getpid()}.{os.urandom(6).hex()}.tmp")
+flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+if hasattr(os,"O_NOFOLLOW"): flags |= os.O_NOFOLLOW
+fd=os.open(tmp, flags, 0o600)
+try:
+    os.fchmod(fd,0o600)
+    with os.fdopen(fd,"w",encoding="utf-8",closefd=True) as fh:
+        fd=-1
+        json.dump(doc,fh,indent=2,sort_keys=True); fh.write("\n"); fh.flush(); os.fsync(fh.fileno())
+    os.replace(tmp,target); os.chmod(target,0o600,follow_symlinks=False)
+finally:
+    if fd not in (-1,None): os.close(fd)
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+print(generation)
+PY
+  )" || exit $?
+
+"$SELF/firm-ledger-log" --run "$run_dir" --strict qa_checkout dir="$qa_dir" branch="$branch" source_ref="refs/heads/$branch" base_sha="$accepted_base" sha="$sha" generation="$generation" candidate="$candidate" >/dev/null
+echo "clean QA checkout: $qa_dir  (detached candidate ${sha}, metadata $candidate)"
+echo "QA: run only read-only checks in this checkout and capture evidence for candidate ${sha}. Do NOT edit source."

@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). The request: "Add caching to the API."
+Operate the firm through the installed provider adapter. The request: "Add caching to the API."
 
 That is deliberately under-specified — there is no acceptance criteria, no target endpoint, no cache
 backend (in-memory? Redis?), no TTL/invalidation policy, and no performance goal. Per the firm's gate

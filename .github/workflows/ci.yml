@@ -1,18 +1,25 @@
 name: ci
 
-# The firm's first CI. Deliberately narrow: bash syntax across bin/, the tests/ suite on both bash 3.2
-# (macOS's permanent default — this repo's own scripts hold themselves to it) and a modern bash, and
-# firm-run-evals --structural (structure only — no `claude` login, no spend). Model-driven eval
-# execution (`firm-run-evals` without --structural, `firm-gpt-qa`, live `firm-doctor --probe`) stays
-# manual: those need a real login and real budget, which CI does not have.
+# Hosted runners are outside the exact P2 ledger-write row. They run every suite that is meaningful
+# on an unsupported host, including a real-host assertion that writes fail closed before mutation.
+# The complete write-path suite is a manual dispatch to a deliberately labelled exact-P2 self-hosted
+# runner; pull-request code can never schedule that trusted runner. Structural eval mode remains
+# provider-neutral and offline — no login and no spend.
 #
-# The suite is NOT dependency-free: the scripts under test and several tests themselves shell out to
-# python3, `test-validate-verdict` needs `jsonschema`, and `test-policy-yaml-valid` needs `pyyaml`.
-# Both are installed, at pinned versions, in the step below.
+# The suite is NOT dependency-free: the scripts and tests shell out to python3 and Node;
+# `test-validate-verdict` needs `jsonschema`, and `test-policy-yaml-valid` needs `pyyaml`. Hosted
+# runners provide Node; the exact-P2 runner is explicitly checked. Python packages are pinned below.
 
 "on":
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_exact_p2:
+        description: Run the full suite on a trusted exact-P2 self-hosted runner
+        required: true
+        default: false
+        type: boolean
 
 # Least privilege for GITHUB_TOKEN. Declared explicitly because an absent `permissions:` key silently
 # inherits the REPOSITORY default, which may be read/write. Nothing here writes to the repo, posts a
@@ -37,10 +44,11 @@ jobs:
             echo "checking $f"
             bash -n "$f"
           done
+      - name: provider manifest base versions agree
+        run: bin/firm-version --check
 
-  # Two OSes on purpose: ubuntu-latest carries a modern bash, macos-latest is invoked via /bin/bash
-  # specifically to exercise the 3.2.x the scripts claim to support (macOS ships an ancient bash for
-  # licensing reasons and always will — Homebrew's newer bash on the PATH would defeat the point).
+  # Two hosted OSes on purpose: Ubuntu supplies modern Bash/GNU userland and macOS supplies Bash 3.2/
+  # BSD userland. Neither claims successful ledger mutation: their OS/Python rows are unsupported.
   test:
     needs: syntax
     strategy:
@@ -63,9 +71,53 @@ jobs:
       # ubuntu-x86_64 and macos-arm64 runners, so no build toolchain is needed.
       - name: install the declared prerequisites (pinned)
         run: python -m pip install jsonschema==4.26.0 pyyaml==6.0.3
-      - name: run the suite (default bash)
+      - name: run unsupported-P2 suite (modern Bash and GNU userland)
+        if: runner.os == 'Linux'
+        run: bash tests/run-tests.sh --unsupported-p2
+      - name: run unsupported-P2 suite (macOS Bash 3.2 and BSD userland)
+        if: runner.os == 'macOS'
+        run: /bin/bash tests/run-tests.sh --unsupported-p2
+      - name: firm-run-evals --structural (provider-neutral; no login, no spend)
+        run: bin/firm-run-evals --structural
+
+  # Manual-only by construction: untrusted pull-request code must never reach a self-hosted runner.
+  # Provision the runner with the default labels plus the custom `agent-firm-p2` label. The explicit
+  # probe below prevents a stale/mislabelled machine from silently weakening what this job proves.
+  exact-p2:
+    name: exact P2 full write-path suite
+    if: github.event_name == 'workflow_dispatch' && inputs.run_exact_p2
+    needs: syntax
+    runs-on: [self-hosted, macOS, ARM64, agent-firm-p2]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: create an isolated environment from the runner's P2 Python
+        run: |
+          p2_venv="$RUNNER_TEMP/agent-firm-p2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 -m venv "$p2_venv"
+          "$p2_venv/bin/python" -m pip install jsonschema==4.26.0 pyyaml==6.0.3
+          printf '%s\n' "$p2_venv/bin" >> "$GITHUB_PATH"
+      - name: verify the exact P2 process row
+        run: |
+          command -v node >/dev/null
+          python3 - <<'PY'
+          import platform, sys
+          actual = (
+              platform.system(), platform.mac_ver()[0], platform.release(),
+              platform.machine(), tuple(sys.version_info[:3]), sys.implementation.name,
+          )
+          expected = ("Darwin", "26.5.1", "25.5.0", "arm64", (3, 9, 6), "cpython")
+          if actual != expected:
+              raise SystemExit(f"exact P2 runner mismatch: expected {expected!r}, got {actual!r}")
+          PY
+      - name: git identity for scratch-repo fixtures
+        run: |
+          git config --global user.email ci@agent-firm.local
+          git config --global user.name "agent-firm CI"
+          git config --global init.defaultBranch main
+      - name: run the full suite (default bash)
         run: bash tests/run-tests.sh
-      - name: run the suite (bash 3.2 compatibility — /bin/bash specifically)
+      - name: run the full suite (macOS Bash 3.2)
         run: /bin/bash tests/run-tests.sh
-      - name: firm-run-evals --structural (structure only — no claude login, no spend)
+      - name: firm-run-evals --structural (provider-neutral; no login, no spend)
         run: bin/firm-run-evals --structural

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# traceability-check [run_dir]
+# firm-traceability-check [run_dir] [verdict_path]
 # Cross-references acceptance criteria (01-acceptance-criteria.yaml) against the QA verdict's
 # acceptance_criteria_coverage (08-qa-verdict.json). Defaults to the active run
 # (.agent-firm/CURRENT_RUN).
@@ -106,11 +106,358 @@
 # below, and the assertion in tests/test-traceability-check.sh that keeps it that way.
 set -euo pipefail
 
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+strict=0
+if [[ "${1:-}" == "--strict" ]]; then strict=1; shift; fi
 run_dir="${1:-}"
+verdict_path="${2:-}"
 if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent-firm/CURRENT_RUN)"; fi
 if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
+if [[ -f "$run_dir/09-test-evidence/qa-candidate.json" ]]; then strict=1; fi
 
-python3 - "$run_dir" <<'PY'
+if [[ $strict -eq 1 ]]; then
+python3 - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$SELF/firm-new-run" <<'PY'
+import collections
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+run = Path(os.path.abspath(sys.argv[1]))
+verdict_path = Path(sys.argv[2]) if sys.argv[2] else run / "08-qa-verdict.json"
+schema_path = Path(sys.argv[3])
+policy_path = Path(sys.argv[4])
+metadata_reader = Path(sys.argv[5])
+
+def cannot(message):
+    print(f"TRACEABILITY: CANNOT VERIFY -- {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def inadequate(message):
+    print(f"TRACEABILITY: FAIL -- {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    import yaml
+    import jsonschema
+except BaseException as exc:
+    cannot(f"strict validation prerequisites unavailable or broken: {type(exc).__name__}: {exc}")
+
+def load_yaml(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = yaml.safe_load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+    return value
+
+def load_json(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+
+def safe_file(relative, label):
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        cannot(f"{label} must be a non-empty run-relative path")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in relative):
+        cannot(f"{label} contains a control character")
+    parts = Path(relative).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        cannot(f"{label} contains traversal or an empty component")
+    current = run
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            cannot(f"{label} does not exist inside this run: {relative}: {exc}")
+        if stat.S_ISLNK(info.st_mode):
+            cannot(f"{label} contains a symlinked component: {relative}")
+    if not stat.S_ISREG(os.lstat(current).st_mode):
+        cannot(f"{label} is not a regular file: {relative}")
+    if os.path.commonpath((str(run), str(current))) != str(run):
+        cannot(f"{label} escapes the run")
+    return current
+
+def utc(value):
+    if isinstance(value, datetime.datetime):
+        return value.tzinfo is not None and value.utcoffset() == datetime.timedelta(0) and value.microsecond == 0
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return True
+    except ValueError:
+        return False
+
+candidate_path = run / "09-test-evidence" / "qa-candidate.json"
+trace_path = run / "traceability.yaml"
+criteria_path = run / "01-acceptance-criteria.yaml"
+evidence_parent = run / "09-test-evidence"
+try:
+    evidence_info = os.lstat(evidence_parent)
+    if (stat.S_ISLNK(evidence_info.st_mode) or not stat.S_ISDIR(evidence_info.st_mode)
+            or evidence_info.st_uid != os.getuid()
+            or os.path.realpath(evidence_parent) != os.path.join(os.path.realpath(run),"09-test-evidence")):
+        cannot("candidate evidence parent is unsafe or redirected")
+except OSError as exc:
+    cannot(f"candidate evidence parent is missing or unsafe: {exc}")
+for path, label in ((candidate_path, "candidate metadata"), (trace_path, "traceability matrix"), (criteria_path, "acceptance criteria"), (verdict_path, "QA verdict")):
+    if not path.is_file() or path.is_symlink():
+        cannot(f"missing or unsafe {label}: {path}")
+
+candidate = load_json(candidate_path, "candidate metadata")
+trace = load_yaml(trace_path, "traceability matrix")
+criteria_doc = load_yaml(criteria_path, "acceptance criteria")
+verdict = load_json(verdict_path, "QA verdict")
+schema = load_json(schema_path, "traceability schema")
+policy = load_yaml(policy_path, "high-risk path policy")
+try:
+    jsonschema.validate(trace, schema)
+except Exception as exc:
+    cannot(f"traceability schema validation failed: {exc}")
+
+sha = candidate.get("candidate_sha")
+generation = candidate.get("generation")
+run_id = run.name
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    cannot("candidate metadata needs one full 40-character candidate_sha")
+if not isinstance(candidate.get("base_sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", candidate["base_sha"]):
+    cannot("candidate metadata needs one full 40-character base_sha")
+if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+    cannot("candidate generation must be a positive integer")
+if candidate.get("schema_version") != 2 or candidate.get("run_id") != run_id or candidate.get("clean") is not True:
+    cannot("candidate metadata run identity or clean flag is invalid")
+
+repo = os.path.realpath(str(candidate.get("repository_root", "")))
+checkout = os.path.realpath(str(candidate.get("checkout_path", "")))
+if not repo or not checkout or os.path.islink(candidate.get("checkout_path", "")):
+    cannot("candidate repository/checkout identity is absent or symlinked")
+expected_run = os.path.join(repo, ".agent-firm", "runs", run_id)
+expected_checkout = os.path.join(repo, ".agent-firm", "qa-checkout", run_id)
+if os.path.realpath(run) != os.path.realpath(expected_run):
+    cannot("run is not the candidate repository's canonical run directory")
+try:
+    for component in (
+        repo, os.path.join(repo, ".agent-firm"), os.path.join(repo, ".agent-firm", "runs"), str(run),
+        os.path.join(repo, ".agent-firm", "qa-checkout"), expected_checkout, str(evidence_parent)
+    ):
+        info = os.lstat(component)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            cannot(f"canonical run component is unsafe: {component}")
+    if (os.path.abspath(str(candidate.get("checkout_path", ""))) != expected_checkout
+            or checkout != expected_checkout):
+        cannot("candidate checkout is not the exact canonical QA path")
+    actual_sha = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+    status = subprocess.check_output(["git", "-C", checkout, "status", "--porcelain=v1", "--untracked-files=all"], stderr=subprocess.DEVNULL, text=True)
+    actual_root = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True).strip()
+    common = subprocess.check_output(["git", "-C", checkout, "rev-parse", "--git-common-dir"], stderr=subprocess.DEVNULL, text=True).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(checkout, common)
+    source_ref = candidate.get("source_ref")
+    if not isinstance(source_ref, str) or not re.fullmatch(r"refs/heads/integration/[A-Za-z0-9._/-]+", source_ref):
+        cannot("candidate source_ref is not refs/heads/integration/*")
+    source_sha = subprocess.check_output(["git", "-C", repo, "rev-parse", "--verify", source_ref + "^{commit}"], stderr=subprocess.DEVNULL, text=True).strip()
+    ancestry = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", candidate["base_sha"], sha], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+except subprocess.SubprocessError as exc:
+    cannot(f"candidate checkout cannot be verified: {exc}")
+if actual_sha != sha or status or os.path.realpath(actual_root) != checkout:
+    inadequate("candidate checkout is moved, amended, mismatched, or dirty")
+if os.path.realpath(common) != os.path.realpath(str(candidate.get("git_common_dir", ""))):
+    inadequate("candidate checkout repository identity changed")
+if source_sha != sha or candidate.get("source_ref_sha") != sha or ancestry != 0:
+    inadequate("candidate integration ref or accepted-base ancestry changed")
+try:
+    metadata_done = subprocess.run([str(metadata_reader), "--metadata-view", str(run)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    metadata = json.loads(metadata_done.stdout) if metadata_done.returncode == 0 else None
+except Exception:
+    metadata = None
+if not isinstance(metadata, dict) or metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+    cannot("current approval-eligible run metadata is required")
+if metadata.get("accepted_base_sha") != candidate.get("base_sha") or os.path.realpath(str(metadata.get("git_common_dir", ""))) != os.path.realpath(common):
+    inadequate("run metadata accepted-base/common-dir identity differs from candidate")
+
+tc = trace.get("candidate", {})
+expected_trace_candidate = {key:candidate.get(key) for key in (
+    "run_id", "repository_root", "git_common_dir", "checkout_path", "source_ref", "source_ref_sha", "base_sha"
+)}
+expected_trace_candidate.update({"commit_sha":sha, "generation":generation})
+if tc != expected_trace_candidate:
+    inadequate("traceability candidate identity does not exactly match qa-candidate.json")
+
+if not isinstance(criteria_doc, dict) or not isinstance(criteria_doc.get("criteria"), list) or not criteria_doc["criteria"]:
+    cannot("acceptance criteria must be a non-empty list")
+criteria = criteria_doc["criteria"]
+ids = []
+for item in criteria:
+    if not isinstance(item, dict) or not re.fullmatch(r"AC-[0-9]{3}", str(item.get("id", ""))):
+        cannot("every accepted criterion needs a canonical AC-NNN id")
+    ids.append(item["id"])
+if len(ids) != len(set(ids)):
+    cannot("accepted criteria contain duplicate ids")
+rows = trace["matrix"]
+row_ids = [row["id"] for row in rows]
+if collections.Counter(row_ids) != collections.Counter(ids) or len(row_ids) != len(ids):
+    inadequate("matrix must contain exactly one row for every accepted criterion and no phantom id")
+
+try:
+    with open(run / "run.jsonl", encoding="utf-8") as fh:
+        ledger = [json.loads(line) for line in fh if line.strip()]
+    if not all(isinstance(item, dict) for item in ledger):
+        raise ValueError("non-object ledger record")
+except Exception as exc:
+    cannot(f"target ledger is malformed: {exc}")
+
+def evidence_ref(ref, label):
+    if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
+        inadequate(f"{label} is stale or bound to a different candidate")
+    path = safe_file(ref.get("path"), label)
+    raw = path.read_bytes()
+    if ref.get("sha256") != hashlib.sha256(raw).hexdigest() or ref.get("bytes") != len(raw):
+        inadequate(f"{label} digest or byte size changed")
+    producer = ref.get("producer")
+    if not isinstance(producer, dict):
+        inadequate(f"{label} lacks an exact producer")
+    matches = [event for event in ledger if event.get("event_id") == producer.get("event_id")]
+    if len(matches) != 1 or matches[0].get("event") != producer.get("event"):
+        inadequate(f"{label} producer event is missing or duplicated")
+    event = matches[0]
+    origin = ref.get("path")
+    if event.get("sha") != sha or str(event.get("generation")) != str(generation) or origin not in (event.get("path"), event.get("verdict"), event.get("attempt")):
+        inadequate(f"{label} producer is bound to another candidate or artifact")
+    digest_field = "verdict_sha256" if origin == event.get("verdict") else "sha256"
+    bytes_field = "verdict_bytes" if origin == event.get("verdict") else "bytes"
+    if event.get(digest_field) != ref.get("sha256") or str(event.get(bytes_field)) != str(ref.get("bytes")):
+        inadequate(f"{label} producer digest/size does not match")
+    for field in ("provider", "generation", "attempt_id"):
+        if field in producer and str(event.get(field)) != str(producer[field]):
+            inadequate(f"{label} producer {field} does not match")
+    return path
+
+for row in rows:
+    for index, ref in enumerate(row["evidence"]):
+        evidence_ref(ref, f"{row['id']} evidence #{index + 1}")
+    if row["status"] in ("partial", "uncovered"):
+        gate = row.get("gate_record") or {}
+        expected = "waive_partial" if row["status"] == "partial" else "waive_uncovered"
+        if gate.get("decision") != expected:
+            inadequate(f"{row['id']} has no exact policy-authorized {expected} decision")
+        record_path = evidence_ref(gate, f"{row['id']} gate record")
+        record = load_yaml(record_path, f"{row['id']} gate record")
+        required = {
+            "schema_version": 1, "type": "criterion_gate", "run_id": run_id,
+            "candidate_sha": sha, "criterion_id": row["id"], "decision": expected
+        }
+        if not isinstance(record, dict) or any(record.get(k) != v for k, v in required.items()):
+            inadequate(f"{row['id']} gate record does not match this run/candidate/decision")
+        if not str(record.get("actor", "")).strip() or not utc(record.get("occurred_at")):
+            inadequate(f"{row['id']} gate record lacks actor or exact UTC time")
+        if not isinstance(record.get("objections"), list) or not record["objections"]:
+            inadequate(f"{row['id']} gate record lacks affected objections")
+        if not isinstance(record.get("evidence"), list) or not record["evidence"]:
+            inadequate(f"{row['id']} gate record lacks evidence")
+
+coverage = verdict.get("acceptance_criteria_coverage")
+if not isinstance(coverage, list):
+    cannot("verdict coverage is not a list")
+coverage_ids = [item.get("id") for item in coverage if isinstance(item, dict)]
+if len(coverage_ids) != len(coverage) or collections.Counter(coverage_ids) != collections.Counter(ids) or len(coverage_ids) != len(ids):
+    inadequate("verdict coverage must contain exactly one entry per accepted criterion and no phantom id")
+expected_status = {"yes": "covered", "partial": "partial", "no": "uncovered"}
+row_by_id = {row["id"]: row for row in rows}
+for item in coverage:
+    covered = item.get("covered")
+    if covered not in expected_status or row_by_id[item["id"]]["status"] != expected_status[covered]:
+        inadequate(f"verdict and matrix status disagree for {item['id']}")
+    if not isinstance(item.get("evidence"), str) or not item["evidence"].strip():
+        inadequate(f"verdict coverage lacks evidence for {item['id']}")
+if verdict.get("commit_sha") != sha or verdict.get("run_id") != run_id or verdict.get("generation") != generation:
+    inadequate("verdict is abbreviated, stale, or not bound to this candidate generation")
+if verdict.get("provider") != "primary" or not isinstance(verdict.get("attempt_id"), str) or not verdict["attempt_id"]:
+    inadequate("primary verdict provider/attempt identity is not exact")
+
+try:
+    jsonschema.validate(policy, {"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/highRiskPolicy","$defs":schema["$defs"]})
+except Exception as exc:
+    cannot(f"high-risk policy schema validation failed: {exc}")
+criterion_types = {item["id"]:item.get("type") for item in criteria}
+changed_paths = set(subprocess.check_output(
+    ["git", "-C", repo, "diff", "--name-only", "--no-renames", candidate["base_sha"], sha, "--"],
+    stderr=subprocess.DEVNULL, text=True
+).splitlines())
+def risk_for(entry):
+    affected_criteria = entry.get("affected_criteria")
+    affected_paths = entry.get("affected_paths")
+    reasons = []
+    high = False
+    if not affected_criteria and not affected_paths:
+        return "high", ["ambiguity:no-mapped-criterion-or-path"]
+    for criterion_id in affected_criteria:
+        if criterion_id not in criterion_types:
+            return "high", [f"ambiguity:unknown-criterion:{criterion_id}"]
+        criterion_type = str(criterion_types[criterion_id])
+        reasons.append(f"criterion:{criterion_id}:{criterion_type}")
+        if criterion_type == "security_privacy":
+            high = True
+    for path in affected_paths:
+        if path not in changed_paths:
+            reasons.append(f"ambiguity:unchanged-path:{path}")
+            high = True
+            continue
+        matches=[]
+        for category, patterns in policy["categories"].items():
+            for pattern in patterns:
+                if fnmatch.fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])):
+                    matches.append(f"path:{path}:{category}:{pattern}")
+        if matches:
+            reasons.extend(sorted(matches)); high=True
+        else:
+            reasons.append(f"path:{path}:benign")
+    return ("high" if high else "low"), sorted(set(reasons))
+for index, entry in enumerate(trace.get("two_voice_diff", []), 1):
+    if isinstance(entry.get("blocked_secondary_verdict"),dict):
+        producer_path=evidence_ref(entry["blocked_secondary_verdict"],f"two_voice_diff #{index} archived producer verdict")
+    else:
+        secondary_provider=trace.get("two_voice",{}).get("secondary_provider")
+        producer_path=safe_file(f"08-qa-verdict.{secondary_provider}.json",f"two_voice_diff #{index} current producer verdict")
+    producer=load_json(producer_path,f"two_voice_diff #{index} producer verdict")
+    if producer.get("verdict")!="BLOCK" or producer.get("commit_sha")!=sha or producer.get("run_id")!=run_id or producer.get("generation")!=generation:
+        inadequate(f"two_voice_diff #{index} producer verdict is not a current-candidate BLOCK")
+    objects=producer.get("blocker_objects")
+    texts=producer.get("blockers")
+    if not isinstance(objects,list) or not objects or not isinstance(texts,list) or [item.get("text") for item in objects if isinstance(item,dict)]!=texts:
+        inadequate(f"two_voice_diff #{index} producer verdict lacks exact blocker objects")
+    by_id={item.get("id"):item for item in objects if isinstance(item,dict)}
+    if len(by_id)!=len(objects):
+        inadequate(f"two_voice_diff #{index} producer objection ids are missing or duplicated")
+    objection=by_id.get(entry.get("secondary_blocker_id"))
+    if objection is None:
+        inadequate(f"two_voice_diff #{index} does not name a producer objection id")
+    if (entry.get("secondary_blocker")!=objection.get("text")
+            or entry.get("affected_criteria")!=objection.get("affected_criteria")
+            or entry.get("affected_paths")!=objection.get("affected_paths")):
+        inadequate(f"two_voice_diff #{index} contradicts its producer objection")
+    derived_risk, derived_reasons = risk_for(objection)
+    if entry.get("risk") != derived_risk or sorted(entry.get("risk_reasons") or []) != derived_reasons:
+        inadequate(f"two_voice_diff #{index} risk/reasons do not match producer-bound mechanical derivation")
+print(f"STRICT TRACEABILITY: PASS -- {len(ids)} exact candidate-bound matrix rows")
+PY
+strict_rc=$?
+[[ $strict_rc -eq 0 ]] || exit "$strict_rc"
+fi
+
+python3 - "$run_dir" "$verdict_path" <<'PY'
 import json, re, sys, os, traceback, importlib.util
 
 # --- exit-code contract (spelled out in the shell header above) -------------
@@ -248,7 +595,7 @@ def read_text(path):
 
 run = sys.argv[1]
 ac_path = os.path.join(run, "01-acceptance-criteria.yaml")
-v_path  = os.path.join(run, "08-qa-verdict.json")
+v_path  = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.path.join(run, "08-qa-verdict.json")
 # A missing input is a CANNOT EVALUATE, and always was exit 2 -- which is now the one code for that
 # whole class rather than a separate "missing inputs" meaning.
 if not os.path.exists(ac_path):

@@ -26,7 +26,8 @@ set -uo pipefail
 GUARD="$BIN/firm-merge-guard"
 POLICY="$FIRM_ROOT/agent-firm/policy/merge-authority.yaml"
 SETTINGS="$FIRM_ROOT/.claude/settings.json"
-PLUGIN_HOOKS="$FIRM_ROOT/hooks/hooks.json"
+CODEX_HOOKS="$FIRM_ROOT/hooks/hooks.json"
+CLAUDE_HOOKS="$FIRM_ROOT/hooks/claude.json"
 
 # A PATH with a real python3 (WITH its site-packages, so pyyaml imports) and a real git, but NO gh.
 # Note: symlinking python3 into a scratch dir would break its site-packages and silently turn a
@@ -884,7 +885,7 @@ t_case "AC-015/SEC-06/SEC-19 the WHOLE hook budget — PARSE and waits — fits 
 # budget nobody drives is just a number, the two assertions after the arithmetic MEASURE it: one
 # runs a worst-case-shaped fixture AT MAX_COMMAND_BYTES through the real script, the other runs the
 # original SEC-19 reproducer, and both must finish inside PARSE_BUDGET.
-assert_ok "PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= the timeout in BOTH registrations" python3 -c "
+assert_ok "PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + margin <= each provider plugin timeout" python3 -c "
 import json, re
 src = open('$GUARD').read()
 m = re.search(r'^GH_TIMEOUT, GIT_TIMEOUT, KILL_GRACE = (\d+), (\d+), (\d+)\$', src, re.M)
@@ -900,7 +901,7 @@ parse = int(mp.group(1))
 assert parse > 0, 'PARSE_BUDGET is zero, so the parse phase is not really in the budget'
 budget = parse + gh + gt + 2 * grace + int(mm.group(1))
 found = []
-for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
+for path in ('$CLAUDE_HOOKS', '$CODEX_HOOKS'):
     d = json.load(open(path))
     for entry in d['hooks']['PreToolUse']:
         for h in entry['hooks']:
@@ -910,7 +911,7 @@ for path in ('$SETTINGS', '$PLUGIN_HOOKS'):
                 found.append((path.rsplit('/', 1)[-1], t))
                 assert budget <= t, (f'{path}: worst case {parse}+{gh}+{gt}+2*{grace}+{mm.group(1)}'
                                      f'={budget}s does not fit under the registered {t}s hook timeout')
-assert len(found) == 2, f'expected the guard in BOTH registrations, found {found}'
+assert len(found) == 2, f'expected exactly one Claude-plugin and one Codex-plugin registration, found {found}'
 print('ok', found, 'budget', budget)
 "
 assert_ok "the KILL_GRACE constant is the one actually used to reap a hung child" python3 -c "
@@ -1236,7 +1237,7 @@ assert_ok "settings.json and hooks.json contain no allowlist data" python3 -c "
 import yaml
 d = yaml.safe_load(open('$POLICY'))
 vals = [v for a in d['allowed'] for v in ([a['gh_login']] + list(a['git_emails']))]
-for f in ('$SETTINGS', '$PLUGIN_HOOKS'):
+for f in ('$SETTINGS', '$CLAUDE_HOOKS', '$CODEX_HOOKS'):
     text = open(f).read()
     bad = [v for v in vals if v in text]
     assert not bad, f'{f} duplicates allowlist data: {bad}'
@@ -1822,22 +1823,16 @@ assert_ok "a failure in the LEDGER path cannot fail a tool call (garbage stdin)"
 assert_ok "  (no active run at all)" \
   sh -c "cd '$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-norun.XXXXXX")' && printf '{}' | '$BIN/firm-ledger-hook'"
 
-t_case "AC-023 BOTH hook surfaces are wired, ledger FIRST, guard added not substituted"
-assert_ok "settings.json (project mode) keeps the ledger hook and adds the guard" python3 -c "
+t_case "plugin manifest commands keep ledger FIRST and one guard command per manifest"
+assert_ok "tracked settings owns permissions only and cannot duplicate the Claude plugin hooks" python3 -c "
 import json
 d = json.load(open('$SETTINGS'))
-pre = d['hooks']['PreToolUse']
-bash = [e for e in pre if e.get('matcher') == 'Bash']
-assert len(bash) == 1, pre
-cmds = [h['command'] for h in bash[0]['hooks']]
-assert len(cmds) == 2, cmds
-assert 'firm-ledger-hook' in cmds[0], cmds
-assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
-assert 'CLAUDE_PROJECT_DIR' in cmds[1], cmds
+assert 'permissions' in d
+assert 'hooks' not in d, d
 "
-assert_ok "hooks.json (plugin mode) keeps the ledger hook and adds the guard" python3 -c "
+assert_ok "Claude plugin hook keeps the ledger hook and adds the guard" python3 -c "
 import json
-d = json.load(open('$PLUGIN_HOOKS'))
+d = json.load(open('$CLAUDE_HOOKS'))
 bash = [e for e in d['hooks']['PreToolUse'] if e.get('matcher') == 'Bash']
 assert len(bash) == 1, d
 cmds = [h['command'] for h in bash[0]['hooks']]
@@ -1846,12 +1841,147 @@ assert 'firm-ledger-hook' in cmds[0], cmds
 assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
 assert 'CLAUDE_PLUGIN_ROOT' in cmds[1], cmds
 "
-assert_ok "the Notification hook is untouched" python3 -c "
+assert_ok "the Claude Notification hook is preserved" python3 -c "
 import json
-d = json.load(open('$PLUGIN_HOOKS'))
+d = json.load(open('$CLAUDE_HOOKS'))
 n = d['hooks']['Notification'][0]['hooks'][0]['command']
 assert 'firm-notify' in n, n
 "
+assert_ok "Codex default hook keeps ledger then guard and uses PermissionRequest notify" python3 -c "
+import json
+d = json.load(open('$CODEX_HOOKS'))
+bash = [e for e in d['hooks']['PreToolUse'] if e.get('matcher') == 'Bash']
+assert len(bash) == 1, d
+cmds = [h['command'] for h in bash[0]['hooks']]
+assert len(cmds) == 2, cmds
+assert 'firm-ledger-hook' in cmds[0], cmds
+assert 'firm-merge-guard' in cmds[1] and '--hook' in cmds[1], cmds
+assert 'CLAUDE_PLUGIN_ROOT' in cmds[1], cmds
+n = d['hooks']['PermissionRequest'][0]['hooks'][0]['command']
+assert 'firm-notify' in n, n
+"
+
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; effective_id="20260810T000001Z-claude-effective"
+  else
+    provider_hooks="$CODEX_HOOKS"; effective_id="20260810T000002Z-codex-effective"
+  fi
+  EFFECTIVE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"
+  mk_run "$EFFECTIVE_REPO" "$effective_id"
+  EFFECTIVE_LEDGER="$EFFECTIVE_REPO/.agent-firm/runs/$effective_id/run.jsonl"
+  hook_commands="$(python3 - "$provider_hooks" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))['hooks']['PreToolUse']
+entry=next(item for item in d if item.get('matcher')=='Bash')
+for hook in entry['hooks']:
+    print(hook['command'])
+PY
+)"
+  ledger_command="$(printf '%s\n' "$hook_commands" | sed -n '1p')"
+  guard_command="$(printf '%s\n' "$hook_commands" | sed -n '2p')"
+  registered_timeout="$(python3 -c "import json; d=json.load(open('$provider_hooks'))['hooks']['PreToolUse'][0]['hooks']; print(next(h['timeout'] for h in d if 'firm-merge-guard' in h['command']))")"
+  effective_payload="$(mk_payload 'git push origin main')"
+  started_ms="$(python3 -c 'import time; print(int(time.monotonic()*1000))')"
+  assert_rc "$provider effective plugin ledger hook exits 0" 0 sh -c \
+    "cd '$EFFECTIVE_REPO' && printf '%s' '$effective_payload' | env CLAUDE_PLUGIN_ROOT='$FIRM_ROOT' PATH='$GH_OK:$PATH' sh -c '$ledger_command'"
+  assert_rc "$provider effective plugin guard decision exits 0" 0 sh -c \
+    "cd '$EFFECTIVE_REPO' && printf '%s' '$effective_payload' | env CLAUDE_PLUGIN_ROOT='$FIRM_ROOT' PATH='$GH_OK:$PATH' sh -c '$guard_command'"
+  elapsed_ms=$(( $(python3 -c 'import time; print(int(time.monotonic()*1000))') - started_ms ))
+  assert_ok "$provider effective event pair completes inside its registered timeout" sh -c \
+    "[ '$elapsed_ms' -lt '$((registered_timeout * 1000))' ]"
+  assert_ok "$provider effective source produces exactly one ledger event and one guard decision" python3 -c "
+import json
+records=[json.loads(line) for line in open('$EFFECTIVE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
+"
+done
+
+# This is an explicit, disposable selection fixture, not a claim about a real provider loader. It
+# models only the bounded legacy scopes doctor actually diagnoses: Claude project+user and the
+# obsolete Codex project prototype. Exact-SHA real-loader scope/selection remains Q-02.
+t_case "bounded fixture scopes measure diagnosed legacy duplicate hook multiplication"
+LOADER_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/firm-loader-selection.XXXXXX")"; t_track "$LOADER_FIXTURE"
+mkdir -p "$LOADER_FIXTURE/project/.claude" "$LOADER_FIXTURE/project/.codex" \
+  "$LOADER_FIXTURE/home/.claude" "$LOADER_FIXTURE/home/.codex"
+python3 - "$CLAUDE_HOOKS" "$CODEX_HOOKS" "$LOADER_FIXTURE" <<'PY'
+import json,os,sys
+claude,codex,root=sys.argv[1:]
+for source,targets in (
+    (claude,["project/.claude/settings.json","home/.claude/settings.json"]),
+    (codex,["project/.codex/hooks.json"]),
+):
+    hooks=json.load(open(source))["hooks"]
+    for rel in targets:
+        with open(os.path.join(root,rel),"w") as fh:
+            json.dump({"hooks":hooks,"unrelated":{"preserve":True}},fh)
+            fh.write("\n")
+PY
+cat > "$LOADER_FIXTURE/select.py" <<'PY'
+import json,os,sys
+provider,plugin,project,home=sys.argv[1:]
+sources=[plugin]
+if provider == "claude":
+    sources += [os.path.join(project,".claude/settings.json"),os.path.join(home,".claude/settings.json")]
+else:
+    sources += [os.path.join(project,".codex/hooks.json")]
+for source in sources:
+    if not os.path.isfile(source): continue
+    for entry in json.load(open(source)).get("hooks",{}).get("PreToolUse",[]):
+        if entry.get("matcher") != "Bash": continue
+        for hook in entry.get("hooks",[]):
+            if hook.get("type") == "command": print(hook["command"])
+PY
+run_selected_fixture_hooks() {
+  _provider="$1"; _plugin="$2"; _repo="$3"
+  python3 "$LOADER_FIXTURE/select.py" "$_provider" "$_plugin" \
+    "$LOADER_FIXTURE/project" "$LOADER_FIXTURE/home" | while IFS= read -r _command; do
+      (cd "$_repo" && printf '%s' "$(mk_payload 'git push origin main')" | \
+        env CLAUDE_PLUGIN_ROOT="$FIRM_ROOT" PATH="$GH_OK:$PATH" sh -c "$_command") || exit $?
+    done
+}
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000003Z-claude-duplicates"; expected_pairs=3; modeled="project+user"
+  else
+    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000004Z-codex-duplicates"; expected_pairs=2; modeled="project"
+  fi
+  FIXTURE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"; mk_run "$FIXTURE_REPO" "$fixture_id"
+  FIXTURE_LEDGER="$FIXTURE_REPO/.agent-firm/runs/$fixture_id/run.jsonl"
+  assert_ok "$provider fixture executes every explicitly selected hook" \
+    run_selected_fixture_hooks "$provider" "$provider_hooks" "$FIXTURE_REPO"
+  assert_ok "$provider bounded $modeled duplicate scope multiplies measured events to $expected_pairs pairs" python3 -c "
+import json
+records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==$expected_pairs, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==$expected_pairs, records
+"
+done
+python3 - "$LOADER_FIXTURE" <<'PY'
+import json,os,sys
+root=sys.argv[1]
+for rel in ("project/.claude/settings.json","home/.claude/settings.json","project/.codex/hooks.json"):
+    path=os.path.join(root,rel); d=json.load(open(path)); d["hooks"]={}
+    with open(path,"w") as fh: json.dump(d,fh); fh.write("\n")
+PY
+for provider in claude codex; do
+  if [ "$provider" = claude ]; then
+    provider_hooks="$CLAUDE_HOOKS"; fixture_id="20260810T000005Z-claude-clean"
+  else
+    provider_hooks="$CODEX_HOOKS"; fixture_id="20260810T000006Z-codex-clean"
+  fi
+  FIXTURE_REPO="$(mk_id_repo "$ALLOWED_EMAIL")"; mk_run "$FIXTURE_REPO" "$fixture_id"
+  FIXTURE_LEDGER="$FIXTURE_REPO/.agent-firm/runs/$fixture_id/run.jsonl"
+  assert_ok "$provider fixture executes the sole plugin-selected source after cleanup" \
+    run_selected_fixture_hooks "$provider" "$provider_hooks" "$FIXTURE_REPO"
+  assert_ok "$provider cleaned fixture measures one ledger event and one decision" python3 -c "
+import json
+records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
+"
+done
 
 # ============================================================ AC-024 · the firm's own fixtures
 t_case "AC-024 the firm's own scratch repos and tooling are not false-positived"

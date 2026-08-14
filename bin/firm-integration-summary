@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# firm-integration-summary [--run RUN] --stage integrate/INSTANCE --source FILE
+# Publishes one immutable, stage-specific integration summary and updates the digest-bound index.
+set -euo pipefail
+
+exec python3 - "$@" <<'PY'
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+MAX_SUMMARY_BYTES = 1024 * 1024
+MAX_HISTORY_ENTRIES = 64
+SAFE_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SAFE_INSTANCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+INDEX_REL = "integration-summaries/index.json"
+
+
+def stop(message, code=1):
+    print(f"firm-integration-summary: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def require_directory(path, label, exact_mode=None):
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        stop(f"missing {label}: {exc}", 2)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        stop(f"unsafe {label}", 2)
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        stop(f"foreign-owned or writable {label}", 2)
+    if exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode:
+        stop(f"{label} mode must be {exact_mode:04o}", 2)
+
+
+def resolve_run(raw):
+    if raw is None:
+        current = Path.cwd() / ".agent-firm" / "CURRENT_RUN"
+        try:
+            if current.is_symlink():
+                stop("CURRENT_RUN must not be a symlink", 2)
+            raw = current.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            stop(f"no run dir (pass --run or set CURRENT_RUN): {exc}", 2)
+    if not raw or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        stop("run path is empty or contains a control character", 2)
+    if ".." in Path(raw).parts:
+        stop("run path contains traversal", 2)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = Path(os.path.abspath(path))
+    if not SAFE_RUN.fullmatch(path.name) or path.parent.name != "runs" or path.parent.parent.name != ".agent-firm":
+        stop("run must be <repo>/.agent-firm/runs/<safe-id>", 2)
+    repo = path.parent.parent.parent
+    for component, label in (
+        (repo, "repository"),
+        (repo / ".agent-firm", ".agent-firm directory"),
+        (path.parent, "runs directory"),
+        (path, "run directory"),
+    ):
+        require_directory(component, label)
+    try:
+        top = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        stop(f"run is not under a Git repository root: {exc}", 2)
+    if os.path.realpath(top) != os.path.realpath(repo):
+        stop("run repository identity mismatch", 2)
+    return repo, path
+
+
+def read_regular(path, label, maximum, modes=None):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        stop(f"cannot open {label}: {exc}", 2)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+            stop(f"unsafe {label}", 2)
+        if stat.S_IMODE(before.st_mode) & 0o022:
+            stop(f"group/world-writable {label}", 2)
+        if modes is not None and stat.S_IMODE(before.st_mode) not in modes:
+            stop(f"unexpected {label} mode", 2)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                stop(f"{label} exceeds {maximum} bytes", 2)
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            stop(f"{label} changed while being read", 2)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_source(raw):
+    if not raw or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        stop("source path is empty or contains a control character", 2)
+    source_input = os.path.abspath(raw)
+    try:
+        if stat.S_ISLNK(os.lstat(source_input).st_mode):
+            stop("source must not be a symlink", 2)
+    except OSError as exc:
+        stop(f"source is unavailable: {exc}", 2)
+    source = Path(os.path.realpath(source_input))
+    payload = read_regular(source, "summary source", MAX_SUMMARY_BYTES)
+    if not payload:
+        stop("summary source is empty", 2)
+    try:
+        text = payload.decode("utf-8", "strict")
+    except UnicodeError:
+        stop("summary source is not strict UTF-8", 2)
+    if "\x00" in text:
+        stop("summary source contains NUL", 2)
+    return payload
+
+
+def entry_for(stage, payload):
+    instance = stage.split("/", 1)[1]
+    return {
+        "stage": stage,
+        "path": f"integration-summaries/{instance}.md",
+        "bytes": len(payload),
+        "sha256": digest(payload),
+    }
+
+
+def validate_entry(entry, run, seen_stages, seen_paths):
+    if not isinstance(entry, dict) or set(entry) != {"stage", "path", "bytes", "sha256"}:
+        stop("integration summary index has an invalid entry schema", 2)
+    stage = entry["stage"]
+    if not isinstance(stage, str) or not stage.startswith("integrate/") or not SAFE_INSTANCE.fullmatch(stage[10:]):
+        stop("integration summary index has an unsafe stage", 2)
+    expected_path = f"integration-summaries/{stage[10:]}.md"
+    if entry["path"] != expected_path:
+        stop("integration summary index path does not match its stage", 2)
+    if stage in seen_stages or entry["path"] in seen_paths:
+        stop("integration summary index repeats a stage or path", 2)
+    seen_stages.add(stage)
+    seen_paths.add(entry["path"])
+    if isinstance(entry["bytes"], bool) or not isinstance(entry["bytes"], int) or not 1 <= entry["bytes"] <= MAX_SUMMARY_BYTES:
+        stop("integration summary index has an invalid byte count", 2)
+    if not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]):
+        stop("integration summary index has an invalid digest", 2)
+    payload = read_regular(run / entry["path"], "indexed integration summary", MAX_SUMMARY_BYTES, modes={0o644})
+    if len(payload) != entry["bytes"] or digest(payload) != entry["sha256"]:
+        stop(f"indexed integration summary changed or is mismatched: {entry['path']}", 1)
+    return payload
+
+
+def load_index(run):
+    path = run / INDEX_REL
+    if not os.path.lexists(path):
+        return None
+    raw = read_regular(path, "integration summary index", 256 * 1024, modes={0o600})
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=unique_object)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        stop(f"integration summary index is malformed: {exc}", 2)
+    if not isinstance(value, dict) or set(value) != {"schema_version", "run_id", "current_stage", "entries"}:
+        stop("integration summary index has an invalid top-level schema", 2)
+    if value["schema_version"] != 1 or value["run_id"] != run.name:
+        stop("integration summary index identity mismatch", 2)
+    if (not isinstance(value["entries"], list) or not value["entries"]
+            or len(value["entries"]) > MAX_HISTORY_ENTRIES):
+        stop(f"integration summary index must have 1 through {MAX_HISTORY_ENTRIES} entries", 2)
+    if raw != json_bytes(value):
+        stop("integration summary index is not in canonical encoding", 2)
+    seen_stages = set()
+    seen_paths = set()
+    for entry in value["entries"]:
+        validate_entry(entry, run, seen_stages, seen_paths)
+    if value["current_stage"] != value["entries"][-1]["stage"]:
+        stop("integration summary index current stage is not its final entry", 2)
+    return value
+
+
+def write_exclusive(path, payload, mode):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(payload)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise OSError("short write")
+            view = view[count:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_index(path, payload):
+    parent = path.parent
+    fd, temporary = tempfile.mkstemp(prefix=".index.", suffix=".tmp", dir=str(parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600, follow_symlinks=False)
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+parser = argparse.ArgumentParser(prog="firm-integration-summary")
+parser.add_argument("--run")
+parser.add_argument("--stage", required=True)
+parser.add_argument("--source", required=True)
+args = parser.parse_args()
+
+if not args.stage.startswith("integrate/") or not SAFE_INSTANCE.fullmatch(args.stage[10:]):
+    stop("stage must be integrate/<safe-instance>", 2)
+
+_, run = resolve_run(args.run)
+source_payload = read_source(args.source)
+summaries = run / "integration-summaries"
+try:
+    os.mkdir(summaries, 0o700)
+except FileExistsError:
+    pass
+require_directory(summaries, "integration summaries directory", exact_mode=0o700)
+
+lock_path = summaries / ".publish.lock"
+lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+try:
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+except OSError as exc:
+    stop(f"cannot open publication lock: {exc}", 2)
+try:
+    lock_info = os.fstat(lock_fd)
+    if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
+            or stat.S_IMODE(lock_info.st_mode) != 0o600):
+        stop("unsafe publication lock", 2)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    index = load_index(run)
+    new_entry = entry_for(args.stage, source_payload)
+    entries = [] if index is None else list(index["entries"])
+    existing = [entry for entry in entries if entry["stage"] == args.stage]
+    if existing:
+        if existing[0] != new_entry:
+            stop(f"stage {args.stage} is already published with different bytes", 1)
+        receipt = {
+            "schema_version": 1,
+            "status": "unchanged",
+            "run_id": run.name,
+            "current_stage": index["current_stage"],
+            "summary": existing[0],
+            "index_path": INDEX_REL,
+            "index_sha256": digest(json_bytes(index)),
+        }
+        print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
+        raise SystemExit(0)
+
+    if len(entries) >= MAX_HISTORY_ENTRIES:
+        stop(f"integration summary history reached its {MAX_HISTORY_ENTRIES}-entry bound", 1)
+
+    destination = run / new_entry["path"]
+    try:
+        write_exclusive(destination, source_payload, 0o644)
+    except FileExistsError:
+        existing_payload = read_regular(destination, "orphaned integration summary", MAX_SUMMARY_BYTES, modes={0o644})
+        if existing_payload != source_payload:
+            stop(f"unindexed destination already exists with different bytes: {new_entry['path']}", 1)
+
+    entries.append(new_entry)
+    new_index = {
+        "schema_version": 1,
+        "run_id": run.name,
+        "current_stage": args.stage,
+        "entries": entries,
+    }
+    atomic_index(run / INDEX_REL, json_bytes(new_index))
+    verified = load_index(run)
+    if verified != new_index:
+        stop("published index did not verify exactly", 1)
+    receipt = {
+        "schema_version": 1,
+        "status": "published",
+        "run_id": run.name,
+        "current_stage": args.stage,
+        "summary": new_entry,
+        "history_entries": len(entries),
+        "index_path": INDEX_REL,
+        "index_sha256": digest(json_bytes(new_index)),
+    }
+    print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
+finally:
+    os.close(lock_fd)
+PY

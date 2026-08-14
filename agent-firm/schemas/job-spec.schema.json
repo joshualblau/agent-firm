@@ -18,7 +18,11 @@
     "required_tools": { "type": "array", "items": { "type": "string" } },
     "denied_tools": { "type": "array", "items": { "type": "string" } },
     "mcp_servers": { "type": "array", "items": { "type": "string" }, "description": "least-privilege, e.g. ['heightslabs (read-only)']" },
-    "model": { "type": "string", "enum": ["fable", "opus", "sonnet", "haiku", "codex"] },
+    "model": {
+      "type": "string",
+      "enum": ["ceiling", "heavyweight", "workhorse", "fast", "fable", "opus", "sonnet", "haiku", "codex"],
+      "description": "Provider-neutral tier. Legacy provider names remain accepted for historical runs and map through policy/model-tiers.yaml."
+    },
     "max_turns": { "type": "integer", "minimum": 1 },
     "max_wall_clock_minutes": { "type": "integer", "minimum": 1 },
     "success_criteria": { "type": "string" },

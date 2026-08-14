@@ -92,6 +92,74 @@ assert_ok "the new deny rules landed"             has_rule "$S" deny  "Bash(cat 
 assert_ok "Read-tool deny rules landed"           has_rule "$S" deny  "Read(./.env)"
 
 # ---------------------------------------------------------------------------
+t_case "permission migration preserves legacy hooks and unrelated configuration for manual review"
+legacy_proj="$(mk_target '{"permissions":{"allow":["Bash(cat:*)"],"ask":[],"deny":[]},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"custom-hook"},{"type":"command","command":"firm-ledger-hook"}]}]},"custom":{"owner":"project","enabled":true}}')"
+t_track "$legacy_proj"
+LS="$legacy_proj/.claude/settings.json"
+legacy_before="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+assert_ok "migration succeeds without claiming hook ownership" install_in "$legacy_proj" --migrate
+legacy_after="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+assert_eq "legacy hook and unrelated config subtrees remain semantically exact" "$legacy_before" "$legacy_after"
+assert_ok "retired permission is still removed" lacks_rule "$LS" allow "Bash(cat:*)"
+assert_ok "canonical permission source no longer embeds plugin-owned hooks" python3 -c \
+  "import json; d=json.load(open('$FIRM_ROOT/.claude/settings.json')); assert 'hooks' not in d"
+legacy_home="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-home.XXXXXX")"; t_track "$legacy_home"
+legacy_stubs="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-stubs.XXXXXX")"; t_track "$legacy_stubs"
+printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 0\n' > "$legacy_stubs/claude"
+printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 0\nexit 0\n' > "$legacy_stubs/codex"
+chmod +x "$legacy_stubs/claude" "$legacy_stubs/codex"
+python_exe="$(python3 -c 'import sys; print(sys.executable)')"
+legacy_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
+ln -s "$python_exe" "$legacy_stubs/python3"
+legacy_hash="$(shasum -a 256 "$LS" | cut -d' ' -f1)"
+legacy_mode="$(t_file_mode "$LS")"
+legacy_doctor_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; legacy_doctor_rc=$?
+assert_eq "confirmed duplicate alone blocks doctor readiness" "1" "$legacy_doctor_rc"
+assert_output "doctor detects the external Claude duplicate" "project Claude settings contain a confirmed legacy duplicate firm hook" \
+  printf '%s\n' "$legacy_doctor_out"
+assert_output "doctor gives config-preserving manual guidance" "preserve unrelated hooks/settings" \
+  printf '%s\n' "$legacy_doctor_out"
+assert_eq "doctor detection leaves the external settings byte-identical" "$legacy_hash" \
+  "$(shasum -a 256 "$LS" | cut -d' ' -f1)"
+assert_eq "doctor detection leaves the external settings mode identical" "$legacy_mode" \
+  "$(t_file_mode "$LS")"
+legacy_config_before="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
+python3 - "$LS" <<'PY'
+import json,os,sys
+p=sys.argv[1]; mode=os.stat(p).st_mode & 0o777; d=json.load(open(p))
+for entry in d.get("hooks",{}).get("PreToolUse",[]):
+    entry["hooks"]=[h for h in entry.get("hooks",[]) if "firm-ledger-hook" not in h.get("command","") and "firm-merge-guard" not in h.get("command","")]
+with open(p,"w") as fh: json.dump(d,fh,separators=(",",":")); fh.write("\n")
+os.chmod(p,mode)
+PY
+assert_eq "fixture operator removed only the firm command" "$legacy_config_before" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
+assert_eq "manual cleanup preserves mode" "$legacy_mode" \
+  "$(t_file_mode "$LS")"
+legacy_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; legacy_clean_rc=$?
+assert_eq "readiness returns after only the confirmed duplicate is removed" "0" "$legacy_clean_rc"
+
+mkdir -p "$legacy_home/.claude"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"firm-merge-guard --hook"}]}]},"custom":{"owner":"user"}}' > "$legacy_home/.claude/settings.json"
+US="$legacy_home/.claude/settings.json"; chmod 640 "$US"
+user_hash="$(shasum -a 256 "$US" | cut -d' ' -f1)"; user_mode="$(t_file_mode "$US")"
+user_doctor_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; user_doctor_rc=$?
+assert_eq "confirmed user duplicate blocks doctor readiness" "1" "$user_doctor_rc"
+assert_output "doctor identifies user scope exactly" "user Claude settings contain a confirmed legacy duplicate firm hook" printf '%s\n' "$user_doctor_out"
+assert_eq "user duplicate detection preserves full bytes" "$user_hash" "$(shasum -a 256 "$US" | cut -d' ' -f1)"
+assert_eq "user duplicate detection preserves mode" "$user_mode" "$(t_file_mode "$US")"
+python3 - "$US" <<'PY'
+import json,os,sys
+p=sys.argv[1]; mode=os.stat(p).st_mode & 0o777; d=json.load(open(p)); d["hooks"]={}
+with open(p,"w") as fh: json.dump(d,fh,separators=(",",":")); fh.write("\n")
+os.chmod(p,mode)
+PY
+assert_eq "user cleanup preserves unrelated configuration" '{"owner":"user"}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["custom"],separators=(",",":")))' "$US")"
+user_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; user_clean_rc=$?
+assert_eq "readiness returns after the user duplicate is removed" "0" "$user_clean_rc"
+
+# ---------------------------------------------------------------------------
 t_case "--migrate is idempotent and settles to a clean install"
 assert_ok "second migrate is a no-op"   install_in "$proj" --migrate
 assert_ok "plain install now exits 0"   install_in "$proj"

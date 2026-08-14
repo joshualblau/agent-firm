@@ -1,4 +1,4 @@
-Operate the firm (read CLAUDE.md). Run a FULL-track engagement: add a persistent in-memory TODO
+Operate the firm through the installed provider adapter. Run a FULL-track engagement: add a persistent in-memory TODO
 module in `src/todo.js` exposing `addTodo(text)` and `listTodos()` (addTodo returns the created item
 `{id, text, done:false}`; listTodos returns all items in insertion order), with unit tests in
 `test/todo.test.js` using `node:test`.

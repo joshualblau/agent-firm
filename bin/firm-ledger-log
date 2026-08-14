@@ -1,32 +1,2272 @@
 #!/usr/bin/env bash
-# ledger-log <event> [key=value ...]
-# Appends one JSON event line to the current run's run.jsonl (ts added automatically).
-# Resolves the run dir from ./.agent-firm/CURRENT_RUN. Best-effort: never fails the caller.
+# firm-ledger-log [--run RUN] [--strict] [--event-id ID] [--print-event-id] EVENT [key=value ...]
+# firm-ledger-log --run RUN --strict --role-start ...
+#
+# Ordinary logging remains best-effort by default. Role starts are an explicit, fail-closed mode.
 set -uo pipefail
 
-event="${1:-event}"; shift || true
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do
+  __dir="$(cd -P "$(dirname "$__src")" && pwd)"
+  __src="$(readlink "$__src")"
+  case $__src in /*) ;; *) __src="$__dir/$__src" ;; esac
+done
+__root="$(cd -P "$(dirname "$__src")/.." && pwd)"
 
-run_dir=""
-[[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
-if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
-  exit 0   # no active run; logging is best-effort
-fi
+exec python3 - "$__root" "$@" <<'PY'
+import datetime
+import errno
+import fcntl
+import hashlib
+import inspect
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import secrets
+import select
+import stat
+import subprocess
+import sys
+import tempfile
+import time
 
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Build a JSON object from key=value pairs using jq if available; else a minimal manual encode.
-if command -v jq >/dev/null 2>&1; then
-  args=(--arg ts "$ts" --arg event "$event")
-  filter='{ts:$ts, event:$event}'
-  i=0
-  for kv in "$@"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    args+=(--arg "k$i" "$k" --arg "v$i" "$v")
-    filter="$filter + {(\$k$i): \$v$i}"
-    i=$((i+1))
-  done
-  jq -cn "${args[@]}" "$filter" >> "$run_dir/run.jsonl" 2>/dev/null || \
-    printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
-else
-  printf '{"ts":"%s","event":"%s"}\n' "$ts" "$event" >> "$run_dir/run.jsonl"
-fi
-exit 0
+TOOL_ROOT = Path(sys.argv[1])
+ARGS = sys.argv[2:]
+SAFE_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SAFE_EVENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+SAFE_EVENT_ID = re.compile(r"evt-[A-Za-z0-9._:-]{1,128}\Z")
+SAFE_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+SAFE_ROLE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
+SAFE_STAGE_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+CHUNK = 64 * 1024
+MAX_JSON_OPERAND = 128 * 1024
+MAX_LEDGER_LINE = 1024 * 1024
+MAX_AUTHORITY = 16
+MAX_AUTHORITY_FIELDS = 32
+P2_DESCRIPTOR_MAX_STDOUT_BYTES = 256
+P2_DESCRIPTOR_READ_CHUNK = 256
+P2_DESCRIPTOR_PROCESS_NS = 5_000_000_000
+P2_DESCRIPTOR_CLEANUP_NS = 6_000_000_000
+P2_DESCRIPTOR_KILL_RESERVE_NS = 100_000_000
+P2_MNT_LOCAL = 0x1000
+PRODUCER_RESERVED = {
+    "ts", "event", "event_id", "run_id", "stage", "role", "agent", "contract",
+    "authority", "activation", "activation_justification",
+}
+COMMON_FIELDS = {"ts", "event", "event_id", "run_id"}
+NATIVE_ONLY_FIELDS = {"contract", "authority", "activation", "activation_justification"}
+NATIVE_REQUIRED_FIELDS = COMMON_FIELDS | {
+    "stage", "role", "agent", "contract", "authority", "activation",
+}
+FAILPOINTS = {
+    "before_contract_read", "during_drift_validation", "contract_replace",
+    "contract_truncate", "contract_grow", "contract_mutate", "contract_mode",
+    "before_temp_write", "partial_temp_write", "temp_fsync", "pre_rename",
+    "post_rename", "directory_fsync", "post_append_pre_proof", "proof_read",
+    "proof_compare",
+}
+BARRIER_PHASES = {
+    "after_contract_open", "after_lock", "after_source_open", "after_temp_fsync",
+    "before_replace", "after_replace", "after_result_scan", "after_final_proof",
+    "after_result_construction", "after_success_output", "before_return",
+    "after_support_gate",
+}
+P2_TEST_REJECTIONS = {
+    "linux", "unknown_platform",
+    "macos_version_mismatch", "macos_version_unverifiable",
+    "kernel_version_mismatch", "kernel_version_unverifiable",
+    "architecture_mismatch", "architecture_unverifiable",
+    "python_version_mismatch", "python_version_unverifiable",
+    "filesystem_type_mismatch", "filesystem_locality_mismatch", "filesystem_unverifiable",
+    "statvfs_fd_missing",
+    "nofollow_missing", "nofollow_invalid", "directory_missing", "directory_invalid",
+    "nonblock_missing", "nonblock_invalid",
+    "open_dir_fd_missing", "stat_dir_fd_missing", "stat_nofollow_missing",
+    "unlink_dir_fd_missing", "replace_missing", "replace_dir_fd_missing",
+    "same_filesystem_mismatch", "regular_file_check_missing", "file_fsync_missing",
+    "directory_fsync_missing", "flock_missing",
+    "bind_type_error", "bind_not_implemented", "bind_enotsup", "bind_enoent",
+}
+CAPABILITY_BIND_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, "ENOSYS", None), getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None), getattr(errno, "EINVAL", None),
+    ) if isinstance(value, int)
+)
+DESCRIPTOR_TEST_BEHAVIORS = {
+    "success", "abi_size", "abi_flags_offset", "abi_fstypename_offset",
+    "symbol", "syscall", "schema_missing", "schema_extra",
+    "schema_version_type", "filesystem_type", "flags_type", "invalid_utf8",
+    "duplicate", "trailing", "cap_256", "cap_257", "nonzero",
+    "filesystem_mismatch", "locality_mismatch", "flags_negative", "flags_overflow",
+    "timeout", "ignore_term", "terminate_error", "wait_error", "clock_deadlines",
+    "popen_error", "pass_fds_error", "pipe_error",
+}
+
+
+class RoleFailure(Exception):
+    def __init__(self, code, category, identity="request"):
+        super().__init__(category)
+        self.code = code
+        self.category = category
+        self.identity = identity
+
+
+class ValidationError(Exception):
+    pass
+
+
+class LedgerError(Exception):
+    pass
+
+
+class DuplicateEvent(LedgerError):
+    pass
+
+
+class DuplicateActivation(LedgerError):
+    pass
+
+
+class ContractDrift(Exception):
+    pass
+
+
+class CommitError(Exception):
+    def __init__(self, phase):
+        super().__init__(phase)
+        self.phase = phase
+
+
+def role_fail(code, category, identity="request"):
+    raise RoleFailure(code, category, safe_identity(identity))
+
+
+def safe_identity(value):
+    value = str(value)
+    if len(value) > 160 or not value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return "request"
+    if not re.fullmatch(r"[A-Za-z0-9_./:@+-]+", value):
+        return "request"
+    return value
+
+
+def ordinary_fail(strict, message):
+    if strict:
+        print(f"firm-ledger-log: {message}", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+def unsupported_write_configuration():
+    role_fail(17, "WRITE_CONFIGURATION_UNSUPPORTED", "p2")
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def parse_json_unique(raw):
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def printable(value, maximum=4096, allow_empty=False):
+    return (
+        isinstance(value, str)
+        and (allow_empty or bool(value))
+        and len(value.encode("utf-8")) <= maximum
+        and all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
+    )
+
+
+def exact_keys(value, keys):
+    return isinstance(value, dict) and set(value) == set(keys)
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def format_ts(value):
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def parse_ts(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp is not a string")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def validate_common_record(record, ledger_run_id):
+    if not COMMON_FIELDS.issubset(record):
+        raise LedgerError("missing producer identity")
+    try:
+        parse_ts(record["ts"])
+    except Exception as exc:
+        raise LedgerError("invalid timestamp") from exc
+    if not isinstance(record["event"], str) or not SAFE_EVENT.fullmatch(record["event"]):
+        raise LedgerError("unsafe event")
+    if not isinstance(record["event_id"], str) or not SAFE_EVENT_ID.fullmatch(record["event_id"]):
+        raise LedgerError("unsafe event id")
+    if not isinstance(record["run_id"], str) or not SAFE_RUN.fullmatch(record["run_id"]):
+        raise LedgerError("unsafe run id")
+    if record["run_id"] != ledger_run_id:
+        raise LedgerError("foreign run binding")
+
+
+def validate_observation(record, family):
+    try:
+        parse_ts(record["ts"])
+    except Exception as exc:
+        raise LedgerError("invalid observation timestamp") from exc
+    if family == "shell_observation":
+        if not exact_keys(record, {"ts", "event", "cmd"}) or record["event"] != "bash":
+            raise LedgerError("invalid shell observation")
+        if not isinstance(record["cmd"], str):
+            raise LedgerError("invalid observation value")
+        return
+    if family == "merge_observation":
+        if not exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) or record["event"] != "merge_guard_block":
+            raise LedgerError("invalid merge observation")
+        if not isinstance(record["cmd"], str):
+            raise LedgerError("invalid observation value")
+        values = (record["decision"], record["reason"])
+        if not all(printable(value, 4096) for value in values):
+            raise LedgerError("invalid observation value")
+        return
+    expected = {"ts", "event", "cmd", "decision", "matched", "gh_login", "git_email"}
+    if not exact_keys(record, expected) or record["event"] != "merge_guard_permit":
+        raise LedgerError("invalid merge permit observation")
+    if record["decision"] != "permitted" or not isinstance(record["cmd"], str):
+        raise LedgerError("invalid merge permit decision")
+    if not printable(record["matched"], 256):
+        raise LedgerError("invalid merge permit match")
+    login = record["gh_login"]
+    if not isinstance(login, str) or re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}", login
+    ) is None:
+        raise LedgerError("invalid merge permit login")
+    email = record["git_email"]
+    if not printable(email, 4096) or "@" not in email:
+        raise LedgerError("invalid merge permit email")
+
+
+def validate_stored_activation(activation, role, justification):
+    expected = {
+        "schema_version", "action", "provider", "selected_by", "selector", "tier",
+        "policy_sha256", "adapter_source", "resolver_argv", "apply", "apply_instruction", "failure",
+    }
+    if not exact_keys(activation, expected):
+        raise LedgerError("invalid activation keys")
+    if activation["schema_version"] != 1 or activation["action"] != "native_role_launch":
+        raise LedgerError("invalid activation contract")
+    provider = activation["provider"]
+    selected_by = activation["selected_by"]
+    selector = activation["selector"]
+    if provider not in ("claude", "codex") or selected_by not in ("role", "tier", "alias"):
+        raise LedgerError("invalid activation selector")
+    if not printable(selector, 128) or not isinstance(activation["tier"], str) or not SAFE_ROLE.fullmatch(activation["tier"]):
+        raise LedgerError("invalid activation selector")
+    if selected_by == "role":
+        if selector != role or justification is not None:
+            raise LedgerError("invalid role-selected activation")
+    elif not printable(justification, 2048):
+        raise LedgerError("missing activation justification")
+    if selected_by == "tier" and selector != activation["tier"]:
+        raise LedgerError("invalid tier-selected activation")
+    digest = activation["policy_sha256"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise LedgerError("invalid activation digest")
+    expected_adapter = "commands/start.md" if provider == "claude" else "codex-skills/start/SKILL.md"
+    if activation["adapter_source"] != expected_adapter:
+        raise LedgerError("invalid activation adapter")
+    expected_argv = [
+        "firm-model-resolve", "--provider", provider, f"--{selected_by}", selector,
+        "--format", "activation",
+    ]
+    if activation["resolver_argv"] != expected_argv:
+        raise LedgerError("invalid activation resolver projection")
+    apply = activation["apply"]
+    if not exact_keys(apply, {"model", "display", "effort"}) or not all(
+        printable(apply.get(key), 256) for key in ("model", "display", "effort")
+    ):
+        raise LedgerError("invalid activation apply projection")
+    if apply["effort"] not in ("low", "medium", "high", "xhigh", "max", "ultra"):
+        raise LedgerError("invalid activation effort")
+    if provider == "codex":
+        if not re.fullmatch(r"gpt-[a-z0-9.-]+", apply["model"]) or not apply["display"].startswith("GPT-"):
+            raise LedgerError("invalid Codex apply projection")
+    elif apply["model"].startswith("gpt-") or apply["display"].startswith("GPT-"):
+        raise LedgerError("invalid Claude apply projection")
+    if activation["apply_instruction"] != "apply_exact_model_display_effort_immediately_before_native_launch" or activation["failure"] != "block":
+        raise LedgerError("invalid activation failure contract")
+
+
+def validate_native_record(record, ledger_run_id):
+    allowed = NATIVE_REQUIRED_FIELDS | {"activation_justification"}
+    if set(record) not in (NATIVE_REQUIRED_FIELDS, allowed):
+        raise LedgerError("incomplete or extended native record")
+    validate_common_record(record, ledger_run_id)
+    stage = record["stage"]
+    role = record["role"]
+    agent = record["agent"]
+    if not printable(stage, 256) or any(not SAFE_STAGE_PART.fullmatch(part) for part in stage.split("/")):
+        raise LedgerError("invalid native stage")
+    if not isinstance(role, str) or not SAFE_ROLE.fullmatch(role):
+        raise LedgerError("invalid native role")
+    if not printable(agent, 256) or not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_./:-]{0,254}", agent) or ".." in Path(agent).parts:
+        raise LedgerError("invalid native agent")
+    if not record["event"].endswith("_started"):
+        raise LedgerError("invalid native event")
+    contract = record["contract"]
+    if not exact_keys(contract, {"path", "bytes", "sha256", "mode"}):
+        raise LedgerError("invalid native contract")
+    try:
+        validate_relative_path(contract["path"], "role-contracts")
+    except ValidationError as exc:
+        raise LedgerError("invalid native contract path") from exc
+    if isinstance(contract["bytes"], bool) or not isinstance(contract["bytes"], int) or contract["bytes"] < 0:
+        raise LedgerError("invalid native contract size")
+    if not isinstance(contract["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", contract["sha256"]):
+        raise LedgerError("invalid native contract digest")
+    if contract["mode"] != "0644":
+        raise LedgerError("invalid native contract mode")
+    authority = record["authority"]
+    if not isinstance(authority, list) or not authority or len(authority) > MAX_AUTHORITY:
+        raise LedgerError("invalid native authority")
+    seen = set()
+    for item in authority:
+        if not exact_keys(item, {"source_run_id", "event_id", "event", "matched"}):
+            raise LedgerError("invalid native authority projection")
+        if not isinstance(item["source_run_id"], str) or not SAFE_RUN.fullmatch(item["source_run_id"]):
+            raise LedgerError("invalid native authority run")
+        if not isinstance(item["event_id"], str) or not SAFE_EVENT_ID.fullmatch(item["event_id"]):
+            raise LedgerError("invalid native authority id")
+        if not isinstance(item["event"], str) or not SAFE_EVENT.fullmatch(item["event"]):
+            raise LedgerError("invalid native authority event")
+        marker = (item["source_run_id"], item["event_id"])
+        if marker in seen:
+            raise LedgerError("repeated native authority")
+        seen.add(marker)
+        matched = item["matched"]
+        if not isinstance(matched, dict) or not matched or len(matched) > MAX_AUTHORITY_FIELDS:
+            raise LedgerError("invalid native matched fields")
+        for key, value in matched.items():
+            if not isinstance(key, str) or not SAFE_FIELD.fullmatch(key) or key in COMMON_FIELDS or key in NATIVE_ONLY_FIELDS:
+                raise LedgerError("invalid native matched field")
+            if not printable(value, 4096):
+                raise LedgerError("invalid native matched value")
+    validate_stored_activation(record["activation"], role, record.get("activation_justification"))
+
+
+def classify_record(record, ledger_run_id):
+    if not isinstance(record, dict):
+        raise LedgerError("ledger line is not an object")
+    families = []
+    if NATIVE_ONLY_FIELDS & set(record):
+        validate_native_record(record, ledger_run_id)
+        families.append("native_role_start")
+    elif exact_keys(record, {"ts", "event", "cmd"}) and record.get("event") == "bash":
+        validate_observation(record, "shell_observation")
+        families.append("shell_observation")
+    elif exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) and record.get("event") == "merge_guard_block":
+        validate_observation(record, "merge_observation")
+        families.append("merge_observation")
+    elif record.get("event") == "merge_guard_permit":
+        validate_observation(record, "merge_permit_observation")
+        families.append("merge_permit_observation")
+    else:
+        validate_common_record(record, ledger_run_id)
+        for key, value in record.items():
+            if key in COMMON_FIELDS:
+                continue
+            if not isinstance(key, str) or not SAFE_FIELD.fullmatch(key):
+                raise LedgerError("unsafe ordinary extension")
+            if not printable(value, 4096, allow_empty=True):
+                raise LedgerError("invalid ordinary extension")
+        families.append("ordinary")
+    if len(families) != 1:
+        raise LedgerError("ambiguous ledger family")
+    return families[0]
+
+
+def stat_identity(st):
+    return (
+        st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid,
+        st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+    )
+
+
+def object_identity(st):
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid)
+
+
+def directory_flags():
+    try:
+        directory = os.O_DIRECTORY
+        nofollow = os.O_NOFOLLOW
+    except AttributeError:
+        unsupported_write_configuration()
+    if not isinstance(directory, int) or directory <= 0 or not isinstance(nofollow, int) or nofollow <= 0:
+        unsupported_write_configuration()
+    return os.O_RDONLY | directory | nofollow
+
+
+class RunBinding:
+    """Held, no-follow descriptor chain for one repository run namespace."""
+    def __init__(self, repo, path):
+        self.repo = Path(repo)
+        self.path = Path(path)
+        self.name = self.path.name
+        self.fds = []
+        try:
+            repo_fd = os.open(self.repo, directory_flags())
+            self.fds.append(repo_fd)
+            agent_fd = os.open(".agent-firm", directory_flags(), dir_fd=repo_fd)
+            self.fds.append(agent_fd)
+            runs_fd = os.open("runs", directory_flags(), dir_fd=agent_fd)
+            self.fds.append(runs_fd)
+            run_fd = os.open(self.name, directory_flags(), dir_fd=runs_fd)
+            self.fds.append(run_fd)
+            self.repo_fd, self.agent_fd, self.runs_fd, self.run_fd = self.fds
+            self.identities = tuple(object_identity(os.fstat(fd)) for fd in self.fds)
+            for identity in self.identities:
+                if identity[4] != os.getuid() or identity[3] & 0o022:
+                    raise ValidationError("unsafe bound run namespace")
+            self.prove(initial_binding=True)
+        except Exception:
+            self.close()
+            raise
+
+    def _entry_identity(self, parent_fd, name):
+        check = os.open(name, directory_flags(), dir_fd=parent_fd)
+        try:
+            return object_identity(os.fstat(check))
+        finally:
+            os.close(check)
+
+    def prove(self, initial_binding=False):
+        try:
+            if tuple(object_identity(os.fstat(fd)) for fd in self.fds) != self.identities:
+                raise ValidationError("bound run descriptor drift")
+            if object_identity(os.lstat(self.repo)) != self.identities[0]:
+                raise ValidationError("repository entry drift")
+            if self._entry_identity(self.repo_fd, ".agent-firm") != self.identities[1]:
+                raise ValidationError(".agent-firm entry drift")
+            if self._entry_identity(self.agent_fd, "runs") != self.identities[2]:
+                raise ValidationError("runs entry drift")
+            if self._entry_identity(self.runs_fd, self.name) != self.identities[3]:
+                raise ValidationError("run entry drift")
+        except OSError as exc:
+            if initial_binding:
+                raise
+            raise ValidationError("bound run namespace changed") from exc
+
+    def open(self, name, flags, mode=None):
+        flags |= os.O_NOFOLLOW
+        if mode is None:
+            return os.open(name, flags, dir_fd=self.run_fd)
+        return os.open(name, flags, mode, dir_fd=self.run_fd)
+
+    def entry_identity(self, name, flags=os.O_RDONLY):
+        fd = self.open(name, flags)
+        try:
+            return stat_identity(os.fstat(fd))
+        finally:
+            os.close(fd)
+
+    def close(self):
+        for fd in reversed(getattr(self, "fds", [])):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = []
+
+
+def bind_run(repo, run):
+    try:
+        return RunBinding(repo, run)
+    except (TypeError, NotImplementedError, OSError) as exc:
+        raise ValidationError("cannot bind run namespace") from exc
+
+
+def require_owned_directory(path, label):
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"missing {label}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ValidationError(f"unsafe {label}")
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o022:
+        raise ValidationError(f"unsafe ownership or mode for {label}")
+
+
+def validate_run(target, require_eligible):
+    if not isinstance(target, str) or not target:
+        raise ValidationError("empty run path")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in target):
+        raise ValidationError("run path contains a control character")
+    if ".." in Path(target).parts:
+        raise ValidationError("run path contains traversal")
+    run = Path(target)
+    if not run.is_absolute():
+        run = Path.cwd() / run
+    run = Path(os.path.abspath(str(run)))
+    if not SAFE_RUN.fullmatch(run.name) or run.name in (".", ".."):
+        raise ValidationError("unsafe run id")
+    if run.parent.name != "runs" or run.parent.parent.name != ".agent-firm":
+        raise ValidationError("target is not <repo>/.agent-firm/runs/<safe-id>")
+    repo = run.parent.parent.parent
+    for component, label in (
+        (repo, "repository"),
+        (repo / ".agent-firm", ".agent-firm"),
+        (run.parent, "runs directory"),
+        (run, "run directory"),
+    ):
+        require_owned_directory(component, label)
+    try:
+        top = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError("run is not in a validated repository") from exc
+    if os.path.realpath(top) != os.path.realpath(repo):
+        raise ValidationError("unexpected repository root")
+    if require_eligible:
+        metadata = read_owned_json(run / "run-metadata.json", (0o600, 0o644), "run metadata")
+        if not isinstance(metadata, dict):
+            raise ValidationError("run metadata is not an object")
+        if metadata.get("run_id") != run.name:
+            raise ValidationError("run metadata identity mismatch")
+        if metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+            raise ValidationError("run is not current and approval eligible")
+    return repo, run
+
+
+def read_owned_json(path, modes, label):
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValidationError(f"cannot open {label}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) not in modes:
+            raise ValidationError(f"unsafe {label}")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_JSON_OPERAND:
+                raise ValidationError(f"oversized {label}")
+            chunks.append(chunk)
+        return parse_json_unique(b"".join(chunks).decode("utf-8", "strict"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"malformed {label}") from exc
+    finally:
+        os.close(fd)
+
+
+def read_owned_json_held(run, name, modes, label):
+    try:
+        fd = run.open(name, os.O_RDONLY)
+    except OSError as exc:
+        raise ValidationError(f"cannot open {label}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) not in modes:
+            raise ValidationError(f"unsafe {label}")
+        identity = stat_identity(st)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_JSON_OPERAND:
+                raise ValidationError(f"oversized {label}")
+            chunks.append(chunk)
+        value = parse_json_unique(b"".join(chunks).decode("utf-8", "strict"))
+        if stat_identity(os.fstat(fd)) != identity:
+            raise ValidationError(f"drifting {label}")
+        return fd, identity, value
+    except (UnicodeError, ValueError, json.JSONDecodeError, OSError) as exc:
+        os.close(fd)
+        raise ValidationError(f"malformed {label}") from exc
+
+
+def prove_held_file(run, name, fd, identity, label):
+    try:
+        run.prove()
+        if stat_identity(os.fstat(fd)) != identity or run.entry_identity(name) != identity:
+            raise ValidationError(f"{label} identity drift")
+    except OSError as exc:
+        raise ValidationError(f"{label} entry changed") from exc
+
+
+def validate_relative_path(value, prefix=None):
+    if not printable(value, 512):
+        raise ValidationError("unsafe relative path")
+    path = Path(value)
+    parts = path.parts
+    if path.is_absolute() or not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValidationError("unsafe relative path")
+    if str(path) != value or (prefix is not None and (not parts or parts[0] != prefix)):
+        raise ValidationError("non-canonical relative path")
+    for part in parts:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part):
+            raise ValidationError("unsafe relative path component")
+    return parts
+
+
+def open_contract(run, relative, failpoint):
+    parts = validate_relative_path(relative, "role-contracts")
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fds = []
+    try:
+        run.prove()
+        current = os.dup(run.run_fd)
+        fds.append(current)
+        for part in parts[:-1]:
+            nxt = os.open(part, dir_flags, dir_fd=current)
+            st = os.fstat(nxt)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o022:
+                raise ValidationError("unsafe contract directory")
+            fds.append(nxt)
+            current = nxt
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+        fd = os.open(parts[-1], flags, dir_fd=current)
+    except (OSError, ValidationError) as exc:
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("cannot open sealed contract") from exc
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o644:
+        os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("sealed contract must be an owned mode-0644 regular file")
+    initial = stat_identity(st)
+    if failpoint == "before_contract_read":
+        os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("injected contract read failure")
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            count += len(chunk)
+            digest.update(chunk)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("sealed contract read failed") from exc
+    if failpoint == "during_drift_validation" or after != initial or count != initial[5]:
+        os.close(fd)
+        for item in reversed(fds):
+            os.close(item)
+        raise ValidationError("sealed contract drifted during its stable read")
+    chain = tuple((item, object_identity(os.fstat(item))) for item in fds)
+    return fd, initial, chain, {
+        "path": relative,
+        "bytes": count,
+        "sha256": digest.hexdigest(),
+        "mode": "0644",
+    }
+
+
+def reopen_contract(run, relative, chain):
+    parts = validate_relative_path(relative, "role-contracts")
+    if len(chain) != len(parts):
+        raise ValidationError("sealed contract path changed")
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    opened = []
+    try:
+        run.prove()
+        for held_fd, expected in chain:
+            held = os.fstat(held_fd)
+            if (
+                object_identity(held) != expected or not stat.S_ISDIR(held.st_mode)
+                or held.st_uid != os.getuid() or stat.S_IMODE(held.st_mode) & 0o022
+            ):
+                raise ValidationError("sealed contract path changed")
+        current = run.run_fd
+        for index, part in enumerate(parts[:-1]):
+            current = os.open(part, dir_flags, dir_fd=current)
+            opened.append(current)
+            live = os.fstat(current)
+            expected = chain[index + 1][1]
+            if (
+                object_identity(live) != expected or not stat.S_ISDIR(live.st_mode)
+                or live.st_uid != os.getuid() or stat.S_IMODE(live.st_mode) & 0o022
+            ):
+                raise ValidationError("sealed contract path changed")
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+        fd = os.open(parts[-1], flags, dir_fd=current)
+        identity = stat_identity(os.fstat(fd))
+        os.close(fd)
+        return identity
+    except (OSError, ValidationError) as exc:
+        raise ValidationError("sealed contract path changed") from exc
+    finally:
+        for item in reversed(opened):
+            os.close(item)
+
+
+def prove_contract(fd, identity, chain, run, relative):
+    run.prove()
+    if stat_identity(os.fstat(fd)) != identity or reopen_contract(run, relative, chain) != identity:
+        raise ValidationError("sealed contract identity or metadata drifted")
+
+
+def maybe_mutate_contract(failpoint, run, relative):
+    path = run.path / relative
+    if failpoint == "contract_replace":
+        replacement = path.with_name(path.name + ".firm-test-replacement")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= os.O_NOFOLLOW
+        fd = os.open(replacement, flags, 0o644)
+        try:
+            os.write(fd, b"replacement\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(replacement, path)
+    elif failpoint == "contract_truncate":
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        os.close(fd)
+    elif failpoint == "contract_grow":
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        try:
+            os.write(fd, b"growth")
+        finally:
+            os.close(fd)
+    elif failpoint == "contract_mutate":
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            os.write(fd, b"X")
+        finally:
+            os.close(fd)
+    elif failpoint == "contract_mode":
+        os.chmod(path, 0o600, follow_symlinks=False)
+
+
+def parse_role_options(argv):
+    values = {}
+    booleans = set()
+    takes_value = {
+        "--run": "run", "--stage": "stage", "--role": "role", "--contract": "contract",
+        "--event": "event", "--authority-json": "authority_json", "--agent": "agent",
+        "--activation-json": "activation_json",
+        "--activation-justification": "activation_justification",
+    }
+    index = 0
+    while index < len(argv):
+        flag = argv[index]
+        if flag in ("--strict", "--role-start"):
+            if flag in booleans:
+                role_fail(2, "INPUT_INVALID", "duplicate-option")
+            booleans.add(flag)
+            index += 1
+            continue
+        if flag in takes_value:
+            key = takes_value[flag]
+            if key in values or index + 1 >= len(argv):
+                role_fail(2, "INPUT_INVALID", "option")
+            values[key] = argv[index + 1]
+            index += 2
+            continue
+        role_fail(2, "INPUT_INVALID", "option")
+    required = {"run", "stage", "role", "contract", "event", "authority_json", "agent", "activation_json"}
+    if booleans != {"--strict", "--role-start"} or set(values) - (required | {"activation_justification"}) or not required.issubset(values):
+        role_fail(2, "INPUT_INVALID", "required-options")
+    return values
+
+
+def validate_stage(value):
+    if not printable(value, 256):
+        role_fail(2, "INPUT_INVALID", "stage")
+    parts = value.split("/")
+    if not parts or any(not SAFE_STAGE_PART.fullmatch(part) for part in parts):
+        role_fail(2, "INPUT_INVALID", "stage")
+
+
+def validate_authority_json(raw, repo):
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_JSON_OPERAND:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    try:
+        value = parse_json_unique(raw)
+    except Exception:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    if not isinstance(value, list) or not value or len(value) > MAX_AUTHORITY:
+        role_fail(2, "INPUT_INVALID", "authority-json")
+    seen = set()
+    validated = []
+    for item in value:
+        if not exact_keys(item, {"source_run", "event_id", "expect"}):
+            role_fail(2, "INPUT_INVALID", "authority-schema")
+        source = item["source_run"]
+        if not printable(source, 256) or Path(source).parts != (".agent-firm", "runs", Path(source).name):
+            role_fail(2, "INPUT_INVALID", "authority-source")
+        source_id = Path(source).name
+        if not SAFE_RUN.fullmatch(source_id) or source != f".agent-firm/runs/{source_id}":
+            role_fail(2, "INPUT_INVALID", "authority-source")
+        event_id = item["event_id"]
+        if not isinstance(event_id, str) or not SAFE_EVENT_ID.fullmatch(event_id):
+            role_fail(2, "INPUT_INVALID", "authority-event-id")
+        marker = (source_id, event_id)
+        if marker in seen:
+            role_fail(2, "INPUT_INVALID", "authority-duplicate")
+        seen.add(marker)
+        expect = item["expect"]
+        if not exact_keys(expect, {"event", "run_id", "fields"}):
+            role_fail(2, "INPUT_INVALID", "authority-expect")
+        if not isinstance(expect["event"], str) or not SAFE_EVENT.fullmatch(expect["event"]):
+            role_fail(2, "INPUT_INVALID", "authority-event")
+        if expect["run_id"] != source_id:
+            role_fail(2, "INPUT_INVALID", "authority-run-id")
+        fields = expect["fields"]
+        if not isinstance(fields, dict) or not fields or len(fields) > MAX_AUTHORITY_FIELDS:
+            role_fail(2, "INPUT_INVALID", "authority-fields")
+        for key, field_value in fields.items():
+            if not isinstance(key, str) or not SAFE_FIELD.fullmatch(key) or key in COMMON_FIELDS or key in NATIVE_ONLY_FIELDS:
+                role_fail(2, "INPUT_INVALID", "authority-field")
+            if not printable(field_value, 4096):
+                role_fail(2, "INPUT_INVALID", "authority-value")
+        try:
+            source_repo, source_run = validate_run(str(repo / source), False)
+            source_binding = bind_run(source_repo, source_run)
+        except ValidationError:
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        if source_repo != repo:
+            source_binding.close()
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        validated.append((source_binding, source_id, event_id, expect))
+    return validated
+
+
+def validate_activation_json(raw, role, justification):
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_JSON_OPERAND:
+        role_fail(2, "INPUT_INVALID", "activation-json")
+    try:
+        activation = parse_json_unique(raw)
+    except Exception:
+        role_fail(2, "INPUT_INVALID", "activation-json")
+    expected = {
+        "schema_version", "action", "provider", "selected_by", "selector", "tier",
+        "policy_sha256", "adapter_source", "resolver_argv", "apply", "apply_instruction", "failure",
+    }
+    if not exact_keys(activation, expected):
+        role_fail(2, "INPUT_INVALID", "activation-schema")
+    if activation["schema_version"] != 1 or activation["action"] != "native_role_launch":
+        role_fail(2, "INPUT_INVALID", "activation-schema")
+    provider = activation["provider"]
+    selected_by = activation["selected_by"]
+    selector = activation["selector"]
+    if provider not in ("claude", "codex") or selected_by not in ("role", "tier", "alias"):
+        role_fail(2, "INPUT_INVALID", "activation-selector")
+    if not printable(selector, 128) or not SAFE_ROLE.fullmatch(activation["tier"]):
+        role_fail(2, "INPUT_INVALID", "activation-selector")
+    if selected_by == "role":
+        if selector != role or justification is not None:
+            role_fail(2, "INPUT_INVALID", "activation-role")
+    elif not printable(justification, 2048):
+        role_fail(2, "INPUT_INVALID", "activation-justification")
+    if not re.fullmatch(r"[0-9a-f]{64}", activation["policy_sha256"] if isinstance(activation["policy_sha256"], str) else ""):
+        role_fail(2, "INPUT_INVALID", "activation-policy")
+    expected_adapter = "commands/start.md" if provider == "claude" else "codex-skills/start/SKILL.md"
+    if activation["adapter_source"] != expected_adapter:
+        role_fail(2, "INPUT_INVALID", "activation-adapter")
+    resolver_argv = activation["resolver_argv"]
+    expected_argv = [
+        "firm-model-resolve", "--provider", provider, f"--{selected_by}", selector,
+        "--format", "activation",
+    ]
+    if resolver_argv != expected_argv:
+        role_fail(2, "INPUT_INVALID", "activation-resolver")
+    apply = activation["apply"]
+    if not exact_keys(apply, {"model", "display", "effort"}) or not all(printable(apply.get(key), 256) for key in ("model", "display", "effort")):
+        role_fail(2, "INPUT_INVALID", "activation-apply")
+    if activation["apply_instruction"] != "apply_exact_model_display_effort_immediately_before_native_launch" or activation["failure"] != "block":
+        role_fail(2, "INPUT_INVALID", "activation-contract")
+    command = [str(TOOL_ROOT / "bin" / "firm-model-resolve")] + resolver_argv[1:]
+    try:
+        result = subprocess.run(
+            command, cwd=TOOL_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=15, check=False,
+        )
+        fresh = parse_json_unique(result.stdout.strip()) if result.returncode == 0 else None
+    except Exception:
+        fresh = None
+    if fresh != activation:
+        role_fail(2, "INPUT_INVALID", "activation-revalidation")
+    return activation
+
+
+def guarded_p2_test_rejection(run_path):
+    requested = os.environ.get("FIRM_LEDGER_P2_TEST_REJECT", "")
+    if not requested:
+        return None
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run_path)
+    try:
+        inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    except ValueError:
+        inside_temp = False
+    if guard != "1" or not inside_temp or requested not in P2_TEST_REJECTIONS:
+        role_fail(2, "INPUT_INVALID", "test-support")
+    return requested
+
+
+def preflight_write_environment(run_path):
+    """Pure process/capability classification before RunBinding consumes security primitives."""
+    reject = guarded_p2_test_rejection(run_path)
+    try:
+        system = platform.system()
+        macos = platform.mac_ver()[0]
+        kernel = platform.release()
+        architecture = platform.machine()
+        python = tuple(sys.version_info[:3])
+        implementation = getattr(sys.implementation, "name", "")
+        python_executable = sys.executable
+        if reject == "linux":
+            system = "Linux"
+        elif reject == "unknown_platform":
+            system = "Unknown"
+        if reject == "macos_version_mismatch":
+            macos = "26.5.0"
+        elif reject == "macos_version_unverifiable":
+            macos = ""
+        if reject == "kernel_version_mismatch":
+            kernel = "25.4.0"
+        elif reject == "kernel_version_unverifiable":
+            kernel = ""
+        if reject == "architecture_mismatch":
+            architecture = "x86_64"
+        elif reject == "architecture_unverifiable":
+            architecture = ""
+        if reject == "python_version_mismatch":
+            python = (3, 9, 5)
+        elif reject == "python_version_unverifiable":
+            implementation = ""
+        if (
+            system != "Darwin" or macos != "26.5.1" or kernel != "25.5.0"
+            or architecture != "arm64" or python != (3, 9, 6) or implementation != "cpython"
+            or not isinstance(python_executable, str) or not os.path.isabs(python_executable)
+            or not python_executable
+        ):
+            unsupported_write_configuration()
+
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if reject == "nofollow_missing":
+            nofollow = None
+        elif reject == "nofollow_invalid":
+            nofollow = 0
+        if reject == "directory_missing":
+            directory = None
+        elif reject == "directory_invalid":
+            directory = 0
+        declared_dir_fd = (
+            callable(os.open) and isinstance(os.supports_dir_fd, set)
+            and os.open in os.supports_dir_fd
+        )
+        if reject == "open_dir_fd_missing":
+            declared_dir_fd = False
+        if (
+            not isinstance(nofollow, int) or nofollow <= 0
+            or not isinstance(directory, int) or directory <= 0
+            or not callable(os.open) or not declared_dir_fd
+        ):
+            unsupported_write_configuration()
+        return {
+            "reject": reject, "nofollow": nofollow, "directory": directory,
+            "python_executable": python_executable,
+        }
+    except RoleFailure:
+        raise
+    except Exception:
+        unsupported_write_configuration()
+
+
+def bind_write_run(repo, run_path, preflight):
+    """Bind once, mapping only unavailable primitive failures to the P2 support class."""
+    reject = preflight["reject"]
+    try:
+        if reject == "bind_type_error":
+            raise TypeError("forced binding primitive failure")
+        if reject == "bind_not_implemented":
+            raise NotImplementedError("forced binding primitive failure")
+        if reject == "bind_enotsup":
+            raise OSError(errno.ENOTSUP, "forced binding primitive failure")
+        if reject == "bind_enoent":
+            raise OSError(errno.ENOENT, "forced namespace failure")
+        return RunBinding(repo, run_path)
+    except (TypeError, NotImplementedError):
+        unsupported_write_configuration()
+    except OSError as exc:
+        if exc.errno in CAPABILITY_BIND_ERRNOS:
+            unsupported_write_configuration()
+        raise ValidationError("cannot bind run namespace") from exc
+
+
+DESCRIPTOR_HELPER_CODE = r'''import ctypes
+import json
+import os
+import sys
+
+EXPECTED_SIZE = 2168
+EXPECTED_FLAGS_OFFSET = 64
+EXPECTED_FSTYPENAME_OFFSET = 72
+
+class Fsid(ctypes.Structure):
+    _fields_ = [("value", ctypes.c_int32 * 2)]
+
+class StatFs(ctypes.Structure):
+    _fields_ = [
+        ("f_bsize", ctypes.c_uint32), ("f_iosize", ctypes.c_int32),
+        ("f_blocks", ctypes.c_uint64), ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64), ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64), ("f_fsid", Fsid),
+        ("f_owner", ctypes.c_uint32), ("f_type", ctypes.c_uint32),
+        ("f_flags", ctypes.c_uint32), ("f_fssubtype", ctypes.c_uint32),
+        ("f_fstypename", ctypes.c_char * 16),
+        ("f_mntonname", ctypes.c_char * 1024),
+        ("f_mntfromname", ctypes.c_char * 1024),
+        ("f_flags_ext", ctypes.c_uint32), ("f_reserved", ctypes.c_uint32 * 7),
+    ]
+
+if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdigit():
+    raise SystemExit(21)
+if (ctypes.sizeof(StatFs) != EXPECTED_SIZE
+        or StatFs.f_flags.offset != EXPECTED_FLAGS_OFFSET
+        or StatFs.f_fstypename.offset != EXPECTED_FSTYPENAME_OFFSET):
+    raise SystemExit(22)
+fd = int(sys.argv[1], 10)
+libc = ctypes.CDLL(None, use_errno=True)
+fstatfs = getattr(libc, "fstatfs")
+fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(StatFs)]
+fstatfs.restype = ctypes.c_int
+value = StatFs()
+result = fstatfs(fd, ctypes.byref(value))
+if result != 0:
+    raise SystemExit(23)
+filesystem = bytes(value.f_fstypename).split(b"\0", 1)[0].decode("ascii", "strict")
+payload = {"schema_version": 1, "filesystem": filesystem, "flags": int(value.f_flags)}
+os.write(1, (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+'''
+
+
+class DescriptorProbeClock:
+    """Production monotonic clock with one guarded exact-boundary test schedule."""
+    def __init__(self, controlled):
+        self.controlled = controlled
+        self.origin = 100_000_000_000 if controlled else None
+        self.process_calls = 0
+
+    def now_ns(self, phase):
+        if not self.controlled:
+            return time.monotonic_ns()
+        if phase == "start":
+            return self.origin
+        if phase == "cleanup_boundary":
+            return self.origin + P2_DESCRIPTOR_CLEANUP_NS
+        if phase == "process":
+            self.process_calls += 1
+            if self.process_calls == 1:
+                return self.origin
+        return self.origin + P2_DESCRIPTOR_PROCESS_NS
+
+
+def guarded_descriptor_test_configuration(run):
+    behavior = os.environ.get("FIRM_LEDGER_DESCRIPTOR_TEST_BEHAVIOR", "")
+    state_path = os.environ.get("FIRM_LEDGER_DESCRIPTOR_TEST_STATE", "")
+    if not behavior and not state_path:
+        return {"behavior": "", "state_path": ""}
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run.path)
+    state_parent = os.path.realpath(os.path.dirname(state_path)) if state_path else ""
+    try:
+        run_inside = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+        state_inside = (
+            state_parent != temp_root
+            and os.path.commonpath((temp_root, state_parent)) == temp_root
+        )
+        run_stat = os.lstat(run_path)
+        state_parent_stat = os.lstat(state_parent)
+        owned_directories = all(
+            stat.S_ISDIR(item.st_mode) and item.st_uid == os.getuid()
+            and stat.S_IMODE(item.st_mode) & 0o022 == 0
+            for item in (run_stat, state_parent_stat)
+        )
+    except (OSError, ValueError):
+        run_inside = state_inside = False
+        owned_directories = False
+    if (
+        guard != "1" or not run_inside or behavior not in DESCRIPTOR_TEST_BEHAVIORS
+        or not state_path or not state_inside or os.path.lexists(state_path)
+        or not os.path.isabs(state_path) or not owned_directories
+    ):
+        role_fail(2, "INPUT_INVALID", "test-support")
+    return {"behavior": behavior, "state_path": state_path}
+
+
+def write_descriptor_test_state(configuration, state):
+    path = configuration["state_path"]
+    if not path:
+        return
+    payload = (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+        try:
+            write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        role_fail(2, "INPUT_INVALID", "test-support")
+
+
+def descriptor_fixture_payload(behavior):
+    values = {
+        "schema_missing": b'{"filesystem":"apfs","flags":4096}\n',
+        "schema_extra": b'{"schema_version":1,"filesystem":"apfs","flags":4096,"extra":0}\n',
+        "schema_version_type": b'{"schema_version":"1","filesystem":"apfs","flags":4096}\n',
+        "filesystem_type": b'{"schema_version":1,"filesystem":7,"flags":4096}\n',
+        "flags_type": b'{"schema_version":1,"filesystem":"apfs","flags":true}\n',
+        "invalid_utf8": b'{"schema_version":1,"filesystem":"apfs\xff","flags":4096}\n',
+        "duplicate": b'{"schema_version":1,"filesystem":"apfs","flags":4096,"flags":4096}\n',
+        "trailing": b'{"schema_version":1,"filesystem":"apfs","flags":4096}\ntrailing',
+        "filesystem_mismatch": b'{"schema_version":1,"filesystem":"hfs","flags":4096}\n',
+        "locality_mismatch": b'{"schema_version":1,"filesystem":"apfs","flags":0}\n',
+        "flags_negative": b'{"schema_version":1,"filesystem":"apfs","flags":-1}\n',
+        "flags_overflow": b'{"schema_version":1,"filesystem":"apfs","flags":4294967296}\n',
+    }
+    if behavior in ("cap_256", "cap_257"):
+        size = 256 if behavior == "cap_256" else 257
+        compact = b'{"schema_version":1,"filesystem":"apfs","flags":4096}\n'
+        return b"{" + b" " * (size - len(compact)) + compact[1:]
+    return values.get(behavior)
+
+
+def descriptor_helper_code(behavior):
+    if behavior == "abi_size":
+        return DESCRIPTOR_HELPER_CODE.replace("EXPECTED_SIZE = 2168", "EXPECTED_SIZE = 2169")
+    if behavior == "abi_flags_offset":
+        return DESCRIPTOR_HELPER_CODE.replace("EXPECTED_FLAGS_OFFSET = 64", "EXPECTED_FLAGS_OFFSET = 65")
+    if behavior == "abi_fstypename_offset":
+        return DESCRIPTOR_HELPER_CODE.replace(
+            "EXPECTED_FSTYPENAME_OFFSET = 72", "EXPECTED_FSTYPENAME_OFFSET = 73"
+        )
+    if behavior == "symbol":
+        return DESCRIPTOR_HELPER_CODE.replace('getattr(libc, "fstatfs")', 'getattr(libc, "firm_missing_fstatfs")')
+    if behavior == "syscall":
+        return DESCRIPTOR_HELPER_CODE.replace("fstatfs(fd, ctypes.byref(value))", "fstatfs(-1, ctypes.byref(value))")
+    payload = descriptor_fixture_payload(behavior)
+    if payload is not None:
+        return "import os,sys; int(sys.argv[1]); os.write(1,%r)" % payload
+    if behavior == "nonzero":
+        return "import sys; int(sys.argv[1]); raise SystemExit(7)"
+    if behavior == "ignore_term":
+        return (
+            "import os,signal,sys,time; int(sys.argv[1]); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); os.write(1,b'R'); time.sleep(30)"
+        )
+    if behavior in ("terminate_error", "wait_error", "clock_deadlines"):
+        return "import os,sys,time; int(sys.argv[1]); os.write(1,b'R'); time.sleep(30)"
+    if behavior == "timeout":
+        return "import sys,time; int(sys.argv[1]); time.sleep(30)"
+    return DESCRIPTOR_HELPER_CODE
+
+
+def parse_descriptor_fact(output):
+    if not output or len(output) > P2_DESCRIPTOR_MAX_STDOUT_BYTES or not output.endswith(b"\n"):
+        raise ValidationError("descriptor filesystem state unavailable")
+    body = output[:-1]
+    if b"\n" in body or b"\r" in body or not body:
+        raise ValidationError("descriptor filesystem state unavailable")
+    try:
+        text = body.decode("utf-8", "strict")
+        decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+        record, end = decoder.raw_decode(text)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError("descriptor filesystem state unavailable") from exc
+    if end != len(text) or not exact_keys(record, {"schema_version", "filesystem", "flags"}):
+        raise ValidationError("descriptor filesystem state unavailable")
+    schema = record["schema_version"]
+    filesystem = record["filesystem"]
+    flags = record["flags"]
+    if (
+        not isinstance(schema, int) or isinstance(schema, bool) or schema != 1
+        or not isinstance(filesystem, str)
+        or not isinstance(flags, int) or isinstance(flags, bool)
+        or flags < 0 or flags > 0xFFFF_FFFF
+    ):
+        raise ValidationError("descriptor filesystem state unavailable")
+    if filesystem != "apfs" or flags & P2_MNT_LOCAL == 0:
+        raise ValidationError("descriptor filesystem state unavailable")
+    return {"filesystem": filesystem, "flags": flags}
+
+
+def cleanup_descriptor_helper(process, clock, cleanup_deadline_ns, behavior, state):
+    """Continue bounded fallback cleanup after operation errors, but retain uncertainty."""
+    uncertain = False
+    reaped = False
+    operations = state.setdefault("cleanup_operations", [])
+    try:
+        if behavior == "terminate_error":
+            raise OSError(errno.EIO, "injected terminate operation error")
+        process.terminate()
+        operations.append("terminate:success")
+    except (OSError, subprocess.SubprocessError):
+        operations.append("terminate:error")
+        uncertain = True
+
+    if not uncertain or behavior == "wait_error":
+        try:
+            if behavior == "wait_error":
+                raise OSError(errno.EIO, "injected wait operation error")
+            terminate_deadline = cleanup_deadline_ns - P2_DESCRIPTOR_KILL_RESERVE_NS
+            remaining = max(0.0, (terminate_deadline - clock.now_ns("cleanup")) / 1e9)
+            process.wait(timeout=remaining)
+            operations.append("wait_after_terminate:success")
+            reaped = True
+        except subprocess.TimeoutExpired:
+            operations.append("wait_after_terminate:timeout")
+        except (OSError, subprocess.SubprocessError):
+            operations.append("wait_after_terminate:error")
+            uncertain = True
+
+    if not reaped:
+        try:
+            process.kill()
+            operations.append("kill:success")
+        except (OSError, subprocess.SubprocessError):
+            operations.append("kill:error")
+            uncertain = True
+        try:
+            remaining = max(0.0, (cleanup_deadline_ns - clock.now_ns("cleanup")) / 1e9)
+            process.wait(timeout=remaining)
+            operations.append("final_wait:success")
+            reaped = True
+        except (OSError, subprocess.SubprocessError):
+            operations.append("final_wait:error")
+            uncertain = True
+
+    state["cleanup_uncertain"] = uncertain
+    state["eventual_reaped"] = reaped
+    state["cleanup_boundary_observed_ns"] = clock.now_ns("cleanup_boundary")
+    return reaped and not uncertain
+
+
+def descriptor_filesystem_fact(run, python_executable):
+    """Resolve APFS/local on the held run descriptor in one bounded helper lifetime."""
+    configuration = guarded_descriptor_test_configuration(run)
+    behavior = configuration["behavior"]
+    controlled = behavior in {"ignore_term", "terminate_error", "wait_error", "clock_deadlines"}
+    clock = DescriptorProbeClock(controlled)
+    started_ns = clock.now_ns("start")
+    process_deadline_ns = started_ns + P2_DESCRIPTOR_PROCESS_NS
+    cleanup_deadline_ns = started_ns + P2_DESCRIPTOR_CLEANUP_NS
+    state = {
+        "schema_version": 1, "behavior": behavior or "production",
+        "started_ns": started_ns, "process_deadline_ns": process_deadline_ns,
+        "cleanup_deadline_ns": cleanup_deadline_ns, "pid": None,
+        "retained_stdout_bytes": 0, "status": "failed", "eventual_reaped": False,
+    }
+    process = None
+    stdout = None
+    reaped = False
+    try:
+        helper_executable = (
+            python_executable + ".firm-missing" if behavior == "popen_error"
+            else python_executable
+        )
+        inherited_fds = (run.run_fd, -1) if behavior == "pass_fds_error" else (run.run_fd,)
+        process = subprocess.Popen(
+            [helper_executable, "-I", "-S", "-B", "-c", descriptor_helper_code(behavior), str(run.run_fd)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0, close_fds=True, pass_fds=inherited_fds, env={"LC_ALL": "C"},
+        )
+        state["pid"] = process.pid
+        stdout = process.stdout
+        if behavior == "pipe_error" and stdout is not None:
+            stdout.close()
+            stdout = None
+        if stdout is None:
+            raise ValidationError("descriptor filesystem state unavailable")
+        fd = stdout.fileno()
+        output = bytearray()
+        while True:
+            remaining_ns = process_deadline_ns - clock.now_ns("process")
+            if remaining_ns <= 0:
+                raise ValidationError("descriptor filesystem state unavailable")
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining_ns / 1e9)
+            except InterruptedError:
+                continue
+            if not readable:
+                raise ValidationError("descriptor filesystem state unavailable")
+            read_size = min(
+                P2_DESCRIPTOR_READ_CHUNK,
+                P2_DESCRIPTOR_MAX_STDOUT_BYTES - len(output) + 1,
+            )
+            chunk = os.read(fd, read_size)
+            if not chunk:
+                break
+            if len(output) + len(chunk) > P2_DESCRIPTOR_MAX_STDOUT_BYTES:
+                raise ValidationError("descriptor filesystem state unavailable")
+            output.extend(chunk)
+            state["retained_stdout_bytes"] = len(output)
+        remaining_ns = process_deadline_ns - clock.now_ns("process")
+        if remaining_ns <= 0:
+            raise ValidationError("descriptor filesystem state unavailable")
+        try:
+            returncode = process.wait(timeout=remaining_ns / 1e9)
+        except subprocess.TimeoutExpired as exc:
+            raise ValidationError("descriptor filesystem state unavailable") from exc
+        reaped = True
+        state["eventual_reaped"] = True
+        state["returncode"] = returncode
+        if returncode != 0:
+            raise ValidationError("descriptor filesystem state unavailable")
+        fact = parse_descriptor_fact(bytes(output))
+        state["status"] = "success"
+        return fact
+    except RoleFailure:
+        raise
+    except BaseException as exc:
+        state["failure_type"] = type(exc).__name__
+        if process is not None and not reaped:
+            cleanup_descriptor_helper(process, clock, cleanup_deadline_ns, behavior, state)
+        raise ValidationError("descriptor filesystem state unavailable") from exc
+    finally:
+        if stdout is not None:
+            stdout.close()
+        if process is not None and state["eventual_reaped"]:
+            try:
+                os.waitpid(process.pid, os.WNOHANG)
+                state["second_wait_unavailable"] = False
+            except ChildProcessError:
+                state["second_wait_unavailable"] = True
+        if controlled:
+            state["controlled_clock_observations_ns"] = [
+                clock.now_ns("start"), clock.now_ns("process"), clock.now_ns("cleanup_boundary")
+            ]
+        write_descriptor_test_state(configuration, state)
+
+
+def require_supported_write_environment(run, preflight):
+    """Fail closed before either producer opens/creates a lock or transaction temp."""
+    reject = preflight["reject"]
+    try:
+        nofollow = preflight["nofollow"]
+        directory = preflight["directory"]
+        nonblock = getattr(os, "O_NONBLOCK", None)
+        if reject == "nonblock_missing":
+            nonblock = None
+        elif reject == "nonblock_invalid":
+            nonblock = 0
+        if (
+            not isinstance(nofollow, int) or nofollow <= 0
+            or not isinstance(directory, int) or directory <= 0
+            or not isinstance(nonblock, int) or nonblock <= 0
+        ):
+            unsupported_write_configuration()
+
+        replace_parameters = inspect.signature(os.replace).parameters if callable(os.replace) else {}
+        capabilities = {
+            "stat_dir_fd_missing": os.stat in os.supports_dir_fd,
+            "stat_nofollow_missing": os.stat in os.supports_follow_symlinks,
+            "statvfs_fd_missing": os.statvfs in os.supports_fd,
+            "unlink_dir_fd_missing": os.unlink in os.supports_dir_fd,
+            "replace_missing": callable(os.replace),
+            "replace_dir_fd_missing": (
+                "src_dir_fd" in replace_parameters and "dst_dir_fd" in replace_parameters
+            ),
+            "regular_file_check_missing": callable(stat.S_ISREG) and callable(stat.S_ISDIR),
+            "file_fsync_missing": callable(os.fsync),
+            "directory_fsync_missing": callable(os.fsync),
+            "flock_missing": callable(fcntl.flock),
+        }
+        if reject in capabilities:
+            capabilities[reject] = False
+        if not all(capabilities.values()):
+            unsupported_write_configuration()
+
+        run.prove()
+        held_stats = tuple(os.fstat(fd) for fd in run.fds)
+        same_filesystem = len({item.st_dev for item in held_stats}) == 1
+        if reject == "same_filesystem_mismatch":
+            same_filesystem = False
+        if not same_filesystem:
+            unsupported_write_configuration()
+        device = held_stats[0].st_dev
+        filesystem = descriptor_filesystem_fact(run, preflight["python_executable"])
+        if reject == "filesystem_unverifiable":
+            filesystem = None
+        elif reject == "filesystem_type_mismatch":
+            filesystem = {"filesystem": "hfs", "flags": filesystem["flags"]}
+        elif reject == "filesystem_locality_mismatch":
+            filesystem = {"filesystem": filesystem["filesystem"], "flags": 0}
+        if (
+            filesystem is None or filesystem["filesystem"] != "apfs"
+            or filesystem["flags"] & P2_MNT_LOCAL == 0
+        ):
+            unsupported_write_configuration()
+
+        file_probe_fd = None
+        git_dir_fd = None
+        try:
+            git_control_stat = os.stat(".git", dir_fd=run.repo_fd, follow_symlinks=False)
+            if stat.S_ISREG(git_control_stat.st_mode):
+                file_probe_fd = os.open(
+                    ".git", os.O_RDONLY | nofollow | nonblock, dir_fd=run.repo_fd
+                )
+            elif stat.S_ISDIR(git_control_stat.st_mode):
+                git_dir_fd = os.open(
+                    ".git", os.O_RDONLY | directory | nofollow, dir_fd=run.repo_fd
+                )
+                file_probe_fd = os.open(
+                    "HEAD", os.O_RDONLY | nofollow | nonblock, dir_fd=git_dir_fd
+                )
+            else:
+                unsupported_write_configuration()
+            file_probe_stat = os.fstat(file_probe_fd)
+            if (
+                not stat.S_ISREG(file_probe_stat.st_mode)
+                or file_probe_stat.st_uid != os.getuid()
+                or file_probe_stat.st_dev != device
+            ):
+                unsupported_write_configuration()
+            os.fsync(file_probe_fd)
+        finally:
+            if file_probe_fd is not None:
+                os.close(file_probe_fd)
+            if git_dir_fd is not None:
+                os.close(git_dir_fd)
+
+        if reject == "directory_fsync_missing":
+            unsupported_write_configuration()
+        os.fsync(run.run_fd)
+        if reject == "flock_missing":
+            unsupported_write_configuration()
+        probe_fd = os.dup(run.run_fd)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
+    except RoleFailure:
+        raise
+    except Exception:
+        unsupported_write_configuration()
+
+
+def prepare_write_run(repo, run_path):
+    """One shared preflight, typed binding, and post-bind P2 verification sequence."""
+    preflight = preflight_write_environment(run_path)
+    run = bind_write_run(repo, run_path, preflight)
+    try:
+        require_supported_write_environment(run, preflight)
+    except BaseException:
+        run.close()
+        raise
+    return run
+
+
+def active_failpoint(run):
+    requested = os.environ.get("FIRM_LEDGER_FAILPOINT", "")
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    barrier = os.environ.get("FIRM_LEDGER_BARRIER_PHASE", "")
+    if not requested and not guard:
+        return None
+    if not requested and barrier:
+        phases = barrier.split(",")
+        if guard != "1" or not phases or len(set(phases)) != len(phases) or any(
+            phase not in BARRIER_PHASES for phase in phases
+        ):
+            role_fail(2, "INPUT_INVALID", "test-barrier")
+        return None
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run)
+    inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
+    if guard != "1" or not inside_temp:
+        if guard:
+            role_fail(2, "INPUT_INVALID", "test-guard")
+        return None
+    if requested not in FAILPOINTS:
+        role_fail(2, "INPUT_INVALID", "failpoint")
+    return requested
+
+
+def ledger_barrier(run, phase, detail=""):
+    requested = os.environ.get("FIRM_LEDGER_BARRIER_PHASE", "")
+    phases = requested.split(",") if requested else []
+    if phase not in phases:
+        return
+    guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
+    barrier_dir = os.environ.get("FIRM_LEDGER_BARRIER_DIR", "")
+    token = os.environ.get("FIRM_LEDGER_BARRIER_TOKEN", "writer")
+    if (
+        guard != "1" or not phases or len(set(phases)) != len(phases)
+        or any(item not in BARRIER_PHASES for item in phases)
+        or not SAFE_FIELD.fullmatch(token)
+    ):
+        role_fail(2, "INPUT_INVALID", "test-barrier")
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    run_path = os.path.realpath(run.path)
+    barrier_path = os.path.realpath(barrier_dir) if barrier_dir else ""
+    if (
+        run_path == temp_root or os.path.commonpath((temp_root, run_path)) != temp_root
+        or not barrier_path or barrier_path == temp_root
+        or os.path.commonpath((temp_root, barrier_path)) != temp_root
+    ):
+        role_fail(2, "INPUT_INVALID", "test-barrier")
+    try:
+        require_owned_directory(Path(barrier_path), "test barrier")
+        if phase in ("after_success_output", "before_return"):
+            sys.stdout.flush()
+        suffix = "." + phase if len(phases) > 1 else ""
+        ready = os.path.join(barrier_path, token + suffix + ".ready")
+        release = os.path.join(barrier_path, token + suffix + ".release")
+        fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            write_all(fd, (phase + (":" + detail if detail else "") + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                release_fd = os.open(release, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                time.sleep(0.01)
+                continue
+            else:
+                os.close(release_fd)
+                return
+    except (OSError, CommitError) as exc:
+        raise LedgerError("test barrier failed") from exc
+    raise LedgerError("test barrier timeout")
+
+
+def open_lock(run):
+    flags = os.O_RDWR | os.O_CREAT
+    fd = None
+    for _ in range(8):
+        try:
+            run.prove()
+            fd = run.open("run.jsonl.lock", flags, 0o600)
+            break
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise LedgerError("lock open failed") from exc
+    if fd is None:
+        raise LedgerError("lock open failed")
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        os.close(fd)
+        raise LedgerError("unsafe lock")
+    return fd, stat_identity(st)
+
+
+def prove_lock(run, fd, identity):
+    try:
+        run.prove()
+        check_fd = run.open("run.jsonl.lock", os.O_RDONLY)
+    except OSError as exc:
+        raise LedgerError("lock path changed") from exc
+    try:
+        if stat_identity(os.fstat(fd)) != identity or stat_identity(os.fstat(check_fd)) != identity:
+            raise LedgerError("lock identity changed")
+    finally:
+        os.close(check_fd)
+
+
+def acquire_locks(target_run, authority_runs):
+    modes = {target_run.name: (target_run, fcntl.LOCK_EX)}
+    for run in authority_runs:
+        modes.setdefault(run.name, (run, fcntl.LOCK_SH))
+    held = []
+    try:
+        for run_name in sorted(modes):
+            run, mode = modes[run_name]
+            fd, identity = open_lock(run)
+            try:
+                fcntl.flock(fd, mode)
+            except OSError:
+                os.close(fd)
+                raise
+            held.append((run, fd, identity))
+        for run, fd, identity in held:
+            prove_lock(run, fd, identity)
+        return held
+    except (OSError, LedgerError) as exc:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        raise LedgerError("lock failed") from exc
+
+
+def prove_locks(held):
+    for run, fd, identity in held:
+        prove_lock(run, fd, identity)
+
+
+def open_ledger(run):
+    try:
+        fd = run.open("run.jsonl", os.O_RDONLY)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        raise LedgerError("ledger open failed") from exc
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        os.close(fd)
+        raise LedgerError("unsafe ledger")
+    return fd, stat_identity(st)
+
+
+def ledger_records(fd, copy_fd=None):
+    pending = b""
+    while True:
+        try:
+            chunk = os.read(fd, CHUNK)
+        except OSError as exc:
+            raise LedgerError("ledger read failed") from exc
+        if not chunk:
+            break
+        if copy_fd is not None:
+            write_all(copy_fd, chunk)
+        pending += chunk
+        while b"\n" in pending:
+            raw, pending = pending.split(b"\n", 1)
+            if not raw or len(raw) > MAX_LEDGER_LINE:
+                raise LedgerError("malformed ledger line")
+            try:
+                record = parse_json_unique(raw.decode("utf-8", "strict"))
+            except Exception as exc:
+                raise LedgerError("malformed ledger line") from exc
+            if not isinstance(record, dict):
+                raise LedgerError("ledger line is not an object")
+            yield record
+        if len(pending) > MAX_LEDGER_LINE:
+            raise LedgerError("oversized ledger line")
+    if pending:
+        raise LedgerError("incomplete ledger line")
+
+
+def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=()):
+    event_ids = set()
+    activation_ids = set()
+    wanted = set(wanted_event_ids)
+    matches = {}
+    count = 0
+    for record in ledger_records(fd, copy_fd):
+        family = classify_record(record, ledger_run_id)
+        count += 1
+        if family not in ("ordinary", "native_role_start"):
+            continue
+        event_id = record["event_id"]
+        if event_id in event_ids:
+            raise DuplicateEvent(event_id)
+        event_ids.add(event_id)
+        if event_id in wanted:
+            matches[event_id] = record
+        if family == "native_role_start":
+            identity = (record["run_id"], record["stage"], record["role"])
+            if identity in activation_ids:
+                raise LedgerError("duplicate native activation")
+            activation_ids.add(identity)
+    return {
+        "count": count,
+        "event_ids": event_ids,
+        "activation_ids": activation_ids,
+        "matches": matches,
+    }
+
+
+def validate_authorities(items, start_time):
+    projections = []
+    descriptors = []
+    for source_run, source_id, event_id, expect in items:
+        fd, identity = open_ledger(source_run)
+        if fd is None:
+            role_fail(11, "AUTHORITY_INVALID", source_id)
+        try:
+            scan = scan_ledger(fd, source_id, wanted_event_ids=(event_id,))
+        except DuplicateEvent as exc:
+            os.close(fd)
+            if str(exc) == event_id:
+                role_fail(11, "AUTHORITY_INVALID", event_id)
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", source_id)
+        except LedgerError:
+            os.close(fd)
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", source_id)
+        if event_id not in scan["matches"]:
+            os.close(fd)
+            role_fail(11, "AUTHORITY_INVALID", event_id)
+        record = scan["matches"][event_id]
+        try:
+            earlier = parse_ts(record.get("ts")) < start_time
+        except Exception:
+            earlier = False
+        if not earlier or record.get("event") != expect["event"] or record.get("run_id") != expect["run_id"]:
+            os.close(fd)
+            role_fail(11, "AUTHORITY_INVALID", event_id)
+        for key, value in expect["fields"].items():
+            if record.get(key) != value:
+                os.close(fd)
+                role_fail(11, "AUTHORITY_INVALID", event_id)
+        projections.append({
+            "source_run_id": source_id,
+            "event_id": event_id,
+            "event": expect["event"],
+            "matched": {key: expect["fields"][key] for key in sorted(expect["fields"])},
+        })
+        descriptors.append((source_run, fd, identity))
+    return projections, descriptors
+
+
+def prove_authority_descriptors(descriptors):
+    for run, fd, identity in descriptors:
+        if stat_identity(os.fstat(fd)) != identity or not same_open_ledger(run, identity):
+            raise LedgerError("authority ledger identity changed")
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        if written <= 0:
+            raise CommitError("append")
+        view = view[written:]
+
+
+def descriptor_digest(fd, phase):
+    try:
+        before = stat_identity(os.fstat(fd))
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        count = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            count += len(chunk)
+            digest.update(chunk)
+        os.lseek(fd, position, os.SEEK_SET)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        raise CommitError(phase) from exc
+    if before != after or count != after[5]:
+        raise CommitError(phase)
+    return count, digest
+
+
+def prove_exact_append(fd, prefix_length, prefix_digest, payload):
+    try:
+        before = stat_identity(os.fstat(fd))
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, 0, os.SEEK_SET)
+        remaining = prefix_length
+        digest = hashlib.sha256()
+        while remaining:
+            chunk = os.read(fd, min(CHUNK, remaining))
+            if not chunk:
+                raise CommitError("proof")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        appended = bytearray()
+        while len(appended) < len(payload):
+            chunk = os.read(fd, len(payload) - len(appended))
+            if not chunk:
+                raise CommitError("proof")
+            appended.extend(chunk)
+        trailing = os.read(fd, 1)
+        os.lseek(fd, position, os.SEEK_SET)
+        after = stat_identity(os.fstat(fd))
+    except OSError as exc:
+        raise CommitError("proof") from exc
+    if (
+        before != after or after[5] != prefix_length + len(payload) or trailing
+        or digest.digest() != prefix_digest.digest() or bytes(appended) != payload
+    ):
+        raise CommitError("proof")
+
+
+def same_open_ledger(run, expected):
+    fd, identity = open_ledger(run)
+    if fd is not None:
+        os.close(fd)
+    return identity == expected
+
+
+def prove_live_ledger_identity(run, proof_fd, proof_identity):
+    try:
+        run.prove()
+        if stat_identity(os.fstat(proof_fd)) != proof_identity:
+            raise CommitError("proof")
+        live_fd, live_identity = open_ledger(run)
+        if live_fd is None:
+            raise CommitError("proof")
+        try:
+            if live_identity != proof_identity:
+                raise CommitError("proof")
+        finally:
+            os.close(live_fd)
+    except (OSError, LedgerError, ValidationError) as exc:
+        raise CommitError("proof") from exc
+
+
+def atomic_commit(
+    run, record, event_id, role_key=None, failpoint=None, contract_check=None,
+    lock_check=None, precommit_check=None,
+):
+    temp_name = f".run.jsonl.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    temp_fd = None
+    temp_identity = None
+    old_fd = None
+    old_identity = None
+    renamed = False
+    try:
+        run.prove()
+        if failpoint == "before_temp_write":
+            raise CommitError("append")
+        try:
+            temp_fd = run.open(temp_name, flags, 0o600)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        temp_st = os.fstat(temp_fd)
+        temp_identity = object_identity(temp_st)
+        if not stat.S_ISREG(temp_st.st_mode) or temp_st.st_uid != os.getuid() or stat.S_IMODE(temp_st.st_mode) != 0o600:
+            raise CommitError("append")
+        old_fd, old_identity = open_ledger(run)
+        ledger_barrier(run, "after_source_open")
+        if old_fd is None:
+            old_length, old_digest = 0, hashlib.sha256()
+        else:
+            old_length, old_digest = descriptor_digest(old_fd, "append")
+        scan = {"event_ids": set(), "activation_ids": set()}
+        if old_fd is not None:
+            scan = scan_ledger(old_fd, run.name, copy_fd=temp_fd)
+        if event_id in scan["event_ids"]:
+            raise DuplicateEvent("duplicate event id")
+        if role_key is not None and (run.name, role_key[0], role_key[1]) in scan["activation_ids"]:
+            raise DuplicateActivation("duplicate activation")
+        payload = (json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        if failpoint == "partial_temp_write":
+            write_all(temp_fd, payload[:max(1, len(payload) // 2)])
+            raise CommitError("append")
+        write_all(temp_fd, payload)
+        if failpoint == "temp_fsync":
+            raise CommitError("append")
+        try:
+            os.fsync(temp_fd)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        expected_digest = old_digest.copy()
+        expected_digest.update(payload)
+
+        def prove_temp():
+            run.prove()
+            try:
+                if (
+                    object_identity(os.fstat(temp_fd)) != temp_identity
+                    or run.entry_identity(temp_name)[:5] != temp_identity
+                ):
+                    raise CommitError("append")
+            except OSError as exc:
+                raise CommitError("append") from exc
+            count, digest = descriptor_digest(temp_fd, "append")
+            if count != old_length + len(payload) or digest.digest() != expected_digest.digest():
+                raise CommitError("append")
+
+        prove_temp()
+        run.prove()
+        ledger_barrier(run, "after_temp_fsync", temp_name)
+        if lock_check is not None:
+            lock_check()
+        if precommit_check is not None:
+            precommit_check()
+        if contract_check is not None:
+            contract_check()
+        if old_fd is None:
+            try:
+                os.stat("run.jsonl", dir_fd=run.run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise CommitError("append")
+        elif not same_open_ledger(run, old_identity):
+            raise CommitError("append")
+        prove_temp()
+        ledger_barrier(run, "before_replace", temp_name)
+        run.prove()
+        if lock_check is not None:
+            lock_check()
+        if precommit_check is not None:
+            precommit_check()
+        if contract_check is not None:
+            contract_check()
+        if old_fd is None:
+            try:
+                os.stat("run.jsonl", dir_fd=run.run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise CommitError("append")
+        elif not same_open_ledger(run, old_identity):
+            raise CommitError("append")
+        prove_temp()
+        if failpoint == "pre_rename":
+            raise CommitError("append")
+        try:
+            os.replace(temp_name, "run.jsonl", src_dir_fd=run.run_fd, dst_dir_fd=run.run_fd)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        renamed = True
+        ledger_barrier(run, "after_replace")
+        if failpoint == "post_rename":
+            raise CommitError("append")
+        try:
+            if failpoint == "directory_fsync":
+                raise CommitError("append")
+            os.fsync(run.run_fd)
+        except OSError as exc:
+            raise CommitError("append") from exc
+        run.prove()
+        if contract_check is not None:
+            contract_check()
+        if lock_check is not None:
+            lock_check()
+        if failpoint == "post_append_pre_proof":
+            raise CommitError("proof")
+        if failpoint == "proof_read":
+            raise CommitError("proof")
+        try:
+            proof_fd, proof_identity = open_ledger(run)
+        except LedgerError as exc:
+            raise CommitError("proof") from exc
+        if proof_fd is None:
+            raise CommitError("proof")
+        try:
+            prove_exact_append(proof_fd, old_length, old_digest, payload)
+            proven_scan = scan_ledger(proof_fd, run.name, wanted_event_ids=(event_id,))
+            ledger_barrier(run, "after_result_scan")
+            prove_live_ledger_identity(run, proof_fd, proof_identity)
+            prove_exact_append(proof_fd, old_length, old_digest, payload)
+            prove_live_ledger_identity(run, proof_fd, proof_identity)
+            ledger_barrier(run, "after_final_proof")
+        except LedgerError as exc:
+            raise CommitError("proof") from exc
+        finally:
+            os.close(proof_fd)
+        exact = proven_scan["matches"].get(event_id) == record
+        activation_ok = role_key is None or (run.name, role_key[0], role_key[1]) in proven_scan["activation_ids"]
+        if failpoint == "proof_compare" or not exact or not activation_ok:
+            raise CommitError("proof")
+        if contract_check is not None:
+            contract_check()
+        if lock_check is not None:
+            lock_check()
+    except (DuplicateEvent, DuplicateActivation, LedgerError, ContractDrift, CommitError):
+        raise
+    except OSError as exc:
+        raise CommitError("proof" if renamed else "append") from exc
+    finally:
+        if old_fd is not None:
+            os.close(old_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if not renamed:
+            if temp_identity is not None:
+                try:
+                    if run.entry_identity(temp_name)[:5] == temp_identity:
+                        os.unlink(temp_name, dir_fd=run.run_fd)
+                except (FileNotFoundError, OSError, ValidationError):
+                    pass
+
+
+def ordinary_main(argv):
+    target = None
+    strict = False
+    requested_event_id = None
+    print_event_id = False
+    while argv and argv[0].startswith("--"):
+        flag = argv.pop(0)
+        if flag == "--run":
+            if not argv:
+                print("firm-ledger-log: --run needs a path", file=sys.stderr)
+                raise SystemExit(2)
+            target = argv.pop(0)
+        elif flag == "--strict":
+            strict = True
+        elif flag == "--event-id":
+            if not argv:
+                print("firm-ledger-log: --event-id needs a value", file=sys.stderr)
+                raise SystemExit(2)
+            requested_event_id = argv.pop(0)
+        elif flag == "--print-event-id":
+            print_event_id = True
+        else:
+            print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
+            raise SystemExit(2)
+    event = argv.pop(0) if argv else "event"
+    if target is None:
+        current = Path.cwd() / ".agent-firm" / "CURRENT_RUN"
+        try:
+            target = current.read_text(encoding="utf-8").strip()
+        except OSError:
+            raise SystemExit(0)
+    if not target:
+        raise SystemExit(0)
+    try:
+        repo, run_path = validate_run(target, False)
+        run = prepare_write_run(repo, run_path)
+    except RoleFailure:
+        raise
+    except ValidationError as exc:
+        ordinary_fail(strict, str(exc))
+    try:
+        ledger_barrier(run, "after_support_gate")
+    except RoleFailure:
+        run.close()
+        raise
+    except LedgerError:
+        run.close()
+        role_fail(2, "INPUT_INVALID", "test-barrier")
+    if not SAFE_EVENT.fullmatch(event):
+        ordinary_fail(strict, "event contains unsafe characters")
+    event_id = requested_event_id or (
+        "evt-" + utc_now().strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    if not isinstance(event_id, str) or not SAFE_EVENT_ID.fullmatch(event_id):
+        ordinary_fail(strict, "event id contains unsafe characters")
+    record = {"ts": format_ts(utc_now()), "event": event, "event_id": event_id}
+    for item in argv:
+        if "=" not in item:
+            ordinary_fail(strict, f"field is not key=value: {item}")
+        key, value = item.split("=", 1)
+        if not SAFE_FIELD.fullmatch(key):
+            ordinary_fail(strict, f"unsafe field name: {key}")
+        if key in COMMON_FIELDS or key in NATIVE_ONLY_FIELDS:
+            ordinary_fail(strict, f"reserved field cannot be overridden: {key}")
+        if key in record:
+            ordinary_fail(strict, f"duplicate field: {key}")
+        if not printable(value, 4096, allow_empty=True):
+            ordinary_fail(strict, f"unsafe field value: {key}")
+        record[key] = value
+    record["run_id"] = run.name
+    held = []
+    try:
+        held = acquire_locks(run, [])
+        ledger_barrier(run, "after_lock")
+        atomic_commit(run, record, event_id, lock_check=lambda: prove_locks(held))
+        result = event_id if print_event_id else None
+        ledger_barrier(run, "after_result_construction")
+    except DuplicateEvent:
+        ordinary_fail(strict, f"duplicate event id: {event_id}")
+    except (LedgerError, CommitError):
+        ordinary_fail(strict, "could not append target ledger")
+    finally:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        run.close()
+    if result is not None:
+        print(result)
+        ledger_barrier(run, "after_success_output")
+    ledger_barrier(run, "before_return")
+    raise SystemExit(0)
+
+
+def role_main(argv):
+    values = parse_role_options(argv)
+    role = values["role"]
+    stage = values["stage"]
+    event = values["event"]
+    agent = values["agent"]
+    validate_stage(stage)
+    if not SAFE_ROLE.fullmatch(role):
+        role_fail(2, "INPUT_INVALID", "role")
+    if not SAFE_EVENT.fullmatch(event) or not event.endswith("_started"):
+        role_fail(2, "INPUT_INVALID", "event")
+    if not printable(agent, 256) or not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_./:-]{0,254}", agent) or ".." in Path(agent).parts:
+        role_fail(2, "INPUT_INVALID", "agent")
+    try:
+        repo, run_path = validate_run(values["run"], False)
+        run = prepare_write_run(repo, run_path)
+    except RoleFailure:
+        raise
+    except ValidationError:
+        role_fail(10, "RUN_INVALID", Path(values["run"]).name)
+    try:
+        ledger_barrier(run, "after_support_gate")
+    except RoleFailure:
+        run.close()
+        raise
+    except LedgerError:
+        run.close()
+        role_fail(2, "INPUT_INVALID", "test-barrier")
+    failpoint = active_failpoint(run.path)
+    justification = values.get("activation_justification")
+    activation = validate_activation_json(values["activation_json"], role, justification)
+    authority_items = validate_authority_json(values["authority_json"], repo)
+    contract_fd = None
+    contract_chain = ()
+    metadata_fd = None
+    held = []
+    authority_descriptors = []
+    try:
+        try:
+            metadata_fd, metadata_identity, metadata = read_owned_json_held(
+                run, "run-metadata.json", (0o600, 0o644), "run metadata",
+            )
+            if not isinstance(metadata, dict) or metadata.get("run_id") != run.name:
+                raise ValidationError("run metadata identity mismatch")
+            if metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+                raise ValidationError("run is not current and approval eligible")
+        except ValidationError:
+            role_fail(10, "RUN_INVALID", run.name)
+        try:
+            contract_fd, contract_identity, contract_chain, contract = open_contract(
+                run, values["contract"], failpoint,
+            )
+        except ValidationError:
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        maybe_mutate_contract(failpoint, run, values["contract"])
+        try:
+            prove_contract(contract_fd, contract_identity, contract_chain, run, values["contract"])
+        except (OSError, ValidationError):
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        ledger_barrier(run, "after_contract_open")
+        try:
+            held = acquire_locks(run, [item[0] for item in authority_items])
+            ledger_barrier(run, "after_lock")
+        except LedgerError:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
+        start_time = utc_now()
+        authority, authority_descriptors = validate_authorities(authority_items, start_time)
+        event_id = (
+            "evt-" + start_time.strftime("%Y%m%dT%H%M%S") +
+            f"-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        record = {
+            "ts": format_ts(start_time),
+            "event": event,
+            "event_id": event_id,
+            "run_id": run.name,
+            "stage": stage,
+            "role": role,
+            "agent": agent,
+            "contract": contract,
+            "authority": authority,
+            "activation": activation,
+        }
+        if justification is not None:
+            record["activation_justification"] = justification
+
+        def contract_check():
+            try:
+                prove_held_file(run, "run-metadata.json", metadata_fd, metadata_identity, "run metadata")
+                prove_contract(
+                    contract_fd, contract_identity, contract_chain, run, values["contract"],
+                )
+            except (OSError, ValidationError) as exc:
+                raise ContractDrift() from exc
+
+        try:
+            atomic_commit(
+                run, record, event_id, role_key=(stage, role), failpoint=failpoint,
+                contract_check=contract_check, lock_check=lambda: prove_locks(held),
+                precommit_check=lambda: prove_authority_descriptors(authority_descriptors),
+            )
+        except DuplicateActivation:
+            role_fail(13, "DUPLICATE_ACTIVATION", f"{stage}:{role}")
+        except DuplicateEvent:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", event_id)
+        except LedgerError:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
+        except ContractDrift:
+            role_fail(12, "CONTRACT_INVALID", values["contract"])
+        except CommitError as exc:
+            if exc.phase == "proof":
+                role_fail(16, "POST_APPEND_PROOF_FAILED", event_id)
+            role_fail(15, "APPEND_OR_DURABILITY_FAILED", event_id)
+        result = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "run_id": run.name,
+            "event": event,
+            "stage": stage,
+            "role": role,
+            "agent": agent,
+            "contract": contract,
+            "authority": authority,
+            "activation": activation,
+        }
+        if justification is not None:
+            result["activation_justification"] = justification
+        ledger_barrier(run, "after_result_construction")
+        print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
+        ledger_barrier(run, "after_success_output")
+    finally:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        for _, fd, _ in reversed(authority_descriptors):
+            os.close(fd)
+        if contract_fd is not None:
+            os.close(contract_fd)
+        for directory_fd, _ in reversed(contract_chain):
+            os.close(directory_fd)
+        if metadata_fd is not None:
+            os.close(metadata_fd)
+        for source_run, _, _, _ in authority_items:
+            source_run.close()
+        run.close()
+    ledger_barrier(run, "before_return")
+    raise SystemExit(0)
+
+
+try:
+    if "--role-start" in ARGS:
+        role_main(list(ARGS))
+    ordinary_main(list(ARGS))
+except RoleFailure as exc:
+    print(f"firm-ledger-log: {exc.category}: {exc.identity}", file=sys.stderr)
+    raise SystemExit(exc.code)
+except KeyboardInterrupt:
+    raise SystemExit(130)
+PY

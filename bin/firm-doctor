@@ -15,12 +15,12 @@
 #   5. op:// references in .env.op actually resolve  (with --probe, or when op is authed)
 #   6. Claude profile: CLAUDE_CONFIG_DIR isolated + CLAUDE_CODE_OAUTH_TOKEN present (macOS account switch)
 #   7. Codex profile: CODEX_HOME isolated + has its own auth.json (switches the ChatGPT account)
-#   8. codex present (the Phase-3 GPT QA judge), chezmoi bootstrap sanity (informational)
+#   8. both provider CLIs present and subscription login/model configuration ready
 #   9. retired permission rules (fail-closed): the retirement policy is present AND readable, and no
 #      settings.json still grants a rule it withdrew. "Could not check" counts as a FAIL, not a WARN.
 #
 # Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
-#   --probe   also run live account probes (op run resolve, codex login status) — needs network.
+#   --probe   also run live account/model probes — needs network and a small subscription turn.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
@@ -262,11 +262,7 @@ else
 fi
 # Python prerequisites. jsonschema is GATE-CRITICAL: without it firm-validate-verdict exits 4
 # (DEGRADED) and a QA verdict cannot clear the Final gate.
-# pyyaml is NOT "advisory" any more — that wording predates the regression suite. It is REQUIRED to
-# run the firm's own tests (tests/test-policy-yaml-valid.sh) and CI installs it. In a work project it
-# is still non-fatal at runtime, hence WARN and not FAIL here, but "non-fatal" is not "no effect":
-# without it the traceability/assertion parsers drop to a looser regex, which fails CLOSED (CANNOT
-# VERIFY) on criteria files pyyaml would have parsed exactly.
+# pyyaml is gate-critical in 0.8.0 because firm-final-qa-check parses structured two-voice state.
 if python3 -c 'import jsonschema' >/dev/null 2>&1; then
   pass "python jsonschema present — QA verdicts can be schema-validated"
 else
@@ -274,9 +270,9 @@ else
   info "fix: python3 -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)"
 fi
 if python3 -c 'import yaml' >/dev/null 2>&1; then
-  pass "python pyyaml present — acceptance-criteria/assertion parsing is exact"
+  pass "python pyyaml present — traceability, eval assertions, and final QA can parse exactly"
 else
-  warn "python pyyaml missing — traceability + eval assertion parsing falls back to a looser regex that can fail closed (CANNOT VERIFY), and the agent-firm repo's own test suite cannot pass; install with 'python3 -m pip install --user pyyaml'."
+  fail "python pyyaml missing — firm-final-qa-check cannot evaluate two-voice state; install with 'python3 -m pip install --user pyyaml'."
 fi
 
 # Retired permission rules. firm-install only unions rules, so a project installed before a rule was
@@ -416,8 +412,183 @@ PY
   done
 fi
 
-if command -v codex >/dev/null 2>&1; then pass "codex present — the Phase-3 GPT QA judge (firm-gpt-qa) can run"
-else warn "codex not found — firm-gpt-qa degrades gracefully to Claude-only QA (never treated as a pass)."; fi
+section "9. Provider CLIs and reviewer readiness"
+if [ -x "$SELF/firm-version" ]; then
+  if "$SELF/firm-version" --check >/dev/null 2>&1; then pass "Claude and Codex plugin manifest base versions match"
+  else fail "plugin manifest versions drifted — run 'firm-version --check' for details"; fi
+fi
+
+resolve_reviewer_tuple() {
+  _provider="$1"; _override_set="$2"; _override="$3"
+  _resolver_args=(--provider "$_provider" --role reviewer --format json)
+  if [ "$_override_set" = x ]; then _resolver_args+=(--expect-model "$_override"); fi
+  _resolved="$($SELF/firm-model-resolve "${_resolver_args[@]}" 2>&1)"; _resolved_rc=$?
+  [ "$_resolved_rc" -eq 0 ] || { printf '%s\n' "$_resolved" >&2; return "$_resolved_rc"; }
+  printf '%s' "$_resolved" | python3 -c '
+import json,sys
+provider=sys.argv[1]; d=json.load(sys.stdin)
+assert set(d)=={"provider","selected_by","selector","tier","model","display","effort","policy_sha256"}
+assert d["provider"]==provider and d["selected_by"]=="role" and d["selector"]=="reviewer"
+assert d["tier"]=="heavyweight" and d["effort"]=="xhigh"
+for field in ("model","display","effort"):
+ value=d[field]; assert isinstance(value,str) and value and not any(ord(ch)<32 for ch in value)
+print("\t".join((d["model"],d["display"],d["effort"])))
+' "$_provider"
+}
+
+MODEL_ENVELOPE_READY=1
+_claude_tuple="$(resolve_reviewer_tuple claude "${FIRM_CLAUDE_QA_MODEL+x}" "${FIRM_CLAUDE_QA_MODEL:-}")"; _claude_tuple_rc=$?
+if [ "$_claude_tuple_rc" -ne 0 ]; then
+  fail "canonical Claude reviewer envelope or FIRM_CLAUDE_QA_MODEL compatibility alias is invalid; no provider command ran"
+  MODEL_ENVELOPE_READY=0
+else
+  IFS=$'\t' read -r CLAUDE_REVIEW_MODEL CLAUDE_REVIEW_DISPLAY CLAUDE_REVIEW_EFFORT <<< "$_claude_tuple"
+fi
+_codex_tuple="$(resolve_reviewer_tuple codex "${FIRM_GPT_QA_MODEL+x}" "${FIRM_GPT_QA_MODEL:-}")"; _codex_tuple_rc=$?
+if [ "$_codex_tuple_rc" -ne 0 ]; then
+  fail "canonical Codex reviewer envelope or FIRM_GPT_QA_MODEL compatibility alias is invalid; no provider command ran"
+  MODEL_ENVELOPE_READY=0
+else
+  IFS=$'\t' read -r CODEX_REVIEW_MODEL CODEX_REVIEW_DISPLAY CODEX_REVIEW_EFFORT <<< "$_codex_tuple"
+fi
+
+if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v claude >/dev/null 2>&1; then
+  pass "claude present — Claude-primary orchestration and firm-claude-qa are available"
+  if run_capped 10 claude auth status >/dev/null 2>&1; then
+    pass "Claude subscription authentication is ready"
+    if [ "$PROBE" = 1 ]; then
+      if run_capped 45 claude -p "Reply with exactly: ok" --model "$CLAUDE_REVIEW_MODEL" \
+        --effort "$CLAUDE_REVIEW_EFFORT" --output-format text --permission-mode dontAsk --tools "" \
+        --no-session-persistence >/dev/null 2>&1; then
+        pass "Claude reviewer $CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, effort $CLAUDE_REVIEW_EFFORT) completed a bounded no-tools probe"
+      else
+        warn "Claude reviewer $CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, effort $CLAUDE_REVIEW_EFFORT) failed its bounded probe — check model compatibility, quota, and login."
+      fi
+    else
+      info "canonical Claude reviewer: display=$CLAUDE_REVIEW_DISPLAY model=$CLAUDE_REVIEW_MODEL effort=$CLAUDE_REVIEW_EFFORT (run firm-doctor --probe to verify it live)"
+    fi
+  else warn "Claude authentication is not ready — run 'claude auth' or the provider's login flow before using Claude staff/reviewer."; fi
+elif [ "$MODEL_ENVELOPE_READY" != 1 ]; then
+  info "Claude provider checks skipped because canonical reviewer-envelope validation failed first."
+else
+  fail "claude not found — dual-provider Agent Firm installation is incomplete"
+fi
+if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v codex >/dev/null 2>&1; then
+  pass "codex present — Codex-primary orchestration and firm-gpt-qa are available"
+  if run_capped 10 codex login status >/dev/null 2>&1; then
+    pass "Codex ChatGPT subscription authentication is ready"
+    if [ "$PROBE" = 1 ]; then
+      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
+        -m "$CODEX_REVIEW_MODEL" -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" \
+        "Reply with exactly: ok" >/dev/null 2>&1; then
+        pass "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) completed a bounded read-only probe"
+      else
+        warn "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) failed its bounded probe — check model compatibility, quota, and login."
+      fi
+    else
+      info "canonical Codex reviewer: display=$CODEX_REVIEW_DISPLAY model=$CODEX_REVIEW_MODEL effort=$CODEX_REVIEW_EFFORT (run firm-doctor --probe to verify it live)"
+    fi
+  else warn "Codex authentication is not ready — run 'codex login' before using GPT staff/reviewer."; fi
+elif [ "$MODEL_ENVELOPE_READY" != 1 ]; then
+  info "Codex provider checks skipped because canonical reviewer-envelope validation failed first."
+else
+  fail "codex not found — dual-provider Agent Firm installation is incomplete"
+fi
+if [ "$MODEL_ENVELOPE_READY" = 1 ]; then
+  info "canonical reviewer models: GPT=$CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, $CODEX_REVIEW_EFFORT) · Claude=$CLAUDE_REVIEW_DISPLAY ($CLAUDE_REVIEW_MODEL, $CLAUDE_REVIEW_EFFORT)"
+fi
+
+section "9.5. Plugin hook ownership and legacy duplicates"
+FIRM_SOURCE_ROOT="$(cd "$SELF/.." && pwd)"
+if python3 - "$FIRM_SOURCE_ROOT" <<'PY' >/dev/null 2>&1
+import json, os, sys
+root = sys.argv[1]
+claude_plugin = json.load(open(os.path.join(root, ".claude-plugin", "plugin.json")))
+codex_plugin = json.load(open(os.path.join(root, ".codex-plugin", "plugin.json")))
+assert claude_plugin.get("hooks") == "./hooks/claude.json"
+assert "hooks" not in codex_plugin
+for rel in ("hooks/claude.json", "hooks/hooks.json"):
+    doc = json.load(open(os.path.join(root, rel)))
+    pre = [entry for entry in doc["hooks"]["PreToolUse"] if entry.get("matcher") == "Bash"]
+    assert len(pre) == 1
+    commands = [hook.get("command", "") for hook in pre[0].get("hooks", [])]
+    assert sum("firm-ledger-hook" in command for command in commands) == 1
+    assert sum("firm-merge-guard" in command for command in commands) == 1
+    guard = next(hook for hook in pre[0]["hooks"] if "firm-merge-guard" in hook.get("command", ""))
+    assert isinstance(guard.get("timeout"), int) and guard["timeout"] > 0
+settings = json.load(open(os.path.join(root, ".claude", "settings.json")))
+assert "hooks" not in settings, "tracked project settings duplicate the Claude plugin hook source"
+PY
+then
+  pass "repository manifests declare one plugin-owned ledger/merge-guard hook adapter per runtime; runtime loader selection is unverified until Q-02; tracked settings contain no duplicate"
+else
+  fail "plugin hook ownership is ambiguous or malformed — reinstall/repair the package before running the firm"
+  info "expected Claude hooks/claude.json, Codex hooks/hooks.json, and no tracked .claude/settings.json hook block."
+fi
+
+check_legacy_claude_hooks() {
+  _legacy_scope="$1"; _legacy_file="$2"
+  [ -f "$_legacy_file" ] || return 0
+  _legacy_out="$(python3 - "$_legacy_file" <<'PY' 2>&1
+import json, sys
+doc = json.load(open(sys.argv[1]))
+hits = []
+def walk(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "command" and isinstance(child, str) and ("firm-ledger-hook" in child or "firm-merge-guard" in child):
+                hits.append(child)
+            walk(child)
+    elif isinstance(value, list):
+        for child in value: walk(child)
+walk(doc.get("hooks", {}))
+print("\n".join(hits))
+PY
+)"; _legacy_rc=$?
+  if [ "$_legacy_rc" -ne 0 ]; then
+    if grep -Eq 'firm-(ledger-hook|merge-guard)' "$_legacy_file" 2>/dev/null; then
+      warn "$_legacy_scope Claude settings may contain a legacy firm hook but JSON could not be parsed — inspect $_legacy_file manually; firm-doctor did not rewrite it."
+    fi
+  elif [ -n "$_legacy_out" ]; then
+    fail "$_legacy_scope Claude settings contain a confirmed legacy duplicate firm hook — readiness is blocked. Review $_legacy_file, preserve unrelated hooks/settings, and remove only confirmed duplicate firm command objects manually; firm-doctor did not rewrite it."
+  fi
+}
+
+_canonical_settings="$FIRM_SOURCE_ROOT/.claude/settings.json"
+_project_settings="$(pwd)/.claude/settings.json"
+if [ "$_project_settings" != "$_canonical_settings" ]; then
+  check_legacy_claude_hooks "project" "$_project_settings"
+fi
+check_legacy_claude_hooks "user" "$HOME/.claude/settings.json"
+
+# The bounded repository model diagnoses only the obsolete project Codex prototype. Actual supported
+# Codex loader scopes and runtime selection remain unverified until Q-02; bootstrap never overwrites
+# project config.
+if [ -f .codex/hooks.json ]; then
+  _codex_legacy_out="$(python3 - .codex/hooks.json <<'PY' 2>&1
+import json, sys
+doc=json.load(open(sys.argv[1]))
+hits=[]
+def walk(value):
+    if isinstance(value,dict):
+        for key,child in value.items():
+            if key == "command" and isinstance(child,str) and ("firm-ledger-hook" in child or "firm-merge-guard" in child):
+                hits.append(child)
+            walk(child)
+    elif isinstance(value,list):
+        for child in value: walk(child)
+walk(doc.get("hooks",{}))
+print("\n".join(hits))
+PY
+)"; _codex_legacy_rc=$?
+  if [ "$_codex_legacy_rc" -ne 0 ]; then
+    if grep -Eq 'firm-(ledger-hook|merge-guard)' .codex/hooks.json 2>/dev/null; then
+      warn "obsolete .codex/hooks.json may contain a legacy firm hook but JSON could not be parsed — inspect it manually; firm-doctor did not rewrite it."
+    fi
+  elif [ -n "$_codex_legacy_out" ]; then
+    fail "confirmed obsolete duplicate .codex/hooks.json firm hook detected — readiness is blocked. Preserve project-specific hooks; remove that file manually only after confirming it contains no project-specific hooks, or remove only the confirmed duplicate command object. firm-doctor did not rewrite it; the plugin now provides hooks/hooks.json."
+  fi
+fi
 if command -v chezmoi >/dev/null 2>&1; then
   cfg="$HOME/.config/chezmoi/chezmoi.toml"
   if [ -f "$cfg" ] && grep -q 'mode *= *"service"' "$cfg" 2>/dev/null; then pass "chezmoi present + [onepassword] mode=\"service\" (reproducible second-machine bootstrap)"

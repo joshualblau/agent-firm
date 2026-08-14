@@ -9,7 +9,7 @@
         ]
       }
     ],
-    "Notification": [
+    "PermissionRequest": [
       {
         "matcher": "",
         "hooks": [

@@ -2,13 +2,13 @@
   "name": "local",
   "owner": { "name": "Josh Blau" },
   "metadata": {
-    "description": "Local marketplace hosting the agent-firm plugin."
+    "description": "Claude marketplace for the shared dual-provider agent-firm plugin source."
   },
   "plugins": [
     {
       "name": "agent-firm",
       "source": "./",
-      "description": "Reusable AI engineering firm (core roles, run-ledger, evidence gates, worktree/integration tooling, QA, continuous-improvement loop)."
+      "description": "Claude-primary adapter for the shared Agent Firm lifecycle, with GPT cross-provider QA."
     }
   ]
 }

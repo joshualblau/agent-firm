@@ -1,9 +1,10 @@
 {
   "name": "agent-firm",
   "displayName": "The Firm",
-  "version": "0.7.0",
-  "description": "A reusable AI engineering firm: a hierarchical lead + role subagents, a run-ledger source of truth, evidence gates, bounded execution, worktree/integration tooling, and a continuous-improvement loop. Activate per engagement with /agent-firm:start.",
+  "version": "0.8.0",
+  "description": "A dual-provider AI engineering firm with shared role contracts, run-ledger evidence gates, bounded execution, worktree isolation, cross-provider QA, and guarded integration. Activate with /agent-firm:start.",
   "author": { "name": "Josh Blau" },
   "license": "UNLICENSED",
-  "keywords": ["agents", "orchestration", "qa", "lifecycle", "claude-code"]
+  "keywords": ["agents", "orchestration", "qa", "lifecycle", "claude-code", "codex"],
+  "hooks": "./hooks/claude.json"
 }

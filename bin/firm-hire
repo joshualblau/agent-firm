@@ -28,7 +28,7 @@ expected_deliverable: ""       # must be independently reviewable
 required_tools: []             # least-privilege
 denied_tools: []
 mcp_servers: []                # least-privilege; read-only where possible
-model: sonnet                  # opus | sonnet | haiku | codex
+model: workhorse               # ceiling | heavyweight | workhorse | fast (legacy names still validate)
 max_turns: 25
 max_wall_clock_minutes: 30
 success_criteria: ""

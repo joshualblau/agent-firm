@@ -58,31 +58,34 @@ The Lead decides the track at intake and records it in `00-intake.md`.
 The same rule binds `firm-integrate`: integration runs on `integration/*` branches only, and refuses
 any other target. Merging to the default branch is a **human gate**, never a script's decision.
 
-## Second-voice (GPT) QA judge policy
+## Cross-provider second-voice QA policy
 
-The firm's independent cross-provider QA judge (`bin/firm-gpt-qa`, run via the Codex CLI) raises two
-separate questions. Keep them separate — conflating them is what produced the contradiction this
-section now resolves.
+The independent judge is always the provider opposite the primary staff: `firm-gpt-qa` for a
+Claude-primary run and `firm-claude-qa` for a Codex-primary run. Both wrappers use subscription auth,
+write provider-suffixed verdicts, and share the exit contract below. The judge raises two separate
+questions. Keep them separate.
 
 ### 1 · Must the judge run? (availability)
 
 The judge runs whenever it is available, and it is **REQUIRED for any run touching auth / permissions /
 crypto / PII**.
 
-- When the judge is **UNAVAILABLE** (`firm-gpt-qa` exits **3** — codex absent, or codex present but
-  incompatible with the configured model), QA degrades to Claude-only and records it as a **skipped**
-  second voice. This MUST be surfaced by the Lead as a **Final-gate warning** — never a silent pass.
-  (Exit **3** = unavailable → Claude-only, logged; exit **1** = the judge RAN and **BLOCKED** — a real
-  judgement to act on. Do not conflate the two.)
+- When the judge is **UNAVAILABLE** (the selected wrapper exits **3** because its CLI, subscription
+  authentication, or configured model is unavailable), QA degrades to the primary voice and records
+  a **skipped** second voice. This MUST be surfaced by the Lead as a Final-gate warning—never a silent
+  pass. Exit 3 is unavailable; exit 1 means a valid BLOCK or a judge failure/timeout and is blocking.
 - On a **required** run (auth/permissions/crypto/PII), a skipped/unavailable judge does **not** pass
   by default: the Lead must obtain an **explicit, logged human waiver at the Final gate** to proceed
   without the second voice. No waiver ⇒ the run is not done.
-- The judge model is env-configurable (`FIRM_GPT_QA_MODEL`); pinning/upgrading the Codex CLI to a
-  compatible version is the **human's environment action**, prompted by the exit-3 message.
+- The canonical reviewer tuple—model, display, and effort—comes from
+  `firm-model-resolve --role reviewer`. `FIRM_GPT_QA_MODEL` and `FIRM_CLAUDE_QA_MODEL` are
+  equality-checked compatibility aliases, not free overrides: when set, each must equal the
+  canonical resolved model, and a mismatch blocks before provider execution. Installing,
+  authenticating, or upgrading a provider CLI is the human's environment action.
 
 ### 2 · The judge RAN and BLOCKED — does the block bind? (the two-voice rule)
 
-**Canon.** The judge's BLOCK **binds** unless the Claude QA voice **dissents** on that same point.
+**Canon.** The cross-provider judge's BLOCK **binds** unless primary QA **dissents** on that same point.
 This is the repository owner's decision of 2026-08-07; it is recorded, with the owner's instruction
 quoted verbatim as the authority, in
 `system-changes/20260807T000000Z-two-voice-rule-judge-binds-unless-qa-dissents.md`.
@@ -93,33 +96,35 @@ answer is neither: **binding by default, with a bounded escalation when the two 
 the same evidence differently.**
 
 Apply this **per disputed point**, not per verdict — a judge BLOCK usually carries several blockers, and
-they can land in different branches.
+they can land in different branches. A disputed point is identified by the producer verdict's stable
+blocker-object id. The disposition must repeat that object's text, affected criteria, and affected
+paths exactly, and mechanical risk classification reads the producer object rather than disposition
+input.
 
 | # | Situation | Outcome |
 |---|---|---|
-| 1 | Judge BLOCKs · **QA does not dissent** (QA agrees, or is silent on that point) | **The block stands.** The gate does not clear until the objection is fixed and the judge re-run to APPROVE. |
-| 2a | Judge BLOCKs · QA dissents · **high-risk** issue (defined below) | **Blocking.** The disagreement must be **RESOLVED** before the gate clears. Recording it is not resolving it. |
-| 2b | Judge BLOCKs · QA dissents · **not** high-risk | **Attempt** resolution (one bounded round). If it does not resolve easily, **record the judge's dissent and proceed on QA's decision.** |
+| 1 | Judge BLOCKs · **primary QA does not dissent** (agrees, or is silent on that point) | **The block stands.** The gate does not clear until the objection is fixed and the judge re-run to APPROVE. |
+| 2a | Judge BLOCKs · primary QA dissents · **high-risk** issue (defined below) | **Blocking.** The disagreement must be **RESOLVED** before the gate clears. Recording it is not resolving it. |
+| 2b | Judge BLOCKs · primary QA dissents · **not** high-risk | **Attempt** resolution (one bounded round). If it does not resolve easily, record the judge's dissent and proceed on primary QA's decision. |
 
 - **Resolved** (case 2a) means one of exactly three things, each of them an artifact: one voice
   **withdraws** its reading on the record; the underlying defect is **fixed** so the dispute is moot; or
   the **human decides it at the Final gate** and the decision is written down. Fatigue is not resolution.
 - **One bounded round** (case 2b) is the attempt budget: re-read the disputed evidence, and where the
-  artifact actually changed, re-run `firm-gpt-qa` against it once. This deliberately adds no new key to
+  artifact actually changed, re-run the selected provider wrapper against it once. This deliberately adds no new key to
   `execution-budget.yaml`; if a second round is wanted, that is a human call at the Final gate.
 - **Case 2b is never a silent pass.** The dissent is enumerated in the run's `traceability.yaml` under
   `two_voice_diff` (and as a per-criterion `disagreement_note`), restated in `10-handoff.md`, and listed
-  in the Final-gate payload. QA's decision stands; the judge's objection travels with it.
-- **The reverse direction is unchanged:** a **QA BLOCK is blocking** whatever the judge says. The judge
-  cannot clear a Claude-voice BLOCK — `definition-of-done.yaml` requires a schema-valid **APPROVE** from
-  QA, and no second voice substitutes for it.
+  in the Final-gate payload. Primary QA's decision stands; the judge's objection travels with it.
+- **The reverse direction is unchanged:** a **primary QA BLOCK is blocking** whatever the judge says.
+  No second voice substitutes for the schema-valid primary `08-qa-verdict.json`.
 - **The human always retains the override** at the Final gate, in every branch above, and an override
   must be written down (the run id and verdict file it answers, plus each objection it disposes of). The
   conditions under which the *Lead* may propose one are the subject of
   `system-changes/20260803T073753Z-stop-rule-for-adversarial-review.md`, which is still `Status:
   proposed` and is not canon.
 
-**What counts as QA dissent.** Only a *positive, contrary* position by the Claude QA voice on the
+**What counts as primary QA dissent.** Only a *positive, contrary* position by primary QA on the
 disputed point, visible in its own artifact: a differing `acceptance_criteria_coverage` score, a
 `disagreement_note`, or an explicit rebuttal in `08-qa-verdict.json`. **Silence, absence, "not assessed",
 or a shrug is not dissent** — it is case 1, and the block stands. A dissent recorded *after* the judge
@@ -149,5 +154,64 @@ That is a statement about which branch applies, not about whether the issue matt
 
 **Ambiguity resolves toward blocking**, as everywhere else in this policy set:
 
-- Unclear whether **QA dissents** → treat as **no dissent** → case 1, the block stands.
+- Unclear whether **primary QA dissents** → treat as **no dissent** → case 1, the block stands.
 - Unclear whether the issue is **high-risk** → treat as **high-risk** → case 2a, resolve it.
+
+### Mechanical candidate and reviewer records
+
+- Candidate identity is the persisted full SHA and generation from `qa-candidate.json`; branch names,
+  abbreviations, timestamps, and whichever checkout happens to be current are not identity.
+- Strict traceability contains exactly one matrix row per accepted criterion, rejects duplicates and
+  phantom ids, and verifies current hashes for safe run-relative evidence files. Partial/uncovered rows
+  require typed candidate-bound gate records.
+- High-risk is derived from accepted security/privacy criteria and the committed diff matched against
+  `high-risk-paths.yaml`. A supplied classification may confirm that result but cannot downgrade it;
+  ambiguity blocks.
+- Each second-voice invocation has a numbered attempt and an explicit-target ledger outcome. CLI,
+  authentication, or configured-model absence can be unavailable; timeout, malformed output, tool
+  failure, schema failure, identity mismatch, or candidate-generation drift is BLOCK.
+- A canonical provider verdict is published atomically only after schema and exact
+  run/SHA/generation/provider/attempt identity validate. Re-runs archive the prior canonical verdict
+  before work begins, so stale approval is recoverable but never current.
+- Before any provider phase, the wrapper requires the run's immutable baseline to match exactly one
+  `run_started` relation and to be an ancestor of the candidate. The baseline is included in the
+  controlled manifest with exact source/copy digest, size, mode, and transform.
+- Candidate QA, evidence, and private reviewer-control parents are owned no-follow directories at the
+  exact canonical path. Producers and every consumer repeat parent containment checks before use.
+
+### Versioned candidate, evidence, and attempt contract
+
+Current approval state uses traceability schema version 2 and current run metadata schema version 2.
+The persisted QA candidate binds the canonical repository root and Git common-dir, an
+`integration/*` source ref and its exact full SHA, the accepted base and ancestry, a clean detached
+checkout at the same full SHA, and a monotonically increasing generation. Moving or rewriting the
+source ref, changing the checkout, using an abbreviated SHA, or presenting a different repository or
+run blocks.
+
+Every evidence, command-result, gate, disposition, and verdict reference is a closed object containing
+its canonical run-relative path, full candidate SHA, lowercase SHA-256, byte size, and producer. The
+producer names one unique explicit-target ledger `event_id` and event; reviewer producers additionally
+name provider, generation, and immutable attempt id. Consumers open references no-follow, recompute
+bytes and digest, and require the producer event to name the same artifact and identity exactly.
+Copied, changed, symlinked, outside-run, unproduced, multiply produced, or stale evidence cannot clear
+a gate.
+
+Each secondary invocation has one immutable attempt record and one terminal explicit-target outcome
+event. An attempt-local verdict may be projected to the canonical provider verdict only after schema,
+candidate, generation, provider, attempt, checkout, and ledger identity all revalidate. A prior BLOCK
+remains in its original attempt when a later APPROVE becomes current; dispositions answer the retained
+BLOCK and cannot treat the archive itself as a current verdict. Historical metadata without a provider
+remains readable as Claude-primary provenance but is always `historical: true` and
+`approval_eligible: false`.
+
+### One Final decision sequence
+
+When all mechanical evidence is valid but an exact human decision is still required,
+`firm-final-qa-check` returns the distinct nonpassing `decision_required` state (exit 4) and records the
+unresolved objections plus permitted record types. Exit 4 is neither PASS nor an unavailable/error
+substitute. The Lead may prepare a clearly non-ship-ready draft handoff from that state, performs one
+Final human interaction with the complete aggregated producer-id/text objection set and options,
+appends one shared typed candidate-bound record naming every relevant producer id and text, references
+that same exact record from every relevant disposition, and reruns the mechanical check once. Only a fresh exit 0 permits finalizing
+the handoff/package. A missing, rejecting, stale, wrong-run/SHA/generation, or wrong-objection record
+remains nonpassing; there is no second approval prompt hidden behind packaging.

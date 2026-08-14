@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# firm-version [--check | --release X.Y.Z | --local-refresh [cachebuster]]
+# Validate complete SemVer and update VERSION plus both provider manifests as one recoverable
+# three-target source transaction. A local refresh is not reported complete unless dual-provider
+# bootstrap succeeds; on bootstrap failure the original source bytes are restored.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"; ROOT="$(cd "$SELF/.." && pwd)"
+
+mode="${1:---check}"
+value="${2:-}"
+case "$mode" in
+  --check) [ "$#" -le 1 ] || { echo "firm-version: --check takes no value" >&2; exit 2; } ;;
+  --release) [ "$#" -eq 2 ] || { echo "firm-version: --release requires exactly one SemVer" >&2; exit 2; } ;;
+  --local-refresh)
+    [ "$#" -le 2 ] || { echo "firm-version: --local-refresh accepts at most one cachebuster" >&2; exit 2; }
+    [ "$#" -eq 2 ] || value="local-$(date -u +%Y%m%d-%H%M%S)"
+    ;;
+  -h|--help)
+    sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *) echo "firm-version: unknown mode '$mode'" >&2; exit 2 ;;
+esac
+
+exec python3 - "$ROOT" "$mode" "$value" "$SELF/firm-bootstrap" <<'PY'
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+root, mode, supplied, bootstrap = sys.argv[1:]
+paths = {
+    "version": os.path.join(root, "VERSION"),
+    "claude": os.path.join(root, ".claude-plugin", "plugin.json"),
+    "codex": os.path.join(root, ".codex-plugin", "plugin.json"),
+}
+
+CORE = r"(?:0|[1-9][0-9]*)"
+IDENT = r"[0-9A-Za-z-]+"
+SEMVER = re.compile(
+    rf"{CORE}\.{CORE}\.{CORE}"
+    rf"(?:-(?:{IDENT})(?:\.(?:{IDENT}))*)?"
+    rf"(?:\+(?:{IDENT})(?:\.(?:{IDENT}))*)?"
+)
+BUILDS = re.compile(rf"{IDENT}(?:\.{IDENT})*")
+
+def fail(message, code=2):
+    print(f"firm-version: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+def validate_semver(value, label, allow_build):
+    if not isinstance(value, str) or not SEMVER.fullmatch(value):
+        fail(f"invalid {label} SemVer: {value!r}")
+    core_and_pre, plus, build = value.partition("+")
+    if plus and not allow_build:
+        fail(f"{label} must not contain build metadata: {value!r}")
+    pre = core_and_pre.partition("-")[2]
+    if pre:
+        for ident in pre.split("."):
+            if ident.isdigit() and len(ident) > 1 and ident.startswith("0"):
+                fail(f"invalid {label} SemVer numeric prerelease identifier: {value!r}")
+    return core_and_pre, build
+
+def load_targets():
+    loaded = {}
+    for name, path in paths.items():
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            fail(f"cannot inspect {name} target {path}: {exc}")
+        if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            fail(f"{name} target is not a regular non-symlink file: {path}")
+        if not st.st_mode & 0o444:
+            fail(f"{name} target is unreadable by policy: {path}")
+        if not st.st_mode & 0o222:
+            fail(f"{name} target is unwritable by policy: {path}")
+        parent = os.path.dirname(path)
+        pst = os.stat(parent)
+        if not pst.st_mode & 0o222 or not pst.st_mode & 0o111:
+            fail(f"{name} target parent is not writable/searchable: {parent}")
+        try:
+            with open(path, "rb") as fh:
+                payload = fh.read()
+        except OSError as exc:
+            fail(f"cannot read {name} target {path}: {exc}")
+        loaded[name] = {"path": path, "bytes": payload, "mode": stat.S_IMODE(st.st_mode)}
+    return loaded
+
+def canonical_from(raw):
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"VERSION is not UTF-8: {exc}")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text or "\n" in text or "\r" in text or text != text.strip():
+        fail(f"invalid canonical VERSION bytes: {raw!r}")
+    validate_semver(text, "canonical", False)
+    return text
+
+def manifest_version(provider, raw):
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        fail(f"cannot parse {provider} manifest JSON: {type(exc).__name__}: {exc}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("version"), str):
+        fail(f"{provider} manifest requires one string top-level version")
+    validate_semver(doc["version"], f"{provider} manifest", True)
+    return doc["version"]
+
+def validate_relationships(loaded):
+    canonical = canonical_from(loaded["version"]["bytes"])
+    versions = {}
+    for provider in ("claude", "codex"):
+        value = manifest_version(provider, loaded[provider]["bytes"])
+        base, plus, build = value.partition("+")
+        if base != canonical:
+            fail(f"{provider} base {base!r} != canonical {canonical!r}")
+        if plus:
+            pieces = build.split(".")
+            if len(pieces) < 2 or pieces[0] != provider or not all(pieces):
+                fail(f"{provider} cachebuster must be +{provider}.<non-empty identifiers>: {value!r}")
+        versions[provider] = value
+    return canonical, versions
+
+VERSION_LINE = re.compile(
+    rb'(?m)^([ \t]*"version"[ \t]*:[ \t]*)("(?:\\.|[^"\\])*")([ \t]*,?[ \t]*(?:\r?\n|$))'
+)
+
+def replace_manifest_version(raw, old, new, provider):
+    matches = list(VERSION_LINE.finditer(raw))
+    if len(matches) != 1:
+        fail(f"{provider} manifest must contain exactly one line-form version field")
+    try:
+        observed = json.loads(matches[0].group(2).decode("utf-8"))
+    except Exception as exc:
+        fail(f"cannot decode {provider} manifest version token: {exc}")
+    if observed != old:
+        fail(f"{provider} manifest textual version does not match parsed top-level version")
+    encoded = json.dumps(new, ensure_ascii=False).encode("utf-8")
+    return raw[:matches[0].start(2)] + encoded + raw[matches[0].end(2):]
+
+def requested_failure():
+    point = os.environ.get("FIRM_VERSION_TEST_FAIL_POINT", "")
+    if not point:
+        return ""
+    if os.environ.get("FIRM_VERSION_TESTING") != "1":
+        fail("FIRM_VERSION_TEST_FAIL_POINT requires FIRM_VERSION_TESTING=1")
+    tmp = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
+    real_root = os.path.realpath(root)
+    try:
+        contained = os.path.commonpath((tmp, real_root)) == tmp
+    except ValueError:
+        contained = False
+    if not contained:
+        fail("version failure injection is confined to a disposable TMPDIR root")
+    return point
+
+def stage_all(payloads, loaded, injection=""):
+    staged = {}
+    try:
+        for name in ("version", "claude", "codex"):
+            path = paths[name]
+            fd, tmp = tempfile.mkstemp(prefix=".firm-version.", suffix=".tmp", dir=os.path.dirname(path))
+            staged[name] = tmp
+            try:
+                if injection == f"stage:{name}":
+                    raise OSError(f"injected staged-write failure for {name}")
+                with os.fdopen(fd, "wb") as fh:
+                    fd = -1
+                    fh.write(payloads[name])
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp, loaded[name]["mode"])
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        return staged
+    except BaseException:
+        for tmp in staged.values():
+            try: os.unlink(tmp)
+            except FileNotFoundError: pass
+        raise
+
+def replace_all(payloads, loaded, injection=""):
+    staged = stage_all(payloads, loaded, injection)
+    try:
+        for name in ("version", "claude", "codex"):
+            if injection == f"rename:{name}":
+                raise OSError(f"injected rename failure for {name}")
+            os.replace(staged[name], paths[name])
+            staged.pop(name)
+        return
+    finally:
+        for tmp in staged.values():
+            try: os.unlink(tmp)
+            except FileNotFoundError: pass
+
+def restore(original):
+    current = load_targets()
+    payloads = {name: original[name]["bytes"] for name in paths}
+    replace_all(payloads, current, "")
+    for name in paths:
+        with open(paths[name], "rb") as fh:
+            if fh.read() != original[name]["bytes"]:
+                raise OSError(f"post-recovery byte mismatch for {name}")
+
+loaded = load_targets()
+canonical, versions = validate_relationships(loaded)
+if mode == "--check":
+    print(f"firm-version: OK claude={versions['claude']} codex={versions['codex']} base={canonical}")
+    raise SystemExit(0)
+
+if mode == "--release":
+    validate_semver(supplied, "release", False)
+    new_canonical = supplied
+    desired = {"claude": supplied, "codex": supplied}
+else:
+    if not BUILDS.fullmatch(supplied):
+        fail(f"invalid cachebuster identifier sequence: {supplied!r}")
+    new_canonical = canonical
+    desired = {"claude": f"{canonical}+claude.{supplied}", "codex": f"{canonical}+codex.{supplied}"}
+    validate_semver(desired["claude"], "Claude cache version", True)
+    validate_semver(desired["codex"], "Codex cache version", True)
+
+suffix = b"\n" if loaded["version"]["bytes"].endswith(b"\n") else b""
+payloads = {
+    "version": new_canonical.encode("utf-8") + suffix,
+    "claude": replace_manifest_version(loaded["claude"]["bytes"], versions["claude"], desired["claude"], "claude"),
+    "codex": replace_manifest_version(loaded["codex"]["bytes"], versions["codex"], desired["codex"], "codex"),
+}
+
+# Validate every staged payload before the first replacement.
+prospective = {name: dict(loaded[name], bytes=payloads[name]) for name in paths}
+prospective_canonical, prospective_versions = validate_relationships(prospective)
+if prospective_canonical != new_canonical or prospective_versions != desired:
+    fail("prospective three-target validation disagrees with requested versions")
+
+injection = requested_failure()
+try:
+    replace_all(payloads, loaded, injection)
+except BaseException as exc:
+    print(f"firm-version: source transaction failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        restore(loaded)
+        print("firm-version: RECOVERY COMPLETE — all three original source targets restored byte-for-byte", file=sys.stderr)
+    except BaseException as recovery:
+        print(f"firm-version: RECOVERY BLOCKED — exact source restoration failed: {type(recovery).__name__}: {recovery}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"firm-version: source transaction committed ({new_canonical}; cache refresh pending={mode == '--local-refresh'})")
+if mode == "--local-refresh" and os.environ.get("FIRM_VERSION_SKIP_INSTALL", "0") != "1":
+    completed = subprocess.run([bootstrap])
+    if completed.returncode != 0:
+        print(f"firm-version: dual-provider cache refresh BLOCKED (bootstrap rc={completed.returncode})", file=sys.stderr)
+        try:
+            restore(loaded)
+            print("firm-version: RECOVERY COMPLETE — pre-refresh VERSION and manifest bytes restored", file=sys.stderr)
+        except BaseException as recovery:
+            print(f"firm-version: RECOVERY BLOCKED — restore the three source files from version control before retrying: {recovery}", file=sys.stderr)
+        raise SystemExit(completed.returncode or 1)
+    print("firm-version: dual-provider cache refresh complete")
+elif mode == "--local-refresh":
+    print("firm-version: source-only refresh complete; paired provider cache refresh explicitly skipped by FIRM_VERSION_SKIP_INSTALL=1")
+else:
+    print("firm-version: release transaction complete")
+PY

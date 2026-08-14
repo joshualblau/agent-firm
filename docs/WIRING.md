@@ -8,7 +8,8 @@ Order matters — later steps depend on earlier ones. Replace `work` with your p
 `personal`, `client-acme`, …). You can start with a single profile.
 
 **Minimum to be operational:** A → B → C (one profile) → D. Sections E–H are optional, per-need.
-Run `firm-doctor` after any step — it fail-closed-checks the whole setup and tells you exactly what's off.
+Run `firm-doctor` after any step — it fail-closed-checks both provider CLIs, plugin versions, reviewer
+readiness, and the rest of the setup, then tells you exactly what's off.
 
 ---
 
@@ -31,6 +32,15 @@ grep -E 'ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|ANTHROPIC_AUTH_TOKEN' ~/
 # PATH only INSIDE a claude session, not in your terminal. Open a new shell afterwards.
 ~/agent-firm/bin/firm-bootstrap
 ```
+
+Bootstrap requires compatible Claude and Codex CLIs. It completes bounded capability, local
+selector/schema, and exact matching-state capture for both before its first provider mutation. The
+two stores cannot be updated atomically. A provider failure triggers only supported reverse-order
+inverses for freshly created entries. Existing plugin refresh has no proven exact inverse; bootstrap
+does not repeat the forward update/add command as rollback and emits mode-0600
+`BLOCKED_RECOVERY_REQUIRED`. Inspect its prior/observed digests, completed mutations, and unavailable
+reverses; manually restore only the named agent-firm entries before another preflight. Do not retry
+against active state until that record is resolved.
 
 ## B. 1Password backbone (once) — *you do the account steps*
 
@@ -73,6 +83,24 @@ direnv allow                                     # loads the profile + resolves 
 
 firm-doctor                                      # fail-closed: no key leak, profiles isolated, op+direnv+refs OK
 ```
+
+The installed plugin is the only firm hook owner for each runtime. `firm-install` merges permissions
+and preserves hook/configuration subtrees. `firm-doctor` FAILs readiness on confirmed legacy Claude settings hooks or
+`.codex/hooks.json`, but does not rewrite them: preserve custom entries and remove only confirmed
+duplicate firm commands after manual review.
+
+Start from either provider after the doctor is clean:
+
+```text
+Claude Code: /agent-firm:start <goal>
+Codex:       $agent-firm:start <goal>
+```
+
+The Packager first writes a non-ship-ready draft. If `firm-final-qa-check` emits exit 4
+`decision_required`, the Lead presents its exact objections and permitted record types in one Final
+interaction. A matching typed current-run/current-full-SHA record is followed by one fresh mechanical
+rerun; only exit 0 finalizes the handoff. Rejection, stale/mismatched input, or another nonzero result
+remains blocked and does not open a second prompt in that Final cycle.
 
 `.env.op` is committed (references only — no values); `.envrc` stays machine-local (gitignored).
 `firm-doctor` must show **0 FAIL** before you run an engagement.
@@ -150,7 +178,8 @@ acceptable for a given project.
 
 ```bash
 # In a node-20 environment (the devcontainer — a host shell on node 14 cannot run `node --test`):
-firm-run-evals greet-fast-path
+firm-run-evals --provider claude greet-fast-path
+# or: firm-run-evals --provider codex greet-fast-path
 # This is the first live firm run; it bills your subscription. Confirm greet-fast-path PASSes,
 # then wire `firm-run-evals` into CI as the System-Change regression gate.
 ```
@@ -162,6 +191,12 @@ firm-run-evals greet-fast-path
 A–C repeat (plus `chezmoi` for home glue — see `docs/PHASE4.md`, "Second-machine bootstrap"). The only
 hand-carried secret is the one `OP_SERVICE_ACCOUNT_TOKEN`. Per project you re-clone, `cp` the two files,
 edit `FIRM_PROFILE`, and `direnv allow`. Then `firm-doctor` to verify.
+
+Before treating a new machine as release-ready, separately gate an exact-SHA exercise in disposable
+Claude/Codex homes: fresh load, repeat refresh/idempotence, one effective hook event pair per runtime,
+and normal plus interrupted cross-provider rollback. Compare project configuration and provider-store
+inventories before/after, preserve history and unrelated entries, and obtain human review of the
+rollback record. Fixture tests and a successful bootstrap are not substitutes for that evidence.
 
 See also: `docs/INSTALL.md` (plugin install), `docs/PHASE4.md` (profiles/secrets rationale + the macOS
 Keychain caveat), `docs/PHASE5.md` (firewall/visual/approvals/evals details).

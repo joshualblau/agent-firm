@@ -1,0 +1,34 @@
+schema_version: 1
+version: 1
+default_on_ambiguity: required
+categories:
+  auth_permissions_crypto_pii:
+    - "**/auth/**"
+    - "**/*auth*"
+    - "**/permissions/**"
+    - "**/*permission*"
+    - "**/crypto/**"
+    - "**/*crypto*"
+    - "**/pii/**"
+    - "**/*pii*"
+    - "**/*credential*"
+    - "**/*secret*"
+    - ".claude/settings.json"
+  hooks_and_policy:
+    - "hooks/**"
+    - "**/hooks/**"
+    - "agent-firm/policy/**"
+    - "**/*allowlist*"
+  reviewer_wrappers:
+    - "bin/firm-gpt-qa"
+    - "bin/firm-claude-qa"
+    - "bin/firm-reviewer-common"
+    - "bin/firm-bounded-exec"
+    - "agent-firm/contracts/qa-judge.md"
+  traceability_and_final_gate:
+    - "bin/firm-qa-checkout"
+    - "bin/firm-traceability-check"
+    - "bin/firm-final-qa-check"
+    - "agent-firm/schemas/traceability.schema.json"
+    - "agent-firm/schemas/qa-verdict.schema.json"
+    - "agent-firm/templates/traceability.yaml"

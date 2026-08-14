@@ -1,0 +1,20 @@
+{
+  "name": "agent-firm-local",
+  "interface": {
+    "displayName": "Agent Firm Local"
+  },
+  "plugins": [
+    {
+      "name": "agent-firm",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

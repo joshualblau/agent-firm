@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# firm-final-qa-check [run_dir]
+# Candidate-bound two-voice gate. Exit 0 pass, 1 evaluated BLOCK, 2 cannot evaluate.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+
+run_dir="${1:-}"
+[[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
+if [[ -z "$run_dir" || ! -d "$run_dir" || -L "$run_dir" ]]; then
+  echo "FINAL QA: CANNOT EVALUATE -- pass a contained non-symlink run dir or set CURRENT_RUN" >&2
+  exit 2
+fi
+primary="$run_dir/08-qa-verdict.json"
+[[ -f "$primary" && ! -L "$primary" ]] || { echo "FINAL QA: CANNOT EVALUATE -- missing primary verdict" >&2; exit 2; }
+"$SELF/firm-validate-verdict" "$primary" >/dev/null 2>&1
+pvalid=$?
+[[ $pvalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- primary verdict validation rc=$pvalid" >&2; exit 2; }
+trace_detail="$("$SELF/firm-traceability-check" --strict "$run_dir" "$primary" 2>&1)"
+trc=$?
+if [[ $trc -eq 1 ]]; then echo "FINAL QA: BLOCK -- primary candidate traceability is incomplete" >&2; exit 1; fi
+[[ $trc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- strict traceability rc=$trc: ${trace_detail//$'\n'/ }" >&2; exit 2; }
+
+python3 - "$run_dir" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$ROOT/agent-firm/schemas/qa-verdict.schema.json" "$ROOT/agent-firm/schemas/traceability.schema.json" "$SELF/firm-new-run" "$SELF/firm-ledger-log" <<'PY'
+import collections
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+run = Path(os.path.abspath(sys.argv[1]))
+policy_path = Path(sys.argv[2])
+verdict_schema_path = Path(sys.argv[3])
+trace_schema_path = Path(sys.argv[4])
+metadata_reader = Path(sys.argv[5])
+ledger_writer = Path(sys.argv[6])
+
+def cannot(message):
+    print(f"FINAL QA: CANNOT EVALUATE -- {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def block(message):
+    print(f"FINAL QA: BLOCK -- {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+def atomic_write(path, payload):
+    parent=path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        cannot("decision-state parent is unsafe")
+    flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+    if hasattr(os,"O_NOFOLLOW"): flags |= os.O_NOFOLLOW
+    tmp=parent/("."+path.name+f".{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    fd=os.open(tmp,flags,0o600)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,"wb",closefd=True) as fh:
+            fd=-1; fh.write(payload); fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp,path); os.chmod(path,0o600,follow_symlinks=False)
+    finally:
+        if fd != -1: os.close(fd)
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+try:
+    import yaml
+    import jsonschema
+except BaseException as exc:
+    cannot(f"validation prerequisites unavailable or broken: {type(exc).__name__}: {exc}")
+
+def load_json(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+
+def load_yaml(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except Exception as exc:
+        cannot(f"{label} is unreadable or malformed: {type(exc).__name__}: {exc}")
+
+def safe_file(relative, label):
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        cannot(f"{label} must be a run-relative path")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in relative):
+        cannot(f"{label} contains a control character")
+    parts = Path(relative).parts
+    if any(part in ("", ".", "..") for part in parts):
+        cannot(f"{label} contains traversal")
+    current = run
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            cannot(f"{label} is missing: {relative}: {exc}")
+        if stat.S_ISLNK(info.st_mode):
+            cannot(f"{label} contains a symlinked component")
+    if not stat.S_ISREG(os.lstat(current).st_mode):
+        cannot(f"{label} is not a regular file")
+    return current
+
+def utc(value):
+    if isinstance(value, datetime.datetime):
+        return value.tzinfo is not None and value.utcoffset() == datetime.timedelta(0) and value.microsecond == 0
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return True
+    except ValueError:
+        return False
+
+evidence_parent = run / "09-test-evidence"
+try:
+    evidence_info = os.lstat(evidence_parent)
+    if (stat.S_ISLNK(evidence_info.st_mode) or not stat.S_ISDIR(evidence_info.st_mode)
+            or evidence_info.st_uid != os.getuid()
+            or os.path.realpath(evidence_parent) != os.path.join(os.path.realpath(run),"09-test-evidence")):
+        cannot("candidate evidence parent is unsafe or redirected")
+except OSError as exc:
+    cannot(f"candidate evidence parent is missing or unsafe: {exc}")
+candidate = load_json(run / "09-test-evidence" / "qa-candidate.json", "candidate metadata")
+trace = load_yaml(run / "traceability.yaml", "traceability")
+criteria = load_yaml(run / "01-acceptance-criteria.yaml", "acceptance criteria")
+primary = load_json(run / "08-qa-verdict.json", "primary verdict")
+schema = load_json(verdict_schema_path, "verdict schema")
+trace_schema = load_json(trace_schema_path, "traceability schema")
+policy = load_yaml(policy_path, "high-risk path policy")
+sha = candidate["candidate_sha"]
+generation = candidate["generation"]
+run_id = run.name
+
+repo = os.path.realpath(str(candidate.get("repository_root", "")))
+expected_run = os.path.join(repo, ".agent-firm", "runs", run_id)
+expected_checkout = os.path.join(repo, ".agent-firm", "qa-checkout", run_id)
+if os.path.realpath(run) != os.path.realpath(expected_run):
+    cannot("run is not the candidate repository's canonical run directory")
+try:
+    for component in (
+        repo, os.path.join(repo,".agent-firm"), os.path.join(repo,".agent-firm","runs"), str(run),
+        os.path.join(repo,".agent-firm","qa-checkout"), expected_checkout, str(evidence_parent)
+    ):
+        info=os.lstat(component)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(component)
+    raw_checkout=str(candidate.get("checkout_path",""))
+    if os.path.abspath(raw_checkout) != expected_checkout or os.path.realpath(raw_checkout) != expected_checkout:
+        raise ValueError("candidate checkout is not the exact canonical QA path")
+except Exception as exc:
+    cannot(f"canonical run component is unsafe: {exc}")
+metadata_done = subprocess.run([str(metadata_reader), "--metadata-view", str(run)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+if metadata_done.returncode != 0:
+    cannot(f"run metadata view failed: {metadata_done.stderr.strip()}")
+try:
+    metadata=json.loads(metadata_done.stdout)
+except Exception as exc:
+    cannot(f"run metadata view is malformed: {exc}")
+if metadata.get("historical") is not False or metadata.get("approval_eligible") is not True:
+    block("historical or approval-ineligible metadata cannot approve a current candidate")
+if metadata.get("accepted_base_sha") != candidate.get("base_sha") or os.path.realpath(str(metadata.get("git_common_dir",""))) != os.path.realpath(str(candidate.get("git_common_dir",""))):
+    block("run metadata accepted-base/common-dir identity differs from candidate")
+
+if primary.get("verdict") != "APPROVE" or primary.get("blockers"):
+    block("primary QA did not issue an internally consistent APPROVE")
+provider = metadata.get("primary_provider")
+if provider not in ("claude", "codex"):
+    cannot("current candidate run needs primary_provider claude or codex")
+expected = "gpt" if provider == "claude" else "claude"
+secondary_path = run / f"08-qa-verdict.{expected}.json"
+voice = trace.get("two_voice")
+diffs = trace.get("two_voice_diff")
+if not isinstance(voice, dict) or not isinstance(diffs, list):
+    cannot("traceability two_voice state is malformed")
+if voice.get("secondary_provider") != expected:
+    block(f"secondary_provider must be {expected}")
+
+# Derive, never trust, whether the second voice is mandatory.
+accepted = criteria.get("criteria") if isinstance(criteria, dict) else None
+if not isinstance(accepted, list) or not accepted:
+    cannot("accepted criteria are absent")
+criterion_high = any(isinstance(item, dict) and item.get("type") == "security_privacy" for item in accepted)
+try:
+    jsonschema.validate(policy, {"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/highRiskPolicy","$defs":trace_schema["$defs"]})
+    changed = subprocess.check_output(
+        ["git", "-C", candidate["repository_root"], "diff", "--name-only", "--no-renames", candidate["base_sha"], sha, "--"],
+        stderr=subprocess.DEVNULL, text=True
+    ).splitlines()
+    path_high = any(fnmatch.fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:]))
+                    for path in changed for patterns in policy["categories"].values() for pattern in patterns)
+except Exception as exc:
+    block(f"high-risk classification is ambiguous: {type(exc).__name__}: {exc}")
+derived_required = criterion_high or path_high
+if not isinstance(voice.get("required"), bool) or voice["required"] != derived_required:
+    block(f"supplied two_voice.required does not match derived value {str(derived_required).lower()}")
+
+def ledger_events():
+    events=[]
+    path=safe_file("run.jsonl", "target ledger")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for number,line in enumerate(fh,1):
+                item=json.loads(line)
+                if not isinstance(item,dict):
+                    raise ValueError(f"line {number} is not an object")
+                events.append(item)
+    except Exception as exc:
+        cannot(f"target ledger is malformed: {exc}")
+    return events
+
+events = ledger_events()
+
+def evidence_ref(ref, label):
+    if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
+        block(f"{label} is missing, stale, or bound to another SHA")
+    path=safe_file(ref.get("path"), label)
+    raw=path.read_bytes()
+    if ref.get("sha256") != hashlib.sha256(raw).hexdigest() or ref.get("bytes") != len(raw):
+        block(f"{label} digest or byte size changed")
+    producer=ref.get("producer")
+    if not isinstance(producer,dict):
+        block(f"{label} lacks an exact producer")
+    matches=[event for event in events if event.get("event_id")==producer.get("event_id")]
+    if len(matches)!=1 or matches[0].get("event")!=producer.get("event"):
+        block(f"{label} producer event is missing or duplicated")
+    event=matches[0]; origin=ref.get("path")
+    if event.get("sha")!=sha or str(event.get("generation"))!=str(generation) or origin not in (event.get("path"),event.get("verdict"),event.get("attempt")):
+        block(f"{label} producer candidate/artifact identity mismatches")
+    digest_field="verdict_sha256" if origin==event.get("verdict") else "sha256"
+    bytes_field="verdict_bytes" if origin==event.get("verdict") else "bytes"
+    if event.get(digest_field)!=ref.get("sha256") or str(event.get(bytes_field))!=str(ref.get("bytes")):
+        block(f"{label} producer digest/size mismatches")
+    for field in ("provider","generation","attempt_id"):
+        if field in producer and str(event.get(field))!=str(producer[field]):
+            block(f"{label} producer {field} mismatches")
+    return path
+
+def validate_identity(verdict, label, expected_provider=None):
+    try:
+        jsonschema.validate(verdict, schema)
+    except Exception as exc:
+        cannot(f"{label} schema validation failed: {exc}")
+    if verdict.get("commit_sha") != sha or verdict.get("run_id") != run_id or verdict.get("generation") != generation:
+        block(f"{label} is abbreviated, stale, or bound to another candidate generation")
+    if expected_provider and verdict.get("provider") != expected_provider:
+        block(f"{label} provider identity is mismatched")
+    if not isinstance(verdict.get("attempt_id"),str) or not verdict["attempt_id"]:
+        block(f"{label} attempt identity is missing")
+
+validate_identity(primary, "primary verdict", "primary")
+
+def blocker_objects(verdict, label):
+    objects=verdict.get("blocker_objects") or []
+    if verdict.get("verdict")=="APPROVE":
+        if verdict.get("blockers") or objects:
+            block(f"{label} APPROVE carries blocker state")
+        return {}
+    texts=verdict.get("blockers")
+    if not isinstance(texts,list) or not texts or not isinstance(objects,list) or not objects:
+        block(f"{label} BLOCK lacks producer-bound objection objects")
+    ids=[item.get("id") for item in objects if isinstance(item,dict)]
+    object_texts=[item.get("text") for item in objects if isinstance(item,dict)]
+    if len(ids)!=len(objects) or len(ids)!=len(set(ids)) or object_texts!=texts:
+        block(f"{label} blocker text/id projection is inconsistent")
+    return {item["id"]:item for item in objects}
+
+def bind_disposition(entry, objects, label):
+    objection=objects.get(entry.get("secondary_blocker_id"))
+    if objection is None:
+        block(f"{label} does not identify an exact producer objection")
+    for entry_key,object_key in (("secondary_blocker","text"),("affected_criteria","affected_criteria"),("affected_paths","affected_paths")):
+        if entry.get(entry_key)!=objection.get(object_key):
+            block(f"{label} contradicts producer field {object_key}")
+    return objection
+
+def decision_required(kind, objections, permitted_record_types):
+    event_id=f"evt-final-decision-required-g{generation}-{os.getpid()}-{os.urandom(6).hex()}"
+    relative=f"09-test-evidence/final-decision-required.{event_id}.json"
+    path=run/relative
+    state={"schema_version":1,"status":"decision_required","run_id":run_id,"candidate_sha":sha,
+           "generation":generation,"kind":kind,"objections":objections,
+           "permitted_record_types":permitted_record_types,"event_id":event_id,
+           "created_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
+    payload=(json.dumps(state,indent=2,sort_keys=True)+"\n").encode("utf-8")
+    atomic_write(path,payload)
+    done=subprocess.run([str(ledger_writer),"--run",str(run),"--strict","--event-id",event_id,
+                         "final_decision_required",f"path={relative}",f"sha={sha}",f"generation={generation}",
+                         f"sha256={hashlib.sha256(payload).hexdigest()}",f"bytes={len(payload)}",f"kind={kind}"],
+                        stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+    if done.returncode != 0:
+        cannot(f"could not retain decision_required target event: {done.stderr.strip()}")
+    print(f"FINAL QA: DECISION REQUIRED -- {relative}",file=sys.stderr)
+    raise SystemExit(4)
+
+def validate_attempt_verdict(verdict_path, verdict, label, current):
+    attempt_id=verdict.get("attempt_id")
+    attempt_rel=f"09-test-evidence/reviewer-attempts/{attempt_id}/attempt.json"
+    if not (run/attempt_rel).is_file():
+        block(f"{label} has no immutable wrapper attempt record")
+    attempt_path=safe_file(attempt_rel,f"{label} attempt")
+    attempt=load_json(attempt_path,f"{label} attempt")
+    expected_status="approve" if verdict.get("verdict")=="APPROVE" else "block"
+    local_rel=f"09-test-evidence/reviewer-attempts/{attempt_id}/verdict.json"
+    if not (run/local_rel).is_file():
+        block(f"{label} has no immutable attempt-local verdict")
+    local_path=safe_file(local_rel,f"{label} immutable verdict")
+    local_raw=local_path.read_bytes()
+    if any((attempt.get("attempt_id")!=attempt_id,attempt.get("provider")!=expected,
+            attempt.get("run_id")!=run_id,attempt.get("candidate_sha")!=sha,
+            attempt.get("generation")!=generation,attempt.get("status")!=expected_status,
+            attempt.get("exit_code")!=(0 if expected_status=="approve" else 1),
+            attempt.get("verdict")!=local_rel,attempt.get("canonical_promoted") is not True,
+            attempt.get("verdict_sha256")!=hashlib.sha256(local_raw).hexdigest(),
+            attempt.get("verdict_bytes")!=len(local_raw))):
+        block(f"{label} attempt record does not exactly describe the wrapper result")
+    try:
+        local_doc=json.loads(local_raw)
+    except Exception as exc:
+        cannot(f"{label} immutable verdict is malformed: {exc}")
+    if local_doc!=verdict:
+        block(f"{label} differs from its immutable attempt-local verdict")
+    event_id=attempt.get("outcome_event_id")
+    matches=[event for event in events if event.get("event_id")==event_id]
+    event_name="reviewer_approve" if expected_status=="approve" else "reviewer_block"
+    attempt_raw=attempt_path.read_bytes()
+    if len(matches)!=1:
+        block(f"{label} needs exactly one wrapper outcome event")
+    event=matches[0]
+    if any((event.get("event")!=event_name,event.get("provider")!=expected,
+            str(event.get("generation"))!=str(generation),event.get("sha")!=sha,
+            event.get("attempt")!=attempt_rel,event.get("attempt_id")!=attempt_id,
+            event.get("verdict")!=local_rel,str(event.get("exit_code"))!=str(attempt.get("exit_code")),
+            event.get("sha256")!=hashlib.sha256(attempt_raw).hexdigest(),
+            str(event.get("bytes"))!=str(len(attempt_raw)),
+            event.get("verdict_sha256")!=hashlib.sha256(local_raw).hexdigest(),
+            str(event.get("verdict_bytes"))!=str(len(local_raw)))):
+        block(f"{label} attempt/event/verdict chain is inconsistent")
+    if current:
+        state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json",f"{label} reviewer state"),f"{label} reviewer state")
+        if state.get("candidate_sha")!=sha or state.get("generation")!=generation or state.get("attempt_id")!=attempt_id:
+            block(f"{label} is not the latest serialized attempt")
+        if Path(verdict_path)!=secondary_path or attempt.get("canonical")!=str(secondary_path.relative_to(run)):
+            block(f"{label} is not the current canonical projection")
+    return local_rel, local_raw, attempt
+
+criterion_types={item.get("id"):item.get("type") for item in accepted if isinstance(item,dict)}
+changed_set=set(changed)
+def derived_objection_risk(objection):
+    affected_criteria=objection.get("affected_criteria") or []
+    affected_paths=objection.get("affected_paths") or []
+    reasons=[]; high=False
+    if not affected_criteria and not affected_paths:
+        return "high",["ambiguity:no-mapped-criterion-or-path"]
+    for criterion_id in affected_criteria:
+        if criterion_id not in criterion_types:
+            return "high",[f"ambiguity:unknown-criterion:{criterion_id}"]
+        criterion_type=str(criterion_types[criterion_id])
+        reasons.append(f"criterion:{criterion_id}:{criterion_type}")
+        high = high or criterion_type=="security_privacy"
+    for path in affected_paths:
+        if path not in changed_set:
+            reasons.append(f"ambiguity:unchanged-path:{path}"); high=True; continue
+        matches=[]
+        for category,patterns in policy["categories"].items():
+            for pattern in patterns:
+                if fnmatch.fnmatch(path,pattern) or (pattern.startswith("**/") and fnmatch.fnmatch(path,pattern[3:])):
+                    matches.append(f"path:{path}:{category}:{pattern}")
+        if matches:
+            reasons.extend(sorted(matches)); high=True
+        else:
+            reasons.append(f"path:{path}:benign")
+    return ("high" if high else "low"),sorted(set(reasons))
+
+present = secondary_path.is_file() and not secondary_path.is_symlink()
+if not present:
+    if voice.get("status") != "unavailable":
+        block("secondary verdict is missing without a structured unavailable state")
+    if diffs:
+        cannot("unavailable secondary cannot carry blocker dispositions")
+    attempt_ref = voice.get("attempt")
+    attempt_path = evidence_ref(attempt_ref, "unavailable attempt")
+    attempt = load_json(attempt_path, "unavailable attempt")
+    trusted = {"cli_missing", "authentication", "model", "unsupported_capability"}
+    if not isinstance(attempt_ref, dict) or attempt_ref.get("provider") != expected or attempt_ref.get("generation") != generation or attempt_ref.get("attempt_id")!=attempt.get("attempt_id"):
+        block("unavailable attempt reference does not match provider/generation")
+    if any((
+        attempt.get("provider") != expected,
+        attempt.get("candidate_sha") != sha,
+        attempt.get("generation") != generation,
+        attempt.get("status") != "unavailable",
+        attempt.get("exit_code") != 3,
+        attempt.get("trusted_reason") not in trusted
+    )):
+        block("unavailable attempt is fabricated, stale, ambiguous, or not from trusted readiness")
+    rel_attempt = attempt_ref["path"]
+    matches=[event for event in events if event.get("event_id")==attempt.get("outcome_event_id")]
+    state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json","unavailable reviewer state"),"unavailable reviewer state")
+    if len(matches)!=1 or matches[0].get("event")!="reviewer_unavailable" or matches[0].get("attempt")!=rel_attempt or str(matches[0].get("exit_code"))!="3" or state.get("attempt_id")!=attempt.get("attempt_id"):
+        block("unavailable state needs the latest exact target-ledger exit-3 attempt")
+    if derived_required:
+        if not isinstance(voice.get("unavailable_waiver"),dict):
+            decision_required("required_secondary_unavailable",[{
+                "id":f"required-secondary-unavailable:{expected}:{attempt['attempt_id']}",
+                "text":f"{expected} unavailable: {attempt['trusted_reason']}",
+                "affected_criteria":sorted(criterion_types),"affected_paths":sorted(changed_set),
+                "risk":"high","risk_reasons":["required-secondary-unavailable"],
+                "permitted_record_types":["required_unavailable"]
+            }],["required_unavailable"])
+        waiver_path = evidence_ref(voice.get("unavailable_waiver"), "required-unavailable waiver")
+        waiver = load_yaml(waiver_path, "required-unavailable waiver")
+        needed = {
+            "schema_version":1, "type":"required_unavailable", "run_id":run_id,
+            "candidate_sha":sha, "provider":expected, "decision":"waive_required_secondary",
+            "attempt":rel_attempt, "trusted_reason":attempt["trusted_reason"]
+        }
+        if not isinstance(waiver,dict) or any(waiver.get(key) != value for key,value in needed.items()):
+            block("required-unavailable waiver does not exactly match the attempt/run/SHA/reason")
+        if not str(waiver.get("actor","")).strip() or not utc(waiver.get("occurred_at")):
+            block("required-unavailable waiver lacks actor or UTC time")
+        if not isinstance(waiver.get("objections"),list) or not waiver["objections"]:
+            block("required-unavailable waiver lacks affected objections")
+    print(f"FINAL QA: PASS -- {expected} unavailable is target-attributed and policy-authorized")
+    raise SystemExit(0)
+
+secondary = load_json(secondary_path, "secondary verdict")
+validate_identity(secondary, "secondary verdict", expected)
+current_local_rel,current_local_raw,current_attempt=validate_attempt_verdict(secondary_path,secondary,"secondary verdict",True)
+if voice.get("status") != "available":
+    cannot("secondary verdict exists but two_voice.status is not available")
+if secondary.get("verdict") == "APPROVE":
+    if secondary.get("blockers"):
+        block("secondary APPROVE is internally inconsistent with blockers")
+    if not diffs:
+        print("FINAL QA: PASS -- both current candidate-bound provider verdicts approve")
+        raise SystemExit(0)
+    archived_docs={}
+    for entry in diffs:
+        label=entry.get("secondary_blocker")
+        evidence_ref(entry.get("evidence"),f"disposition evidence for {label}")
+        if entry.get("disposition") not in ("fixed","secondary_withdrew"):
+            block(f"current APPROVE can retain only fixed/secondary_withdrew history: {label}")
+        blocked_path=evidence_ref(entry.get("blocked_secondary_verdict"),f"archived secondary BLOCK for {label}")
+        blocked=load_json(blocked_path,f"archived secondary BLOCK for {label}")
+        validate_identity(blocked,f"archived secondary BLOCK for {label}",expected)
+        if blocked.get("verdict")!="BLOCK" or not blocked.get("blockers"):
+            block(f"archived history is not a wrapper BLOCK: {label}")
+        validate_attempt_verdict(blocked_path,blocked,f"archived secondary BLOCK for {label}",False)
+        archived_docs[str(entry["blocked_secondary_verdict"]["path"])]=blocker_objects(blocked,f"archived secondary BLOCK for {label}")
+        objection=bind_disposition(entry,archived_docs[str(entry["blocked_secondary_verdict"]["path"])],f"disposition for {label}")
+        derived_risk,derived_reasons=derived_objection_risk(objection)
+        if entry.get("risk")!=derived_risk or sorted(entry.get("risk_reasons") or [])!=derived_reasons:
+            block(f"objection risk/reasons do not match producer-bound mechanical derivation: {label}")
+        fresh_path=evidence_ref(entry.get("fresh_secondary_verdict"),f"current secondary APPROVE for {label}")
+        if str(fresh_path.relative_to(run))!=current_local_rel or fresh_path.read_bytes()!=current_local_raw:
+            block(f"fresh approval does not identify the current attempt-local verdict: {label}")
+    archived_ids=set()
+    for objects in archived_docs.values(): archived_ids.update(objects)
+    disposition_ids=[entry.get("secondary_blocker_id") for entry in diffs]
+    if len(disposition_ids)!=len(set(disposition_ids)) or set(disposition_ids)!=archived_ids:
+        block("archived BLOCK producer objection ids and current dispositions differ")
+    print("FINAL QA: PASS -- archived wrapper BLOCK is fully disposed and the latest canonical wrapper verdict approves")
+    raise SystemExit(0)
+
+blockers = secondary.get("blockers")
+if not isinstance(blockers,list) or not blockers or not all(isinstance(item,str) and item.strip() for item in blockers):
+    block("secondary BLOCK lacks an actionable blockers list")
+current_objects=blocker_objects(secondary,"secondary verdict")
+disposition_ids=[item.get("secondary_blocker_id") for item in diffs if isinstance(item,dict)]
+if len(disposition_ids)!=len(diffs) or len(disposition_ids)!=len(set(disposition_ids)) or set(disposition_ids)!=set(current_objects):
+    block("two_voice_diff must contain exactly one entry per producer objection id")
+
+human_entries=[]
+for entry in diffs:
+    label=entry["secondary_blocker"]
+    objection=bind_disposition(entry,current_objects,f"disposition for {label}")
+    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}")
+    disposition=entry.get("disposition")
+    risk=entry.get("risk")
+    derived_risk,derived_reasons=derived_objection_risk(objection)
+    if risk!=derived_risk or sorted(entry.get("risk_reasons") or [])!=derived_reasons:
+        block(f"objection risk/reasons do not match producer-bound mechanical derivation: {label}")
+    bounded=entry.get("bounded_resolution")
+    if disposition == "unresolved":
+        block(f"secondary objection remains unresolved: {label}")
+    if disposition == "proceed_with_primary":
+        if entry.get("positive_dissent") is not True or risk != "low":
+            block(f"proceed_with_primary needs positive, unambiguous low-risk dissent: {label}")
+        if not isinstance(bounded,dict) or bounded.get("attempted") is not True or bounded.get("rounds") != 1:
+            block(f"proceed_with_primary needs exactly one bounded resolution round: {label}")
+        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}")
+        continue
+    if disposition in ("fixed", "secondary_withdrew"):
+        block(f"{disposition} requires a later wrapper APPROVE promoted as current canonical: {label}")
+    if disposition == "human_decision":
+        human_entries.append((entry,objection))
+        continue
+    cannot(f"unknown disposition for {label}: {disposition}")
+
+if human_entries:
+    if any(not isinstance(entry.get("record"),dict) for entry,_ in human_entries):
+        structured=[]
+        for entry,objection in human_entries:
+            risk,reasons=derived_objection_risk(objection)
+            structured.append({**objection,"risk":risk,"risk_reasons":reasons,"permitted_record_types":["human_decision"]})
+        decision_required("secondary_objections",structured,["human_decision"])
+    record_refs=[entry["record"] for entry,_ in human_entries]
+    if any(ref!=record_refs[0] for ref in record_refs[1:]):
+        block("all human-decision objections must reference one exact shared record")
+    record_path=evidence_ref(record_refs[0],"aggregate human decision")
+    record=load_yaml(record_path,"aggregate human decision")
+    needed={"schema_version":1,"type":"human_decision","run_id":run_id,"candidate_sha":sha,"decision":"proceed"}
+    if not isinstance(record,dict) or any(record.get(k)!=v for k,v in needed.items()):
+        block("aggregate human decision does not match this run/candidate")
+    if not str(record.get("actor","")).strip() or not utc(record.get("occurred_at")):
+        block("aggregate human decision lacks actor or exact UTC time")
+    expected_ids=[objection["id"] for _,objection in human_entries]
+    expected_texts=[objection["text"] for _,objection in human_entries]
+    if collections.Counter(record.get("objection_ids") or [])!=collections.Counter(expected_ids) or collections.Counter(record.get("objections") or [])!=collections.Counter(expected_texts):
+        block("aggregate human decision must name every exact producer objection id and text")
+
+print("FINAL QA: PASS -- every exact secondary objection has a typed current-SHA disposition")
+PY
+exit $?

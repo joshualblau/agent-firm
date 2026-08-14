@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# Resolve one provider-neutral Agent Firm tier/role/legacy alias to exact runtime values.
+# Exit 0 resolved, 2 invalid input/policy/mismatch. This command never guesses or downgrades.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+
+exec python3 - "$ROOT/agent-firm/policy/model-tiers.yaml" "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import sys
+
+DEFAULT_POLICY = sys.argv[1]
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(DEFAULT_POLICY), "..", ".."))
+
+parser = argparse.ArgumentParser(
+    prog="firm-model-resolve",
+    description="Resolve an Agent Firm role, tier, or legacy alias without fallback.")
+parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+selector = parser.add_mutually_exclusive_group(required=True)
+selector.add_argument("--tier")
+selector.add_argument("--role")
+selector.add_argument("--alias")
+parser.add_argument("--expect-model")
+parser.add_argument("--expect-display")
+parser.add_argument("--expect-effort")
+parser.add_argument("--format", choices=("json", "shell", "args", "activation"), default="json")
+parser.add_argument("--policy", default=DEFAULT_POLICY, help=argparse.SUPPRESS)
+args = parser.parse_args(sys.argv[2:])
+
+def fail(message):
+    print(f"firm-model-resolve: BLOCKED: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    import yaml
+except BaseException as exc:
+    fail(f"cannot load canonical model policy because PyYAML is unavailable or broken: {type(exc).__name__}: {exc}")
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Fail before PyYAML can silently collapse a duplicate policy key."""
+
+def construct_unique_mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"unhashable policy key: {key!r}", key_node.start_mark) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"duplicate policy key: {key!r}", key_node.start_mark)
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_unique_mapping)
+
+if not os.path.isfile(args.policy) or os.path.islink(args.policy):
+    fail(f"policy must be a regular non-symlink file: {args.policy}")
+try:
+    with open(args.policy, "rb") as fh:
+        policy_bytes = fh.read()
+    policy = yaml.load(policy_bytes, Loader=UniqueKeyLoader)
+except BaseException as exc:
+    fail(f"cannot parse policy {args.policy}: {type(exc).__name__}: {exc}")
+
+EXPECTED_ROOT_KEYS = {"principle", "tiers", "role_tiers", "legacy_aliases", "quota_discipline"}
+EXPECTED_TIERS = {"ceiling", "heavyweight", "workhorse", "fast"}
+EXPECTED_ROLES = {
+    "lead", "intake-analyst", "architect", "implementer", "integrator", "reviewer",
+    "recruiter", "packager", "qa-tester", "specialist", "scout",
+}
+EXPECTED_ALIASES = {"fable", "opus", "sonnet", "haiku", "codex"}
+PROVIDERS = {"claude", "codex"}
+ACTIVATION_SOURCES = {
+    "claude": "commands/start.md",
+    "codex": "codex-skills/start/SKILL.md",
+}
+ACTIVATION_INSTRUCTION = "apply_exact_model_display_effort_immediately_before_native_launch"
+ROLE_START_ARGV = [
+    "firm-ledger-log", "--run", "<run>", "--strict", "--role-start",
+    "--stage", "<stage-instance>", "--role", "<role>",
+    "--contract", "<run-relative-contract>", "--event", "<expected-start-event>",
+    "--authority-json", "<authority-json>", "--agent", "<native-agent-id>",
+    "--activation-json", "<exact-resolver-activation-json>",
+]
+ROLE_START_RESULT_REQUIRED_FIELDS = [
+    "schema_version", "event_id", "run_id", "event", "stage", "role", "agent",
+    "contract", "authority", "activation",
+]
+NATIVE_LAUNCHES = {
+    "claude": "claude_native_agent",
+    "codex": "codex_native_subagent",
+}
+
+if not isinstance(policy, dict) or set(policy) != EXPECTED_ROOT_KEYS:
+    fail("policy root must contain exactly principle, tiers, role_tiers, legacy_aliases, and quota_discipline")
+tiers = policy["tiers"]
+role_tiers = policy["role_tiers"]
+aliases = policy["legacy_aliases"]
+if not isinstance(tiers, dict) or set(tiers) != EXPECTED_TIERS:
+    fail(f"tiers must contain exactly: {', '.join(sorted(EXPECTED_TIERS))}")
+if not isinstance(role_tiers, dict) or set(role_tiers) != EXPECTED_ROLES:
+    fail(f"role_tiers must contain exactly: {', '.join(sorted(EXPECTED_ROLES))}")
+if not isinstance(aliases, dict) or set(aliases) != EXPECTED_ALIASES:
+    fail(f"legacy_aliases must contain exactly: {', '.join(sorted(EXPECTED_ALIASES))}")
+
+for tier_name, tier_data in tiers.items():
+    if not isinstance(tier_data, dict):
+        fail(f"tier {tier_name!r} must be a mapping")
+    allowed = PROVIDERS | {"role", "used_for", "never"}
+    if not PROVIDERS.issubset(tier_data) or set(tier_data) - allowed:
+        fail(f"tier {tier_name!r} must define both providers and only supported descriptive fields")
+    for provider in sorted(PROVIDERS):
+        cell = tier_data[provider]
+        if not isinstance(cell, dict) or set(cell) != {"model", "display", "effort"}:
+            fail(f"{tier_name}.{provider} must contain exactly model, display, and effort")
+        for field in ("model", "display", "effort"):
+            value = cell[field]
+            if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
+                fail(f"{tier_name}.{provider}.{field} must be a non-empty printable string")
+
+for role, mapped_tier in role_tiers.items():
+    if not isinstance(mapped_tier, str) or mapped_tier not in tiers:
+        fail(f"role_tiers.{role} references unknown tier {mapped_tier!r}")
+for alias, mapped_tier in aliases.items():
+    if not isinstance(mapped_tier, str) or mapped_tier not in tiers:
+        fail(f"legacy_aliases.{alias} references unknown tier {mapped_tier!r}")
+
+if args.role is not None:
+    if args.role not in role_tiers:
+        fail(f"unknown role {args.role!r}; valid roles: {', '.join(sorted(role_tiers))}")
+    selected_by, selector_value, tier = "role", args.role, role_tiers[args.role]
+elif args.alias is not None:
+    if args.alias not in aliases:
+        fail(f"unknown legacy alias {args.alias!r}; valid aliases: {', '.join(sorted(aliases))}")
+    selected_by, selector_value, tier = "alias", args.alias, aliases[args.alias]
+else:
+    selected_by, selector_value, tier = "tier", args.tier, args.tier
+
+if tier not in tiers:
+    fail(f"unknown tier {tier!r}; valid tiers: {', '.join(sorted(tiers))}")
+cell = tiers[tier][args.provider]
+
+expected = {
+    "model": args.expect_model,
+    "display": args.expect_display,
+    "effort": args.expect_effort,
+}
+for field, wanted in expected.items():
+    if wanted is not None and wanted != cell[field]:
+        fail(f"explicit {field} mismatch for {args.provider}/{tier}: expected {cell[field]!r}, got {wanted!r}; no fallback applied")
+
+result = {
+    "provider": args.provider,
+    "selected_by": selected_by,
+    "selector": selector_value,
+    "tier": tier,
+    "model": cell["model"],
+    "display": cell["display"],
+    "effort": cell["effort"],
+    "policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
+}
+
+def load_native_adapter(provider):
+    relative = ACTIVATION_SOURCES[provider]
+    adapter_path = os.path.join(REPO_ROOT, relative)
+    if not os.path.isfile(adapter_path) or os.path.islink(adapter_path):
+        fail(f"native adapter must be a regular non-symlink file: {relative}")
+    try:
+        with open(adapter_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        matches = re.findall(
+            r"^```firm-native-role-adapter[ \t]*\n(.*?)^```[ \t]*$", text, re.MULTILINE | re.DOTALL)
+        if len(matches) != 1:
+            fail(f"{relative} must contain exactly one executable firm-native-role-adapter block")
+        adapter = yaml.load(matches[0], Loader=UniqueKeyLoader)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        fail(f"cannot parse native adapter {relative}: {type(exc).__name__}: {exc}")
+    expected = {
+        "schema_version": 1,
+        "provider": provider,
+        "resolver_argv": [
+            "firm-model-resolve", "--provider", provider, "<selector-flag>", "<selector>",
+            "--format", "activation",
+        ],
+        "resolve_timing": "immediately_before_role_start",
+        "role_start_argv": ROLE_START_ARGV,
+        "role_start_optional_argv": ["--activation-justification", "<text>"],
+        "result_required_fields": ROLE_START_RESULT_REQUIRED_FIELDS,
+        "result_optional_fields": ["activation_justification"],
+        "native_launch": NATIVE_LAUNCHES[provider],
+        "native_launch_fields": [
+            "activation.apply.model", "activation.apply.display", "activation.apply.effort", "agent",
+        ],
+        "retain_result_field": "event_id",
+        "apply_fields": ["model", "display", "effort"],
+        "apply_instruction": ACTIVATION_INSTRUCTION,
+        "failure_conditions": [
+            "resolver_nonzero", "producer_nonzero", "missing_result_field",
+            "result_schema_mismatch", "result_value_mismatch",
+        ],
+        "failure": "block",
+    }
+    if adapter != expected:
+        fail(f"native adapter contract mismatch in {relative}")
+    return relative
+
+if args.format == "json":
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+elif args.format == "shell":
+    for key in ("provider", "tier", "model", "display", "effort"):
+        print(f"FIRM_RESOLVED_{key.upper()}={shlex.quote(result[key])}")
+elif args.format == "activation":
+    adapter_source = load_native_adapter(args.provider)
+    activation = {
+        "schema_version": 1,
+        "action": "native_role_launch",
+        "provider": args.provider,
+        "selected_by": selected_by,
+        "selector": selector_value,
+        "tier": tier,
+        "policy_sha256": result["policy_sha256"],
+        "adapter_source": adapter_source,
+        "resolver_argv": [
+            "firm-model-resolve", "--provider", args.provider, f"--{selected_by}", selector_value,
+            "--format", "activation",
+        ],
+        "apply": {
+            "model": result["model"],
+            "display": result["display"],
+            "effort": result["effort"],
+        },
+        "apply_instruction": ACTIVATION_INSTRUCTION,
+        "failure": "block",
+    }
+    print(json.dumps(activation, sort_keys=True, separators=(",", ":")))
+else:
+    if args.provider == "claude":
+        print("--model", shlex.quote(cell["model"]), "--effort", shlex.quote(cell["effort"]))
+    else:
+        print("-m", shlex.quote(cell["model"]), "-c", shlex.quote(f'model_reasoning_effort="{cell["effort"]}"'))
+PY

@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Supervise one provider phase as a process group and emit a bounded structured result.
+# Exit: child rc, 124 wall timeout, 125 turn limit, 126 spawn failure, 2 invalid control input.
+set -euo pipefail
+exec python3 - "$@" <<'PY'
+import argparse
+import errno
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+MAX_TIMEOUT = 900
+MAX_GRACE = 30
+MAX_OUTPUT = 1024 * 1024
+MAX_TURNS = 1000
+MAX_EVENT_RECORD = 65536
+
+def positive(name, value, maximum):
+    if not re.fullmatch(r"[0-9]+", str(value or "")):
+        raise ValueError(f"{name} must be a positive integer (maximum {maximum})")
+    parsed = int(value)
+    if parsed < 1 or parsed > maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return parsed
+
+def atomic_write(path, payload, mode=0o600):
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        raise OSError(f"unsafe output parent: {parent}")
+    try:
+        st = os.lstat(path)
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise OSError(f"refusing non-regular or symlink output: {path}")
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = None
+    tmp = None
+    try:
+        for _ in range(32):
+            candidate = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+            try:
+                fd = os.open(candidate, flags, mode)
+                tmp = candidate
+                break
+            except FileExistsError:
+                continue
+        if fd is None:
+            raise OSError("could not allocate exclusive temporary output")
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb", closefd=True) as fh:
+            fd = None
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        os.chmod(path, mode, follow_symlinks=False)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+def turn_event(line):
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("type") or value.get("event")
+    return kind in {
+        "assistant", "assistant_message", "assistant/analysis", "turn",
+        "turn.completed", "turn_complete", "message.completed"
+    }
+
+parser = argparse.ArgumentParser(prog="firm-bounded-exec", add_help=True)
+parser.add_argument("--phase", required=True)
+parser.add_argument("--provider", required=True)
+parser.add_argument("--timeout", default="30")
+parser.add_argument("--grace", default="2")
+parser.add_argument("--max-output", default="65536")
+parser.add_argument("--max-turns")
+parser.add_argument("--generation", default="1")
+parser.add_argument("--output")
+parser.add_argument("--result")
+parser.add_argument("--cwd")
+parser.add_argument("command", nargs=argparse.REMAINDER)
+args = parser.parse_args()
+if args.command and args.command[0] == "--":
+    args.command = args.command[1:]
+
+started = time.monotonic()
+result = {
+    "schema_version": 1,
+    "phase": args.phase,
+    "provider": args.provider,
+    "status": "invalid",
+    "exit_code": None,
+    "duration_ms": 0,
+    "generation": None,
+    "output_bytes": 0,
+    "retained_bytes": 0,
+    "truncated": False,
+    "timed_out": False,
+    "term_sent": False,
+    "kill_sent": False,
+    "turn_count": 0
+    ,"parser_limit_bytes": MAX_EVENT_RECORD
+    ,"parser_peak_bytes": 0
+    ,"parser_status": "ok"
+    ,"overlong_records": 0
+}
+control_paths_valid = False
+
+def validate_destination(path):
+    if not path:
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        raise ValueError(f"unsafe output parent: {parent}")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"refusing non-regular or symlink output: {path}")
+
+def finish(code, output=b""):
+    result["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
+    if args.output:
+        atomic_write(args.output, output, 0o600)
+    data = (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if args.result:
+        atomic_write(args.result, data, 0o600)
+    else:
+        sys.stdout.buffer.write(data)
+    raise SystemExit(code)
+
+try:
+    import stat
+    validate_destination(args.output)
+    validate_destination(args.result)
+    control_paths_valid = True
+    timeout = positive("timeout", args.timeout, MAX_TIMEOUT)
+    grace = positive("grace", args.grace, MAX_GRACE)
+    output_limit = positive("max-output", args.max_output, MAX_OUTPUT)
+    generation = positive("generation", args.generation, 2147483647)
+    turns = positive("max-turns", args.max_turns, MAX_TURNS) if args.max_turns is not None else None
+    if not args.command:
+        raise ValueError("a command is required after --")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.phase):
+        raise ValueError("phase contains unsafe characters")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", args.provider):
+        raise ValueError("provider contains unsafe characters")
+    if any("\x00" in item for item in args.command):
+        raise ValueError("command contains NUL")
+    if args.cwd and (not os.path.isdir(args.cwd) or os.path.islink(args.cwd)):
+        raise ValueError("cwd must be an existing non-symlink directory")
+except (ValueError, OSError) as exc:
+    result["error"] = str(exc)
+    if control_paths_valid:
+        try:
+            finish(2)
+        except OSError as write_exc:
+            print(f"firm-bounded-exec: invalid input: {exc}; result write failed: {write_exc}", file=sys.stderr)
+            raise SystemExit(2)
+    print(f"firm-bounded-exec: invalid input: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+result["generation"] = generation
+retained = bytearray()
+total = 0
+line_buffer = bytearray()
+discarding_record = False
+proc = None
+pgid = None
+try:
+    proc = subprocess.Popen(
+        args.command,
+        cwd=args.cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True
+    )
+    pgid = proc.pid
+except (OSError, ValueError) as exc:
+    result["status"] = "spawn_error"
+    result["error"] = f"{type(exc).__name__}: {exc}"
+    finish(126)
+
+selector = selectors.DefaultSelector()
+assert proc.stdout is not None
+os.set_blocking(proc.stdout.fileno(), False)
+selector.register(proc.stdout, selectors.EVENT_READ)
+deadline = started + timeout
+termination_reason = None
+term_at = None
+pipe_open = True
+
+def signal_group(sig):
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        raise
+
+while True:
+    now = time.monotonic()
+    if termination_reason is None and now >= deadline:
+        termination_reason = "timeout"
+        result["timed_out"] = True
+        result["term_sent"] = signal_group(signal.SIGTERM)
+        term_at = now
+    if termination_reason is not None and term_at is not None and now >= term_at + grace and not result["kill_sent"]:
+        result["kill_sent"] = signal_group(signal.SIGKILL)
+
+    wait_for = 0.05
+    if termination_reason is None:
+        wait_for = max(0.0, min(wait_for, deadline - now))
+    elif term_at is not None and not result["kill_sent"]:
+        wait_for = max(0.0, min(wait_for, term_at + grace - now))
+
+    events = selector.select(wait_for) if pipe_open else []
+    for key, _ in events:
+        try:
+            chunk = os.read(key.fileobj.fileno(), 65536)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            selector.unregister(key.fileobj)
+            pipe_open = False
+            continue
+        total += len(chunk)
+        room = output_limit - len(retained)
+        if room > 0:
+            retained.extend(chunk[:room])
+        pending = chunk
+        while pending:
+            newline = pending.find(b"\n")
+            if discarding_record:
+                if newline < 0:
+                    break
+                discarding_record = False
+                pending = pending[newline + 1:]
+                continue
+            if newline < 0:
+                room = MAX_EVENT_RECORD - len(line_buffer)
+                line_buffer.extend(pending[:room])
+                result["parser_peak_bytes"] = max(result["parser_peak_bytes"], len(line_buffer))
+                if len(pending) > room:
+                    result["parser_status"] = "overlong_record"
+                    result["overlong_records"] += 1
+                    line_buffer.clear()
+                    discarding_record = True
+                break
+            piece = pending[:newline]
+            if len(line_buffer) + len(piece) > MAX_EVENT_RECORD:
+                result["parser_status"] = "overlong_record"
+                result["overlong_records"] += 1
+            else:
+                line_buffer.extend(piece)
+                result["parser_peak_bytes"] = max(result["parser_peak_bytes"], len(line_buffer))
+                if turn_event(line_buffer):
+                    result["turn_count"] += 1
+                    if turns is not None and result["turn_count"] >= turns and termination_reason is None:
+                        termination_reason = "turn_limit"
+                        result["term_sent"] = signal_group(signal.SIGTERM)
+                        term_at = time.monotonic()
+            line_buffer.clear()
+            pending = pending[newline + 1:]
+
+    child_done = proc.poll() is not None
+    if child_done and not pipe_open:
+        break
+    if termination_reason is not None and result["kill_sent"] and time.monotonic() >= (term_at or now) + grace + 1:
+        break
+
+try:
+    rc = proc.wait(timeout=1)
+except subprocess.TimeoutExpired:
+    signal_group(signal.SIGKILL)
+    result["kill_sent"] = True
+    rc = proc.wait()
+
+result["output_bytes"] = total
+result["retained_bytes"] = len(retained)
+result["truncated"] = total > len(retained)
+result["exit_code"] = rc
+if line_buffer and not discarding_record and turn_event(line_buffer):
+    result["turn_count"] += 1
+if termination_reason == "timeout":
+    result["status"] = "timeout"
+    finish(124, bytes(retained))
+if termination_reason == "turn_limit":
+    result["status"] = "turn_limit"
+    finish(125, bytes(retained))
+result["status"] = "ok" if rc == 0 else "exit"
+finish(rc if 0 <= rc <= 255 else 1, bytes(retained))
+PY

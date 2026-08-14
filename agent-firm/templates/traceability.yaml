@@ -1,12 +1,46 @@
-# Traceability matrix — every acceptance criterion mapped to code, tests, and evidence.
-# Produced during Review/QA; bin/traceability-check enforces it against 08-qa-verdict.json.
+# Candidate-bound traceability. Replace the example row with exactly one row per accepted criterion.
+schema_version: 2
 task_slug:
+candidate:
+  run_id:
+  repository_root: ""
+  git_common_dir: ""
+  source_ref: "refs/heads/integration/"
+  source_ref_sha: ""
+  base_sha: ""
+  commit_sha: ""                 # full 40-character SHA from qa-candidate.json
+  generation: 1
+  checkout_path: ""
 matrix:
   - id: AC-001
-    implementation_files: []     # e.g. [src/greet.js]
-    tests: []                    # e.g. [test/greet.test.js::adds two numbers]
-    manual_verification: ""     # if verification was manual, describe it
-    evidence: ""                # path under 09-test-evidence/ or a note
-    status: uncovered            # covered | partial | uncovered
-# Rule: an `uncovered` criterion fails the traceability gate UNLESS it carries an explicit
-# justification (e.g. waived at the Requirements gate, or out of scope).
+    implementation_files: []
+    tests: []
+    manual_verification: ""
+    evidence:
+      - path: 09-test-evidence/example.log
+        candidate_sha: ""
+        sha256: ""                # lowercase SHA-256 after the producer completes
+        bytes: 0
+        producer: {event_id: "evt-example", event: evidence_produced}
+    status: covered              # covered | partial | uncovered
+# Every reference also carries sha256, byte size, and one exact target-ledger producer. Partial or
+# uncovered rows additionally require the same immutable fields on gate_record plus an exact
+# waive_partial/waive_uncovered decision. A prose justification is not authority.
+
+two_voice:
+  secondary_provider: ""        # gpt | claude
+  status: available             # available | unavailable
+  required: true                # cross-check only; the final gate derives this value
+two_voice_diff: []
+# Example entry:
+# - secondary_blocker_id: "obj-exact-immutable-id"
+#   secondary_blocker: "exact blocker text from the secondary verdict"
+#   primary_position: "positive dissent with the evidence read differently"
+#   positive_dissent: true
+#   affected_criteria: [AC-001] # exact cross-check of the producer's blocker object
+#   affected_paths: [src/example] # exact cross-check; the gate derives risk from the producer object
+#   risk: low                   # cross-check only; the checker derives it, and ambiguity is high
+#   risk_reasons: [criterion:AC-001:functional]
+#   bounded_resolution: {attempted: true, rounds: 1, rerun: block, evidence: {path: 09-test-evidence/round.json, candidate_sha: "<sha>", sha256: "<digest>", bytes: 0, producer: {event_id: "evt-round", event: evidence_produced}}}
+#   evidence: {path: 09-test-evidence/primary-position.json, candidate_sha: "<sha>", sha256: "<digest>", bytes: 0, producer: {event_id: "evt-position", event: evidence_produced}}
+#   disposition: proceed_with_primary  # unresolved | fixed | secondary_withdrew | human_decision | proceed_with_primary

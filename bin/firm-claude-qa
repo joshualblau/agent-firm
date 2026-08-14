@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Thin Claude selector over the shared controlled-root reviewer engine. The engine alone resolves the
+# canonical Claude reviewer model, owns the immutable attempt/event chain, and promotes validated output;
+# this wrapper supplies no model fallback, output path, ambient policy, or alternate provider behavior.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+exec "$SELF/firm-reviewer-common" claude "$@"

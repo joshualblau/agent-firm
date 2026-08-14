@@ -1,384 +1,316 @@
 #!/usr/bin/env bash
-# tests/test-run-evals-structural.sh — firm-run-evals --structural: the one mode CI actually runs (no
-# claude login, no spend). Model-driven `run_one` is exercised manually only, per the plan.
-#
-# firm-run-evals hardcodes its evals directory to THIS repo's agent-firm/evals/ (resolved from the
-# script's own location, not parametrized by CWD or an env var), so the cases in the first half of
-# this file run against the real eval directories.
-#
-# UPDATE (SEC-R15 section, second half): a synthetic evals tree IS reachable after all, without any
-# new env var and without writing a broken fixture into the real, git-tracked agent-firm/evals/ --
-# by giving the script a different location to resolve ITSELF from (mk_eval_root below copies it into
-# a throwaway root). That is how the negative paths this header used to call untestable are now
-# covered. The "BAD $name (structure)" path (a missing task.md/assertions.yaml/fixture/) is still not
-# covered; mk_eval always builds a complete eval.
+# Structural confinement and behavioral turn supervision. Provider commands here are inert stubs.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-RUN_EVALS="$BIN/firm-run-evals"
-EVALS_DIR="$FIRM_ROOT/agent-firm/evals"
+RUN="$BIN/firm-run-evals"
+W="$(mktemp -d "${TMPDIR:-/tmp}/firm-evals-structural.XXXXXX")"; t_track "$W"
 
-# The real eval names, computed dynamically (not hardcoded) so this test doesn't silently go stale
-# when PR 3 adds qa-blocks-broken-build or a later change adds/removes an eval.
-real_eval_names() {
-  for d in "$EVALS_DIR"/*/; do
-    n="$(basename "$d")"
-    [ "$n" = "README.md" ] && continue
-    printf '%s\n' "$n"
-  done
+real_names() {
+  for d in "$FIRM_ROOT"/agent-firm/evals/*/; do [ -d "$d" ] && basename "$d"; done
 }
 
-# ---------------------------------------------------------------------------
-t_case "fixture precondition: the real evals directory looks like what this test assumes"
-assert_ok "agent-firm/evals/ exists in this checkout" sh -c "[ -d '$EVALS_DIR' ]"
-n_real="$(real_eval_names | wc -l | tr -d ' ')"
-assert_ok "at least one real eval exists to test against" sh -c "[ '$n_real' -gt 0 ]"
+t_case "shipped evals are parse/shape valid without making a behavioral claim"
+assert_rc "all shipped evals parse" 0 "$RUN" --structural
+assert_output "output explicitly says payloads were not executed" "payloads not executed" "$RUN" --structural
+assert_output "summary disclaims behavioral proof" "NOT a behavioural pass" "$RUN" --structural
 
-# ---------------------------------------------------------------------------
-t_case "--structural (no filter): walks every real eval, no model run, exits 0"
-assert_rc "exits 0" 0 "$RUN_EVALS" --structural
-out_all="$( "$RUN_EVALS" --structural 2>&1 )"
-missing=0
-for name in $(real_eval_names); do
-  case "$out_all" in
-    *"ok   $name"*) : ;;
-    *) missing=1; echo "    (missing from output: $name)" ;;
-  esac
+one="$(real_names | sed -n '1p')"
+t_case "explicit selectors fail closed and listing is a separate non-claiming operation"
+assert_rc "known selector succeeds" 0 "$RUN" --structural "$one"
+assert_rc "unknown structural selector is usage failure" 2 "$RUN" --structural definitely-not-an-eval
+assert_rc "unknown behavioral selector fails before a provider lookup" 2 "$RUN" definitely-not-an-eval
+assert_output "unknown selector gives valid names" "valid eval names:" "$RUN" --structural definitely-not-an-eval
+assert_output "unknown selector gives a copyable correction" "firm-run-evals --list" "$RUN" --structural definitely-not-an-eval
+assert_rc "list is successful" 0 "$RUN" --list
+assert_output "list makes no behavioral or structural claim" "listing only" "$RUN" --list
+
+mk_root() {
+  local root="$1"
+  mkdir -p "$root/bin" "$root/agent-firm/evals" "$root/agent-firm/contracts" "$root/.claude"
+  cp "$RUN" "$root/bin/firm-run-evals"
+  chmod +x "$root/bin/firm-run-evals"
+  ln -s "$BIN/firm-check-assertions" "$root/bin/firm-check-assertions"
+  ln -s "$BIN/firm-bounded-exec" "$root/bin/firm-bounded-exec"
+  printf '# lifecycle fixture\n' > "$root/agent-firm/contracts/lifecycle.md"
+  printf '{}\n' > "$root/.claude/settings.json"
+}
+
+mk_eval() {
+  local root="$1" name="$2"
+  mkdir -p "$root/agent-firm/evals/$name/fixture"
+  printf 'fixture task\n' > "$root/agent-firm/evals/$name/task.md"
+  printf 'seed\n' > "$root/agent-firm/evals/$name/fixture/seed.txt"
+}
+
+ROOT="$W/parse-root"; mk_root "$ROOT"; mk_eval "$ROOT" confined
+OUTSIDE="$W/outside-write"; HIT="$W/listener-hit"; LISTENER_FIFO="$W/listener.fifo"
+STUB="$W/stub"; mkdir "$STUB"
+for command in claude codex firm-gpt-qa firm-claude-qa git sh python payload-project curl; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "$0" >> "$FIRM_SENTINEL_CALLS"\n: > "$FIRM_SENTINEL_TRIP"\nexit 99\n' > "$STUB/$command"
+  chmod +x "$STUB/$command"
 done
-assert_eq "every real eval is reported ok" 0 "$missing"
-assert_output "summary line present" "all evals passed" "$RUN_EVALS" --structural
+CALLS="$W/calls"; TRIP="$W/trip"
 
-t_case "--structural does NOT invoke claude (no login/spend required, no envelope printed)"
-assert_ok "no 'driving the firm headlessly' line (that's run_one's, not structural_check's)" \
-  sh -c "! '$RUN_EVALS' --structural 2>&1 | grep -q 'driving the firm headlessly'"
+# A real local IPC listener makes the listener axis observable in sandboxes that forbid every socket
+# bind. It writes HIT only after a writer connects to the named pipe; structural mode must leave it
+# waiting. This is test-harness setup, not an assertion payload.
+mkfifo "$LISTENER_FIFO"
+( IFS= read listener_value < "$LISTENER_FIFO"; printf '%s\n' "$listener_value" > "$HIT" ) &
+LISTENER_PID=$!
+assert_ok "precondition: local listener is ready" sh -c "[ -p '$LISTENER_FIFO' ] && kill -0 '$LISTENER_PID'"
 
-# ---------------------------------------------------------------------------
-t_case "--structural <name>: scopes to exactly that one eval"
-# `real_eval_names | head -1` would close its read end after one line, SIGPIPE-ing the producer's
-# later printf calls (harmless, but noisy "Broken pipe" stderr). Capture once, slice with sed instead.
-all_names="$(real_eval_names)"
-one_name="$(printf '%s\n' "$all_names" | sed -n '1p')"
-out_one="$("$RUN_EVALS" --structural "$one_name" 2>&1)"
-assert_rc "exits 0" 0 "$RUN_EVALS" --structural "$one_name"
-case "$out_one" in
-  *"ok   $one_name"*) _t_ok "the requested eval is reported" ;;
-  *) _t_no "the requested eval is reported" "got: $(printf '%s' "$out_one" | tr '\n' ' ')" ;;
-esac
-# If there's a second real eval, confirm it was NOT processed when scoped to the first.
-other_name="$(printf '%s\n' "$all_names" | sed -n '2p')"
-if [ -n "$other_name" ]; then
-  case "$out_one" in
-    *"ok   $other_name"*) _t_no "a different eval was NOT also processed" "but it was: $other_name" ;;
-    *) _t_ok "a different eval was NOT also processed" ;;
-  esac
+cat > "$ROOT/agent-firm/evals/confined/assertions.yaml" <<YAML
+name: confined
+assertions:
+  - file_exists: harmless.txt
+  - test_passes: sh -c 'touch "$W/shell-trip"'
+  - test_passes: payload-project --mutate
+  - test_passes: git status
+  - test_passes: python -c 'open("$W/interpreter-trip","w").close()'
+  - test_passes: /usr/bin/touch "$W/absolute-trip"
+  - test_passes: firm-gpt-qa "$W"
+  - test_passes: firm-claude-qa "$W"
+  - test_passes: curl http://127.0.0.1:9/
+  - test_passes: /bin/sh -c 'printf connected > "$LISTENER_FIFO"'
+  - test_passes: /usr/bin/touch "$OUTSIDE"
+YAML
+
+t_case "structural mode validates vocabulary but executes no assertion or payload class"
+assert_rc "tripwire-rich eval is structurally valid" 0 env PATH="$STUB:/usr/bin:/bin" \
+  FIRM_SENTINEL_CALLS="$CALLS" FIRM_SENTINEL_TRIP="$TRIP" "$ROOT/bin/firm-run-evals" --structural confined
+assert_no_file "no stubbed shell/project/provider/reviewer/git/interpreter/network command ran" "$TRIP"
+assert_no_file "no stub call was logged" "$CALLS"
+for sentinel in shell-trip interpreter-trip absolute-trip outside-write listener-hit; do
+  assert_no_file "payload sentinel $sentinel remains absent" "$W/$sentinel"
+done
+kill "$LISTENER_PID" 2>/dev/null || true
+wait "$LISTENER_PID" 2>/dev/null || true
+
+t_case "unknown vocabulary, empty values, and invalid value domains fail parse-only"
+mk_eval "$ROOT" unknown
+printf 'assertions:\n  - made_up_operation: value\n' > "$ROOT/agent-firm/evals/unknown/assertions.yaml"
+assert_rc "unknown assertion fails structural validation" 1 "$ROOT/bin/firm-run-evals" --structural unknown
+assert_output "valid vocabulary is actionable" "valid names:" "$ROOT/bin/firm-run-evals" --structural unknown
+mk_eval "$ROOT" empty-value
+printf 'assertions:\n  - file_exists: ""\n' > "$ROOT/agent-firm/evals/empty-value/assertions.yaml"
+assert_rc "empty string fails" 1 "$ROOT/bin/firm-run-evals" --structural empty-value
+mk_eval "$ROOT" bad-bool
+printf 'assertions:\n  - final_gate_pending: perhaps\n' > "$ROOT/agent-firm/evals/bad-bool/assertions.yaml"
+assert_rc "invalid boolean fails" 1 "$ROOT/bin/firm-run-evals" --structural bad-bool
+mk_eval "$ROOT" bad-verdict
+printf 'assertions:\n  - verdict_is: MAYBE\n' > "$ROOT/agent-firm/evals/bad-verdict/assertions.yaml"
+assert_rc "invalid verdict fails" 1 "$ROOT/bin/firm-run-evals" --structural bad-verdict
+
+t_case "a checker cannot fake parse-only completion"
+FAKE_ROOT="$W/fake-checker"; mk_root "$FAKE_ROOT"; mk_eval "$FAKE_ROOT" fake
+printf 'assertions:\n  - file_exists: x\n' > "$FAKE_ROOT/agent-firm/evals/fake/assertions.yaml"
+rm "$FAKE_ROOT/bin/firm-check-assertions"
+printf '#!/bin/sh\necho "assertions: 1 parsed from $2 via fake"\nexit 0\n' > "$FAKE_ROOT/bin/firm-check-assertions"
+chmod +x "$FAKE_ROOT/bin/firm-check-assertions"
+assert_rc "missing parse-only marker fails" 1 "$FAKE_ROOT/bin/firm-run-evals" --structural fake
+
+t_case "Codex streamed turn cap preemptively terminates the provider process group"
+TURN_ROOT="$W/turn-root"; mk_root "$TURN_ROOT"; mk_eval "$TURN_ROOT" gradual
+printf 'assertions:\n  - file_exists: done\n' > "$TURN_ROOT/agent-firm/evals/gradual/assertions.yaml"
+TURN_STUB="$W/turn-stub"; mkdir "$TURN_STUB"
+cat > "$TURN_STUB/codex" <<'SH'
+#!/bin/sh
+( sleep 20; : > "$TURN_CHILD_DONE" ) &
+echo $! > "$TURN_CHILD_PID"
+i=0
+while [ "$i" -lt 8 ]; do
+  i=$((i+1))
+  printf '{"type":"turn.completed","n":%s}\n' "$i"
+  sleep 1
+done
+: > "$TURN_PROVIDER_DONE"
+SH
+chmod +x "$TURN_STUB/codex"
+PROVIDER_DONE="$W/provider-done"; CHILD_DONE="$W/child-done"; CHILD_PID="$W/child-pid"
+assert_rc "turn-limit result is blocking" 1 env PATH="$TURN_STUB:/usr/bin:/bin" \
+  TURN_PROVIDER_DONE="$PROVIDER_DONE" TURN_CHILD_DONE="$CHILD_DONE" TURN_CHILD_PID="$CHILD_PID" \
+  FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_TIMEOUT_SECONDS=20 FIRM_EVAL_KILL_GRACE=1 \
+  "$TURN_ROOT/bin/firm-run-evals" --provider codex gradual
+assert_no_file "provider did not complete turns beyond the cap" "$PROVIDER_DONE"
+assert_no_file "provider descendant did not complete" "$CHILD_DONE"
+if [ -s "$CHILD_PID" ]; then
+  child_pid="$(sed -n '1p' "$CHILD_PID")"
+  assert_ok "bounded process-group termination reaped the descendant" sh -c "! kill -0 '$child_pid' 2>/dev/null"
+else
+  _t_no "bounded process-group termination recorded the descendant pid" "pid file missing"
 fi
 
-t_case "--structural <unknown-name>: matches nothing, reports so, still exits 0"
-assert_rc "exits 0 even with zero matches" 0 "$RUN_EVALS" --structural does-not-exist-eval-xyz
-assert_output "says no evals matched" "no evals in" "$RUN_EVALS" --structural does-not-exist-eval-xyz
+t_case "Claude behavioral adapter passes a provider-native turn cap"
+CLAUDE_STUB="$W/claude-stub"; mkdir "$CLAUDE_STUB"
+cat > "$CLAUDE_STUB/claude" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "$CLAUDE_ARGS"
+printf '{"num_turns":1,"subtype":"success","is_error":false}\n'
+SH
+chmod +x "$CLAUDE_STUB/claude"
+CLAUDE_ARGS="$W/claude-args"
+env PATH="$CLAUDE_STUB:/usr/bin:/bin" CLAUDE_ARGS="$CLAUDE_ARGS" FIRM_EVAL_MAX_TURNS=3 \
+  "$TURN_ROOT/bin/firm-run-evals" --provider claude gradual >/dev/null 2>&1 || true
+assert_output "native --max-turns is explicit" "--max-turns 3" cat "$CLAUDE_ARGS"
 
-# ---------------------------------------------------------------------------
-t_case "assertion count in the summary matches the real assertions.yaml independently"
-one_dir="$EVALS_DIR/$one_name"
-want_count="$(grep -cE '^[[:space:]]*-[[:space:]]' "$one_dir/assertions.yaml")"
-assert_output "reported count matches an independent grep of the same file" \
-  "($want_count assertions)" "$RUN_EVALS" --structural "$one_name"
+# CR-11 deleted-regression axis inventory (predecessor -> retained R-E executable proof):
+#   selected/nonselected routing -> provider call-log identity for both orientations
+#   exactly one attempt/no retry -> nonzero provider call count remains exactly one
+#   wall timeout -> stalled Codex stub is killed and produces one call
+#   total-case cap -> two cases with cap one produce one provider call and a blocking result
+#   invalid bounds -> zero/negative/nonnumeric/excess for every bound, all pre-provider
+#   malformed/empty/prose result -> provider output is rejected before checker dispatch
+#   missing checker -> preflight blocks before provider dispatch
+#   checker crash/exit -> rc 1, rc 2, and unsupported rc are classified distinctly
 
-# ===========================================================================================
-# SEC-R15: --structural must REALLY invoke bin/firm-check-assertions.
-#
-# It used to grep dash-lines out of assertions.yaml and never run the checker, so every fail-closed
-# guarantee in the checker (exit 2 for an empty/prose-only file, a YAML syntax error, or a fallback
-# parse that dropped a list item) had ZERO coverage in the one mode CI runs — and the grep's count
-# could silently disagree with the checker's real parsed count. The cases below pin all of that.
-#
-# The distinction they must hold apart, in both directions:
-#   checker exit 1 = the assertions RAN and failed  -> structural PASSES (correct: satisfying an
-#                    assertion needs a real model-driven run, which this mode explicitly is not)
-#   checker exit 2 = the assertions COULD NOT RUN   -> structural FAILS  (a check that never ran has
-#                    proven nothing, and must never read as green)
-# ===========================================================================================
+BEHAVIOR_ROOT="$W/behavior-root"; mk_root "$BEHAVIOR_ROOT"
+mk_eval "$BEHAVIOR_ROOT" bounded-one
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$BEHAVIOR_ROOT/agent-firm/evals/bounded-one/assertions.yaml"
+mv "$BEHAVIOR_ROOT/bin/firm-check-assertions" "$BEHAVIOR_ROOT/bin/firm-check-assertions-real"
+cat > "$BEHAVIOR_ROOT/bin/firm-check-assertions" <<'SH'
+#!/bin/sh
+printf 'checker\n' >> "$FIRM_CHECKER_CALLS"
+case "${FIRM_CHECKER_STUB_MODE:-real}" in
+  real) exec "$(dirname "$0")/firm-check-assertions-real" "$@" ;;
+  assertions-failed) echo 'stub assertions failed' >&2; exit 1 ;;
+  malformed) echo 'stub assertions malformed' >&2; exit 2 ;;
+  crash) echo 'stub checker crash' >&2; exit 7 ;;
+esac
+exit 8
+SH
+chmod +x "$BEHAVIOR_ROOT/bin/firm-check-assertions"
 
-# ---- synthetic evals tree -------------------------------------------------
-# firm-run-evals resolves its evals directory from its OWN location ("$SELF/../agent-firm/evals"), so
-# the only way to hand it a deliberately broken eval — without writing one into the real, git-tracked
-# agent-firm/evals/, which this file's header rules out — is to give it a different location to
-# resolve from: a throwaway root holding a COPY of the script under test.
-#
-# It must be a COPY, not a symlink. The script deliberately resolves symlinks back to the real repo
-# (that is how ~/.local/bin/firm-* finds it), so a symlinked fixture would quietly walk the REAL evals
-# directory and every negative case below would pass for the wrong reason. The precondition case right
-# after this proves the copy really is reading the synthetic tree. The sibling firm-check-assertions
-# IS symlinked on purpose — the point is to exercise the real checker.
-mk_eval_root() {
-  d="$(mktemp -d "${TMPDIR:-/tmp}/firm-evalroot.XXXXXX")"
-  t_track "$d"   # subshell-safe registration; see tests/lib.sh
-  mkdir -p "$d/bin" "$d/agent-firm/evals" || return 1
-  cp "$BIN/firm-run-evals" "$d/bin/firm-run-evals" || return 1
-  chmod +x "$d/bin/firm-run-evals" || return 1
-  printf '%s' "$d"
+BEHAVIOR_STUB="$W/behavior-stub"; mkdir "$BEHAVIOR_STUB"
+cat > "$BEHAVIOR_STUB/claude" <<'SH'
+#!/bin/sh
+printf 'claude %s\n' "$*" >> "$FIRM_PROVIDER_CALLS"
+case "${FIRM_PROVIDER_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 4 ;;
+  fail) exit 9 ;;
+  malformed) printf '{broken-json\n' ;;
+  empty) : ;;
+  prose) printf 'provider returned prose only\n' ;;
+  excess) printf '{"num_turns":99,"is_error":false}\n' ;;
+  *) printf '{"num_turns":1,"subtype":"success","is_error":false}\n' ;;
+esac
+SH
+cat > "$BEHAVIOR_STUB/codex" <<'SH'
+#!/bin/sh
+printf 'codex %s\n' "$*" >> "$FIRM_PROVIDER_CALLS"
+case "${FIRM_PROVIDER_STUB_MODE:-ok}" in
+  timeout) /bin/sleep 4 ;;
+  fail) exit 9 ;;
+  malformed) printf '{broken-json\n' ;;
+  empty) : ;;
+  prose) printf 'provider returned prose only\n' ;;
+  excess) printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.started"}' '{"type":"turn.started"}' ;;
+  *) printf '{"type":"turn.started"}\n' ;;
+esac
+SH
+chmod +x "$BEHAVIOR_STUB/claude" "$BEHAVIOR_STUB/codex"
+BEHAVIOR_RUN="$BEHAVIOR_ROOT/bin/firm-run-evals"
+PROVIDER_CALLS="$W/behavior-provider-calls"
+CHECKER_CALLS="$W/behavior-checker-calls"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+
+behavior_run() { # mode timeout turns cases provider [eval]
+  env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+    FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_PROVIDER_STUB_MODE="$1" \
+    FIRM_CHECKER_STUB_MODE="${FIRM_CHECKER_TEST_MODE:-real}" \
+    FIRM_EVAL_TIMEOUT_SECONDS="$2" FIRM_EVAL_MAX_TURNS="$3" FIRM_EVAL_MAX_CASES="$4" \
+    FIRM_EVAL_KILL_GRACE=1 "$BEHAVIOR_RUN" --provider "$5" "${6:-bounded-one}"
 }
 
-# mk_eval <root> <name> — a structurally complete eval (task.md + fixture/) whose assertions.yaml is
-# read from STDIN, so each case can state its own broken/valid file inline.
-mk_eval() {
-  mkdir -p "$1/agent-firm/evals/$2/fixture"
-  printf 'do the thing\n' > "$1/agent-firm/evals/$2/task.md"
-  printf 'seed\n'         > "$1/agent-firm/evals/$2/fixture/seed.txt"
-  cat > "$1/agent-firm/evals/$2/assertions.yaml"
-}
+t_case "behavioral provider selection excludes the nonselected provider"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "Claude selection succeeds" 0 behavior_run ok 3 2 2 claude
+assert_eq "Claude selected exactly once" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "Codex not selected" "0" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "Codex selection succeeds" 0 behavior_run ok 3 2 2 codex
+assert_eq "Codex selected exactly once" "1" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "Claude not selected" "0" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
 
-root="$(mk_eval_root)"
-ln -s "$BIN/firm-check-assertions" "$root/bin/firm-check-assertions"
-FAKE="$root/bin/firm-run-evals"
+t_case "provider failure and wall timeout permit exactly one attempt and no retry"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "provider nonzero blocks" 1 behavior_run fail 3 2 2 claude
+assert_eq "nonzero provider attempted once" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "checker not reached after provider failure" "0" "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "wall timeout blocks" 1 behavior_run timeout 1 2 2 codex
+assert_eq "timed-out provider attempted once" "1" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
+assert_eq "checker not reached after timeout" "0" "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')"
 
-# Well-formed, and deliberately IMPOSSIBLE to satisfy without a real run (no src/, no ledger, no
-# verdict). This is the case that proves structural reports "evaluable", not "satisfied".
-mk_eval "$root" synthetic-good <<'YAML'
-name: synthetic-good
-description: well-formed; both assertions can only be satisfied by a real model-driven run
-assertions:
-  - file_exists: src/nope.js
-  - verdict_is: APPROVE
-YAML
+t_case "total-case cap blocks before a second provider attempt"
+mk_eval "$BEHAVIOR_ROOT" bounded-two
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$BEHAVIOR_ROOT/agent-firm/evals/bounded-two/assertions.yaml"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+assert_rc "one-case cap blocks a two-case run" 1 env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" \
+  FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" FIRM_CHECKER_CALLS="$CHECKER_CALLS" \
+  FIRM_PROVIDER_STUB_MODE=ok FIRM_CHECKER_STUB_MODE=real FIRM_EVAL_TIMEOUT_SECONDS=3 \
+  FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=1 FIRM_EVAL_KILL_GRACE=1 \
+  "$BEHAVIOR_RUN" --provider claude
+assert_eq "case cap allows exactly one provider invocation" "1" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
 
-mk_eval "$root" synthetic-empty </dev/null
-
-mk_eval "$root" synthetic-prose <<'YAML'
-# Prose only: a description and not one assertion. The retired dash-line grep counted 0 here and
-# still reported "ok   synthetic-prose (0 assertions)".
-name: synthetic-prose
-description: this eval asserts nothing at all
-YAML
-
-# Broken under BOTH parse paths, so the case means the same thing whether or not pyyaml is installed:
-# pyyaml raises a scanner error on a plain scalar where the block sequence continues, and the regex
-# fallback cannot turn that line into `- key: value`, so it DROPS it — and a dropped assertion is an
-# unrun check, which is exit 2 either way.
-mk_eval "$root" synthetic-badyaml <<'YAML'
-name: synthetic-badyaml
-assertions:
-  - file_exists: src/a.js
-  this line is neither a list item nor a key: and: breaks: the: block
-YAML
-
-# Parses cleanly (checker exit 1, verbs ran and failed) but the dash-line grep sees THREE dashes while
-# only ONE is an assertion — the silent-disagreement case the old mode could not detect.
-mk_eval "$root" synthetic-disagree <<'YAML'
-name: synthetic-disagree
-notes:
-  - this dash line is not an assertion
-  - neither is this one
-assertions:
-  - file_exists: src/a.js
-YAML
-
-# ---------------------------------------------------------------------------
-t_case "fixture precondition: the synthetic root is really what the copied script walks"
-out_syn="$("$FAKE" --structural 2>&1)"
-case "$out_syn" in
-  *synthetic-good*) _t_ok "the synthetic evals are the ones processed" ;;
-  *) _t_no "the synthetic evals are the ones processed" "got: $(_t_ctx "$out_syn")" ;;
-esac
-case "$out_syn" in
-  *"$one_name"*) _t_no "the REAL evals dir is NOT being walked (would make every case below vacuous)" \
-                       "real eval '$one_name' appeared in the synthetic run" ;;
-  *) _t_ok "the REAL evals dir is NOT being walked (would make every case below vacuous)" ;;
-esac
-
-# ---------------------------------------------------------------------------
-t_case "well-formed assertions that CANNOT be satisfied offline still PASS --structural"
-sb_good="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_good"
-assert_rc "precondition: firm-check-assertions EVALUATES this file and reports failures (exit 1)" 1 \
-  "$BIN/firm-check-assertions" "$root/agent-firm/evals/synthetic-good/assertions.yaml" "$sb_good"
-assert_rc "--structural exits 0 for it" 0 "$FAKE" --structural synthetic-good
-assert_output "reports it ok with the checker's PARSED count" \
-  "ok   synthetic-good (2 assertions)" "$FAKE" --structural synthetic-good
-assert_output "says the count came from firm-check-assertions" \
-  "EVALUABLE by firm-check-assertions" "$FAKE" --structural synthetic-good
-
-t_case "structural-green is never presented as behavioural-green"
-assert_output "the summary line disclaims a behavioural pass" \
-  "NOT a behavioural pass" "$FAKE" --structural synthetic-good
-assert_output "the header says a real run is what proves satisfaction" \
-  "Does NOT prove" "$FAKE" --structural synthetic-good
-# The checker's per-assertion verb lines are evaluated against an empty sandbox, so their PASS/FAIL is
-# meaningless here. Echoing them would invite exactly the misreading above.
-out_good="$("$FAKE" --structural synthetic-good 2>&1)"
-case "$out_good" in
-  *"  FAIL file_exists"*|*"  PASS file_exists"*)
-    _t_no "per-assertion verb outcomes are NOT echoed" "leaked: $(_t_ctx "$out_good")" ;;
-  *) _t_ok "per-assertion verb outcomes are NOT echoed" ;;
-esac
-
-# ---------------------------------------------------------------------------
-t_case "an EMPTY assertions.yaml FAILS --structural (checker exit 2 surfaced, not swallowed)"
-sb_e="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_e"
-assert_rc "precondition: firm-check-assertions CANNOT EVALUATE it (exit 2)" 2 \
-  "$BIN/firm-check-assertions" "$root/agent-firm/evals/synthetic-empty/assertions.yaml" "$sb_e"
-assert_rc "--structural exits 1" 1 "$FAKE" --structural synthetic-empty
-assert_output "reports BAD, not ok" "BAD  synthetic-empty (assertions)" "$FAKE" --structural synthetic-empty
-assert_output "surfaces the checker's own reason" "CANNOT EVALUATE" "$FAKE" --structural synthetic-empty
-assert_output "the summary is a failure" "some evals FAILED" "$FAKE" --structural synthetic-empty
-# Pin the exit-2 branch SPECIFICALLY, not just "it failed somehow". --structural also has a catch-all
-# for any rc outside 0/1/2, and that catch-all would produce a failure here too -- so without this
-# assertion, deleting the deliberate "2 means CANNOT EVALUATE" handling leaves the suite green, which
-# is precisely the guarantee this work-order exists to give CI teeth about.
-assert_output "attributes the failure to the checker's exit 2 specifically" \
-  "NOT EVALUABLE — firm-check-assertions exited 2" "$FAKE" --structural synthetic-empty
-
-t_case "a PROSE-ONLY assertions.yaml (0 assertions) FAILS --structural"
-sb_p="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_p"
-assert_rc "precondition: firm-check-assertions CANNOT EVALUATE it (exit 2)" 2 \
-  "$BIN/firm-check-assertions" "$root/agent-firm/evals/synthetic-prose/assertions.yaml" "$sb_p"
-assert_rc "--structural exits 1" 1 "$FAKE" --structural synthetic-prose
-assert_output "reports BAD, not ok" "BAD  synthetic-prose (assertions)" "$FAKE" --structural synthetic-prose
-# The old mode's exact wrong answer, pinned so it cannot come back.
-out_prose="$("$FAKE" --structural synthetic-prose 2>&1)"
-case "$out_prose" in
-  *"ok   synthetic-prose"*) _t_no "does NOT report the retired 'ok ... (0 assertions)'" \
-                                  "got: $(_t_ctx "$out_prose")" ;;
-  *) _t_ok "does NOT report the retired 'ok ... (0 assertions)'" ;;
-esac
-
-t_case "a YAML SYNTAX ERROR in assertions.yaml FAILS --structural"
-sb_y="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_y"
-assert_rc "precondition: firm-check-assertions CANNOT EVALUATE it (exit 2)" 2 \
-  "$BIN/firm-check-assertions" "$root/agent-firm/evals/synthetic-badyaml/assertions.yaml" "$sb_y"
-assert_rc "--structural exits 1" 1 "$FAKE" --structural synthetic-badyaml
-assert_output "reports BAD, not ok" "BAD  synthetic-badyaml (assertions)" "$FAKE" --structural synthetic-badyaml
-assert_output "surfaces the checker's own reason" "CANNOT EVALUATE" "$FAKE" --structural synthetic-badyaml
-
-# ---------------------------------------------------------------------------
-t_case "grep-count vs checker-parsed-count DISAGREEMENT is surfaced loudly, not reconciled"
-sb_d="$(mktemp -d "${TMPDIR:-/tmp}/firm-chk.XXXXXX")"; t_track "$sb_d"
-dis_yaml="$root/agent-firm/evals/synthetic-disagree/assertions.yaml"
-# Both preconditions matter: the file IS evaluable (so the failure below is the disagreement itself,
-# not a parse failure), and the two counting methods really do differ (so the case isn't vacuous).
-assert_rc "precondition: the file is EVALUABLE (checker exit 1, not 2)" 1 \
-  "$BIN/firm-check-assertions" "$dis_yaml" "$sb_d"
-dis_grep="$(grep -cE '^[[:space:]]*-[[:space:]]' "$dis_yaml" | tr -cd '0-9')"
-assert_eq "precondition: the dash-line grep over-counts (3)" 3 "$dis_grep"
-assert_rc "--structural exits 1" 1 "$FAKE" --structural synthetic-disagree
-assert_output "names the disagreement" "ASSERTION COUNT DISAGREEMENT" "$FAKE" --structural synthetic-disagree
-assert_output "prints the grep's count" "grep counts 3" "$FAKE" --structural synthetic-disagree
-assert_output "prints the checker's count" "PARSED 1" "$FAKE" --structural synthetic-disagree
-
-# ---------------------------------------------------------------------------
-t_case "no silent fallback: a missing firm-check-assertions FAILS instead of reverting to the grep"
-root2="$(mk_eval_root)"          # deliberately WITHOUT the firm-check-assertions symlink
-mk_eval "$root2" synthetic-good <<'YAML'
-name: synthetic-good
-assertions:
-  - file_exists: src/nope.js
-YAML
-assert_rc "--structural exits 1" 1 "$root2/bin/firm-run-evals" --structural synthetic-good
-assert_output "says the checker is missing" "firm-check-assertions is missing" \
-  "$root2/bin/firm-run-evals" --structural synthetic-good
-assert_output "explicitly refuses to guess" "will not guess" \
-  "$root2/bin/firm-run-evals" --structural synthetic-good
-
-# ---------------------------------------------------------------------------
-# An uncaught Python traceback inside firm-check-assertions also exits 1 — the same code as the benign
-# "assertions ran, some failed". Reading a crash as benign would be a fail-open in --structural itself,
-# so it additionally requires the checker's own two landmarks (its parse line and its closing tally)
-# before believing the run happened. Driven with STUB checkers, because a crash cannot be provoked in
-# the real one without editing it. The third stub is the control: identical exit code, landmarks
-# present, must PASS — without it, these cases would pass merely because "a stub checker fails".
-t_case "a firm-check-assertions that exits 1 WITHOUT completing is NOT read as a pass"
-stub_eval='name: synthetic-stub
-assertions:
-  - file_exists: src/nope.js'
-
-# (a) crash-shaped: exit 1, no landmarks
-root_crash="$(mk_eval_root)"
-printf '#!/bin/sh\necho "Traceback (most recent call last):" >&2\necho "FileNotFoundError" >&2\nexit 1\n' \
-  > "$root_crash/bin/firm-check-assertions"; chmod +x "$root_crash/bin/firm-check-assertions"
-printf '%s\n' "$stub_eval" | mk_eval "$root_crash" synthetic-stub
-assert_rc "crash-shaped exit 1 -> --structural exits 1" 1 \
-  "$root_crash/bin/firm-run-evals" --structural synthetic-stub
-assert_output "says the checker did not complete" "did not complete" \
-  "$root_crash/bin/firm-run-evals" --structural synthetic-stub
-
-# (b) exit 0 but silent: still no landmarks, so still not evidence anything was evaluated
-root_silent="$(mk_eval_root)"
-printf '#!/bin/sh\nexit 0\n' > "$root_silent/bin/firm-check-assertions"
-chmod +x "$root_silent/bin/firm-check-assertions"
-printf '%s\n' "$stub_eval" | mk_eval "$root_silent" synthetic-stub
-assert_rc "silent exit 0 -> --structural exits 1" 1 \
-  "$root_silent/bin/firm-run-evals" --structural synthetic-stub
-
-# (c) CONTROL: same exit 1, but it really did evaluate -> must PASS
-root_ok="$(mk_eval_root)"
-printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via stub"\necho "  FAIL file_exists src/nope.js"\necho "--- 0/1 assertions passed"\nexit 1\n' \
-  > "$root_ok/bin/firm-check-assertions"; chmod +x "$root_ok/bin/firm-check-assertions"
-printf '%s\n' "$stub_eval" | mk_eval "$root_ok" synthetic-stub
-assert_rc "completed exit 1 -> --structural exits 0" 0 \
-  "$root_ok/bin/firm-run-evals" --structural synthetic-stub
-assert_output "and reports the stub's parsed count" "ok   synthetic-stub (1 assertions)" \
-  "$root_ok/bin/firm-run-evals" --structural synthetic-stub
-
-# (d) CONTROL: exit 0 with landmarks -> also a pass, so (a)/(b) are not just "any stub fails".
-root_zero="$(mk_eval_root)"
-printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via stub"\necho "--- 1/1 assertions passed"\nexit 0\n' \
-  > "$root_zero/bin/firm-check-assertions"; chmod +x "$root_zero/bin/firm-check-assertions"
-printf '%s\n' "$stub_eval" | mk_eval "$root_zero" synthetic-stub
-assert_rc "completed exit 0 -> --structural exits 0" 0 \
-  "$root_zero/bin/firm-run-evals" --structural synthetic-stub
-
-# (e) exit 2 WITH the landmarks present. This isolates the "2 = CANNOT EVALUATE" rule from the
-#     completeness guard above: the real checker always exits 2 *before* printing anything, so the
-#     completeness guard alone would catch every real exit-2 file, and deleting the exit-2 handling
-#     would leave the suite green on outcome. Only a stub can hold the two rules apart. Exit 2 must
-#     win over a green-looking tally.
-t_case "checker exit 2 fails --structural even when its output looks complete"
-root_two="$(mk_eval_root)"
-printf '#!/bin/sh\necho "assertions: 1 parsed from $1 via stub"\necho "--- 1/1 assertions passed"\nexit 2\n' \
-  > "$root_two/bin/firm-check-assertions"; chmod +x "$root_two/bin/firm-check-assertions"
-printf '%s\n' "$stub_eval" | mk_eval "$root_two" synthetic-stub
-assert_rc "exit 2 beats a 1/1-passed tally -> --structural exits 1" 1 \
-  "$root_two/bin/firm-run-evals" --structural synthetic-stub
-assert_output "reports BAD" "BAD  synthetic-stub (assertions)" \
-  "$root_two/bin/firm-run-evals" --structural synthetic-stub
-assert_output "names exit 2 as the reason" "exited 2" \
-  "$root_two/bin/firm-run-evals" --structural synthetic-stub
-
-# ---------------------------------------------------------------------------
-# Invoking the real checker means its `test_passes` verb executes shell straight out of the eval file,
-# and one SHIPPED eval's test_passes names firm-gpt-qa (which shells out to codex). --structural has to
-# stay hermetic, so it replaces PATH with an allow-list that cannot reach any of those. Tripwires prove
-# it: shadow the dangerous names on PATH, run --structural over the REAL evals, and require that not
-# one of them was executed.
-t_case "--structural stays hermetic: claude/codex/firm-gpt-qa/node are never invoked"
-trip="$(mktemp -d "${TMPDIR:-/tmp}/firm-trip.XXXXXX")"; t_track "$trip"
-mkdir -p "$trip/bin" "$trip/marks"
-for b in claude codex firm-gpt-qa node npm npx pytest; do
-  printf '#!/bin/sh\n: > "%s/%s"\nexit 0\n' "$trip/marks" "$b" > "$trip/bin/$b"
-  chmod +x "$trip/bin/$b"
+t_case "zero, negative, nonnumeric, and excess bounds all fail before provider work"
+for spec in \
+  'FIRM_EVAL_TIMEOUT_SECONDS|0' 'FIRM_EVAL_TIMEOUT_SECONDS|-1' 'FIRM_EVAL_TIMEOUT_SECONDS|text' 'FIRM_EVAL_TIMEOUT_SECONDS|901' \
+  'FIRM_EVAL_MAX_TURNS|0' 'FIRM_EVAL_MAX_TURNS|-1' 'FIRM_EVAL_MAX_TURNS|text' 'FIRM_EVAL_MAX_TURNS|1001' \
+  'FIRM_EVAL_MAX_CASES|0' 'FIRM_EVAL_MAX_CASES|-1' 'FIRM_EVAL_MAX_CASES|text' 'FIRM_EVAL_MAX_CASES|9'; do
+  bound_name="${spec%%|*}"; bound_value="${spec#*|}"
+  : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+  env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+    FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 \
+    FIRM_EVAL_MAX_CASES=2 "$bound_name=$bound_value" \
+    "$BEHAVIOR_RUN" --provider claude bounded-one >/dev/null 2>&1
+  bound_rc=$?
+  if [ "$bound_rc" -eq 2 ] && [ ! -s "$PROVIDER_CALLS" ] && [ ! -s "$CHECKER_CALLS" ]; then
+    _t_ok "$bound_name=$bound_value rejected pre-provider"
+  else
+    _t_no "$bound_name=$bound_value rejected pre-provider" "rc=$bound_rc provider=$(wc -l < "$PROVIDER_CALLS") checker=$(wc -l < "$CHECKER_CALLS")"
+  fi
 done
-assert_ok "precondition: a SHIPPED eval's test_passes really does name firm-gpt-qa" \
-  sh -c "grep -q 'firm-gpt-qa' $EVALS_DIR/*/assertions.yaml"
-assert_ok "precondition: a SHIPPED eval's test_passes really does name node" \
-  sh -c "grep -q 'node --test' $EVALS_DIR/*/assertions.yaml"
-assert_output "precondition: the tripwires shadow the real binaries on PATH" \
-  "$trip/bin/firm-gpt-qa" sh -c "PATH='$trip/bin:\$PATH' command -v firm-gpt-qa"
-out_trip="$(PATH="$trip/bin:$PATH" "$RUN_EVALS" --structural 2>&1)"; rc_trip=$?
-assert_eq "--structural still exits 0 over the real evals" 0 "$rc_trip"
-fired="$(ls -A "$trip/marks" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
-assert_eq "not one tripwire fired" "" "$fired"
 
-# ---------------------------------------------------------------------------
-t_case "regression: every shipped eval still passes --structural, at the checker's own parsed count"
-out_reg="$("$RUN_EVALS" --structural 2>&1)"; rc_reg=$?
-assert_eq "the whole real suite still exits 0" 0 "$rc_reg"
-mismatch=0
-for name in $(real_eval_names); do
-  g="$(grep -cE '^[[:space:]]*-[[:space:]]' "$EVALS_DIR/$name/assertions.yaml" | tr -cd '0-9')"
-  case "$out_reg" in
-    *"ok   $name ($g assertions)"*) : ;;
-    *) mismatch=$((mismatch+1)); echo "    (expected 'ok   $name ($g assertions)')" ;;
-  esac
+t_case "malformed, empty, and prose provider results fail before assertion dispatch"
+for provider in claude codex; do
+  for result_kind in malformed empty prose; do
+    : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+    behavior_run "$result_kind" 3 2 2 "$provider" >/dev/null 2>&1
+    result_rc=$?
+    if [ "$result_rc" -eq 1 ] && [ "$(grep -c "^$provider " "$PROVIDER_CALLS" | tr -d ' ')" = 1 ] \
+      && [ ! -s "$CHECKER_CALLS" ]; then
+      _t_ok "$provider $result_kind result propagated as failure"
+    else
+      _t_no "$provider $result_kind result propagated as failure" "rc=$result_rc calls=$(_t_ctx "$(cat "$PROVIDER_CALLS")")"
+    fi
+  done
 done
-assert_eq "all $n_real shipped evals report ok, parsed count == independent grep count" 0 "$mismatch"
+
+t_case "missing, failing, malformed, and crashed checkers classify without retry"
+MISSING_ROOT="$W/missing-checker-root"; mk_root "$MISSING_ROOT"; mk_eval "$MISSING_ROOT" bounded-one
+printf 'assertions:\n  - file_exists: seed.txt\n' > "$MISSING_ROOT/agent-firm/evals/bounded-one/assertions.yaml"
+rm "$MISSING_ROOT/bin/firm-check-assertions"
+: > "$PROVIDER_CALLS"
+assert_rc "missing checker blocks" 1 env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" \
+  FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 \
+  FIRM_EVAL_MAX_CASES=2 "$MISSING_ROOT/bin/firm-run-evals" --provider claude bounded-one
+assert_eq "missing checker blocks pre-provider" "0" "$(wc -l < "$PROVIDER_CALLS" | tr -d ' ')"
+for checker_case in 'assertions-failed|one or more assertions failed' \
+                    'malformed|malformed or unevaluable assertions' \
+                    'crash|crashed or returned unsupported rc=7'; do
+  checker_mode="${checker_case%%|*}"; checker_message="${checker_case#*|}"
+  : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+  FIRM_CHECKER_TEST_MODE="$checker_mode" behavior_run ok 3 2 2 claude > "$W/checker-$checker_mode.out" 2>&1
+  checker_run_rc=$?
+  if [ "$checker_run_rc" -eq 1 ] \
+    && grep -q "$checker_message" "$W/checker-$checker_mode.out" \
+    && [ "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')" = 1 ] \
+    && [ "$(wc -l < "$CHECKER_CALLS" | tr -d ' ')" = 1 ]; then
+    _t_ok "$checker_mode checker rc classified after one provider attempt"
+  else
+    _t_no "$checker_mode checker rc classified after one provider attempt" "rc=$checker_run_rc output=$(_t_ctx "$(cat "$W/checker-$checker_mode.out")")"
+  fi
+done
 
 t_summary

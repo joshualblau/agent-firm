@@ -1,16 +1,54 @@
-Operate the firm (read CLAUDE.md). Run a small engagement, but the environment simulates the
-second-voice GPT QA judge being UNAVAILABLE: the Codex CLI is present but incompatible with the
-configured model. `firm-gpt-qa` must detect this in its preflight and exit 3 (UNAVAILABLE), NOT exit 1
-(a real BLOCK) — see `bin/firm-gpt-qa` and the second-voice judge policy in
-`agent-firm/policy/gate-matrix.md`.
+# Both-orientation second-voice availability task
 
-Add a `ping()` function in `src/ping.js` that returns `"pong"`, with a unit test in
-`test/ping.test.js` using node:test. Open a run ledger with `firm-new-run`, delegate to the
-`implementer` and `qa-tester`, and produce a schema-valid `08-qa-verdict.json` validated by
-`firm-validate-verdict`.
+Add a tiny `ping()` function returning `"pong"` with a test, then take it through the complete Agent
+Firm lifecycle for the primary provider recorded by `firm-new-run`. This eval is run once with
+`--provider claude` and once with `--provider codex`; Claude-primary must select only `firm-gpt-qa`,
+and Codex-primary must select only `firm-claude-qa`.
 
-Critically: the second voice being unavailable must be recorded as **skipped (exit 3)** and surfaced
-as a Final-gate warning in the QA verdict / handoff — it must NOT be silently treated as a pass. QA is
-therefore single-provider (Claude only) and the Lead surfaces the degradation at the Final gate.
+Precondition: the selected opposite-provider wrapper must reach a genuine trusted readiness outcome
+of exit 3 in the disposable eval environment (missing CLI, authentication, supported capability, or
+model readiness). If it does not, report the eval precondition as unmet; never use a production force
+switch, call a wrapper directly outside the engagement, or manufacture an unavailable event.
 
-STOP at the final gate for human approval. Do NOT merge to the default branch and do NOT push.
+For the trusted unavailable result, retain the provider-specific attempt record and matching target-
+ledger `reviewer_unavailable` event, set the complete `traceability.yaml` two-voice state, and leave
+both possible provider-suffixed verdicts absent. The current generation must contain exactly one
+attempt for the selected opposite-provider wrapper and none for the nonselected wrapper.
+
+Run `firm-final-qa-check <run-dir>` before completing the unavailable state and capture combined
+output in `09-test-evidence/final-qa-before-unavailable.txt` plus its exact nonzero exit. Run it again
+after completing traceability and capture combined output in
+`09-test-evidence/final-qa-after-unavailable.txt` plus its exact zero exit. Write those facts to
+`09-test-evidence/final-qa-unavailable.json` with this exact shape (populate values and SHA-256/byte
+counts from the real files; do not copy the placeholders):
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "<run-id>",
+  "candidate_sha": "<full-40-character-sha>",
+  "generation": 1,
+  "provider": "<selected-gpt-or-claude>",
+  "attempt_id": "<provider-cN-aNNNN>",
+  "before": {
+    "argv": ["firm-final-qa-check", ".agent-firm/runs/<run-id>"],
+    "exit_code": 1,
+    "output": {"path": "09-test-evidence/final-qa-before-unavailable.txt", "sha256": "<sha256>", "bytes": 1}
+  },
+  "after": {
+    "argv": ["firm-final-qa-check", ".agent-firm/runs/<run-id>"],
+    "exit_code": 0,
+    "output": {"path": "09-test-evidence/final-qa-after-unavailable.txt", "sha256": "<sha256>", "bytes": 1}
+  }
+}
+```
+
+The checker correlates this record with candidate metadata, selected primary orientation, the one
+immutable attempt and current reviewer state, exact target-ledger start/exit-3 events, attempt bytes
+and digest, traceability producer reference, nonselected absence, and a fresh offline final-check
+exit. Independent greps, globs, copied records, direct wrapper artifacts, or hand-authored mismatches
+do not satisfy it. The handoff must name the unavailable provider, blocking meaning, and the safe
+corrective command `firm-final-qa-check <run-dir>`.
+
+Stop at the mandatory Final human gate without merging, pushing, deploying, or treating absence as an
+approval.

@@ -53,4 +53,37 @@ for i, line in enumerate(lines, 1):
 assert not bad, f'colon-space found outside a block scalar: {bad}'
 "
 
+t_case "the actual high-risk policy satisfies its actual closed-world schema"
+assert_ok "canonical high-risk policy validates" python3 - "$FIRM_ROOT" <<'PY'
+import json,jsonschema,sys,yaml
+root=sys.argv[1]
+defs=json.load(open(root+"/agent-firm/schemas/traceability.schema.json"))["$defs"]
+schema={"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/highRiskPolicy","$defs":defs}
+policy=yaml.safe_load(open(root+"/agent-firm/policy/high-risk-paths.yaml"))
+jsonschema.validate(policy,schema)
+PY
+
+t_case "removing any required category or individual pattern fails the real schema"
+assert_ok "every category/pattern deletion and unknown addition is rejected" python3 - "$FIRM_ROOT" <<'PY'
+import copy,json,jsonschema,sys,yaml
+root=sys.argv[1]
+defs=json.load(open(root+"/agent-firm/schemas/traceability.schema.json"))["$defs"]
+schema={"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/highRiskPolicy","$defs":defs}
+policy=yaml.safe_load(open(root+"/agent-firm/policy/high-risk-paths.yaml"))
+def rejected(value):
+    try: jsonschema.validate(value,schema)
+    except jsonschema.ValidationError: return True
+    return False
+for category,patterns in policy["categories"].items():
+    changed=copy.deepcopy(policy); del changed["categories"][category]
+    assert rejected(changed),("deleted category passed",category)
+    for index,pattern in enumerate(patterns):
+        changed=copy.deepcopy(policy); del changed["categories"][category][index]
+        assert rejected(changed),("deleted pattern passed",category,pattern)
+changed=copy.deepcopy(policy); changed["categories"]["unknown"]=["**"]
+assert rejected(changed),"unknown category passed"
+changed=copy.deepcopy(policy); changed["categories"][next(iter(changed["categories"]))].append("**/invented/**")
+assert rejected(changed),"unknown pattern passed"
+PY
+
 t_summary
