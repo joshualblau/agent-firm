@@ -23,6 +23,17 @@ assert_eq "child output retained" hello "$(cat "$WORK/ok.out")"
 assert_eq "output mode is 600" 600 "$(t_file_mode "$WORK/ok.out")"
 assert_eq "result mode is 600" 600 "$(t_file_mode "$WORK/ok.json")"
 
+t_case "stdout can be isolated from bounded provider diagnostics"
+assert_rc "split stream capture succeeds" 0 "$BOUND" --phase discovery --provider codex --timeout 2 --grace 1 \
+  --max-output 1024 --generation 1 --output "$WORK/split.out" --stderr-output "$WORK/split.err" \
+  --result "$WORK/split.json" -- sh -c 'printf structured; printf warning >&2'
+assert_eq "stdout contains only provider data" structured "$(cat "$WORK/split.out")"
+assert_eq "stderr contains only provider diagnostics" warning "$(cat "$WORK/split.err")"
+assert_eq "stderr output mode is 600" 600 "$(t_file_mode "$WORK/split.err")"
+assert_eq "stdout byte count is explicit" 10 "$(result_field "$WORK/split.json" stdout_bytes)"
+assert_eq "stderr byte count is explicit" 7 "$(result_field "$WORK/split.json" stderr_bytes)"
+assert_eq "combined retained count preserves the output cap accounting" 17 "$(result_field "$WORK/split.json" retained_bytes)"
+
 t_case "every invalid caller bound is rejected before provider execution"
 for spec in \
   "--timeout 0" "--timeout -1" "--timeout nope" "--timeout 901" \

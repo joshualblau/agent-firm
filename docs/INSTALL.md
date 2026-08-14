@@ -14,8 +14,10 @@ python3 -m pip install --user jsonschema pyyaml
 This is an intentional joint prerequisite: bootstrap, install refresh, and `firm-version
 --local-refresh` do not offer a one-provider mode. Before its first mutation, `firm-bootstrap` uses
 bounded calls to check both executables, required plugin/marketplace subcommands, local selector and
-manifest schemas, and the exact matching marketplace/plugin state reported by both CLIs. A missing,
-old/incompatible, timed-out, or state-unreadable CLI leaves both provider installations unchanged.
+manifest schemas, and the exact matching marketplace/plugin state reported by both CLIs through their
+JSON list interfaces. Provider diagnostics are captured separately (stdout vs stderr) so warnings are
+not parsed as part of the structured state document. A missing, old/incompatible, timed-out, or
+state-unreadable CLI leaves both provider installations unchanged.
 
 - **`jsonschema` is required.** Without it `firm-validate-verdict` cannot schema-check a QA verdict
   and exits **4 (DEGRADED)**, which does not satisfy the Final gate — an unverifiable verdict is not
