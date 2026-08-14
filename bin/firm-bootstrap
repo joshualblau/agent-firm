@@ -78,13 +78,17 @@ def call(provider, phase, argv):
     counter += 1
     safe_phase = re.sub(r"[^A-Za-z0-9_.-]", "-", phase)[:64]
     output = os.path.join(scratch, f"{counter:03d}-{safe_phase}.out")
+    stderr_output = os.path.join(scratch, f"{counter:03d}-{safe_phase}.err")
     result = os.path.join(scratch, f"{counter:03d}-{safe_phase}.json")
     cmd = [bounded, "--phase", safe_phase, "--provider", provider,
            "--timeout", timeout, "--grace", "2", "--max-output", "65536",
-           "--output", output, "--result", result, "--", commands[provider], *argv]
+           "--output", output, "--stderr-output", stderr_output,
+           "--result", result, "--", commands[provider], *argv]
     completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         raw = open(output, "rb").read() if os.path.exists(output) else b""
+        provider_stderr = (open(stderr_output, "rb").read()
+                           if os.path.exists(stderr_output) else b"")
         meta = json.load(open(result, encoding="utf-8")) if os.path.exists(result) else {}
     except Exception as exc:
         return {"ok": False, "rc": completed.returncode, "text": "", "raw": b"", "meta": {},
@@ -92,7 +96,7 @@ def call(provider, phase, argv):
     text = raw.decode("utf-8", "replace")
     return {"ok": completed.returncode == 0 and meta.get("status") == "ok",
             "rc": completed.returncode, "text": text, "raw": raw, "meta": meta,
-            "error": completed.stderr.decode("utf-8", "replace")[:500]}
+            "error": (completed.stderr + provider_stderr).decode("utf-8", "replace")[:500]}
 
 def require(provider, phase, argv, tokens=()):
     result = call(provider, phase, argv)
@@ -140,48 +144,76 @@ def parse_semver(value, label):
 def target_collision(value, expected):
     return value == expected or value.lower() == expected.lower() or value in expected or expected in value
 
-def parse_marketplace(text, provider):
+def json_records(payload, provider, kind):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"{provider} {kind} JSON contains duplicate object key {key!r}")
+            value[key] = item
+        return value
+    try:
+        document = json.loads(payload, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{provider} {kind} did not emit one valid JSON document: {exc}") from exc
+    if provider == "claude":
+        records = document
+    else:
+        key = "marketplaces" if kind == "marketplace" else "installed"
+        if not isinstance(document, dict) or key not in document:
+            raise ValueError(f"{provider} {kind} JSON lacks required top-level {key!r} array")
+        records = document[key]
+    if not isinstance(records, list):
+        raise ValueError(f"{provider} {kind} JSON records must be an array")
+    if any(not isinstance(record, dict) for record in records):
+        raise ValueError(f"{provider} {kind} JSON contains a non-object record")
+    return records
+
+def canonical(fields):
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+def parse_marketplace(payload, provider):
     expected_selector = selectors[f"{provider}_marketplace"]
     expected_root = os.path.realpath(root)
-    pattern = (re.compile(r"^(?P<root>.+) marketplace=(?P<selector>[^ ]+)$") if provider == "claude"
-               else re.compile(r"^marketplace=(?P<selector>[^ ]+) path=(?P<root>.+)$"))
+    root_field = "path" if provider == "claude" else "root"
     relevant = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        match = pattern.fullmatch(line)
-        if not match:
-            if expected_selector.lower() in line.lower() or expected_root.lower() in line.lower():
-                raise ValueError(f"{provider} marketplace emitted an unparsable target-like record: {line!r}")
-            continue
-        selector = match.group("selector")
-        observed_root = os.path.realpath(os.path.abspath(match.group("root")))
-        if target_collision(selector, expected_selector) or target_collision(observed_root, expected_root):
-            relevant.append({"selector": selector, "root": observed_root, "raw": line})
+    for record in json_records(payload, provider, "marketplace"):
+        selector = record.get("name")
+        observed = record.get(root_field)
+        if not isinstance(selector, str) or not selector:
+            raise ValueError(f"{provider} marketplace JSON record has no non-empty string 'name': {record!r}")
+        if observed is not None and not isinstance(observed, str):
+            raise ValueError(f"{provider} marketplace {selector!r} has non-string {root_field!r}")
+        if observed == "":
+            raise ValueError(f"{provider} marketplace {selector!r} has empty {root_field!r}")
+        observed_root = (os.path.realpath(os.path.abspath(observed))
+                         if isinstance(observed, str) else None)
+        if (target_collision(selector, expected_selector)
+                or (observed_root is not None and target_collision(observed_root, expected_root))):
+            relevant.append({"selector": selector, "root": observed_root,
+                             "raw": canonical({"root": observed_root, "selector": selector})})
     exact = [record for record in relevant
              if record["selector"] == expected_selector and record["root"] == expected_root]
     if relevant and (len(relevant) != 1 or len(exact) != 1):
         raise ValueError(f"{provider} marketplace target collision: expected one exact selector/root, got {relevant!r}")
     return exact[0] if exact else None
 
-def parse_plugin(text, provider, expected_version):
+def parse_plugin(payload, provider, expected_version):
     expected_selector = selectors[f"{provider}_plugin"]
-    pattern = re.compile(r"^(?P<selector>[^ ]+) version=(?P<version>[^ ]+)$")
+    selector_field = "id" if provider == "claude" else "pluginId"
     relevant = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        match = pattern.fullmatch(line)
-        if not match:
-            if expected_selector.lower() in line.lower():
-                raise ValueError(f"{provider} plugin emitted an unparsable target-like record: {line!r}")
-            continue
-        selector = match.group("selector")
+    for item in json_records(payload, provider, "plugin"):
+        selector = item.get(selector_field)
+        if not isinstance(selector, str) or not selector:
+            raise ValueError(f"{provider} plugin JSON record has no non-empty string {selector_field!r}: {item!r}")
         if target_collision(selector, expected_selector):
-            version = parse_semver(match.group("version"), f"{provider} plugin {selector}")
-            relevant.append({"selector": selector, **version, "raw": line})
+            observed_version = item.get("version")
+            if not isinstance(observed_version, str):
+                raise ValueError(f"{provider} plugin {selector!r} has no string 'version'")
+            version = parse_semver(observed_version, f"{provider} plugin {selector}")
+            relevant.append({"selector": selector, **version,
+                             "raw": canonical({"selector": selector,
+                                               "version": observed_version})})
     exact = [record for record in relevant if record["selector"] == expected_selector]
     if relevant and (len(relevant) != 1 or len(exact) != 1):
         raise ValueError(f"{provider} plugin target collision: expected one exact selector, got {relevant!r}")
@@ -197,8 +229,8 @@ def parse_plugin(text, provider, expected_version):
     return record
 
 def state_from_results(market, plugin, provider, expected_version):
-    marketplace = parse_marketplace(market["text"], provider)
-    installed = parse_plugin(plugin["text"], provider, expected_version)
+    marketplace = parse_marketplace(market["raw"], provider)
+    installed = parse_plugin(plugin["raw"], provider, expected_version)
     market_lines = [] if marketplace is None else [marketplace["raw"]]
     plugin_lines = [] if installed is None else [installed["raw"]]
     return {
@@ -213,8 +245,9 @@ def state_from_results(market, plugin, provider, expected_version):
     }
 
 def capture(provider, phase_prefix, expected_version, preflight=False):
-    market = call(provider, phase_prefix + "-marketplace-state", ["plugin", "marketplace", "list"])
-    plugin = call(provider, phase_prefix + "-plugin-state", ["plugin", "list"])
+    market = call(provider, phase_prefix + "-marketplace-state",
+                  ["plugin", "marketplace", "list", "--json"])
+    plugin = call(provider, phase_prefix + "-plugin-state", ["plugin", "list", "--json"])
     if not market["ok"] or not plugin["ok"]:
         if preflight:
             stop(f"{provider} exact prior-state capture failed; fix CLI readiness and retry. No provider mutation ran.")

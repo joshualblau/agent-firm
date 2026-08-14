@@ -95,6 +95,7 @@ parser.add_argument("--max-output", default="65536")
 parser.add_argument("--max-turns")
 parser.add_argument("--generation", default="1")
 parser.add_argument("--output")
+parser.add_argument("--stderr-output")
 parser.add_argument("--result")
 parser.add_argument("--cwd")
 parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -112,7 +113,10 @@ result = {
     "duration_ms": 0,
     "generation": None,
     "output_bytes": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
     "retained_bytes": 0,
+    "stderr_retained_bytes": 0,
     "truncated": False,
     "timed_out": False,
     "term_sent": False,
@@ -138,10 +142,12 @@ def validate_destination(path):
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise ValueError(f"refusing non-regular or symlink output: {path}")
 
-def finish(code, output=b""):
+def finish(code, output=b"", stderr_output=b""):
     result["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
     if args.output:
         atomic_write(args.output, output, 0o600)
+    if args.stderr_output:
+        atomic_write(args.stderr_output, stderr_output, 0o600)
     data = (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     if args.result:
         atomic_write(args.result, data, 0o600)
@@ -152,6 +158,7 @@ def finish(code, output=b""):
 try:
     import stat
     validate_destination(args.output)
+    validate_destination(args.stderr_output)
     validate_destination(args.result)
     control_paths_valid = True
     timeout = positive("timeout", args.timeout, MAX_TIMEOUT)
@@ -181,10 +188,10 @@ except (ValueError, OSError) as exc:
     raise SystemExit(2)
 
 result["generation"] = generation
-retained = bytearray()
-total = 0
-line_buffer = bytearray()
-discarding_record = False
+retained = {"stdout": bytearray(), "stderr": bytearray()}
+totals = {"stdout": 0, "stderr": 0}
+line_buffers = {"stdout": bytearray(), "stderr": bytearray()}
+discarding_records = {"stdout": False, "stderr": False}
 proc = None
 pgid = None
 try:
@@ -193,7 +200,7 @@ try:
         cwd=args.cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if args.stderr_output else subprocess.STDOUT,
         start_new_session=True,
         close_fds=True
     )
@@ -205,12 +212,17 @@ except (OSError, ValueError) as exc:
 
 selector = selectors.DefaultSelector()
 assert proc.stdout is not None
-os.set_blocking(proc.stdout.fileno(), False)
-selector.register(proc.stdout, selectors.EVENT_READ)
+streams = {"stdout": proc.stdout}
+if args.stderr_output:
+    assert proc.stderr is not None
+    streams["stderr"] = proc.stderr
+for stream_name, pipe in streams.items():
+    os.set_blocking(pipe.fileno(), False)
+    selector.register(pipe, selectors.EVENT_READ, stream_name)
 deadline = started + timeout
 termination_reason = None
 term_at = None
-pipe_open = True
+open_streams = len(streams)
 
 def signal_group(sig):
     try:
@@ -239,27 +251,29 @@ while True:
     elif term_at is not None and not result["kill_sent"]:
         wait_for = max(0.0, min(wait_for, term_at + grace - now))
 
-    events = selector.select(wait_for) if pipe_open else []
+    events = selector.select(wait_for) if open_streams else []
     for key, _ in events:
+        stream_name = key.data
         try:
             chunk = os.read(key.fileobj.fileno(), 65536)
         except BlockingIOError:
             continue
         if not chunk:
             selector.unregister(key.fileobj)
-            pipe_open = False
+            open_streams -= 1
             continue
-        total += len(chunk)
-        room = output_limit - len(retained)
+        totals[stream_name] += len(chunk)
+        room = output_limit - sum(len(value) for value in retained.values())
         if room > 0:
-            retained.extend(chunk[:room])
+            retained[stream_name].extend(chunk[:room])
+        line_buffer = line_buffers[stream_name]
         pending = chunk
         while pending:
             newline = pending.find(b"\n")
-            if discarding_record:
+            if discarding_records[stream_name]:
                 if newline < 0:
                     break
-                discarding_record = False
+                discarding_records[stream_name] = False
                 pending = pending[newline + 1:]
                 continue
             if newline < 0:
@@ -270,7 +284,7 @@ while True:
                     result["parser_status"] = "overlong_record"
                     result["overlong_records"] += 1
                     line_buffer.clear()
-                    discarding_record = True
+                    discarding_records[stream_name] = True
                 break
             piece = pending[:newline]
             if len(line_buffer) + len(piece) > MAX_EVENT_RECORD:
@@ -289,7 +303,7 @@ while True:
             pending = pending[newline + 1:]
 
     child_done = proc.poll() is not None
-    if child_done and not pipe_open:
+    if child_done and not open_streams:
         break
     if termination_reason is not None and result["kill_sent"] and time.monotonic() >= (term_at or now) + grace + 1:
         break
@@ -301,18 +315,22 @@ except subprocess.TimeoutExpired:
     result["kill_sent"] = True
     rc = proc.wait()
 
-result["output_bytes"] = total
-result["retained_bytes"] = len(retained)
-result["truncated"] = total > len(retained)
+result["stdout_bytes"] = totals["stdout"]
+result["stderr_bytes"] = totals["stderr"]
+result["output_bytes"] = sum(totals.values())
+result["stderr_retained_bytes"] = len(retained["stderr"])
+result["retained_bytes"] = sum(len(value) for value in retained.values())
+result["truncated"] = result["output_bytes"] > result["retained_bytes"]
 result["exit_code"] = rc
-if line_buffer and not discarding_record and turn_event(line_buffer):
-    result["turn_count"] += 1
+for stream_name, line_buffer in line_buffers.items():
+    if line_buffer and not discarding_records[stream_name] and turn_event(line_buffer):
+        result["turn_count"] += 1
 if termination_reason == "timeout":
     result["status"] = "timeout"
-    finish(124, bytes(retained))
+    finish(124, bytes(retained["stdout"]), bytes(retained["stderr"]))
 if termination_reason == "turn_limit":
     result["status"] = "turn_limit"
-    finish(125, bytes(retained))
+    finish(125, bytes(retained["stdout"]), bytes(retained["stderr"]))
 result["status"] = "ok" if rc == 0 else "exit"
-finish(rc if 0 <= rc <= 255 else 1, bytes(retained))
+finish(rc if 0 <= rc <= 255 else 1, bytes(retained["stdout"]), bytes(retained["stderr"]))
 PY
