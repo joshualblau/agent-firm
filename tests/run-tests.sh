@@ -318,7 +318,11 @@ if [ "$runcount" -eq 0 ]; then
   i=0; while [ "$i" -lt "$n" ]; do _emit "$i"; i=$((i+1)); done
   printf '\n────────\n'
   if [ "$skipped" -gt 0 ]; then printf '%d exact-P2 test files skipped by profile\n' "$skipped"; fi
-  if [ "$scope_profile" = fast ]; then
+  # "nothing was in scope" and "you named a file that does not exist" are different answers and get
+  # different exit codes. Only the first is a legitimate zero: `$n` counts what the NAME FILTER
+  # matched, before either profile narrowed it, so a typo'd name still fails the way it always has
+  # rather than being absorbed by whichever profile happens to be on.
+  if [ "$scope_profile" = fast ] && [ "$n" -gt 0 ]; then
     printf '%d test files outside the fast scope\n' "$descoped"
     printf 'no test file ran — fast is not a gate; the full profile has not run\n'
     exit 0

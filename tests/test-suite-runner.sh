@@ -185,6 +185,13 @@ hasnt "the unnamed file is absent from the transcript" "synthetic beta" "$out"
 out="$(bash "$d/tests/run-tests.sh" nosuchtest 2>&1)"
 assert_eq "a name that matches nothing is an error" 1 "$?"
 has "and says so" "no test files matched (nosuchtest)" "$out"
+# A scope profile narrows what RUNS. It must not absorb "that file does not exist" into "nothing was
+# in scope" — that turns a typo'd name into a green run of zero files.
+out="$(bash "$d/tests/run-tests.sh" --fast nosuchtest 2>&1)"
+assert_eq "a name that matches nothing is still an error under --fast" 1 "$?"
+has "with the same message, not the fast profile's zero-file wording" \
+    "no test files matched (nosuchtest)" "$out"
+hasnt "and not the fast profile's exit-0 wording" "no test file ran" "$out"
 
 t_case "a stated worker count is validated, never silently replaced by a guess"
 d="$(mk_suite)"
