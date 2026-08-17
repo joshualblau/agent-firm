@@ -5,12 +5,19 @@ set -uo pipefail
 
 LOG="$BIN/firm-ledger-log"
 RESOLVER="$BIN/firm-model-resolve"
-host_row="$(python3 - <<'PY'
-import platform, sys
+# The OS half of the row is a closed allowlist of proven (macOS, Darwin) pairs. Read it out of the
+# writer itself rather than restating it here: a second hand-maintained copy could drift and make
+# this suite assert a row the production gate does not actually admit.
+host_row="$(python3 - "$LOG" <<'PY'
+import ast, pathlib, platform, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+if match is None:
+    raise SystemExit("cannot read SUPPORTED_P2_OS_ROWS from the production writer")
+rows = ast.literal_eval(match.group(1))
 exact = (
     platform.system() == "Darwin"
-    and platform.mac_ver()[0] == "26.5.1"
-    and platform.release() == "25.5.0"
+    and (platform.mac_ver()[0], platform.release()) in rows
     and platform.machine() == "arm64"
     and tuple(sys.version_info[:3]) == (3, 9, 6)
     and sys.implementation.name == "cpython"
@@ -18,6 +25,47 @@ exact = (
 print("exact" if exact else "unsupported")
 PY
 )"
+
+t_case "the OS half of the P2 row stays a closed set of proven pairs, not a version floor"
+allowlist_row="$(python3 - "$LOG" <<'PY'
+import ast, itertools, pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+if match is None:
+    raise SystemExit("cannot read SUPPORTED_P2_OS_ROWS from the production writer")
+rows = ast.literal_eval(match.group(1))
+# A closed set of literal (macOS, Darwin) pairs — no floors, ranges, prefixes or wildcards can be
+# expressed in this shape, so an unproven future OS row cannot be admitted without a reviewed edit.
+closed = (
+    isinstance(rows, (set, frozenset)) and len(rows) >= 1
+    and all(
+        isinstance(row, tuple) and len(row) == 2
+        and all(isinstance(value, str) and value for value in row)
+        for row in rows
+    )
+)
+proven = ("26.5.1", "25.5.0") in rows and ("26.6.1", "25.6.0") in rows
+# The values FIRM_LEDGER_P2_TEST_REJECT injects for the macOS/kernel mismatch and unverifiable cases
+# must not pair into a member against ANY counterpart the allowlist knows, including "".
+macos_values = sorted({row[0] for row in rows}) + [""]
+kernel_values = sorted({row[1] for row in rows}) + [""]
+unpairable = not any(
+    pair in rows for pair in itertools.chain(
+        itertools.product(("26.5.0", ""), kernel_values),
+        itertools.product(macos_values, ("25.4.0", "")),
+    )
+)
+# Membership is by whole row: a macOS value from one proven row must not pair with the kernel value
+# of a different row. That is what a per-dimension (macos in ... and kernel in ...) gate would lose.
+cross = not any((a[0], b[1]) in rows for a, b in itertools.permutations(sorted(rows), 2))
+print("closed_pairs=%s proven_rows=%s injected_unpairable=%s cross_row_unpairable=%s" % tuple(
+    "yes" if flag else "no" for flag in (closed, proven, unpairable, cross)
+))
+PY
+)"
+assert_eq "OS-row allowlist is a closed set of proven, unpairable pairs" \
+  "closed_pairs=yes proven_rows=yes injected_unpairable=yes cross_row_unpairable=yes" \
+  "$allowlist_row"
 
 t_case "ordinary writes follow the production host classification"
 repo="$(mk_repo)"; mk_run "$repo" ordinary

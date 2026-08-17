@@ -51,6 +51,16 @@ P2_DESCRIPTOR_PROCESS_NS = 5_000_000_000
 P2_DESCRIPTOR_CLEANUP_NS = 6_000_000_000
 P2_DESCRIPTOR_KILL_RESERVE_NS = 100_000_000
 P2_MNT_LOCAL = 0x1000
+# Closed allowlist of PROVEN (macOS product version, Darwin kernel release) pairs. Exact-match
+# fail-closed semantics are unchanged: a host is supported only if its whole row was explicitly
+# proven and added here. Deliberately NOT a floor, range, prefix or wildcard — a version predicate
+# would admit unproven future OS rows, which is the property this gate exists to refuse. Membership
+# is by PAIR, so a macOS value from one proven row combined with a kernel value from another (or an
+# empty/unverifiable value) is still rejected.
+SUPPORTED_P2_OS_ROWS = frozenset({
+    ("26.5.1", "25.5.0"),
+    ("26.6.1", "25.6.0"),
+})
 PRODUCER_RESERVED = {
     "ts", "event", "event_id", "run_id", "stage", "role", "agent", "contract",
     "authority", "activation", "activation_justification",
@@ -975,7 +985,7 @@ def preflight_write_environment(run_path):
         elif reject == "python_version_unverifiable":
             implementation = ""
         if (
-            system != "Darwin" or macos != "26.5.1" or kernel != "25.5.0"
+            system != "Darwin" or (macos, kernel) not in SUPPORTED_P2_OS_ROWS
             or architecture != "arm64" or python != (3, 9, 6) or implementation != "cpython"
             or not isinstance(python_executable, str) or not os.path.isabs(python_executable)
             or not python_executable

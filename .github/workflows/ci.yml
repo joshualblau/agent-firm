@@ -101,14 +101,26 @@ jobs:
         run: |
           command -v node >/dev/null
           python3 - <<'PY'
-          import platform, sys
+          import ast, pathlib, platform, re, sys
+          # The (macOS, Darwin) half of the row is a closed allowlist of proven pairs, read out of the
+          # production writer so this probe cannot admit a row the gate itself refuses. Every other
+          # dimension stays an exact literal.
+          source = pathlib.Path("bin/firm-ledger-log").read_text()
+          match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+          if match is None:
+              raise SystemExit("cannot read SUPPORTED_P2_OS_ROWS from bin/firm-ledger-log")
+          rows = ast.literal_eval(match.group(1))
           actual = (
               platform.system(), platform.mac_ver()[0], platform.release(),
               platform.machine(), tuple(sys.version_info[:3]), sys.implementation.name,
           )
-          expected = ("Darwin", "26.5.1", "25.5.0", "arm64", (3, 9, 6), "cpython")
-          if actual != expected:
-              raise SystemExit(f"exact P2 runner mismatch: expected {expected!r}, got {actual!r}")
+          expected_fixed = ("Darwin", "arm64", (3, 9, 6), "cpython")
+          actual_fixed = (actual[0], actual[3], actual[4], actual[5])
+          if actual_fixed != expected_fixed or (actual[1], actual[2]) not in rows:
+              raise SystemExit(
+                  f"exact P2 runner mismatch: expected {expected_fixed!r} with an OS row in "
+                  f"{sorted(rows)!r}, got {actual!r}"
+              )
           PY
       - name: git identity for scratch-repo fixtures
         run: |
