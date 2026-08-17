@@ -30,6 +30,9 @@ mk_root() {
   mkdir -p "$root/bin" "$root/agent-firm/evals" "$root/agent-firm/contracts" "$root/.claude"
   cp "$RUN" "$root/bin/firm-run-evals"
   chmod +x "$root/bin/firm-run-evals"
+  # firm-run-evals resolves its interpreter through its sibling bin/firm-python, so the scratch root
+  # needs that sibling too (one python for the tools, the doctor and the write gate).
+  ln -s "$BIN/firm-python" "$root/bin/firm-python"
   ln -s "$BIN/firm-check-assertions" "$root/bin/firm-check-assertions"
   ln -s "$BIN/firm-bounded-exec" "$root/bin/firm-bounded-exec"
   printf '# lifecycle fixture\n' > "$root/agent-firm/contracts/lifecycle.md"

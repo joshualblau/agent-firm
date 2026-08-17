@@ -7,7 +7,7 @@ POLICY="$FIRM_ROOT/agent-firm/policy/model-tiers.yaml"
 W="$(mktemp -d "${TMPDIR:-/tmp}/firm-model-tiers.XXXXXX")"; t_track "$W"
 
 t_case "canonical policy resolves every tier, role, alias, provider, and field exactly"
-assert_ok "complete canonical resolution matrix" python3 - "$RESOLVE" "$POLICY" <<'PY'
+assert_ok "complete canonical resolution matrix" t_python - "$RESOLVE" "$POLICY" <<'PY'
 import json, pathlib, subprocess, sys, yaml
 resolve, policy_path = sys.argv[1:]
 policy = yaml.safe_load(pathlib.Path(policy_path).read_text())
@@ -59,7 +59,7 @@ assert_output "override failure says no fallback" "no fallback applied" \
   "$RESOLVE" --provider codex --role reviewer --expect-effort ultra
 
 t_case "closed policy schema rejects duplicate, missing, unknown, and dangling entries"
-assert_ok "all policy-shape mutations fail with rc 2" python3 - "$RESOLVE" "$POLICY" "$W" <<'PY'
+assert_ok "all policy-shape mutations fail with rc 2" t_python - "$RESOLVE" "$POLICY" "$W" <<'PY'
 import copy, pathlib, subprocess, sys, yaml
 resolve, policy_path, workspace = sys.argv[1:]
 raw = pathlib.Path(policy_path).read_text()
@@ -92,7 +92,7 @@ for name, text in cases.items():
 PY
 
 t_case "mutation of every provider field, role mapping, and alias mapping is detected"
-assert_ok "all canonical mapping mutations fail an exact expectation" python3 - "$RESOLVE" "$POLICY" "$W" <<'PY'
+assert_ok "all canonical mapping mutations fail an exact expectation" t_python - "$RESOLVE" "$POLICY" "$W" <<'PY'
 import copy, pathlib, subprocess, sys, yaml
 resolve, policy_path, workspace = sys.argv[1:]
 base = yaml.safe_load(pathlib.Path(policy_path).read_text())
@@ -129,7 +129,7 @@ assert counter == 40, counter
 PY
 
 t_case "native adapters consume an executable resolver-bound launch object"
-assert_ok "Claude frontmatter projections match policy" python3 - "$FIRM_ROOT" <<'PY'
+assert_ok "Claude frontmatter projections match policy" t_python - "$FIRM_ROOT" <<'PY'
 import json, pathlib, subprocess, sys, yaml
 root = pathlib.Path(sys.argv[1])
 resolve = root / "bin/firm-model-resolve"
@@ -142,7 +142,7 @@ for role in [r for r in roles if r != "lead"]:
     assert front["name"] == role
     assert (front["model"], front["effort"]) == (got["model"], got["effort"]), (role, front, got)
 PY
-assert_ok "both provider adapters reject every resolver, role-start, and apply mutation" python3 - "$FIRM_ROOT" "$W" <<'PY'
+assert_ok "both provider adapters reject every resolver, role-start, and apply mutation" t_python - "$FIRM_ROOT" "$W" <<'PY'
 import copy, json, pathlib, re, shutil, subprocess, sys, yaml
 
 root, workspace = map(pathlib.Path, sys.argv[1:])
@@ -278,7 +278,7 @@ for provider in sources:
         require_rejection(provider, "output-" + field,
                           lambda target, field=field: mutate_activation_output(target, field))
 PY
-assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" python3 - "$BIN/firm-reviewer-common" <<'PY'
+assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" t_python - "$BIN/firm-reviewer-common" <<'PY'
 import ast, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 source = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]

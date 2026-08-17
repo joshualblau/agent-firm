@@ -56,6 +56,9 @@ set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+# The pyyaml discriminator below is a statement about ONE interpreter. Ask the firm's resolved one
+# (bin/firm-python) so this and firm-doctor cannot disagree about whether a parser is installed.
+. "$SELF/firm-python"
 parse_only=0
 if [ "${1:-}" = "--parse-only" ]; then parse_only=1; shift; fi
 if [ "$parse_only" -eq 1 ]; then
@@ -66,7 +69,7 @@ else
     echo "usage: firm-check-assertions <assertions.yaml> <scratch-repo> [result.json]" >&2; exit 2; }
   repo="$2"
 fi
-python3 - "$1" "$repo" "${3:-}" "$SELF" "$parse_only" <<'PY'
+firm_python - "$1" "$repo" "${3:-}" "$SELF" "$parse_only" <<'PY'
 import glob, hashlib, importlib.util, json, os, re, stat, subprocess, sys
 apath, repo, rpath, selfdir = sys.argv[1:5]
 parse_only = sys.argv[5] == "1"

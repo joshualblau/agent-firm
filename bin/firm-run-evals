@@ -30,6 +30,7 @@ __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the 
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 EVALS="$ROOT/agent-firm/evals"
 MANUAL="$ROOT/agent-firm/contracts/lifecycle.md"  # shared provider-neutral lifecycle contract
 SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
@@ -146,7 +147,7 @@ structural_assertions() {
 # the project's bin/firm-ledger-hook, which doesn't exist in an eval scratch repo (it would fail every
 # Bash call). Strip "hooks" so the eval loads only the allow/ask/deny posture.
 make_eval_settings() { # $1 = dest file
-  python3 - "$SETTINGS" "$1" <<'PY'
+  firm_python - "$SETTINGS" "$1" <<'PY'
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 d = json.load(open(src)); d.pop("hooks", None)
@@ -207,7 +208,7 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
   fi
 
   if [ "$provider" = claude ]; then
-    turns="$(python3 - "$out/result.json" <<'PY'
+    turns="$(firm_python - "$out/result.json" <<'PY'
 import json, sys
 try:
     value = json.load(open(sys.argv[1], encoding="utf-8")).get("num_turns")
@@ -220,7 +221,7 @@ except Exception as e:
 PY
 )" || return 1
   else
-    turns="$(python3 - "$out/result.json" <<'PY'
+    turns="$(firm_python - "$out/result.json" <<'PY'
 import json, sys
 count = 0
 try:
@@ -244,7 +245,7 @@ PY
   echo "    accounted top-level turns: $turns/$eval_max_turns"
 
   # Show the run envelope summary for observability.
-  [ "$provider" = claude ] && python3 - "$out/result.json" <<'PY' 2>/dev/null || true
+  [ "$provider" = claude ] && firm_python - "$out/result.json" <<'PY' 2>/dev/null || true
 import json,sys
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)

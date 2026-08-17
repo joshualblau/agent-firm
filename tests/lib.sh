@@ -60,6 +60,20 @@ TESTS_DIR="$(cd -P "$(dirname "$_t_src")" && pwd)"
 FIRM_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
 BIN="$FIRM_ROOT/bin"
 
+# ---- the suite's own interpreter ------------------------------------------
+# t_python runs the interpreter bin/firm-python RESOLVES — the same one every firm-* tool runs — not
+# whatever `python3` is first on PATH. Use it wherever the harness stands in for the firm: reading the
+# same YAML/JSON the firm reads (pyyaml and jsonschema are installed for ONE interpreter, and on a
+# normal machine PATH's python3 is not it), building a fixture the firm will consume, or asserting a
+# property of the interpreter a script under test will actually use. A harness that probes a different
+# python than the code under test is asserting about a different machine — which is the exact defect
+# the firm-python resolver exists to close, one layer down.
+#
+# Bare `python3` deliberately survives where a test is ABOUT PATH resolution (tests/test-merge-guard.sh
+# builds PATHs on purpose, and firm-merge-guard's own fail-closed contract is written against them).
+. "$BIN/firm-python"
+t_python() { firm_python "$@"; }
+
 # ---- output --------------------------------------------------------------
 _t_ok() { T_PASS=$((T_PASS+1)); printf '    ok   %s\n' "$1"; }
 _t_no() {

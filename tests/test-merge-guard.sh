@@ -42,6 +42,9 @@ mk_guard_tree() {
   t_track "$_d"
   mkdir -p "$_d/bin" "$_d/agent-firm/policy"
   cp "$GUARD" "$_d/bin/firm-merge-guard"
+  # The guard resolves its interpreter through its sibling bin/firm-python (one python for the guard,
+  # the ledger writer and the doctor), so a scratch copy needs that sibling or it cannot evaluate.
+  cp "$BIN/firm-python" "$_d/bin/firm-python"
   cp "$POLICY" "$_d/agent-firm/policy/merge-authority.yaml"
   printf '%s' "$_d"
 }
@@ -71,9 +74,9 @@ mk_id_repo() {
 }
 
 # The two allow-listed values, read from the shipped policy file (never hard-coded here).
-ALLOWED_LOGIN="$(python3 -c "
+ALLOWED_LOGIN="$(t_python -c "
 import yaml; d=yaml.safe_load(open('$POLICY')); print(d['allowed'][0]['gh_login'])")"
-ALLOWED_EMAIL="$(python3 -c "
+ALLOWED_EMAIL="$(t_python -c "
 import yaml; d=yaml.safe_load(open('$POLICY')); print(d['allowed'][0]['git_emails'][0])")"
 
 # ---- runners -------------------------------------------------------------------------------
@@ -849,9 +852,12 @@ t_case "AC-015 no usable YAML parser is cannot-evaluate (not a silent downgrade)
 # pyyaml ABSENT: a python3 wrapper that adds -S, so site-packages is never loaded and
 # importlib.util.find_spec('yaml') genuinely returns None.
 NOYAML="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-noyaml.XXXXXX")"; t_track "$NOYAML"
-REALPY="$(command -v python3)"
+# The wrapper must wrap the interpreter the GUARD resolves (bin/firm-python), not PATH's python3:
+# the guard no longer inherits PATH's, so a wrapper around a different interpreter would leave the
+# real one -- with its real pyyaml -- reachable, and this case would pass while testing nothing.
+REALPY="$(t_python -c 'import sys; print(sys.executable)')"
 printf '#!/bin/sh\nexec %s -S "$@"\n' "$REALPY" > "$NOYAML/python3"; chmod +x "$NOYAML/python3"
-if [ "$(PATH="$NOYAML:$PATH" python3 -c "import importlib.util; print(importlib.util.find_spec('yaml') is None)" 2>/dev/null)" = "True" ]; then
+if [ "$("$NOYAML/python3" -c "import importlib.util; print(importlib.util.find_spec('yaml') is None)" 2>/dev/null)" = "True" ]; then
   assert_rc "pyyaml ABSENT -> cannot evaluate" 2 \
     mg "$TREE" "$GH_OK:$NOYAML" "$REPO_OK" --command 'git push origin main'
   assert_output "  and says pyyaml is not installed" "pyyaml is not installed" \
@@ -1062,10 +1068,32 @@ t_case "AC-016/SEC-07 an interpreter that dies with status 1 is cannot-evaluate,
 # a bad shebang or a failed exec also exits 1, and 1 used to be INSIDE the pass-through case arm —
 # so a broken interpreter was reported as a decision, with no message and no ledger event. The
 # checker now exits 3 for a refusal, so a bare 1 can only mean 'not from the checker'.
-PYFAIL1="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyfail1.XXXXXX")"; t_track "$PYFAIL1"
-printf '#!/bin/sh\nexit 1\n' > "$PYFAIL1/python3"; chmod +x "$PYFAIL1/python3"
-PYFAIL99="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyfail99.XXXXXX")"; t_track "$PYFAIL99"
-printf '#!/bin/sh\nexit 99\n' > "$PYFAIL99/python3"; chmod +x "$PYFAIL99/python3"
+# A python3 double the RESOLVER can actually select. bin/firm-python probes each candidate with
+# `-c <program> <args>` and picks only one that answers as the interpreter the P2 gate admits, so a
+# double that fails everything is never selected at all: the guard would fall through to the real
+# interpreter and the case below would quietly stop testing anything. These doubles therefore answer
+# the PROBE honestly by delegating to the real interpreter, and betray only the actual checker run —
+# which is precisely the SEC-17 threat: a shim that passes for python3 without running the program it
+# was handed. (The stronger property the resolver adds — a double that cannot even answer the probe is
+# refused rather than trusted — is asserted separately below.)
+MG_REALPY="$(t_python -c 'import sys; print(sys.executable)')"
+mk_py_double() {   # <exit-code> [extra shell line before exit] -> echoes a PATH dir holding it
+  _d="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pydouble.XXXXXX")"
+  t_track "$_d"
+  {
+    printf '#!/bin/sh\n'
+    printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+    [ -n "${2:-}" ] && printf '%s\n' "$2"
+    # Loud on the betrayal path only: a case that expects the checker to have been REACHED can then
+    # prove it positively, instead of inferring it from an exit code.
+    printf 'echo MG-PY-DOUBLE-EXECUTED >&2\n'
+    printf 'exit %s\n' "$1"
+  } > "$_d/python3"
+  chmod +x "$_d/python3"
+  printf '%s' "$_d"
+}
+PYFAIL1="$(mk_py_double 1)"
+PYFAIL99="$(mk_py_double 99)"
 assert_rc "python3 exits 1 -> 2 (cannot evaluate), NOT 1 (a refusal)" 2 \
   mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
 assert_output "  and it says the checker itself failed" "the checker itself exited 1" \
@@ -1093,12 +1121,9 @@ t_case "AC-015/AC-016/SEC-17 an exit CODE alone cannot author a decision — the
 # when it agrees. BOTH directions are asserted: the stub codes must block, and the REAL interpreter
 # must still be able to reach permit AND refuse (otherwise this test would pass on a guard that
 # simply blocked everything).
-PYEXIT0="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyexit0.XXXXXX")"; t_track "$PYEXIT0"
-printf '#!/bin/sh\nexit 0\n' > "$PYEXIT0/python3"; chmod +x "$PYEXIT0/python3"
-PYEXIT3="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyexit3.XXXXXX")"; t_track "$PYEXIT3"
-printf '#!/bin/sh\nexit 3\n' > "$PYEXIT3/python3"; chmod +x "$PYEXIT3/python3"
-PYQUIET="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pyquiet.XXXXXX")"; t_track "$PYQUIET"
-printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$PYQUIET/python3"; chmod +x "$PYQUIET/python3"
+PYEXIT0="$(mk_py_double 0)"
+PYEXIT3="$(mk_py_double 3)"
+PYQUIET="$(mk_py_double 0 'cat >/dev/null')"
 assert_rc "python3 exits 0 with no sentinel -> 2, NOT 0 (this was a FAIL-OPEN)" 2 \
   mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
 assert_rc "  and through the hook it BLOCKS" 2 \
@@ -1206,7 +1231,7 @@ assert_output "the script header says user.name is NOT read" "user.name" head -4
 # ============================================================ AC-018 · exactly one allowlist file
 t_case "AC-018 the allowlist lives in exactly ONE data file"
 assert_file "the policy file exists where the convention says" "$POLICY"
-assert_ok "the allow-listed EMAILS appear in no other tracked file" python3 -c "
+assert_ok "the allow-listed EMAILS appear in no other tracked file" t_python -c "
 import os, subprocess, yaml
 root = '$FIRM_ROOT'
 d = yaml.safe_load(open('$POLICY'))
@@ -1226,14 +1251,14 @@ for f in files:
             offenders.append((f, em))
 assert not offenders, f'allow-listed email duplicated outside the policy file: {offenders}'
 "
-assert_ok "the guard script contains no allow-listed login or email literal" python3 -c "
+assert_ok "the guard script contains no allow-listed login or email literal" t_python -c "
 import yaml
 d = yaml.safe_load(open('$POLICY'))
 src = open('$GUARD').read()
 bad = [v for a in d['allowed'] for v in ([a['gh_login']] + list(a['git_emails'])) if v in src]
 assert not bad, f'the script hard-codes allowlist data: {bad}'
 "
-assert_ok "settings.json and hooks.json contain no allowlist data" python3 -c "
+assert_ok "settings.json and hooks.json contain no allowlist data" t_python -c "
 import yaml
 d = yaml.safe_load(open('$POLICY'))
 vals = [v for a in d['allowed'] for v in ([a['gh_login']] + list(a['git_emails']))]
@@ -1351,7 +1376,7 @@ mk_run "$LREPO" "20260803T000000Z-guard-test"
 assert_rc "the blocked command exits non-zero" 1 mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
 LEDGER="$LREPO/.agent-firm/runs/20260803T000000Z-guard-test/run.jsonl"
 assert_file "run.jsonl was created" "$LEDGER"
-assert_ok "the event names the refused command, the matched surface and BOTH identities" python3 -c "
+assert_ok "the event names the refused command, the matched surface and BOTH identities" t_python -c "
 import json
 recs = [json.loads(l) for l in open('$LEDGER') if l.strip()]
 blocks = [r for r in recs if r.get('event') == 'merge_guard_block']
@@ -1725,8 +1750,15 @@ assert_eq "prefilter[jq]   a gated command padded past the bound is still CHECK"
 # the same positive proof the $VAR rows use.
 assert_rc "over the bound, a benign command is still permitted (the bound is not a blanket block)" 0 \
   mg "$TREE" "$GH_OK" "$REPO_OK" --command "$PF_OVER"
-assert_rc "  and it got there by REACHING the classifier (blocks under a booby-trapped PATH)" 2 \
-  mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_OVER"
+# The reach proof uses a python DOUBLE the resolver can select (see mk_py_double): the booby-trapped
+# EXPLODE stub answers nothing, so bin/firm-python now refuses it and falls through to a real
+# interpreter -- which is the correct behaviour, but it stops the stub from proving anything. The
+# double answers the probe and then betrays the checker run, so a 2 plus its marker is positive proof
+# that the classifier was reached.
+assert_rc "  and it got there by REACHING the classifier (a python double that betrays its run)" 2 \
+  mg "$TREE" "$PYFAIL99" "$REPO_OK" --command "$PF_OVER"
+assert_output "  ...and the double really ran" "MG-PY-DOUBLE-EXECUTED" \
+  mg "$TREE" "$PYFAIL99" "$REPO_OK" --command "$PF_OVER"
 assert_rc "  while the same string one byte SHORTER is still decided in bash, zero subprocesses" 0 \
   mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_UNDER"
 assert_eq "  ...and really spawned nothing to do it" "" \
@@ -2015,7 +2047,7 @@ t_case "the embedded python checker compiles cleanly, with warnings as errors"
 assert_ok "extractable, syntactically valid, and warning-free" python3 -c "
 import re, sys, warnings
 src = open('$GUARD').read()
-m = re.search(r\"python3 - <<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)
+m = re.search(r\"- <<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)
 assert m, 'the embedded checker could not be extracted from the guard'
 prog = m.group(1)
 assert 'def classify(' in prog and 'FIRM_MG_DECISION' in prog, prog[:200]

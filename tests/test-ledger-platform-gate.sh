@@ -8,7 +8,7 @@ RESOLVER="$BIN/firm-model-resolve"
 # The OS half of the row is a closed allowlist of proven (macOS, Darwin) pairs. Read it out of the
 # writer itself rather than restating it here: a second hand-maintained copy could drift and make
 # this suite assert a row the production gate does not actually admit.
-host_row="$(python3 - "$LOG" <<'PY'
+host_row="$(t_python - "$LOG" <<'PY'
 import ast, pathlib, platform, re, sys
 source = pathlib.Path(sys.argv[1]).read_text()
 match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
@@ -27,7 +27,7 @@ PY
 )"
 
 t_case "the OS half of the P2 row stays a closed set of proven pairs, not a version floor"
-allowlist_row="$(python3 - "$LOG" <<'PY'
+allowlist_row="$(t_python - "$LOG" <<'PY'
 import ast, itertools, pathlib, re, sys
 source = pathlib.Path(sys.argv[1]).read_text()
 match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
@@ -109,7 +109,7 @@ native_out="$("$LOG" --run "$native_run" --strict --role-start \
 native_rc=$?
 if [ "$host_row" = exact ]; then
   assert_eq "exact P2 host permits the native role start" 0 "$native_rc"
-  assert_ok "native receipt names the retained event" python3 -c \
+  assert_ok "native receipt names the retained event" t_python -c \
     'import json,sys; assert json.loads(sys.argv[1])["event"] == "build_started"' "$native_out"
   assert_file "native ledger exists on exact P2" "$native_run/run.jsonl"
 else

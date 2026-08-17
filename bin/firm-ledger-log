@@ -13,7 +13,13 @@ while [ -L "$__src" ]; do
 done
 __root="$(cd -P "$(dirname "$__src")/.." && pwd)"
 
-exec python3 - "$__root" "$@" <<'PY'
+# The P2 gate below judges the PYTHON process it runs in, so the writer must not inherit whatever
+# `python3` happens to be first on PATH. firm-python resolves the interpreter the gate admits (and
+# launches it natively when this shell is translated). If the host has none, the resolver says so and
+# this still reaches the centralized gate, which refuses the write with WRITE_CONFIGURATION_UNSUPPORTED.
+. "$(cd -P "$(dirname "$__src")" && pwd)/firm-python"
+
+exec "${FIRM_PYTHON_ARGV[@]}" - "$__root" "$@" <<'PY'
 import datetime
 import errno
 import fcntl

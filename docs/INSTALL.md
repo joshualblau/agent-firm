@@ -11,6 +11,16 @@ Both `claude` and `codex` CLIs, `git`, and two Python packages are required:
 python3 -m pip install --user jsonschema pyyaml
 ```
 
+Install them into the interpreter the firm actually runs. Once the repository is on disk that is
+`bin/firm-python`, which resolves the interpreter the P2 ledger gate admits rather than whatever
+`python3` your `PATH` happens to name (a conda/pyenv `python3` in front is common, and packages
+installed into it are invisible to the firm):
+
+```bash
+bin/firm-python -m pip install --user jsonschema pyyaml   # or: firm-bootstrap --with-python-deps
+bin/firm-python --status                                  # which interpreter, and whether it is P2
+```
+
 This is an intentional joint prerequisite: bootstrap, install refresh, and `firm-version
 --local-refresh` do not offer a one-provider mode. Before its first mutation, `firm-bootstrap` uses
 bounded calls to check both executables, required plugin/marketplace subcommands, local selector and

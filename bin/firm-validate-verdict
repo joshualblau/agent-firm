@@ -22,8 +22,11 @@ __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the 
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
 SCHEMA="$(cd "$SCRIPT_DIR/.." && pwd)/agent-firm/schemas/qa-verdict.schema.json"
+# `jsonschema` is only present for SOME interpreter on a host. Probe the one the firm has pinned, so
+# this gate and firm-doctor's dependency verdict are answers about the same python. See bin/firm-python.
+. "$SCRIPT_DIR/firm-python"
 
-python3 - "$verdict" "$SCHEMA" <<'PY'
+firm_python - "$verdict" "$SCHEMA" <<'PY'
 import json, sys
 vpath, spath = sys.argv[1], sys.argv[2]
 try:
@@ -48,7 +51,7 @@ except ImportError:
           "`jsonschema` is not installed.")
     print("  verdict =", data["verdict"], "(unverified)")
     print("  This does NOT satisfy the Final gate. Install the prerequisite:")
-    print("    python3 -m pip install --user jsonschema pyyaml     (or: firm-bootstrap --with-python-deps)")
+    print("    firm-python -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)")
     sys.exit(4)
 except Exception as e:
     print("INVALID (jsonschema):", e); sys.exit(1)

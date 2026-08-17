@@ -167,6 +167,30 @@ SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 POLICY="$ROOT/agent-firm/policy/merge-authority.yaml"
 
+# The interpreter is resolved LAZILY - inside this function, never at startup. 98.73% of Bash tool
+# calls are classified structurally with zero subprocesses (see the budget notes above) and that
+# property is why this hook is affordable at all; only the calls that were already going to pay for
+# a python start pay for the probe as well.
+#
+# Why resolve rather than inherit PATH's `python3`: the allowlist is parsed with pyyaml, and pyyaml
+# is installed FOR ONE INTERPRETER. On a machine whose PATH python3 is a conda build without it,
+# this guard answered "BLOCKED (cannot evaluate) - pyyaml is not installed" to every merge and push
+# while the firm's own interpreter had pyyaml sitting right there. Resolving is also what keeps this
+# guard, the ledger writer and firm-doctor on ONE python, so they cannot reach different verdicts
+# about the same machine. See bin/firm-python. A missing or unusable resolver is reported here as
+# cannot-evaluate, never as a permit.
+_mg_python_ready() {
+  if [ -z "${FIRM_PYTHON_DISPLAY:-}" ]; then
+    . "$SELF/firm-python" || return 1
+  fi
+  case "${FIRM_PYTHON_ARGV[0]:-}" in
+    "")  return 1 ;;
+    /*)  [ -x "${FIRM_PYTHON_ARGV[0]}" ] || return 1 ;;
+    *)   command -v "${FIRM_PYTHON_ARGV[0]}" >/dev/null 2>&1 || return 1 ;;
+  esac
+  return 0
+}
+
 MODE=""
 CMD=""
 while [ "$#" -gt 0 ]; do
@@ -204,7 +228,7 @@ done
 # (NOT argv) so a command line containing a secret is not exposed in `ps` output.
 # ---------------------------------------------------------------------------------------------
 _mg_py() {
-  python3 - <<'PYEOF'
+  "${FIRM_PYTHON_ARGV[@]}" - <<'PYEOF'
 import json, os, re, subprocess, sys
 
 MODE    = os.environ.get("FIRM_MG_MODE", "")
@@ -1591,6 +1615,10 @@ _mg_may_match() {
 }
 
 if [ "$MODE" = "surface" ]; then
+  if ! _mg_python_ready; then
+    printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to print the covered surface.\n' >&2
+    exit 2
+  fi
   FIRM_MG_MODE=surface FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="" _mg_py
   exit $?
 fi
@@ -1622,16 +1650,17 @@ _mg_report_rc() {
 _mg_unproven() {
   printf 'firm-merge-guard: CANNOT EVALUATE — the checker exited %s (which would mean "%s") but\n' "$1" "$2" >&2
   printf '  did not emit its proof-of-execution sentinel, so that exit status cannot be read as a\n' >&2
-  printf '  decision. A `python3` on PATH that is a stub, a shim, or the wrong interpreter can\n' >&2
-  printf '  return any status without running the check. Blocking, and nothing was recorded in the\n' >&2
-  printf '  ledger. Verify python3 (a declared firm prerequisite, see docs/INSTALL.md).\n' >&2
+  printf '  decision. A python3 that is a stub, a shim, or the wrong interpreter can return any\n' >&2
+  printf '  status without running the check. Blocking, and nothing was recorded in the ledger.\n' >&2
+  printf '  Verify the resolved interpreter with: firm-python --status  (python3 is a declared firm\n' >&2
+  printf '  prerequisite, see docs/INSTALL.md).\n' >&2
   exit 2
 }
 
 if [ "$MODE" = "command" ]; then
   _mg_may_match "$CMD" || exit 0
-  if ! command -v python3 >/dev/null 2>&1; then
-    printf 'firm-merge-guard: CANNOT EVALUATE — python3 is required to inspect this command.\n' >&2
+  if ! _mg_python_ready; then
+    printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to inspect this command.\n' >&2
     exit 2
   fi
   # stdout is captured because it carries the decision SENTINEL and nothing else; stderr is NOT
@@ -1685,10 +1714,11 @@ else
   _mg_may_match "$payload" || exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  printf 'firm-merge-guard: BLOCKED (cannot evaluate) — python3 is not installed, so this command\n' >&2
-  printf '  cannot be checked against the merge-authority allowlist. Install python3 (a declared\n' >&2
-  printf '  firm prerequisite, see docs/INSTALL.md) or remove the firm-merge-guard PreToolUse hook.\n' >&2
+if ! _mg_python_ready; then
+  printf 'firm-merge-guard: BLOCKED (cannot evaluate) — no usable python3 was found (bin/firm-python\n' >&2
+  printf '  resolves it), so this command cannot be checked against the merge-authority allowlist.\n' >&2
+  printf '  Install python3 (a declared firm prerequisite, see docs/INSTALL.md) or remove the\n' >&2
+  printf '  firm-merge-guard PreToolUse hook.\n' >&2
   exit 2
 fi
 

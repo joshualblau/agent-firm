@@ -48,6 +48,9 @@ mk_doctor_root() { # <policy-json | MISSING> -> echoes root path
   _r="$(mktemp -d "${TMPDIR:-/tmp}/firm-droot.XXXXXX")"
   mkdir -p "$_r/bin" "$_r/agent-firm/policy"
   cp "$BIN/firm-doctor" "$_r/bin/firm-doctor"
+  # firm-doctor runs the interpreter bin/firm-python resolves, so the resolver is part of the minimum
+  # root now: without its sibling the doctor fails closed (loudly) before it reaches any check.
+  cp "$BIN/firm-python" "$_r/bin/firm-python"
   [ "$1" = MISSING ] || printf '%s\n' "$1" > "$_r/agent-firm/policy/retired-permissions.json"
   printf '%s' "$_r"
 }

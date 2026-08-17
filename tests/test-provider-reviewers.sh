@@ -24,8 +24,8 @@ STUB="$WORK/stub"; mkdir "$STUB"
 CALLS="$WORK/calls.log"; : > "$CALLS"
 printf 'redirect target must stay unchanged\n' > "$WORK/redirect-target"
 REDIRECT_SHA="$(shasum -a 256 "$WORK/redirect-target" | awk '{print $1}')"
-SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$RUN/09-test-evidence/qa-candidate.json")"
-GEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$RUN/09-test-evidence/qa-candidate.json")"
+SHA="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$RUN/09-test-evidence/qa-candidate.json")"
+GEN="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$RUN/09-test-evidence/qa-candidate.json")"
 
 mkdir -p "$RUN/09-test-evidence/nested"
 printf 'captured evidence\nUNLABELED-PRIVATE-SOURCE-SENTINEL-7f31\n' > "$RUN/09-test-evidence/nested/proof.log"
@@ -35,7 +35,7 @@ proof_bytes="$(wc -c < "$RUN/09-test-evidence/nested/proof.log" | tr -d ' ')"
   "path=09-test-evidence/nested/proof.log" "sha=$SHA" "generation=$GEN" \
   "sha256=$proof_sha" "bytes=$proof_bytes" >/dev/null
 
-python3 - "$RUN" "$RUN_ID" "$SHA" "$GEN" "$proof_sha" "$proof_bytes" <<'PY'
+t_python - "$RUN" "$RUN_ID" "$SHA" "$GEN" "$proof_sha" "$proof_bytes" <<'PY'
 import json,sys,yaml
 run,run_id,sha,gen,digest,size=sys.argv[1:]
 gen=int(gen); size=int(size)
@@ -66,7 +66,7 @@ rm "$RUN/integration-draft-1.md" "$RUN/integration-draft-2.md"
 INT_HISTORY="$RUN/integration-summaries/INT-01.md"
 INT_SUMMARY="$RUN/integration-summaries/INT-02.md"
 
-python3 - "$WORK" "$RUN_ID" "$SHA" "$GEN" <<'PY'
+t_python - "$WORK" "$RUN_ID" "$SHA" "$GEN" <<'PY'
 import json,os,sys
 w,run,sha,gen=sys.argv[1:]
 base={"commit_sha":sha,"run_id":run,"generation":int(gen),"attempt_id":"__ATTEMPT__","environment":"test","commands_run":[],
@@ -81,6 +81,9 @@ for provider in ("gpt","claude"):
   json.dump(d,open(os.path.join(w,f"{provider}-{word.lower()}.json"),"w"))
 PY
 
+# The two provider stubs below are EXTERNAL programs the wrapper spawns, so their bodies stay on
+# PATH's `python3` (they model a CLI the firm does not own, and the wrapper hands them a PATH that
+# contains one). t_python is the harness's own interpreter and is not defined inside a /bin/sh stub.
 cat > "$STUB/codex" <<'SH'
 #!/bin/sh
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
@@ -285,11 +288,11 @@ assert_output "Claude carries explicit effort" "--effort xhigh" cat "$CALLS"
 for spec in "gpt:gpt-5.6-sol:GPT-5.6 sol:$GPT" "claude:opus:Opus 5:$CLAUDE"; do
   provider="${spec%%:*}"; rest="${spec#*:}"; expected_model="${rest%%:*}"; rest="${rest#*:}"
   expected_display="${rest%%:*}"; wrapper="${rest#*:}"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
   attempt="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json"
-  assert_eq "$provider attempt stores canonical model" "$expected_model" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["model"])' "$attempt")"
-  assert_eq "$provider attempt stores canonical display" "$expected_display" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["display"])' "$attempt")"
-  assert_eq "$provider attempt stores canonical effort" xhigh "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["effort"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical model" "$expected_model" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["model"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical display" "$expected_display" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["display"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical effort" xhigh "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["effort"])' "$attempt")"
 done
 FIRM_GPT_QA_MODEL=noncanonical; export FIRM_GPT_QA_MODEL
 : > "$CALLS"; assert_rc "noncanonical reviewer model override is rejected" 2 review_env approve "$GPT"
@@ -298,11 +301,11 @@ assert_eq "provider did not execute for model override" "" "$(cat "$CALLS")"
 
 : > "$CALLS"
 assert_rc "fresh canonical GPT call seeds controlled-layout records" 0 review_env approve "$GPT"
-layout_gpt_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+layout_gpt_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 layout_gpt_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/root"
 layout_gpt_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/config"
 assert_rc "fresh canonical Claude call seeds controlled-layout records" 0 review_env approve "$CLAUDE"
-layout_claude_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
+layout_claude_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
 layout_claude_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/root"
 layout_claude_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/config"
 
@@ -310,7 +313,7 @@ t_case "controlled layout keeps hostile ambient surfaces nested and records ever
 assert_output "fresh GPT provider call records exist" "codex cwd=" cat "$CALLS"
 assert_output "fresh Claude provider call records exist" "claude cwd=" cat "$CALLS"
 assert_ok "every fresh provider call uses its actual attempt-local cwd and HOME" \
-  python3 - "$CALLS" "$layout_gpt_root" "$layout_gpt_home" "$layout_claude_root" "$layout_claude_home" <<'PY'
+  t_python - "$CALLS" "$layout_gpt_root" "$layout_gpt_home" "$layout_claude_root" "$layout_claude_home" <<'PY'
 import os
 import sys
 
@@ -352,29 +355,29 @@ for executable, root, home in (
 PY
 assert_ok "controlled cwd is not the consumer repository" sh -c "! grep -q 'cwd=$REPO ' '$CALLS'"
 assert_output "controlled HOME is private and attempt-local" "/private-reviewer-control/$RUN_ID/" cat "$CALLS"
-checkout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$RUN/09-test-evidence/qa-candidate.json")"
+checkout="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$RUN/09-test-evidence/qa-candidate.json")"
 assert_no_file "provider could not write candidate snapshot" "$checkout/write-sentinel"
 assert_ok "production wrappers expose no FORCE bypass" sh -c "! grep -R 'FORCE_INCOMPAT' '$BIN/firm-gpt-qa' '$BIN/firm-claude-qa' '$BIN/firm-reviewer-common'"
 for provider in gpt claude; do
   sentinel="$(find "$RUN/09-test-evidence/reviewer-attempts" -path "*/behavior-sentinel.json" -type f | while read -r p; do grep -q '"provider": "'$provider'"' "${p%/behavior-sentinel.json}/attempt.json" && echo "$p"; done | tail -1)"
   assert_file "$provider retained pre-cleanup behavior sentinel" "$sentinel"
   for axis in agents claude settings hooks plugins mcp skills memory network policy approval snapshot_write; do
-    assert_eq "$provider $axis hostile axis stayed inactive" False "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$sentinel" "$axis")"
+    assert_eq "$provider $axis hostile axis stayed inactive" False "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$sentinel" "$axis")"
   done
 done
 for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   provider="${pair%%:*}"; wrapper="${pair#*:}"
   assert_rc "$provider controlled snapshot write is detected before cleanup" 1 review_env snapshot_write "$wrapper"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
   attempt="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json"
-  assert_eq "$provider attempt records detected snapshot write" True "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_snapshot_write_detected"])' "$attempt")"
+  assert_eq "$provider attempt records detected snapshot write" True "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_snapshot_write_detected"])' "$attempt")"
 done
 
 t_case "judge manifest inventories required state, nested proof, exact digests, and open canonical review"
 manifest_capture="$WORK/input-manifest.json"; STUB_MANIFEST_CAPTURE="$manifest_capture"; export STUB_MANIFEST_CAPTURE
 assert_rc "GPT captures the controlled input manifest" 0 review_env approve "$GPT"
 unset STUB_MANIFEST_CAPTURE
-assert_ok "manifest has exact required origins and nested referenced evidence" python3 - "$manifest_capture" "$RUN" <<'PY'
+assert_ok "manifest has exact required origins and nested referenced evidence" t_python - "$manifest_capture" "$RUN" <<'PY'
 import hashlib,json,os,sys
 manifest,run=sys.argv[1:]; d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
 required={"01-acceptance-criteria.yaml","traceability.yaml","09-test-evidence/qa-candidate.json","run-metadata.json",
@@ -390,13 +393,13 @@ for origin,item in entries.items():
     assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o")
     assert item["transform"]=="redacted_utf8"
 PY
-python3 - "$RUN/07-review-findings.yaml" <<'PY'
+t_python - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="open"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 assert_rc "GPT sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$GPT"
 assert_rc "Claude sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$CLAUDE"
-python3 - "$RUN/07-review-findings.yaml" <<'PY'
+t_python - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="resolved"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
@@ -407,7 +410,7 @@ rm "$RUN/run-baseline.json"
 : > "$CALLS"; assert_rc "missing run baseline blocks" 1 review_env approve "$GPT"
 assert_eq "provider did not run without baseline" "" "$(cat "$CALLS")"
 cp "$WORK/run-baseline.json" "$RUN/run-baseline.json"
-python3 - "$RUN/run-baseline.json" <<'PY'
+t_python - "$RUN/run-baseline.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["default_branch_start_sha"]="0"*40; json.dump(d,open(p,"w"))
 PY
@@ -424,7 +427,7 @@ printf '# Integration summary\n\nOverwritten historical cycle.\n' > "$INT_HISTOR
 assert_eq "provider did not run for overwritten history" "" "$(cat "$CALLS")"
 mv "$WORK/integration-summary-pristine.md" "$INT_HISTORY"
 cp "$RUN/08-qa-verdict.json" "$WORK/primary.json"
-python3 - "$RUN" <<'PY'
+t_python - "$RUN" <<'PY'
 import json,os,sys
 run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p)); rel="09-test-evidence/over-cap.bin"
 with open(run+"/"+rel,"wb") as fh: fh.write(b"x"*(8*1024*1024+1))
@@ -442,14 +445,14 @@ rm "$RUN/09-test-evidence/nested"; mv "$RUN/09-test-evidence/nested-real" "$RUN/
 t_case "canonical lifecycle archives stale approval, generation-guards promotion, and uses mode 0600"
 assert_rc "fresh GPT approval promotes" 0 review_env approve "$GPT"
 canonical="$RUN/08-qa-verdict.gpt.json"
-approved_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
+approved_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
 assert_eq "canonical mode is 600" 600 "$(t_file_mode "$canonical")"
 assert_rc "failed rerun cannot leave stale approval current" 1 review_env malformed "$GPT"
 assert_no_file "stale canonical approval is absent after failure" "$canonical"
 assert_file "prior immutable approval remains recoverable" "$RUN/09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json"
-latest_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+latest_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 latest_attempt="$RUN/09-test-evidence/reviewer-attempts/$latest_id/attempt.json"
-assert_eq "failed attempt points at prior immutable approval" "09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prior_verdict"])' "$latest_attempt")"
+assert_eq "failed attempt points at prior immutable approval" "09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["prior_verdict"])' "$latest_attempt")"
 candidate_backup="$WORK/candidate.backup"; cp "$RUN/09-test-evidence/qa-candidate.json" "$candidate_backup"
 assert_rc "candidate generation change during judge blocks promotion" 1 review_env reorder "$GPT"
 assert_no_file "reordered attempt did not promote" "$canonical"
@@ -483,7 +486,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   state="$RUN/09-test-evidence/reviewer-state.$provider.json"; state_saved="$WORK/state-$provider.json"
   cp "$state" "$state_saved"; cp "$state" "$WORK/state-target-$provider.json"
   canonical_state_saved="$WORK/canonical-state-$provider.json"; cp "$canonical" "$canonical_state_saved"
-  predicted="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
+  predicted="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
   rm "$state"; ln -s "$WORK/state-target-$provider.json" "$state"
   assert_rc "$provider rejects symlinked mutable attempt state" 1 review_env approve "$wrapper"
   rm "$state"; mv "$state_saved" "$state"; chmod 600 "$state"
@@ -491,7 +494,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   rm -f "$canonical"; mv "$canonical_state_saved" "$canonical"
   assert_eq "$provider state redirect target stayed byte-identical" "$(shasum -a 256 "$state" | awk '{print $1}')" "$(shasum -a 256 "$WORK/state-target-$provider.json" | awk '{print $1}')"
 
-  predicted="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
+  predicted="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
   ln -s "$WORK/redirect-target" "$RUN/09-test-evidence/reviewer-attempts/$predicted"
   assert_rc "$provider rejects preexisting symlinked attempt directory" 1 review_env approve "$wrapper"
   rm "$RUN/09-test-evidence/reviewer-attempts/$predicted"
@@ -506,7 +509,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   rm "$private_run/hostile-$provider"
 
   assert_rc "$provider rejects a diagnostic target replaced during execution" 1 review_env diagnostic_symlink "$wrapper"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$state")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$state")"
   diagnostic="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/diagnostic.json"
   test -L "$diagnostic" && rm "$diagnostic"
 
@@ -528,10 +531,10 @@ assert_rc "reordered second attempt cannot overtake the live owner" 1 review_env
 wait "$first_pid"; first_rc=$?
 assert_eq "first concurrent attempt promotes" 0 "$first_rc"
 canonical="$RUN/08-qa-verdict.gpt.json"
-current_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
-state_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+current_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
+state_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 assert_eq "canonical projection matches the sole current attempt" "$state_id" "$current_id"
-assert_ok "current attempt has exactly one outcome event" python3 - "$RUN" "$current_id" <<'PY'
+assert_ok "current attempt has exactly one outcome event" t_python - "$RUN" "$current_id" <<'PY'
 import json,sys
 run,aid=sys.argv[1:]; attempt=json.load(open(f"{run}/09-test-evidence/reviewer-attempts/{aid}/attempt.json"))
 events=[json.loads(x) for x in open(run+"/run.jsonl") if x.strip()]
@@ -539,7 +542,7 @@ assert sum(e.get("event_id")==attempt["outcome_event_id"] for e in events)==1
 PY
 for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   provider="${pair%%:*}"; wrapper="${pair#*:}"; lock="$RUN/09-test-evidence/.reviewer-$provider.lock"
-  python3 - "$lock" "$provider" "$RUN_ID" "$SHA" "$GEN" <<'PY'
+  t_python - "$lock" "$provider" "$RUN_ID" "$SHA" "$GEN" <<'PY'
 import json,os,sys
 lock,provider,run,sha,gen=sys.argv[1:]; os.mkdir(lock,0o700)
 json.dump({"schema_version":1,"pid":99999999,"provider":provider,"run_id":run,"candidate_sha":sha,"generation":int(gen),"started_at":"2026-08-10T00:00:00Z"},open(lock+"/owner.json","w"))
@@ -569,7 +572,7 @@ assert_eq "provider did not run for malformed metadata" "" "$(cat "$CALLS")"
 mv "$WORK/run-metadata.json" "$RUN/run-metadata.json"; chmod 600 "$RUN/run-metadata.json"
 historical="$REPO/.agent-firm/runs/historical-reviewer-fixture"; mkdir -p "$historical/09-test-evidence"
 cp "$RUN/09-test-evidence/qa-candidate.json" "$historical/09-test-evidence/qa-candidate.json"
-python3 - "$historical" "$SHA" <<'PY'
+t_python - "$historical" "$SHA" <<'PY'
 import json,os,sys
 run,sha=sys.argv[1:]; p=run+"/09-test-evidence/qa-candidate.json"; d=json.load(open(p)); d["run_id"]=os.path.basename(run); json.dump(d,open(p,"w")); os.chmod(p,0o600)
 event={"ts":"2025-01-01T00:00:00Z","event":"run_started","event_id":"evt-historical-start","run_id":os.path.basename(run),"base_sha":sha,"track":"full_track"}
@@ -596,7 +599,7 @@ t_case "diagnostics retain allowlisted metadata only and raw output is not retai
 diag="$(find "$RUN/09-test-evidence/reviewer-attempts" -name diagnostic.json -type f | tail -1)"
 assert_file "redacted diagnostic exists" "$diag"
 assert_eq "diagnostic mode is 600" 600 "$(t_file_mode "$diag")"
-assert_ok "diagnostic is capped" python3 -c 'import os,sys; assert os.path.getsize(sys.argv[1]) <= 16384' "$diag"
+assert_ok "diagnostic is capped" t_python -c 'import os,sys; assert os.path.getsize(sys.argv[1]) <= 16384' "$diag"
 assert_output "diagnostic declares allowlisted metadata policy" '"content_policy": "allowlisted_metadata_only"' cat "$diag"
 assert_ok "credential/cookie/account/device/request values are absent" sh -c \
   "! grep -Eqi 'super-secret|user@example\.com|req-123|device[_ -]?code[=:]987|Bearer[[:space:]]+super-secret' '$diag'"
@@ -618,7 +621,7 @@ for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 
   test -f "$hard_lock" && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q . && break
   sleep 0.1
 done
-hard_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
+hard_pid="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
 kill -9 "$hard_pid" 2>/dev/null || true
 wait "$hard_shell" 2>/dev/null || true
 for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do

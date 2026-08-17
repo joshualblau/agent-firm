@@ -5,7 +5,8 @@ __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
-exec python3 - "$ROOT" "$SELF" "$@" <<'PY'
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
+exec "${FIRM_PYTHON_ARGV[@]}" - "$ROOT" "$SELF" "$@" <<'PY'
 import argparse
 import datetime
 import hashlib

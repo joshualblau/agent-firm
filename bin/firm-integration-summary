@@ -2,8 +2,11 @@
 # firm-integration-summary [--run RUN] --stage integrate/INSTANCE --source FILE
 # Publishes one immutable, stage-specific integration summary and updates the digest-bound index.
 set -euo pipefail
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+. "$(cd -P "$(dirname "$__src")" && pwd)/firm-python"   # one resolved interpreter for the whole firm
 
-exec python3 - "$@" <<'PY'
+exec "${FIRM_PYTHON_ARGV[@]}" - "$@" <<'PY'
 import argparse
 import fcntl
 import hashlib

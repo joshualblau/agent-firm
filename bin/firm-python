@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# firm-python — the ONE place the firm decides which python3 it runs.
+#
+# Usage as a COMMAND (it is executable, so firm-link puts it on PATH):
+#   firm-python [args...]        exec the resolved interpreter with args (firm-python -c 'import sys')
+#   firm-python --print-argv     print the resolved argv, one word per line, and exit 0
+#   firm-python --status         print one diagnostic line: p2=<yes|no> argv=<...> reason=<...>
+#   firm-python --require-p2 ... run only if the resolved interpreter satisfies the P2 gate,
+#                                otherwise print why and exit 17 (the write-unsupported class)
+#
+# Usage as a LIBRARY (this file is sourceable on purpose — one definition, not N copies):
+#   . "$SELF/firm-python"        defines firm_python(), firm_python_resolve(), and the
+#                                FIRM_PYTHON_* variables below. Sourcing resolves once, silently.
+#
+# WHY THIS EXISTS
+# Every firm-* tool used to spawn a bare `python3` inherited from $PATH, while the ledger's P2 write
+# gate in bin/firm-ledger-log admits exactly one interpreter row: CPython 3.9.6, arm64, an absolute
+# sys.executable, on Darwin. On an ordinary developer machine those are two different interpreters,
+# and they disagreed in both directions:
+#
+#   · $PATH `python3` can be a conda/pyenv build (3.8.13 here). The gate refuses it, so EVERY ledger
+#     write failed closed with WRITE_CONFIGURATION_UNSUPPORTED: p2 — while firm-doctor, which probed
+#     that same non-gate interpreter, reported the firm healthy. A doctor and a gate that read
+#     different interpreters cannot agree, and did not.
+#   · `/usr/local/bin/bash` is an x86_64-only Homebrew bash that precedes the universal `/bin/bash`
+#     on PATH, so a `#!/usr/bin/env bash` script launched from a terminal runs TRANSLATED, and the
+#     python it spawns reports platform.machine() == "x86_64" even for a universal binary. The arm64
+#     wheels installed for that very interpreter then fail to dlopen (rpds → jsonschema), so the
+#     doctor reported a missing dependency that was installed correctly.
+#
+# So the interpreter is resolved here rather than inherited. `arch -arm64` is used when the current
+# process is translated, because the gate reads the PYTHON process's platform.machine(): pinning
+# python is sufficient and no script's `#!/usr/bin/env bash` shebang has to change. A child spawned
+# from the arm64 python (the ledger's statfs descriptor helper) inherits arm64, so the whole write
+# path lands on one interpreter.
+#
+# HOW IT DEGRADES
+# The probe below tests the INTERPRETER half of the gate only (system/arch/version/implementation/
+# absolute executable). The OS half — the (macOS, Darwin) pair in SUPPORTED_P2_OS_ROWS — is a host
+# fact no interpreter choice can change, so it is not a selection criterion; firm-doctor reports it
+# clause by clause, and firm-ledger-log enforces it.
+#
+# If NO candidate satisfies the interpreter half, this does not pretend otherwise and it does not
+# silently substitute one: FIRM_PYTHON_P2 stays 0, FIRM_PYTHON_REASON names what was probed, and
+#   · `firm-python --require-p2` fails closed with exit 17 and that reason;
+#   · firm-doctor turns it into a FAIL that gates its exit code (section 10);
+#   · firm-ledger-log still reaches its centralized gate, which refuses the write with exit 17 and
+#     WRITE_CONFIGURATION_UNSUPPORTED: p2 before any mutation, lock or temp file — the established
+#     fail-closed contract, which is also what keeps the firm's non-write tooling usable on the
+#     deliberately unsupported CI hosts (see .github/workflows/ci.yml).
+# Falling back is therefore never silent: every path that depends on P2 says so out loud.
+#
+# bash 3.2 safe (macOS ships 3.2.57): no associative arrays, no mapfile, no process substitution, and
+# FIRM_PYTHON_ARGV is never left empty because `"${arr[@]}"` on an empty array is an unbound-variable
+# error under `set -u` in 3.2.
+
+# ---- expectations: the interpreter half of the P2 gate ---------------------
+# Stated once, here. firm-doctor reports "actual vs supported" from these, so its section 10 and this
+# resolver cannot drift apart. The OS-row half is read from SUPPORTED_P2_OS_ROWS in bin/firm-ledger-log
+# by whoever needs it (firm-doctor, tests/test-ledger-platform-gate.sh, .github/workflows/ci.yml) —
+# there is exactly one copy of that set and this file does not add a second.
+FIRM_PYTHON_EXPECT_SYSTEM="Darwin"
+FIRM_PYTHON_EXPECT_ARCH="arm64"
+FIRM_PYTHON_EXPECT_VERSION="3.9.6"
+FIRM_PYTHON_EXPECT_IMPL="cpython"
+
+# Resolution outputs. FIRM_PYTHON_ARGV is the interpreter COMMAND (it can be more than one word, e.g.
+# `/usr/bin/arch -arm64 /usr/bin/python3`), which is why callers use the array or firm_python().
+FIRM_PYTHON_ARGV=(python3)
+FIRM_PYTHON_P2=0
+FIRM_PYTHON_REASON="not resolved yet"
+FIRM_PYTHON_TRIED=""
+FIRM_PYTHON_DISPLAY="python3"
+
+_FIRM_PYTHON_PROBE='
+import os, sys, platform
+system, arch, version, impl = sys.argv[1:5]
+ok = (
+    platform.system() == system
+    and platform.machine() == arch
+    and ".".join(str(part) for part in sys.version_info[:3]) == version
+    and getattr(sys.implementation, "name", "") == impl
+    and isinstance(sys.executable, str)
+    and bool(sys.executable)
+    and os.path.isabs(sys.executable)
+)
+sys.exit(0 if ok else 3)
+'
+
+# _firm_python_probe <argv...> — rc 0 iff that command is a P2-compliant interpreter. Silent, and
+# stdin is closed so a probe can never consume a caller's heredoc or hang on a terminal.
+_firm_python_probe() {
+  "$@" -c "$_FIRM_PYTHON_PROBE" \
+    "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
+    "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" \
+    </dev/null >/dev/null 2>&1
+}
+
+# _firm_python_candidates — one interpreter path per line, in preference order.
+#
+# $PATH `python3` is probed FIRST so an operator who has put a compliant interpreter (a venv, a
+# self-hosted CI runner's 3.9.6) in front keeps the packages installed for it; the absolute paths
+# after it are the macOS system interpreters, which is where 3.9.6 actually lives on this OS.
+# $FIRM_PYTHON, when set, jumps the queue — it is still probed like every other candidate, so an
+# override cannot smuggle a non-compliant interpreter past the P2 report.
+_firm_python_candidates() {
+  if [ -n "${FIRM_PYTHON:-}" ]; then printf '%s\n' "$FIRM_PYTHON"; fi
+  _fp_path="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$_fp_path" ]; then printf '%s\n' "$_fp_path"; fi
+  printf '%s\n' \
+    /usr/bin/python3 \
+    /Library/Developer/CommandLineTools/usr/bin/python3 \
+    /Applications/Xcode.app/Contents/Developer/usr/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
+}
+
+# firm_python_resolve — set FIRM_PYTHON_ARGV / _P2 / _REASON / _TRIED / _DISPLAY. Always rc 0: the
+# verdict is the variables, not the exit status, so a caller under `set -e` decides what to do.
+firm_python_resolve() {
+  FIRM_PYTHON_P2=0
+  FIRM_PYTHON_REASON=""
+  FIRM_PYTHON_TRIED=""
+  _fp_prefix=""
+  # One arch decision for the whole host, not one per candidate. A translated parent's direct child
+  # reports x86_64 no matter which universal binary it is, so on such a parent the `arch -arm64` form
+  # is the only one that can pass; on a real Intel Mac `arch -arm64` fails here in microseconds and
+  # the direct form is used. HOSTTYPE is a bash builtin (the shell binary's own arch), so deciding
+  # this costs no subprocess in the common native case.
+  case "${HOSTTYPE:-}" in
+    arm64|aarch64) : ;;
+    *)
+      if [ -x /usr/bin/arch ] && /usr/bin/arch -arm64 /usr/bin/true >/dev/null 2>&1; then
+        _fp_prefix="/usr/bin/arch -arm64"
+      fi
+      ;;
+  esac
+
+  _fp_seen=""
+  _fp_first=""
+  while IFS= read -r _fp_cand; do
+    [ -n "$_fp_cand" ] || continue
+    case "$_fp_seen" in *"<$_fp_cand>"*) continue ;; esac   # probe each distinct path once
+    _fp_seen="$_fp_seen<$_fp_cand>"
+    [ -x "$_fp_cand" ] || continue
+    [ -n "$_fp_first" ] || _fp_first="$_fp_cand"
+    FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand"
+    if [ -n "$_fp_prefix" ]; then
+      if _firm_python_probe /usr/bin/arch -arm64 "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=(/usr/bin/arch -arm64 "$_fp_cand")
+        FIRM_PYTHON_P2=1
+        break
+      fi
+    else
+      if _firm_python_probe "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=("$_fp_cand")
+        FIRM_PYTHON_P2=1
+        break
+      fi
+    fi
+  done <<EOF
+$(_firm_python_candidates)
+EOF
+
+  if [ "$FIRM_PYTHON_P2" -ne 1 ]; then
+    # Nothing compliant. Keep the firm runnable on a deliberately unsupported host (CI, Linux) with
+    # the plain interpreter, and say exactly why every P2-dependent path is about to refuse.
+    if [ -n "${FIRM_PYTHON:-}" ]; then
+      FIRM_PYTHON_ARGV=("$FIRM_PYTHON")
+    elif [ -n "$_fp_first" ]; then
+      FIRM_PYTHON_ARGV=("$_fp_first")
+    else
+      FIRM_PYTHON_ARGV=(python3)
+    fi
+    FIRM_PYTHON_REASON="no interpreter on this host is $FIRM_PYTHON_EXPECT_SYSTEM/$FIRM_PYTHON_EXPECT_ARCH \
+$FIRM_PYTHON_EXPECT_IMPL $FIRM_PYTHON_EXPECT_VERSION with an absolute sys.executable; probed: ${FIRM_PYTHON_TRIED:-none}"
+  fi
+
+  FIRM_PYTHON_DISPLAY="${FIRM_PYTHON_ARGV[*]}"
+  return 0
+}
+
+# firm_python <args...> — run the resolved interpreter. Heredocs work: `firm_python - a b <<'PY'`.
+firm_python() {
+  "${FIRM_PYTHON_ARGV[@]}" "$@"
+}
+
+firm_python_resolve
+
+# ---- command mode ---------------------------------------------------------
+# Sourced files must not run the dispatcher below, and must not change the caller's shell options.
+# $0 is the outer script when sourced and this file when executed.
+case "${BASH_SOURCE[0]:-$0}" in
+  "$0")
+    set -uo pipefail
+    _fp_require=0
+    case "${1:-}" in
+      --print-argv)
+        printf '%s\n' "${FIRM_PYTHON_ARGV[@]}"
+        exit 0
+        ;;
+      --status)
+        printf 'p2=%s argv=%s reason=%s\n' \
+          "$( [ "$FIRM_PYTHON_P2" -eq 1 ] && printf yes || printf no )" \
+          "$FIRM_PYTHON_DISPLAY" "${FIRM_PYTHON_REASON:-none}"
+        exit 0
+        ;;
+      -h|--help)
+        sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+      --require-p2) _fp_require=1; shift ;;
+    esac
+    if [ "$_fp_require" -eq 1 ] && [ "$FIRM_PYTHON_P2" -ne 1 ]; then
+      printf 'firm-python: no P2-compliant interpreter — %s\n' "$FIRM_PYTHON_REASON" >&2
+      printf 'firm-python: refusing to run a non-compliant interpreter under --require-p2.\n' >&2
+      exit 17
+    fi
+    exec "${FIRM_PYTHON_ARGV[@]}" "$@"
+    ;;
+esac

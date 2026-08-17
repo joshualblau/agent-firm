@@ -7,6 +7,7 @@ set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"; ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
 mode="${1:---check}"
 value="${2:-}"
@@ -24,7 +25,7 @@ case "$mode" in
   *) echo "firm-version: unknown mode '$mode'" >&2; exit 2 ;;
 esac
 
-exec python3 - "$ROOT" "$mode" "$value" "$SELF/firm-bootstrap" <<'PY'
+exec "${FIRM_PYTHON_ARGV[@]}" - "$ROOT" "$mode" "$value" "$SELF/firm-bootstrap" <<'PY'
 import json
 import os
 import re

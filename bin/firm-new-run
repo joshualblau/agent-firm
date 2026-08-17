@@ -12,10 +12,11 @@ while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(
 SCRIPT_DIR="$(cd -P "$(dirname "$__src")" && pwd)"
 FIRM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATES="$FIRM_ROOT/agent-firm/templates"
+. "$SCRIPT_DIR/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
 if [[ "${1:-}" == "--metadata-view" ]]; then
   [[ $# -eq 2 ]] || { echo "usage: firm-new-run --metadata-view <run-dir>" >&2; exit 2; }
-  exec python3 - "$2" <<'PY'
+  exec "${FIRM_PYTHON_ARGV[@]}" - "$2" <<'PY'
 import json, os, re, stat, subprocess, sys
 
 def fail(message):

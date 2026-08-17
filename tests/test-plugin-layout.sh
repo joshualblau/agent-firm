@@ -61,13 +61,13 @@ for path in \
   agent-firm/contracts/roles/packager.md agent-firm/contracts/roles/qa-tester.md \
   agent-firm/contracts/roles/recruiter.md agent-firm/contracts/roles/reviewer.md \
   agent-firm/contracts/roles/scout.md agent-firm/contracts/roles/specialist.md \
-  bin/firm-claude-qa bin/firm-final-qa-check bin/firm-reviewer-common bin/firm-version \
+  bin/firm-claude-qa bin/firm-final-qa-check bin/firm-python bin/firm-reviewer-common bin/firm-version \
   codex-skills/start/SKILL.md hooks/claude.json tests/test-bootstrap-dual.sh \
   tests/test-final-qa-check.sh tests/test-model-tiers.sh tests/test-plugin-layout.sh \
   tests/test-provider-reviewers.sh; do
   assert_ok "tracked intended input: $path" git -C "$FIRM_ROOT" ls-files --error-unmatch "$path"
 done
-for path in bin/firm-claude-qa bin/firm-final-qa-check bin/firm-version \
+for path in bin/firm-claude-qa bin/firm-final-qa-check bin/firm-python bin/firm-version \
   tests/test-bootstrap-dual.sh tests/test-final-qa-check.sh tests/test-model-tiers.sh \
   tests/test-plugin-layout.sh tests/test-provider-reviewers.sh; do
   assert_output "executable Git mode: $path" "100755" sh -c \
@@ -124,8 +124,12 @@ SH
 chmod +x "$HOOK_PROJECT/provider-stubs/claude" "$HOOK_PROJECT/provider-stubs/codex"
 provider_log="$HOOK_PROJECT/provider.log"
 : > "$provider_log"
-python_exe="$(python3 -c 'import sys; print(sys.executable)')"
-hook_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
+# Build this fixture from the interpreter the FIRM resolves (bin/firm-python), not from PATH's
+# python3. firm-doctor probes its own resolved interpreter, so a PYTHONPATH computed from a different
+# one hands it site-packages built for the wrong version -- the fixture would then manufacture the
+# very "installed package fails to import" failure this suite is not trying to test.
+python_exe="$("$BIN/firm-python" -c 'import sys; print(sys.executable)')"
+hook_pythonpath="$("$BIN/firm-python" -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
 ln -s "$python_exe" "$HOOK_PROJECT/provider-stubs/python3"
 hook_before="$(shasum -a 256 "$HOOK_PROJECT/.codex/hooks.json" | cut -d' ' -f1)"
 hook_mode="$(t_file_mode "$HOOK_PROJECT/.codex/hooks.json")"
@@ -246,7 +250,7 @@ assert_output "Claude start uses Claude-primary run metadata" "--primary claude"
 
 t_case "provider adapters share one resolver-bound role-start boundary"
 assert_ok "adapter blocks, call sites, lifecycle, and inventory preserve provider parity" \
-  python3 - "$FIRM_ROOT" <<'PY'
+  t_python - "$FIRM_ROOT" <<'PY'
 import copy, pathlib, re, sys, yaml
 
 root = pathlib.Path(sys.argv[1])
@@ -284,7 +288,8 @@ def required_callsite(provider):
         "The producer validates and records; it does not invoke a provider",
         "perform a second model resolution",
         "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
-        "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+        "Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS 26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython 3.9.6",
+        "A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard",
         "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
     ]
 
@@ -311,7 +316,8 @@ for phrase in (
     "The producer validates and records; it does not invoke or simulate either provider",
     "`firm-model-resolve` remains the sole role-to-tier/model authority",
     "Record ordinary non-role milestones through ordinary `firm-ledger-log`",
-    "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+    "Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS 26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython 3.9.6",
+    "A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard",
     "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
 ):
     assert flat(phrase) in lifecycle, phrase
@@ -323,7 +329,8 @@ for phrase in (
     "retains the same returned `event_id`",
     "a second model resolution are not valid paths",
     "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
-    "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+    "Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS 26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython 3.9.6",
+    "A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard",
     "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
 ):
     assert flat(phrase) in readme, phrase
@@ -345,6 +352,48 @@ launcher_forms = (
 for pattern in launcher_forms:
     assert not re.search(pattern, producer), pattern
 PY
+
+t_case "the user-facing P2 prose names exactly the rows the writer admits"
+# The four copies (README, lifecycle contract, and BOTH provider init instructions) are the only
+# statement a human reads before starting a run, and they went stale the moment the allowlist grew:
+# they still promised a single exact row while the writer had admitted two. Lock them to the writer
+# itself rather than to a restated literal -- a second hand-maintained copy of the row set is exactly
+# what drifted. The phrase assertions above keep the sentence present; this keeps it TRUE.
+assert_ok "prose rows are read from SUPPORTED_P2_OS_ROWS and the four copies stay identical" \
+  python3 - "$FIRM_ROOT" <<'PY'
+import ast, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+source = (root / "bin/firm-ledger-log").read_text()
+match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+if match is None:
+    raise SystemExit("cannot read SUPPORTED_P2_OS_ROWS from the production writer")
+rows = ast.literal_eval(match.group(1))
+
+copies = [
+    root / "README.md",
+    root / "agent-firm/contracts/lifecycle.md",
+    root / "commands/start.md",
+    root / "codex-skills/start/SKILL.md",
+]
+paragraph = re.compile(
+    r"Ledger writes in this release are supported only on a closed allowlist of proven P2 rows:"
+    r".*?proving evidence\.",
+    re.S,
+)
+seen = {}
+for path in copies:
+    text = path.read_text()
+    found = paragraph.findall(text)
+    assert len(found) == 1, (path, len(found))
+    flat = " ".join(found[0].split())
+    # Every proven row is named, and NO row is named that the writer does not admit.
+    listed = set(re.findall(r"macOS (\S+?) with Darwin ([0-9][^,\s]*)", flat))
+    assert listed == set(rows), (path, sorted(listed), sorted(rows))
+    seen.setdefault(flat, []).append(path.name)
+assert len(seen) == 1, seen   # the four copies must stay byte-identical to each other
+PY
+
 assert_ok "independent mutations kill both provider call patterns" python3 - "$FIRM_ROOT" <<'PY'
 import pathlib, sys
 
@@ -369,7 +418,8 @@ def required(provider):
         "The producer validates and records; it does not invoke a provider",
         "perform a second model resolution",
         "Ordinary non-role milestones continue through ordinary `firm-ledger-log`",
-        "Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0, arm64, local APFS, and CPython 3.9.6",
+        "Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS 26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython 3.9.6",
+        "A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard",
         "Linux and every other mismatched or unverifiable environment are unsupported and fail closed without a success result; ordinary best-effort mode is not a fallback",
     ]
 
