@@ -98,6 +98,20 @@ successful ledger mutation. The complete `tests/run-tests.sh` write-path proof r
 exact P2 row or through the manual `run_exact_p2` workflow dispatch on a trusted self-hosted runner
 labelled `agent-firm-p2`. Pull-request code cannot schedule that runner.
 
+The runner executes the test **files** concurrently — one worker per CPU by default, overridden by
+`--jobs N`, `$FIRM_TEST_JOBS`, or `--serial`. This is a change of schedule and nothing else: every
+file and every assertion still runs, each file's output is still printed whole and in the order a
+serial run prints it, and any file exiting non-zero still fails the suite. It also prints a per-file
+wall-clock profile, because "which file is slow" is otherwise unanswerable. On this repo's 8-CPU
+reference host that took the full suite from 21m27s to about 4m. One caveat is recorded in the
+runner's own header: `test-merge-guard.sh` measures the guard's parse phase against its real 4000ms
+production budget, and that case already used 67% of it serially — concurrency has been observed to
+take it to 96%. Every run so far is green; use `--serial` if you need that case's serial margin.
+`--fast` narrows a run to the files
+your changes can reach and is a **development convenience only** — it announces that in its own
+output and deliberately does not print the line a passing full run prints. `full` is what runs before
+QA, the Final gate and CI. `tests/test-suite-runner.sh` holds the runner to all of the above.
+
 ## Layout
 ```
 .claude-plugin/plugin.json    # plugin manifest (name, version) — drives the versioned install
