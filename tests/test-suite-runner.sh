@@ -15,6 +15,9 @@
 #     they can only both fail if they did not. A wall-clock comparison would assert about host load.
 #   · Every synthetic file that must NOT run is written to exit non-zero, so "it was skipped" cannot
 #     be satisfied by a file that ran and happened to pass.
+#   · A case about the runner's MECHANISM may sed a synthetic classifier into its copy. A case about
+#     what the checked-in classifier CONTAINS must not — it has to run the runner as committed, or it
+#     is asserting about a file nobody ships.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -129,9 +132,11 @@ has "and the totals count only what the surviving file reported" \
     "1 passed, 0 failed across 2 test files" "$out"
 
 t_case "a runs_alone file is scheduled with nothing else in flight"
-# The classifier is empty in the checked-in runner, so the MECHANISM is what is tested: a copy with one
-# name classified must schedule that name alone. Without this the empty list is decorative, and the
-# next file that needs isolation would inherit a scheduler nobody had ever run.
+# The MECHANISM, tested through a name the checked-in classifier does not hold: a copy with one name
+# sed'd in must schedule that name alone. Being independent of the real list is the point — it keeps
+# the scheduler honest even if the list is emptied out again — but for exactly that reason it says
+# NOTHING about what the list currently contains. The list is no longer empty (`merge-guard` is in it
+# as of this commit's parent), and its CONTENTS are the separate question the next case asks.
 d="$(mk_suite)"
 sed -e 's/^runs_alone() {$/runs_alone() { case "$1" in solo) return 0 ;; esac ;/' \
   "$RUNNER" > "$d/tests/run-tests.sh"
@@ -142,6 +147,48 @@ out="$(bash "$d/tests/run-tests.sh" --jobs 4 2>&1)"
 assert_eq "the classified file could not overlap its partner, so the suite fails" 1 "$?"
 has   "the classified file is the one that timed out waiting" "FAILURES — solo" "$out"
 hasnt "its partner was not also stranded — it ran after, and found the marker" "FAILURES — solo other" "$out"
+
+t_case "the CHECKED-IN classifier really strands merge-guard, not merely some injected name"
+# The case above sed's a synthetic name into a copy of the runner, so it would keep passing if the
+# `merge-guard) return 0 ;;` entry were deleted from tests/run-tests.sh — measured, not assumed. That
+# deletion is silent in the worst way: tests/test-merge-guard.sh's "classification finishes inside
+# PARSE_BUDGET" case would go back to timing the harness rather than the guard's real parse phase,
+# and would go on PASSING while doing it. So this case runs the runner AS COMMITTED — no sed, no
+# injection — and asks the classifier about the real name.
+#
+# The CONTROL is not decoration. A rendezvous that could never observe an overlap would "prove"
+# isolation just as loudly on a runner that had stopped running anything concurrently at all, so the
+# probe is first shown to report a POSITIVE, with two ordinary names, before its negative is trusted.
+# Everything but the names is held fixed between the two: same file count, same bodies, same --jobs.
+d="$(mk_suite)"
+mk_test "$d" aaa 0 1 0 "$(rendez "$d" A B)"
+mk_test "$d" zzz 0 1 0 "$(rendez "$d" B A)"
+out="$(bash "$d/tests/run-tests.sh" --jobs 4 2>&1)"
+assert_eq "CONTROL: two ordinary names DO overlap, so this probe can see a positive" 0 "$?"
+has "and both are counted" "2 passed, 0 failed across 2 test files" "$out"
+
+d="$(mk_suite)"
+assert_ok "the runner under test is the checked-in file, byte for byte" \
+  cmp -s "$RUNNER" "$d/tests/run-tests.sh"
+mk_test "$d" merge-guard 0 1 0 "$(rendez "$d" A B)"
+mk_test "$d" other       0 1 0 "$(rendez "$d" B A)"
+out="$(bash "$d/tests/run-tests.sh" --jobs 4 2>&1)"
+assert_eq "the same probe under the real name cannot overlap, so the suite fails" 1 "$?"
+has   "merge-guard is the file that timed out waiting" "FAILURES — merge-guard" "$out"
+hasnt "its partner was not also stranded — it ran after, and found the marker" \
+      "FAILURES — merge-guard other" "$out"
+
+# THE LATCH. "Alone" has to hold for the file's whole life, not just until the next launch decision.
+# Three partners and eight workers, so a scheduler leaking even a single slot lets one of them publish
+# the marker and turns the probe above green for the wrong reason.
+d="$(mk_suite)"
+mk_test "$d" merge-guard 0 1 0 "$(rendez "$d" A B)"
+for nm in p1 p2 p3; do mk_test "$d" "$nm" 0 1 0 ": > '$d/B'"; done
+out="$(bash "$d/tests/run-tests.sh" --jobs 8 2>&1)"
+assert_eq "3 partners at --jobs 8 still leave it stranded, so nothing at all starts beside it" 1 "$?"
+has "and it is still the only file named as failed" "FAILURES — merge-guard" "$out"
+has "the partners did run, after it — they were held back, not dropped" \
+    "3 passed, 0 failed across 4 test files" "$out"
 
 # ---------------------------------------------------------------------------
 t_case "--unsupported-p2 skips exactly the classified files, in place, and does not run them"
