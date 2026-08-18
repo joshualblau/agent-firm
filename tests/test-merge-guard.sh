@@ -2109,8 +2109,17 @@ assert_eq "and none of them spawned gh/git/python3" "" \
 # is not hypothetical: this wave added a docstring containing a literal backslash-angle-bracket, which
 # is an invalid escape sequence — a DeprecationWarning on python 3.9 (silent in normal runs) and a
 # SyntaxError in a future python, i.e. the whole gate turning into exit 2 on a version bump.
+#
+# t_python, NOT bare `python3` (CC-08). This file legitimately builds PATHs on purpose and its
+# PATH-resolution cases must keep the bare form -- but this case is not one of them. It compiles the
+# guard's embedded program, and the guard EXECUTES that program under the interpreter bin/firm-python
+# resolves. On this host those were conda 3.8.13 and CPython 3.9.6. Compiling under a different
+# interpreter than the one that runs it is the mis-verification this whole change exists to remove,
+# and in the direction where PATH's python3 is NEWER than 3.9.6 -- an ordinary developer machine with
+# a brew 3.12 -- a 3.10+ construct compiles green here and raises SyntaxError at hook time. That is a
+# false green on a fail-closed control.
 t_case "the embedded python checker compiles cleanly, with warnings as errors"
-assert_ok "extractable, syntactically valid, and warning-free" python3 -c "
+assert_ok "extractable, syntactically valid, and warning-free" t_python -c "
 import re, sys, warnings
 src = open('$GUARD').read()
 m = re.search(r\"- <<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)

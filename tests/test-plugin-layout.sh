@@ -359,8 +359,13 @@ t_case "the user-facing P2 prose names exactly the rows the writer admits"
 # they still promised a single exact row while the writer had admitted two. Lock them to the writer
 # itself rather than to a restated literal -- a second hand-maintained copy of the row set is exactly
 # what drifted. The phrase assertions above keep the sentence present; this keeps it TRUE.
+# t_python, not bare `python3` (SEC-07/CC-08). The three sibling blocks in this file were converted
+# in the same commit that added this one and this one was missed. It reads bin/firm-ledger-log, which
+# is the firm's own source, so it must be read by the interpreter the firm runs -- and on a host with
+# no PATH python3 but a resolvable firm interpreter (the shape tests/test-python-interpreter.sh
+# exists to protect) the bare form makes this file go red for a reason unrelated to what it tests.
 assert_ok "prose rows are read from SUPPORTED_P2_OS_ROWS and the four copies stay identical" \
-  python3 - "$FIRM_ROOT" <<'PY'
+  t_python - "$FIRM_ROOT" <<'PY'
 import ast, pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -390,8 +395,17 @@ for path in copies:
     # Every proven row is named, and NO row is named that the writer does not admit.
     listed = set(re.findall(r"macOS (\S+?) with Darwin ([0-9][^,\s]*)", flat))
     assert listed == set(rows), (path, sorted(listed), sorted(rows))
-    seen.setdefault(flat, []).append(path.name)
-assert len(seen) == 1, seen   # the four copies must stay byte-identical to each other
+    # BYTE-IDENTICAL MEANS BYTE-IDENTICAL (CC-07). This keyed the comparison on `flat`, the
+    # whitespace-NORMALISED text, while the comment and the assertion both said "byte-identical" --
+    # so reflowing one copy onto a single physical line left the check passing and the stated
+    # invariant false. Reproduced against scratch copies. `flat` is kept for the row extraction
+    # above, where normalisation is what makes the regex robust across line wrapping; the identity
+    # of the four copies is judged on the raw paragraph. The claim and the assertion now match, and
+    # the stronger of the two was chosen: these four are generated-by-hand duplicates of one
+    # sentence, a prose linter or an editor reflowing one of them is precisely the drift worth
+    # catching, and the cost of the stricter rule is that a deliberate rewrap must touch all four.
+    seen.setdefault(found[0], []).append(path.name)
+assert len(seen) == 1, {text[:40]: names for text, names in seen.items()}
 PY
 
 assert_ok "independent mutations kill both provider call patterns" python3 - "$FIRM_ROOT" <<'PY'
