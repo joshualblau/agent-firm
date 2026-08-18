@@ -62,9 +62,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 # These suites intentionally exercise successful ledger mutation or consume events emitted by that
-# mutation. Running them on a host outside the exact P2 row would test a configuration the production
-# writer explicitly rejects. Keep the exclusion closed and named: a new test runs by default and must
-# be consciously classified here if it really requires a supported write host.
+# mutation. Running them on a host outside a PROVEN P2 row would test a configuration the production
+# writer explicitly rejects. (Plural since the row set became a closed allowlist of two — "the exact
+# P2 row" is the old singular and it now reads as excluding hosts that are in fact supported.) Keep
+# the exclusion closed and named: a new test runs by default and must be consciously classified here
+# if it really requires a supported write host.
 requires_supported_p2() {
   case "$1" in
     check-assertions|final-qa-check|ledger-compatibility|ledger-log|ledger-role-start|merge-guard|\
@@ -88,7 +90,22 @@ requires_supported_p2() {
 #   2. It asserts an upper bound on elapsed time that host load could break. Most have wide margins —
 #      a 30s registered hook timeout for a pair that takes well under a second, two 20s polls for a
 #      state transition, a 30s deadline on a command asserted to exit in ~0s, one real 5s descriptor
-#      deadline asserted to land under 6.5s. ONE DOES NOT, and it is measured rather than assumed:
+#      deadline asserted to land under 6.5s.
+#
+#      THE ORIGINAL SURVEY MISSED THE TWO TIGHTEST WAITS IN THE SUITE (CR-08): a 2.0s poll for the
+#      reviewer lock and a 3.0s poll for the hard-kill lock, both in tests/test-provider-reviewers.sh,
+#      both sitting on a path this change measurably lengthened (bin/firm-reviewer-common shells out
+#      to bin/firm-model-resolve before creating the lock, and both now pay a full interpreter
+#      resolution — ~200ms each on an idle host, so ~0.4s of a 2.0s budget before any concurrency
+#      multiplier). Neither is a wall-clock ASSERTION, which is why they were not on this list, but
+#      an expired poll there fails an assertion AND makes the next one wrong in the misleading
+#      direction. They are now 10s, matching wait_ready() in tests/test-ledger-role-start.sh; the
+#      loops exit on the first successful test, so a green run pays nothing. That is the cheaper of
+#      the two fixes CR-08 offered — the other was classifying provider-reviewers `runs_alone`, which
+#      costs a large share of the remaining speedup to buy margin the widened polls already give.
+#
+#      ONE FILE DOES assert an elapsed-time bound that load can break, and it is measured rather than
+#      assumed:
 #
 #        tests/test-merge-guard.sh's "classification finishes inside PARSE_BUDGET" runs the guard's
 #        real parse phase against its real 4000ms production budget. Serially it lands at 2675ms —
@@ -429,6 +446,41 @@ EOF
         frc[$i]="$r"
         st[$i]=2; running=$((running-1)); moved=1
         [ "${alone[$i]}" = 1 ] && alone_running=0
+      elif [ "${st[$i]}" = 1 ] && ! kill -0 "${pid[$i]}" 2>/dev/null; then
+        # LIVENESS, not completion (CR-02). The sentinel above stays the ONLY way a worker reports
+        # its exit status, for the reason stated at the top of this block. But a worker that dies
+        # BETWEEN `bash <file>` and the `mv` never writes one, and without this arm `st[i]` stays 1,
+        # `moved` stays 0, `printed` never advances and the runner sleeps 0.05s forever. Reproduced
+        # with a file that does `kill -9 $PPID` after printing its summary — which is what an OOM
+        # kill, a memory cgroup limit, a `ulimit` kill or a stray `pkill -9` looks like from here,
+        # and what a full or read-only $TMPDIR looks like when the write of <i>.rc fails. The serial
+        # runner has no such failure mode; the hosted CI job would have burned GitHub's 360-minute
+        # default and reported a transcript naming nothing, because printing is index-ordered.
+        #
+        # `kill -0` is refused ABOVE as a COMPLETION detector and that refusal still stands: a
+        # finished-but-unreaped child answers signal 0, so a poll on it never terminates. Failing
+        # signal 0 is the other direction and it is sound — the pid is gone, and the `mv` is the
+        # worker's last act before exiting, so a live worker cannot be here. The re-test closes the
+        # only remaining window (exit observed between the -f above and the kill -0 here); if the
+        # sentinel has appeared, the next pass through this loop takes the normal branch.
+        if [ ! -f "$WORK/$i.done" ]; then
+          dur[$i]=$(( $(_now_ms) - ${beg[$i]} ))
+          # The runner authors a summary line here, which it does nowhere else. Whatever count the
+          # file printed before it died describes a run that did not finish, and `tail -1` in the
+          # totals block takes the LAST such line — so without this the grand total would fold in a
+          # "N passed, 0 failed" from a file that was killed. Substituting 0/1 keeps the totals in
+          # the only safe direction and keeps them consistent with the FAILURES list.
+          {
+            printf '\n  WORKER DIED without reporting an exit status — killed (OOM, cgroup, ulimit,\n'
+            printf '  a stray signal), or its exit-status file could not be written. Counted as a\n'
+            printf '  FAILURE of this file, not as a hang. Any count printed above is from an\n'
+            printf '  execution that did not finish and is superseded by the line below.\n'
+            printf '  ── 0 passed, 1 failed\n'
+          } >> "$WORK/$i.out" 2>/dev/null || true
+          frc[$i]=1
+          st[$i]=2; running=$((running-1)); moved=1
+          [ "${alone[$i]}" = 1 ] && alone_running=0
+        fi
       fi
       i=$((i+1))
     done

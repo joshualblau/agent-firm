@@ -1,14 +1,24 @@
 name: ci
 
-# Hosted runners are outside the exact P2 ledger-write row. They run every suite that is meaningful
-# on an unsupported host, including a real-host assertion that writes fail closed before mutation.
-# The complete write-path suite is a manual dispatch to a deliberately labelled exact-P2 self-hosted
-# runner; pull-request code can never schedule that trusted runner. Structural eval mode remains
-# provider-neutral and offline — no login and no spend.
+# Hosted runners are outside every proven P2 ledger-write row. They run every suite that is
+# meaningful on an unsupported host, including a real-host assertion that writes fail closed before
+# mutation. The complete write-path suite is a manual dispatch to a deliberately labelled exact-P2
+# self-hosted runner; pull-request code can never schedule that trusted runner. Structural eval mode
+# remains provider-neutral and offline — no login and no spend.
 #
 # The suite is NOT dependency-free: the scripts and tests shell out to python3 and Node;
 # `test-validate-verdict` needs `jsonschema`, and `test-policy-yaml-valid` needs `pyyaml`. Hosted
 # runners provide Node; the exact-P2 runner is explicitly checked. Python packages are pinned below.
+#
+# THEY ARE INSTALLED FOR THE INTERPRETER THE FIRM RESOLVES, NOT FOR PATH's `python3` (CR-01). Since
+# tests/lib.sh sources bin/firm-python, the whole suite runs whatever that resolver selects. On
+# macos-latest that is /usr/bin/python3 (CPython 3.9.6, arm64, P2-compliant) and NOT the
+# actions/setup-python 3.12 that comes first on PATH — the resolver probes the 3.12, rejects it on
+# version, and moves on. `python -m pip install` therefore put both packages in an interpreter the
+# suite never runs, and the macOS job would have gone red with 14 bare ModuleNotFoundErrors. Every
+# install and every probe below goes through bin/firm-python for that reason, and each is followed by
+# an assertion that the resolved interpreter can actually import what was just installed, so a future
+# drift is a one-line failure rather than a wall of import errors.
 
 "on":
   push:
@@ -16,7 +26,10 @@ name: ci
   workflow_dispatch:
     inputs:
       run_exact_p2:
-        description: Run the full suite on a trusted exact-P2 self-hosted runner
+        # The identifier stays `run_exact_p2` for stability (it is referenced by dispatch callers);
+        # the description says what is now true — the OS half is a closed allowlist of proven rows,
+        # not one row (CC-04).
+        description: Run the full suite on a trusted self-hosted runner on a proven P2 row
         required: true
         default: false
         type: boolean
@@ -56,6 +69,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A worker that dies without publishing its sentinel used to leave tests/run-tests.sh spinning
+    # with no upper bound (CR-02). That is fixed in the runner, but a job with no timeout still burns
+    # GitHub's 360-minute default on ANY hang, and this job had none. The full unsupported-P2 profile
+    # is single-digit minutes on these runners.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -67,10 +85,18 @@ jobs:
           git config --global user.name "agent-firm CI"
           git config --global init.defaultBranch main
       # Versions are pinned so a CI result is reproducible and a bad upstream release can't turn a
-      # green run red (or vice versa) without a reviewed commit here. Both have cp312 wheels for the
-      # ubuntu-x86_64 and macos-arm64 runners, so no build toolchain is needed.
-      - name: install the declared prerequisites (pinned)
-        run: python -m pip install jsonschema==4.26.0 pyyaml==6.0.3
+      # green run red (or vice versa) without a reviewed commit here. Wheels exist for cp39 and cp312
+      # on the ubuntu-x86_64 and macos-arm64 runners, so no build toolchain is needed either way.
+      #
+      # `bin/firm-python -m pip`, not `python -m pip`: this is the same instruction docs/INSTALL.md
+      # gives a human, and it is the only form that puts the packages where the suite will look for
+      # them. See the CR-01 note in this file's header.
+      - name: install the declared prerequisites (pinned, into the resolved interpreter)
+        run: bin/firm-python -m pip install --user jsonschema==4.26.0 pyyaml==6.0.3
+      - name: the resolved interpreter is the one that got the packages
+        run: |
+          bin/firm-python --status
+          bin/firm-python -c 'import jsonschema, yaml, sys; print("deps ok on", sys.executable)'
       - name: run unsupported-P2 suite (modern Bash and GNU userland)
         if: runner.os == 'Linux'
         run: bash tests/run-tests.sh --unsupported-p2
@@ -97,10 +123,29 @@ jobs:
           python3 -m venv "$p2_venv"
           "$p2_venv/bin/python" -m pip install jsonschema==4.26.0 pyyaml==6.0.3
           printf '%s\n' "$p2_venv/bin" >> "$GITHUB_PATH"
-      - name: verify the exact P2 process row
+          printf 'P2_VENV=%s\n' "$p2_venv" >> "$GITHUB_ENV"
+      # SEC-06: this probe used to run `python3` -- the venv it had just prepended to $GITHUB_PATH --
+      # while the suite it certifies resolves its interpreter through bin/firm-python. Nothing bound
+      # the two, which is the same "probe a different interpreter than the code under test" defect
+      # the rest of this change exists to eliminate, left in the one job that certifies the trusted
+      # runner. On a normal native runner they agree; nothing asserted that they must, and
+      # bin/firm-python does not simply take PATH's python3 (it probes candidates, and prefixes each
+      # with `/usr/bin/arch -arm64` when the invoking bash is translated, which changes the answer to
+      # platform.machine()). The row is now read THROUGH the resolver, and the resolver is asserted
+      # to have selected the venv this job just built.
+      - name: verify the P2 process row, through the interpreter the suite will run
         run: |
           command -v node >/dev/null
-          python3 - <<'PY'
+          bin/firm-python --status
+          bin/firm-python --status | grep -q 'p2=yes'
+          argv0="$(bin/firm-python --print-argv | tail -1)"
+          case "$argv0" in
+            "$P2_VENV"/bin/*) printf 'resolved interpreter is this venv: %s\n' "$argv0" ;;
+            *) printf 'P2 runner mismatch: the resolver selected %s, not the venv at %s\n' \
+                 "$argv0" "$P2_VENV" >&2; exit 1 ;;
+          esac
+          bin/firm-python -c 'import jsonschema, yaml'
+          bin/firm-python - <<'PY'
           import ast, pathlib, platform, re, sys
           # The (macOS, Darwin) half of the row is a closed allowlist of proven pairs, read out of the
           # production writer so this probe cannot admit a row the gate itself refuses. Every other
@@ -118,9 +163,10 @@ jobs:
           actual_fixed = (actual[0], actual[3], actual[4], actual[5])
           if actual_fixed != expected_fixed or (actual[1], actual[2]) not in rows:
               raise SystemExit(
-                  f"exact P2 runner mismatch: expected {expected_fixed!r} with an OS row in "
+                  f"P2 runner mismatch: expected {expected_fixed!r} with an OS row in "
                   f"{sorted(rows)!r}, got {actual!r}"
               )
+          print("P2 row verified on the resolved interpreter:", sys.executable, actual)
           PY
       - name: git identity for scratch-repo fixtures
         run: |

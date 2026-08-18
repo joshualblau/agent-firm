@@ -269,6 +269,62 @@ has   "the closing line is the fast one" \
 hasnt "and is NOT the string a passing full run prints" "
 all test files passed" "$out"
 
+t_case "a worker that dies without its sentinel is a FAILURE, not a hang"
+# CR-02. Completion is detected by a sentinel file the worker renames into place as its last act, and
+# that is right (a finished-but-unreaped child still answers `kill -0`, so signal 0 is not a
+# completion detector). But there was no liveness arm underneath it: a worker killed BETWEEN
+# `bash <file>` and the `mv` left st[i]=1 forever, `moved` stayed 0, `printed` never advanced, and
+# the runner slept 0.05s in a loop with no upper bound. Reproduced on the checked-in runner: still
+# spinning at 25s with nothing past the first file, and — because printing is index-ordered — an
+# empty transcript. In CI that is GitHub's 360-minute default burned on a report that names nothing.
+#
+# `kill -9 $PPID` from inside the test file is the reproducer because that is what an OOM kill, a
+# memory cgroup limit, a `ulimit` kill or a stray `pkill -9` does to the worker subshell, and it is
+# also the shape of a $TMPDIR that is full or read-only when <i>.rc is written.
+#
+# CONTROL FIRST, and it is load-bearing: the same fixture with the kill removed must still be a
+# normal green run. Without it, a runner that had simply started failing everything would satisfy the
+# assertions below just as loudly.
+d="$(mk_suite)"
+mk_test "$d" alpha  0 1 0
+mk_test "$d" victim 0 1 0
+out="$(bash "$d/tests/run-tests.sh" --jobs 4 2>&1)"; rc=$?
+assert_eq "CONTROL: the same two files, unkilled, are a green run" 0 "$rc"
+has "CONTROL: and both files reach the transcript" "2 passed, 0 failed across 2 test files" "$out"
+
+d="$(mk_suite)"
+mk_test "$d" alpha  0 1 0
+mk_test "$d" victim 0 1 0 'kill -9 $PPID'
+# The runner must TERMINATE. A hang would hang this test file too, so the reproducer is run with a
+# hard deadline of its own: the runner is backgrounded, polled for up to 30s, and killed if it is
+# still alive — which is a FAIL here, not a silent 6-hour test.
+_cr02_out="$d/killed.log"
+( bash "$d/tests/run-tests.sh" --jobs 4 > "$_cr02_out" 2>&1 ) & _cr02_pid=$!
+_cr02_n=0
+while kill -0 "$_cr02_pid" 2>/dev/null && [ "$_cr02_n" -lt 300 ]; do
+  sleep 0.1; _cr02_n=$((_cr02_n+1))
+done
+if kill -0 "$_cr02_pid" 2>/dev/null; then
+  pkill -9 -P "$_cr02_pid" 2>/dev/null
+  kill -9 "$_cr02_pid" 2>/dev/null
+  wait "$_cr02_pid" 2>/dev/null
+  _t_no "the runner terminates when a worker dies without its sentinel" "still running after 30s"
+  _cr02_rc=124
+else
+  wait "$_cr02_pid"; _cr02_rc=$?
+  _t_ok "the runner terminates when a worker dies without its sentinel"
+fi
+out="$(cat "$_cr02_out" 2>/dev/null)"
+assert_eq "and exits 1, so the suite does not pass on a file that never finished" 1 "$_cr02_rc"
+has "the dead worker is named in the FAILURES line" "FAILURES — victim" "$out"
+has "the transcript says what happened, in the file's own section" \
+    "WORKER DIED without reporting an exit status" "$out"
+has "and it is called a failure rather than a hang" "not as a hang" "$out"
+has "the OTHER file still reports its own result" "── 1 passed, 0 failed" "$out"
+has "the grand total does not fold in the killed file's own count" \
+    "1 passed, 1 failed across 2 test files" "$out"
+hasnt "and the green verdict is not printed" "all test files passed" "$out"
+
 t_case "a fast run that selects nothing is loud about having run nothing"
 # Outside a git checkout the scope fails open, so the empty case is reached through a filter instead:
 # what matters is that "no file ran" never borrows the vocabulary of a green suite.

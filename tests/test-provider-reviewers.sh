@@ -519,13 +519,33 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_eq "$provider state mode remains 600" 600 "$(t_file_mode "$state")"
 done
 
+# pr_wait <seconds-x10> <shell-test...> — poll until the test succeeds, or give up.
+#
+# CR-08: these waits were fixed 20- and 30-iteration lists, i.e. 2.0 s and 3.0 s, and they are the
+# TIGHTEST bounded waits in the suite. bin/firm-reviewer-common shells out to bin/firm-model-resolve
+# before it creates the lock, and both of those now source bin/firm-python and pay a full resolution
+# (~200 ms each on an idle host), so ~0.4 s of the 2.0 s went to interpreter resolution before any
+# concurrency multiplier. This file is not `runs_alone` and is skipped only by --unsupported-p2, so
+# on a supported host it runs alongside up to N-1 other files. An expired poll here does not merely
+# fail: `assert_file "first concurrent attempt owns a structured lock"` fails AND the next assertion
+# becomes wrong in the MISLEADING direction, because with no live owner the second attempt can
+# legitimately return 0 — the transcript would report that the reviewer lock failed to serialise when
+# the real cause was harness timing. Widened to 10 s, matching wait_ready() in
+# tests/test-ledger-role-start.sh, which is the same pattern done with margin. It costs nothing on a
+# green run: the loop exits on the first successful test.
+pr_wait() {
+  local budget="$1" n=0; shift
+  while [ "$n" -lt "$budget" ]; do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1; n=$((n+1))
+  done
+  return 1
+}
+
 t_case "a live concurrent attempt serializes promotion and a provably dead matching lock recovers"
 review_env hold "$GPT" >"$WORK/first-concurrent.out" 2>&1 & first_pid=$!
 lock="$RUN/09-test-evidence/.reviewer-gpt.lock"
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  test -f "$lock/owner.json" && break
-  sleep 0.1
-done
+pr_wait 100 test -f "$lock/owner.json"
 assert_file "first concurrent attempt owns a structured lock" "$lock/owner.json"
 assert_rc "reordered second attempt cannot overtake the live owner" 1 review_env approve "$GPT"
 wait "$first_pid"; first_rc=$?
@@ -617,17 +637,21 @@ assert_eq "no delayed raw artifact exists without another invocation" "" "$(find
 t_case "hard termination is independently cleaned without exposing raw output"
 review_env hard_kill "$GPT" >"$WORK/hard-kill.out" 2>&1 & hard_shell=$!
 hard_lock="$RUN/09-test-evidence/.reviewer-gpt.lock/owner.json"
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  test -f "$hard_lock" && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q . && break
-  sleep 0.1
-done
+# 3.0 s -> 10 s, for the CR-08 reason written at pr_wait above. When this poll expires the t_python
+# below raises on a lock file that is not there, hard_pid is empty, `kill -9 ""` no-ops, and the
+# hard-kill case asserts against state that was never built.
+_pr_hard_ready() {
+  test -f "$hard_lock" \
+    && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q .
+}
+pr_wait 100 _pr_hard_ready
 hard_pid="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
 kill -9 "$hard_pid" 2>/dev/null || true
 wait "$hard_shell" 2>/dev/null || true
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' | grep -q . || break
-  sleep 0.1
-done
+_pr_control_gone() {
+  ! find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' | grep -q .
+}
+pr_wait 100 _pr_control_gone
 assert_eq "hard-killed attempt control is gone" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' -print)"
 assert_ok "hard-kill raw secret is absent from run and private control" sh -c \
   "! grep -R 'HARD-KILL-RAW-SECRET-91b7' '$RUN' '$REPO/.agent-firm/private-reviewer-control/$RUN_ID' 2>/dev/null"
