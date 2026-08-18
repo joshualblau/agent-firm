@@ -97,18 +97,27 @@ requires_supported_p2() {
 #        runs was green, but 96% is not margin, and the worst sample was not the busiest setting, so
 #        it is co-scheduling luck rather than worker count that moves it.
 #
-#      Classifying merge-guard `runs_alone` would buy that case a serial-quality margin and cost most
-#      of the speedup — an ESTIMATED 408s -> ~590s, computed from measured per-file times (merge-guard
-#      is the longest file and would stop overlapping the second longest) and NOT itself measured.
-#      That trade has not been made here: it is
-#      the Lead's to make, the lever is one line below, and `--serial` / `--jobs N` are available to
-#      anyone who wants the serial margin for one run. Both hosted CI jobs use `--unsupported-p2`,
-#      which skips merge-guard outright, so this exposure is local runs and the exact-P2 job only.
-#
-# The list is empty today. It and the scheduler support for it stay, because the next test file that
-# genuinely needs isolation should have somewhere to go that is not "turn parallelism off".
+#      Classifying merge-guard `runs_alone` buys that case a serial-quality margin and costs most of
+#      the speedup. That trade HAS now been made, deliberately — see the entry below for the reason,
+#      which is not the margin. Both hosted CI jobs use `--unsupported-p2`, which skips merge-guard
+#      outright, so the exposure this removes was local runs and the exact-P2 job only.
 runs_alone() {
   case "$1" in
+    # WHY merge-guard IS ALONE: validity, not flake-avoidance. Its "classification finishes inside
+    # PARSE_BUDGET" case drives the guard's REAL 4000ms production budget. Sharing the host does not
+    # merely narrow that assertion's margin, it changes WHAT IT MEASURES — the same unchanged guard
+    # code timed 2675ms with the host to itself and 3829ms while co-scheduled, so the concurrent
+    # number is a fact about this scheduler, not about the guard's parse cost. A production budget
+    # asserted against harness contention is asserting the wrong thing even on the runs it passes.
+    # Serializing the file restores the measurement; the margin it also restores is a side effect.
+    #
+    # Re-evaluate against the three numbers, not from memory: 2675ms serial, 3829ms worst observed
+    # concurrent, 4000ms budget. If the guard's parse cost drops well clear of the budget, or the
+    # budget rises, this entry can go back on the pool.
+    #
+    # Accepted cost: an estimated ~412s -> ~590s, still roughly 2.2x faster than the 1287s serial
+    # baseline. `--serial` and `--jobs N` are unaffected and still mean exactly what they meant.
+    merge-guard) return 0 ;;
     *) return 1 ;;
   esac
 }
