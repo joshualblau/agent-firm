@@ -197,4 +197,82 @@ assert_output "does not call a deny a grant" "PASS project settings carry no ret
 assert_eq "FAIL count matches the control — no new failure" \
   "$base_fails" "$(fails_at "$good_root" "$deny_hit_proj")"
 
+# ---------------------------------------------------------------------------
+t_case "SEC-01 an interpreter that does not RUN cannot produce a PASS from any check"
+# The retired-permission check read rc 0 plus empty stdout as "no hits", and a `#!/bin/sh` + `exit 0`
+# shim produces exactly that. So a two-line shim named python3 got `PASS project settings carry no
+# retired permission rules` and `PASS user settings carry no retired permission rules` printed about
+# settings files nothing had opened -- directly contradicting this check's own comment ("in a
+# fail-closed check it should not be able to produce a PASS from a policy it never checked, however
+# it came to be run") and its header ("'Could not check' counts as a FAIL, not a WARN"). The same
+# shim also produced PASS for jsonschema, for pyyaml and for the hook-adapter manifest check.
+#
+# bin/firm-python refuses that shim as a CANDIDATE now, but $FIRM_PYTHON on a host where nothing is
+# compliant still becomes the degraded argv, and a fail-closed check has no business depending on a
+# fix one layer down. Every one of those probes now carries proof of execution, so the answer is a
+# FAIL that gates the exit code.
+#
+# Modelled the way tests/test-python-interpreter.sh models it: a resolver copy whose expectations no
+# interpreter can satisfy, so the degraded path is taken on every host this suite runs on, plus a
+# $FIRM_PYTHON that is executable and is not an interpreter.
+shim_root="$(mk_doctor_root "$GOOD_POLICY")"; t_track "$shim_root"
+sed 's/^FIRM_PYTHON_EXPECT_VERSION=.*/FIRM_PYTHON_EXPECT_VERSION="0.0.0"/' \
+  "$BIN/firm-python" > "$shim_root/bin/firm-python"
+chmod +x "$shim_root/bin/firm-python"
+shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-dshim.XXXXXX")"; t_track "$shim_dir"
+printf '#!/bin/sh\nexit 0\n' > "$shim_dir/notpython"; chmod +x "$shim_dir/notpython"
+shim_proj="$(mk_proj "$CLEAN_SETTINGS")"; t_track "$shim_proj"
+
+assert_rc "precondition: the stand-in interpreter really does exit 0 for any program" 0 \
+  "$shim_dir/notpython" - -c 'print("never runs")'
+assert_output "precondition: the resolver degrades to it and says p2=no" "p2=no" \
+  env FIRM_PYTHON="$shim_dir/notpython" "$shim_root/bin/firm-python" --status
+shim_argv="$(env FIRM_PYTHON="$shim_dir/notpython" "$shim_root/bin/firm-python" --print-argv | sed -n '1p')"
+assert_eq "precondition: and it is the argv every check below will run" \
+  "$shim_dir/notpython" "$shim_argv"
+
+doctor_shim() { ( cd "$shim_proj" && HOME="$shim_proj/fake-home" \
+  FIRM_PYTHON="$shim_dir/notpython" "$shim_root/bin/firm-doctor" 2>&1 ); }
+shim_out="$(doctor_shim)"
+for claim in \
+  "PASS project settings carry no retired" \
+  "PASS user settings carry no retired" \
+  "PASS python jsonschema present" \
+  "PASS python pyyaml present" \
+  "PASS repository manifests declare one plugin-owned"; do
+  case "$shim_out" in
+    *"$claim"*) _t_no "a non-executing interpreter cannot produce: $claim" "$(_t_ctx "$shim_out")" ;;
+    *) _t_ok "a non-executing interpreter cannot produce: $claim" ;;
+  esac
+done
+assert_output "the retired-rule check says it was SKIPPED, not passed" \
+  "were NOT checked for retired permission rules" doctor_shim
+assert_output "the hook-adapter check says the same" \
+  "plugin hook ownership was NOT verified" doctor_shim
+assert_output "and both point at the interpreter to verify" "bin/firm-python --status" doctor_shim
+shim_rc=0
+( cd "$shim_proj" && HOME="$shim_proj/fake-home" FIRM_PYTHON="$shim_dir/notpython" \
+    "$shim_root/bin/firm-doctor" >/dev/null 2>&1 ) || shim_rc=$?
+assert_ne "and firm-doctor does not exit 0 on a host it could not inspect" "0" "$shim_rc"
+
+# CONTROL. The same root and the same project with the SHIM REMOVED must reach those PASSes again,
+# or the five assertions above would be satisfied by a doctor that had simply stopped passing
+# anything. $FIRM_PYTHON is unset here; everything else is identical.
+ctl_out="$( cd "$shim_proj" && HOME="$shim_proj/fake-home" "$shim_root/bin/firm-doctor" 2>&1 )"
+assert_output "CONTROL: with a real interpreter the retired-rule check PASSes again" \
+  "PASS project settings carry no retired" printf '%s' "$ctl_out"
+# The scratch root deliberately holds no plugin manifests, so the hook-adapter check FAILS here
+# either way -- which makes it the sharper control: the two failure modes must not be the same
+# sentence. With a real interpreter it is "ambiguous or malformed" (the probe ran and found nothing);
+# with the shim it is "was NOT verified" (the probe never ran). A doctor that had merely started
+# failing everything would print the same line in both runs.
+assert_output "CONTROL: with a real interpreter the hook check fails as MALFORMED, not as unverified" \
+  "plugin hook ownership is ambiguous or malformed" printf '%s' "$ctl_out"
+case "$ctl_out" in
+  *"plugin hook ownership was NOT verified"*)
+    _t_no "CONTROL: and does not claim the probe failed to run" "$(_t_ctx "$ctl_out")" ;;
+  *) _t_ok "CONTROL: and does not claim the probe failed to run" ;;
+esac
+
+
 t_summary

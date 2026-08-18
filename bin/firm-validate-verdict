@@ -51,7 +51,9 @@ except ImportError:
           "`jsonschema` is not installed.")
     print("  verdict =", data["verdict"], "(unverified)")
     print("  This does NOT satisfy the Final gate. Install the prerequisite:")
-    print("    firm-python -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)")
+    # `bin/firm-python`, not the bare name: the bare name only resolves after firm-link has run,
+    # and a checkout bootstrapped with FIRM_SKIP_LINK=1 is exactly where this appears (CR-05).
+    print("    bin/firm-python -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)")
     sys.exit(4)
 except Exception as e:
     print("INVALID (jsonschema):", e); sys.exit(1)

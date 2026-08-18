@@ -443,10 +443,10 @@ if [[ -n "$missing_py" ]]; then
     # Install into the interpreter the firm actually runs (bin/firm-python), never whatever
     # `python3` PATH happens to name: installing into a different interpreter is exactly how a
     # host ends up with the package present and firm-doctor still reporting it missing.
-    firm_python -m pip install --user jsonschema pyyaml || echo "  WARNING: pip install failed — run: firm-python -m pip install --user jsonschema pyyaml" >&2
+    firm_python -m pip install --user jsonschema pyyaml || echo "  WARNING: pip install failed — run: bin/firm-python -m pip install --user jsonschema pyyaml" >&2
   else
     echo "  missing Python prerequisite(s):$missing_py"
-    echo "    Install with: firm-python -m pip install --user jsonschema pyyaml (or re-run with --with-python-deps)"
+    echo "    Install with: bin/firm-python -m pip install --user jsonschema pyyaml (or re-run with --with-python-deps)"
   fi
 else
   echo "  Python prerequisites present (jsonschema, pyyaml)"
