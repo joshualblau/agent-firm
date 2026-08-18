@@ -67,6 +67,95 @@ assert_eq "OS-row allowlist is a closed set of proven, unpairable pairs" \
   "closed_pairs=yes proven_rows=yes injected_unpairable=yes cross_row_unpairable=yes" \
   "$allowlist_row"
 
+t_case "SEC-02 the P2 test seam cannot be reached by pointing \$TMPDIR at a real run"
+# The seam defined "inside a temp dir" with tempfile.gettempdir(), which honours \$TMPDIR/\$TEMP/\$TMP.
+# Pointing it at any ancestor of a production run directory made the seam reachable on a fully
+# supported host, where it forges a byte-identical `WRITE_CONFIGURATION_UNSUPPORTED: p2`. The
+# vocabulary is negative-only so it can never ADMIT an unproven write -- but it can SUPPRESS a
+# lifecycle record while emitting the firm's own canonical, deliberately-sanitized "this host cannot
+# write" signal, which is exactly what an operator has been taught to read as "your OS row has not
+# been proven". Reproduced before the fix from a run directory outside every temp root: rc 17 and no
+# record; after it, INPUT_INVALID (2), which no platform refusal ever returns.
+#
+# The fixture has to live OUTSIDE the temp roots or it proves nothing, so it is built under
+# \$HOME/.cache (created and torn down here, never a path the firm uses) rather than under \$TMPDIR
+# like every other fixture in the suite.
+seam_home="${HOME:-}"
+if [ -n "$seam_home" ] && [ -d "$seam_home" ]; then
+  seam_parent="$seam_home/.cache/firm-seam-test.$$"
+  mkdir -p "$seam_parent" 2>/dev/null
+fi
+if [ -n "${seam_parent:-}" ] && [ -d "${seam_parent:-}" ]; then
+  seam_repo="$seam_parent/repo"
+  mkdir -p "$seam_repo"
+  (
+    cd "$seam_repo" || exit 1
+    git init -q .
+    git symbolic-ref HEAD refs/heads/main
+    git config user.email test@agent-firm.local
+    git config user.name "firm tests"
+    git config commit.gpgsign false
+    printf 'seed\n' > seed.txt
+    git add -A
+    git commit -qm seed
+  ) >/dev/null 2>&1
+  seam_run="$seam_repo/.agent-firm/runs/seamprobe"
+  mkdir -p "$seam_run"
+  printf '%s\n' ".agent-firm/runs/seamprobe" > "$seam_repo/.agent-firm/CURRENT_RUN"
+
+  # PRECONDITION. The whole case is about a run directory that is NOT inside a temp root; if the
+  # fixture accidentally is, every assertion below would pass for the wrong reason.
+  assert_ok "precondition: the fixture run is outside /tmp, /var/tmp and the Darwin user temp dir" \
+    t_python -c '
+import os, sys
+run = os.path.realpath(sys.argv[1])
+roots = ["/tmp", "/var/tmp"]
+try:
+    darwin = os.confstr(65537)
+except Exception:
+    darwin = None
+if darwin:
+    roots.append(darwin)
+for root in roots:
+    root = os.path.realpath(root)
+    try:
+        assert os.path.commonpath((root, run)) != root, (root, run)
+    except ValueError:
+        pass
+' "$seam_run"
+
+  if [ "$host_row" = exact ]; then
+    # CONTROL FIRST: an ordinary write to this very run directory succeeds, so the refusals below
+    # are about the seam and not about a run directory the writer would have rejected anyway.
+    seam_ok="$("$LOG" --run "$seam_run" --strict --print-event-id \
+      --event-id evt-seam-control seam_probe class=control 2>/dev/null)"
+    assert_eq "CONTROL: an ordinary write to the fixture run succeeds" "evt-seam-control" "$seam_ok"
+  fi
+  for seam_tmp in "$seam_parent" "$seam_repo" "$seam_repo/.agent-firm" "/"; do
+    assert_rc "TMPDIR=$seam_tmp cannot reach the P2 seam" 2 \
+      env TMPDIR="$seam_tmp" FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux \
+      "$LOG" --run "$seam_run" --strict --print-event-id --event-id evt-seam-forged \
+      seam_probe class=forged
+    assert_output "  and says INPUT_INVALID rather than the platform refusal" "INPUT_INVALID" \
+      env TMPDIR="$seam_tmp" FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux \
+      "$LOG" --run "$seam_run" --strict --print-event-id --event-id evt-seam-forged \
+      seam_probe class=forged
+  done
+  # And a forged rejection must never be mistakable for the real one.
+  seam_forged="$(env TMPDIR="$seam_repo" FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux \
+    "$LOG" --run "$seam_run" --strict --print-event-id --event-id evt-seam-forged \
+    seam_probe class=forged 2>&1 >/dev/null)"
+  case "$seam_forged" in
+    *WRITE_CONFIGURATION_UNSUPPORTED*)
+      _t_no "a forged rejection does not wear the platform refusal's message" "$(_t_ctx "$seam_forged")" ;;
+    *) _t_ok "a forged rejection does not wear the platform refusal's message" ;;
+  esac
+  rm -rf "$seam_parent"
+else
+  _t_no "SEC-02 seam fixture could not be created outside the temp roots" \
+    "no writable \$HOME/.cache; this case did NOT run"
+fi
+
 t_case "ordinary writes follow the production host classification"
 repo="$(mk_repo)"; mk_run "$repo" ordinary
 run="$repo/.agent-firm/runs/ordinary"

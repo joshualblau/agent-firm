@@ -35,7 +35,6 @@ import select
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 
 TOOL_ROOT = Path(sys.argv[1])
@@ -943,18 +942,95 @@ def validate_activation_json(raw, role, justification):
     return activation
 
 
+# _CS_DARWIN_USER_TEMP_DIR — Darwin's per-user temp container, asked of the KERNEL rather than read
+# out of the environment. CPython does not expose the symbolic name in os.confstr_names on 3.9, so
+# the number is spelled here with its symbol; a platform that does not know it raises or returns
+# nothing and simply contributes no root.
+CS_DARWIN_USER_TEMP_DIR = 65537
+
+
+def trusted_temp_roots():
+    """The temp roots $TMPDIR / $TEMP / $TMP cannot move.
+
+    SEC-02. Every test seam in this file defined "inside a temp dir" with tempfile.gettempdir(),
+    which is caller-controlled. Pointing $TMPDIR at any ancestor of a real run directory made the
+    seams reachable on a fully supported host against PRODUCTION state: `TMPDIR=/` was enough,
+    because commonpath(("/", <any absolute path>)) == "/". The P2 vocabulary is negative-only, so
+    this could never ADMIT an unproven write — but it could SUPPRESS a lifecycle record while
+    emitting the firm's own canonical, deliberately-sanitised WRITE_CONFIGURATION_UNSUPPORTED, which
+    is indistinguishable from a real platform refusal. That mattered little while every write on this
+    host failed with that string anyway; now that writes succeed, the string carries information, and
+    an agent that can set env for one invocation could drop a role start and hand back a diagnosis
+    the operator has just been taught to accept.
+
+    The roots are therefore fixed. The cost is stated rather than hidden: on a host whose temp
+    directory is outside all of these, the seams refuse with INPUT_INVALID and the tests that drive
+    them fail loudly. That is the safe direction, and it is where every supported host and both CI
+    runners already put $TMPDIR.
+    """
+    roots = []
+    candidates = ["/tmp", "/var/tmp"]
+    try:
+        darwin_temp = os.confstr(CS_DARWIN_USER_TEMP_DIR)
+    except (AttributeError, OSError, ValueError):
+        darwin_temp = None
+    if darwin_temp:
+        candidates.append(darwin_temp)
+    for candidate in candidates:
+        try:
+            resolved = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if os.path.isabs(resolved) and resolved != os.sep and resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def inside_trusted_temp(path):
+    """True iff <path> resolves STRICTLY inside one of the fixed temp roots."""
+    if not path:
+        return False
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in trusted_temp_roots():
+        try:
+            if resolved != root and os.path.commonpath((root, resolved)) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def owned_private_directory(path):
+    """True iff <path> is a real directory owned by this uid with no group/other write bit.
+
+    The condition guarded_descriptor_test_configuration already applied and guarded_p2_test_rejection
+    did not (SEC-02). A directory somebody else can write is not a directory a test seam may trust.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) & 0o022 == 0
+    )
+
+
 def guarded_p2_test_rejection(run_path):
     requested = os.environ.get("FIRM_LEDGER_P2_TEST_REJECT", "")
     if not requested:
         return None
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
-    temp_root = os.path.realpath(tempfile.gettempdir())
-    run_path = os.path.realpath(run_path)
-    try:
-        inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
-    except ValueError:
-        inside_temp = False
-    if guard != "1" or not inside_temp or requested not in P2_TEST_REJECTIONS:
+    if (
+        guard != "1"
+        or requested not in P2_TEST_REJECTIONS
+        or not inside_trusted_temp(run_path)
+        or not owned_private_directory(os.path.realpath(run_path))
+    ):
         role_fail(2, "INPUT_INVALID", "test-support")
     return requested
 
@@ -1125,25 +1201,15 @@ def guarded_descriptor_test_configuration(run):
     if not behavior and not state_path:
         return {"behavior": "", "state_path": ""}
     guard = os.environ.get("FIRM_LEDGER_TEST_GUARD", "")
-    temp_root = os.path.realpath(tempfile.gettempdir())
     run_path = os.path.realpath(run.path)
     state_parent = os.path.realpath(os.path.dirname(state_path)) if state_path else ""
-    try:
-        run_inside = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
-        state_inside = (
-            state_parent != temp_root
-            and os.path.commonpath((temp_root, state_parent)) == temp_root
-        )
-        run_stat = os.lstat(run_path)
-        state_parent_stat = os.lstat(state_parent)
-        owned_directories = all(
-            stat.S_ISDIR(item.st_mode) and item.st_uid == os.getuid()
-            and stat.S_IMODE(item.st_mode) & 0o022 == 0
-            for item in (run_stat, state_parent_stat)
-        )
-    except (OSError, ValueError):
-        run_inside = state_inside = False
-        owned_directories = False
+    run_inside = inside_trusted_temp(run_path)
+    state_inside = bool(state_parent) and inside_trusted_temp(state_parent)
+    owned_directories = (
+        owned_private_directory(run_path)
+        and bool(state_parent)
+        and owned_private_directory(state_parent)
+    )
     if (
         guard != "1" or not run_inside or behavior not in DESCRIPTOR_TEST_BEHAVIORS
         or not state_path or not state_inside or os.path.lexists(state_path)
@@ -1531,10 +1597,7 @@ def active_failpoint(run):
         ):
             role_fail(2, "INPUT_INVALID", "test-barrier")
         return None
-    temp_root = os.path.realpath(tempfile.gettempdir())
-    run_path = os.path.realpath(run)
-    inside_temp = run_path != temp_root and os.path.commonpath((temp_root, run_path)) == temp_root
-    if guard != "1" or not inside_temp:
+    if guard != "1" or not inside_trusted_temp(run):
         if guard:
             role_fail(2, "INPUT_INVALID", "test-guard")
         return None
@@ -1557,13 +1620,11 @@ def ledger_barrier(run, phase, detail=""):
         or not SAFE_FIELD.fullmatch(token)
     ):
         role_fail(2, "INPUT_INVALID", "test-barrier")
-    temp_root = os.path.realpath(tempfile.gettempdir())
-    run_path = os.path.realpath(run.path)
     barrier_path = os.path.realpath(barrier_dir) if barrier_dir else ""
     if (
-        run_path == temp_root or os.path.commonpath((temp_root, run_path)) != temp_root
-        or not barrier_path or barrier_path == temp_root
-        or os.path.commonpath((temp_root, barrier_path)) != temp_root
+        not inside_trusted_temp(run.path)
+        or not barrier_path
+        or not inside_trusted_temp(barrier_path)
     ):
         role_fail(2, "INPUT_INVALID", "test-barrier")
     try:
