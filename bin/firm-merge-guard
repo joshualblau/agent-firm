@@ -179,10 +179,26 @@ POLICY="$ROOT/agent-firm/policy/merge-authority.yaml"
 # guard, the ledger writer and firm-doctor on ONE python, so they cannot reach different verdicts
 # about the same machine. See bin/firm-python. A missing or unusable resolver is reported here as
 # cannot-evaluate, never as a permit.
+#
+# THIS FUNCTION HAS NO CACHE, DELIBERATELY (SEC-03). It used to skip the source when
+# $FIRM_PYTHON_DISPLAY was non-empty, treating that as proof resolution had already happened. The
+# guard never sets FIRM_PYTHON_DISPLAY in any path, so it was pure external input, and the argv it
+# then trusted was the inherited $FIRM_PYTHON_ARGV. Reproduced: in a repo whose identity is not
+# allow-listed, `firm-merge-guard --command 'git push origin main'` blocked; the same command with
+#   FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV=<stub printing FIRM_MG_DECISION=permit>
+# exited 0 — PERMITTED — having never sourced bin/firm-python. Two environment variables and no file
+# edit turned a control that must refuse into one that permits.
+#
+# A marker this function sets itself would be no better: it would live in a shell variable an
+# exported environment variable of the same name creates for free. So there is nothing to inherit —
+# every call sources, and the five outputs are cleared first so a partial source cannot leave an
+# attacker's values in place. bin/firm-python assigns all five unconditionally at startup, and only
+# one of the three call sites is reached per invocation, so this costs nothing that was not already
+# being paid. It is the same reasoning the header gives for not memoising a PERMIT decision: a cache
+# on a fail-closed control is an authorisation surface.
 _mg_python_ready() {
-  if [ -z "${FIRM_PYTHON_DISPLAY:-}" ]; then
-    . "$SELF/firm-python" || return 1
-  fi
+  unset FIRM_PYTHON_ARGV FIRM_PYTHON_DISPLAY FIRM_PYTHON_P2 FIRM_PYTHON_REASON FIRM_PYTHON_TRIED
+  . "$SELF/firm-python" || return 1
   case "${FIRM_PYTHON_ARGV[0]:-}" in
     "")  return 1 ;;
     /*)  [ -x "${FIRM_PYTHON_ARGV[0]}" ] || return 1 ;;
@@ -513,6 +529,16 @@ SURFACE_GAPS = [
     "A heredoc body fed to a NON-shell (python3 <<'PY' ... PY) is skipped, so a `git push` line",
     "  inside a python/text heredoc is neither matched nor a false positive. Deliberate: this",
     "  repo's own docs and tests are full of the literal string `git push`.",
+    "INTERPRETER SELECTION on a host with NO P2-compliant interpreter. This guard renders its",
+    "  decision inside a python program, and bin/firm-python chooses which python runs it. On a",
+    "  compliant host that is not a lever: a candidate is selected only if it PROVES it executed",
+    "  the probe (a per-probe nonce echoed back with the four expected values), so neither $PATH",
+    "  nor $FIRM_PYTHON can substitute a shim. On a host where NOTHING is compliant the resolver",
+    "  degrades to the first executable candidate — $FIRM_PYTHON, else $PATH's python3 — and",
+    "  whoever controls those controls the program that renders the decision. $FIRM_PYTHON_ARGV /",
+    "  $FIRM_PYTHON_DISPLAY are NOT in this gap: they used to be (a non-empty DISPLAY skipped",
+    "  resolution and the inherited ARGV was run, which permitted a push this guard blocks), and",
+    "  they are now unset before every resolution, with an assertion in tests/test-merge-guard.sh.",
 ]
 
 class Cannot(Exception):
@@ -1715,10 +1741,17 @@ else
 fi
 
 if ! _mg_python_ready; then
-  printf 'firm-merge-guard: BLOCKED (cannot evaluate) — no usable python3 was found (bin/firm-python\n' >&2
-  printf '  resolves it), so this command cannot be checked against the merge-authority allowlist.\n' >&2
-  printf '  Install python3 (a declared firm prerequisite, see docs/INSTALL.md) or remove the\n' >&2
-  printf '  firm-merge-guard PreToolUse hook.\n' >&2
+  # The remedy names the FIRST check that can fail here, which is the sibling resolver, not python3
+  # (CC-10). The realistic trigger is a ${CLAUDE_PLUGIN_ROOT} plugin cache populated before bin/
+  # gained firm-python. And it no longer offers "or remove the PreToolUse hook": telling a blocked
+  # agent that removing the control is one of its two options is not a remedy, it is the bypass.
+  printf 'firm-merge-guard: BLOCKED (cannot evaluate) — the interpreter could not be resolved, so\n' >&2
+  printf '  this command cannot be checked against the merge-authority allowlist.\n' >&2
+  printf '  bin/firm-python is missing next to this script, or it resolved no usable interpreter.\n' >&2
+  printf '  Check it with: firm-python --status  (and see docs/INSTALL.md for the python3\n' >&2
+  printf '  prerequisite itself). If this guard is running from a plugin cache, refresh it with\n' >&2
+  printf '  `firm-version --local-refresh`. Ask the human operator to run the command if it is\n' >&2
+  printf '  legitimate — do NOT remove or edit this guard to get past it.\n' >&2
   exit 2
 fi
 

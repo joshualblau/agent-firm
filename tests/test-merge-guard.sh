@@ -1162,6 +1162,72 @@ assert_eq "  nor through the hook adapter" "" \
 assert_not_output "--surface does not print the sentinel" "FIRM_MG_DECISION" \
   mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
+t_case "SEC-03 an INHERITED interpreter cannot be smuggled past resolution"
+# _mg_python_ready skipped the source whenever $FIRM_PYTHON_DISPLAY was non-empty, treating it as
+# proof that resolution had already happened, and then ran the inherited $FIRM_PYTHON_ARGV. The guard
+# sets neither variable in any path, so both were pure external input. Reproduced before the fix:
+# with a non-allow-listed identity `--command 'git push origin main'` exited 2 (BLOCKED); the same
+# command with FIRM_PYTHON_DISPLAY=cached and FIRM_PYTHON_ARGV=<stub that prints the permit sentinel>
+# exited 0 — PERMITTED — with bin/firm-python never sourced. Two environment variables, no file edit.
+#
+# The stub below is what makes this a real test rather than a shape check: it PRINTS THE PERMIT
+# SENTINEL, so if the guard ever runs it again the answer is a permit and this case goes red, not
+# green-for-the-wrong-reason. mg_env's PATH holds a real python3, so the correctly-resolved guard
+# reaches its real refusal.
+_mg_smuggle_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-smuggle.XXXXXX")"; t_track "$_mg_smuggle_dir"
+# It deliberately does NOT read stdin. A `cat >/dev/null` here would block forever the moment this
+# stub is run outside the guard (the precondition below runs it directly), and a hung test file is a
+# worse failure than the one being pinned. Ignoring stdin is also the more faithful shim: SEC-17's
+# whole point is that a python3 which never reads the program it was handed still exits 0.
+{ printf '#!/bin/sh\n'
+  printf 'printf "FIRM_MG_DECISION=permit\\n"\n'
+  printf 'echo MG-SMUGGLED-STUB-EXECUTED >&2\n'
+  printf 'exit 0\n'; } > "$_mg_smuggle_dir/pystub"
+chmod +x "$_mg_smuggle_dir/pystub"
+# The stub really is an authorisation if anything runs it: proven here, so the assertions below
+# cannot pass because the stub was harmless.
+assert_output "precondition: the stub answers with a PERMIT sentinel" "FIRM_MG_DECISION=permit" \
+  "$_mg_smuggle_dir/pystub"
+mg_smuggled() {   # <cwd> <args...> — the guard, with the two variables an attacker would export
+  local cwd="$1"; shift
+  ( cd "$cwd" && PATH="$NOGH_PATH" \
+      FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
+      FIRM_PYTHON_P2=1 FIRM_PYTHON_REASON=none FIRM_PYTHON_TRIED=cached \
+      "$TREE/bin/firm-merge-guard" "$@" )
+}
+assert_rc "an inherited FIRM_PYTHON_ARGV + DISPLAY cannot permit a gated push" 2 \
+  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+assert_rc "  nor a gated merge" 2 mg_smuggled "$REPO_BAD" --command 'git merge feature/x'
+# The email is read from the policy, never spelled here: AC-018 asserts that no tracked file but
+# the policy carries an allow-listed address.
+assert_rc "  nor an identity rewrite" 2 \
+  mg_smuggled "$REPO_BAD" --command "git config user.email $ALLOWED_EMAIL"
+assert_not_output "the smuggled stub is never executed at all" "MG-SMUGGLED-STUB-EXECUTED" \
+  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+assert_output "the guard reaches its own refusal instead" "NOT allow-listed" \
+  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+# Through the hook adapter, which is the enforcement surface that actually stops the tool call.
+_mg_smuggle_payload="$(mk_payload 'git push origin main')"
+_mg_smuggle_rc=0
+( cd "$REPO_BAD" && printf '%s' "$_mg_smuggle_payload" | PATH="$NOGH_PATH" \
+    FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
+    "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mg_smuggle_rc=$?
+assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mg_smuggle_rc"
+# CONTROL. Without it these five would pass just as loudly on a guard that had stopped permitting
+# anything: the same two variables, exported the same way, must not stop a legitimate permit.
+assert_rc "CONTROL: the same two variables do not break a legitimate permit" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+_mg_ctl_rc=0
+( cd "$REPO_OK" && PATH="$GH_OK:$PATH" \
+    FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
+    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mg_ctl_rc=$?
+assert_eq "CONTROL: an allow-listed identity is still permitted with them exported" "0" "$_mg_ctl_rc"
+# And the guard says so in the one place it claims scope.
+assert_output "--surface declares interpreter selection as a named gap" "INTERPRETER SELECTION" \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "--surface records that the two inherited variables are NOT one" 'FIRM_PYTHON_DISPLAY are NOT in this gap' \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+
 t_case "AC-016/SEC-08 --command with no value is cannot-evaluate, not an authorisation"
 # `firm-merge-guard --command \"\$CMD\"` with an unset variable used to yield exit 0. Every other
 # unreadable input in this script exits 2; this is the same class of input.
