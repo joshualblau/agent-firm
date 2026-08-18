@@ -123,10 +123,15 @@ assert_rc "without --require-p2 the tools still run on the plain interpreter" 0 
 
 t_case "a candidate that cannot answer the probe is skipped, not trusted"
 # This is what resolution adds to the older shim threat (a PATH `python3` that returns a status
-# without running the program it was handed): a candidate that cannot answer the probe as the
-# admitted interpreter is not selected at all, so it cannot author anything. It is NOT a substitute
-# for the proof-of-execution sentinel in firm-merge-guard -- a shim that answers the probe and then
-# betrays the real run is still possible, and that case is asserted in tests/test-merge-guard.sh.
+# without running the program it was handed). BOTH directions are driven here, and the second one is
+# why this case exists at all: the file used to test only `exit 3` -- a candidate that says NO -- and
+# an `exit 0` shim was therefore selected, reported p2=yes, and admitted by --require-p2 (SEC-01 /
+# CR-04 / SEC-05). Exit 3 is the harmless direction; exit 0 is the fail-open one.
+#
+# The resolver now requires PROOF OF EXECUTION, exactly as bin/firm-merge-guard requires
+# FIRM_MG_DECISION on stdout: the probe must return a sentinel line carrying a per-probe nonce it was
+# handed on argv plus the four values it read out of its own process. `exit 0` emits nothing; a
+# constant `echo` of the sentinel cannot know the nonce.
 SHIM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-shim.XXXXXX")"; t_track "$SHIM_DIR"
 printf '#!/bin/sh\nexit 3\n' > "$SHIM_DIR/python3"; chmod +x "$SHIM_DIR/python3"
 assert_eq "the shim is what PATH's python3 would be" "3" \
@@ -137,6 +142,102 @@ if [ "$host_row" = exact ]; then
   assert_output "and still reports p2=yes" "p2=yes" env PATH="$SHIM_DIR:/usr/bin:/bin" "$FP" --status
 fi
 
+# The three shims, probed directly through the resolver's own predicate. Host-independent: this asks
+# the function, not the machine.
+OPEN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-open.XXXXXX")"; t_track "$OPEN_DIR"
+printf '#!/bin/sh\nexit 0\n' > "$OPEN_DIR/python3"; chmod +x "$OPEN_DIR/python3"
+# A shim that knows the format and the four expected values but not the nonce. This is what makes the
+# sentinel more than a magic string: FIRM_PYTHON_EXPECT_* are readable in the file, the nonce is not.
+GUESS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-guess.XXXXXX")"; t_track "$GUESS_DIR"
+printf '#!/bin/sh\necho "FIRM_PYTHON_PROBE_OK guessed Darwin arm64 3.9.6 cpython"\nexit 0\n' \
+  > "$GUESS_DIR/python3"; chmod +x "$GUESS_DIR/python3"
+assert_rc "precondition: the exit-0 shim really does exit 0 for any program" 0 \
+  "$OPEN_DIR/python3" -c 'print("this never runs")'
+_probe_rc() { ( . "$FP" >/dev/null 2>&1; _firm_python_probe "$@" >/dev/null 2>&1; printf '%s' "$?" ); }
+assert_ne "an exit-0 shim does NOT satisfy the probe (the fail-open direction)" "0" "$(_probe_rc "$OPEN_DIR/python3")"
+assert_ne "an exit-3 shim does NOT satisfy the probe (the harmless direction)" "0" "$(_probe_rc "$SHIM_DIR/python3")"
+assert_ne "a constant echo of the sentinel does NOT satisfy the probe" "0" "$(_probe_rc "$GUESS_DIR/python3")"
+if [ "$host_row" = exact ]; then
+  # The control uses the RESOLVED argv, not a bare path: on a translated parent the compliant form is
+  # `/usr/bin/arch -arm64 <path>` and a bare path legitimately fails the arch clause. Asserting on the
+  # bare path would make this control fail for the right reason and prove nothing about the sentinel.
+  assert_eq "CONTROL: a real interpreter DOES satisfy the same probe" "0" \
+    "$(_probe_rc "${FIRM_PYTHON_ARGV[@]}")"
+fi
+
+# End to end, on a resolver copy whose only reachable candidate is the shim. The absolute fallbacks
+# are redirected into a directory that does not exist, so `command -v python3` (the shim) is the whole
+# candidate list -- which is the world in which an exit-status-only probe hands the firm a p2=yes.
+ONLY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-only.XXXXXX")"; t_track "$ONLY_DIR"
+ONLY="$ONLY_DIR/firm-python"
+sed 's#^    /#    /nonexistent-for-tests/#' "$FP" > "$ONLY"; chmod +x "$ONLY"
+assert_ok "precondition: the copy has no absolute system interpreter left to fall back on" \
+  t_python -c '
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+# Every candidate line in _firm_python_candidates is "    /abs/path" possibly with a trailing "\".
+# All of them must have been redirected; if the function is ever reformatted this precondition fails
+# loudly rather than letting the case below assert against a resolver that still has a real fallback.
+survivors = [line for line in text.splitlines() if re.match(r"^    /(?!nonexistent-for-tests/)", line)]
+assert not survivors, survivors
+assert text.count("/nonexistent-for-tests/") == 4, text.count("/nonexistent-for-tests/")
+' "$ONLY"
+if [ "$host_row" = exact ]; then
+  # CONTROL FIRST. Without it, a copy that is simply broken would "prove" the shim is refused just as
+  # loudly, and the two negatives below would mean nothing.
+  assert_output "CONTROL: the same copy still says p2=yes when PATH holds a real interpreter" "p2=yes" \
+    env PATH="/usr/bin:/bin" "$ONLY" --status
+fi
+assert_output "an exit-0 shim as the only candidate is reported p2=no, not vouched for" "p2=no" \
+  env PATH="$OPEN_DIR:/usr/bin:/bin" "$ONLY" --status
+assert_rc "--require-p2 refuses it with the write-unsupported class instead of running it" 17 \
+  env PATH="$OPEN_DIR:/usr/bin:/bin" "$ONLY" --require-p2 -c 'print("this must not run")'
+assert_eq "--require-p2 runs no program at all" "" \
+  "$(env PATH="$OPEN_DIR:/usr/bin:/bin" "$ONLY" --require-p2 -c 'print("this must not run")' 2>/dev/null)"
+assert_output "the reason names what it probed rather than claiming compliance" "probed:" \
+  env PATH="$OPEN_DIR:/usr/bin:/bin" "$ONLY" --status
+
+t_case "an unusable \$FIRM_PYTHON degrades to a working interpreter, and is named"
+# SEC-04 / CR-09: the fallback used to take $FIRM_PYTHON without the `[ -x ]` test every other
+# candidate gets, so a typo made every firm-* tool exit 127 "command not found" -- not the documented
+# 17 -- while FIRM_PYTHON_REASON listed three interpreters, none of them the one about to be run.
+BOGUS="$ONLY_DIR/pyhton3-does-not-exist"
+assert_no_file "precondition: the override really does not exist" "$BOGUS"
+assert_rc "a typo'd override still runs a real interpreter (not exit 127)" 0 \
+  env FIRM_PYTHON="$BOGUS" "$FP" -c 'pass'
+argv_bogus="$(env FIRM_PYTHON="$BOGUS" "$FP" --print-argv | sed -n '1p')"
+assert_ne "the resolver did not select the unusable override" "$BOGUS" "$argv_bogus"
+UNSAT_BOGUS="$(env FIRM_PYTHON="$BOGUS" "$UNSAT" --status 2>&1)"
+case "$UNSAT_BOGUS" in
+  *"$BOGUS (not executable)"*) _t_ok "an unusable override is named in the reason it was skipped" ;;
+  *) _t_no "an unusable override is named in the reason it was skipped" "got: $(_t_ctx "$UNSAT_BOGUS")" ;;
+esac
+case "$UNSAT_BOGUS" in
+  *"argv=$BOGUS"*) _t_no "the degraded argv is a working interpreter, not the unusable override" \
+                     "got: $(_t_ctx "$UNSAT_BOGUS")" ;;
+  *) _t_ok "the degraded argv is a working interpreter, not the unusable override" ;;
+esac
+assert_rc "and the degraded path still runs (rc 0), which is what keeps CI hosts usable" 0 \
+  env FIRM_PYTHON="$BOGUS" "$UNSAT" -c 'pass'
+
+t_case "--help prints a whole document, not a truncated one"
+# CC-11: the extraction was a fixed line range that stopped on the bare heading "WHY THIS EXISTS" and
+# printed no body, which reads as a broken install. It is now addressed by an end marker, so the
+# header can grow without truncating again.
+help_out="$("$FP" --help)"
+help_last="$(printf '%s\n' "$help_out" | sed -n '$p')"
+assert_ne "the last line of --help is not empty" "" "$help_last"
+# Every heading in this header is ALL CAPS, so a last line with no lowercase letter in it is the
+# truncation symptom -- that is exactly what `sed -n '2,15p'` used to print ("WHY THIS EXISTS").
+case "$help_last" in
+  *[a-z]*) _t_ok "the last line of --help is prose, not a bare heading" ;;
+  *) _t_no "the last line of --help is prose, not a bare heading" "got '$help_last'" ;;
+esac
+assert_output "--help documents itself" "--help" "$FP" --help
+assert_output "--help documents the ENVIRONMENT it reads" "ENVIRONMENT" "$FP" --help
+assert_output "--help names \$FIRM_PYTHON" '$FIRM_PYTHON' "$FP" --help
+assert_output "--help reaches the degradation section" "HOW IT DEGRADES" "$FP" --help
+
 t_case "no firm tool spawns a bare PATH python3"
 assert_ok "every bin/firm-* runs the resolved interpreter (the resolver itself excepted)" \
   t_python - "$BIN" <<'PY'
@@ -145,20 +246,106 @@ bin_dir = pathlib.Path(sys.argv[1])
 # firm-python IS the resolver, so it is the one file that may name a bare `python3` (its candidate
 # list). Everywhere else a bare python3 in COMMAND position is the defect this run closed: it is how
 # the tools, the doctor and the write gate ended up reading three different interpreters.
-command_position = re.compile(
-    r"(?:^\s*|[|;&]\s*|\$\(\s*|!\s*|\b(?:exec|if|elif|while|until|then|else|do)\s+)python3\b")
+#
+# THE CLAIM IS INVERTED ON PURPOSE (CR-06). This used to enumerate COMMAND POSITION with a regex of
+# five alternatives, and an enumeration of the ways a shell can start a command is never complete:
+# `PYTHONPATH=x python3 ...`, `env FOO=1 python3 ...`, `timeout 30 python3 ...`, `command python3`
+# and `out="$(python3 ...)"` are all command position and matched none of them -- so the exact defect
+# this run closed could return with the pin still green. The assertion is therefore the small closed
+# claim instead: OUTSIDE A COMMENT, EVERY `python3` TOKEN MUST BE INSIDE A QUOTED STRING, i.e.
+# diagnostic text, never a word the shell will execute.
+#
+# shell_unquoted() keeps only the characters the shell would treat as CODE. It tracks single quotes,
+# double quotes, backslash escapes, `$(...)` and backticks -- and command substitution re-enters code
+# context even inside double quotes, which is exactly how the shell reads it and is why a naive
+# strip-the-quoted-spans version missed `out="$(python3 ...)"`. Anything left over is an unquoted
+# word. The helper is exercised against known-flag and known-clean lines in the next assertion, so a
+# scanner that silently stopped finding things is itself caught.
+def shell_unquoted(line):
+    out = []
+    stack = ["U"]                                  # U unquoted/code · S single · D double · B backtick
+    i, n = 0, len(line)
+    while i < n:
+        ctx, char = stack[-1], line[i]
+        if ctx == "S":                             # no escapes inside single quotes
+            if char == "'":
+                stack.pop()
+            i += 1
+        elif ctx == "D":
+            if char == "\\":
+                i += 2
+            elif char == '"':
+                stack.pop(); i += 1
+            elif char == "$" and line[i + 1:i + 2] == "(":
+                stack.append("U"); i += 2          # $( ) is code even inside " "
+            elif char == "`":
+                stack.append("B"); i += 1
+            else:
+                i += 1
+        else:                                      # U or B: this is code, so keep it
+            if char == "\\":
+                i += 2
+            elif char == "'":
+                stack.append("S"); i += 1
+            elif char == '"':
+                stack.append("D"); i += 1
+            elif char == "$" and line[i + 1:i + 2] == "(":
+                stack.append("U"); i += 2
+            elif char == "`":
+                stack.pop() if ctx == "B" else stack.append("B")
+                i += 1
+            elif char == ")" and len(stack) > 1:
+                stack.pop(); i += 1
+            else:
+                out.append(char); i += 1
+    return "".join(out)
+
 offenders = {}
 for path in sorted(bin_dir.glob("firm-*")):
     if path.name == "firm-python":
         continue
-    hits = [
-        (number, line.strip())
-        for number, line in enumerate(path.read_text().splitlines(), 1)
-        if not line.lstrip().startswith("#") and command_position.search(line)
-    ]
+    hits = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if line.lstrip().startswith("#") or "python3" not in line:
+            continue
+        if "python3" in shell_unquoted(line):
+            hits.append((number, line.strip()))
     if hits:
         offenders[path.name] = hits
 assert not offenders, offenders
+PY
+assert_ok "and that pin catches the launcher/assignment prefixes the old regex did not" \
+  t_python - "$TESTS_DIR/test-python-interpreter.sh" <<'PY'
+import pathlib, re, sys
+# The pin's own scanner, lifted verbatim out of the assertion above so the two cannot drift, then
+# driven over the shapes CR-06 named. A pin that stopped reporting these would be decorative and the
+# resolver could be bypassed again with the suite green -- which is the whole reason CR-06 exists.
+source = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r"^def shell_unquoted\(line\):\n(?:(?:[ \t].*)?\n)+", source, re.M)
+assert match, "shell_unquoted() is no longer extractable from the pin above"
+namespace = {}
+exec(compile(match.group(0), "shell_unquoted", "exec"), namespace)
+shell_unquoted = namespace["shell_unquoted"]
+
+must_flag = [
+    'PYTHONPATH="$STUB" python3 - "$arg" <<\'X\'',
+    'env FOO=1 python3 -c "pass"',
+    'timeout 30 python3 -c "pass"',
+    'command python3 -c "pass"',
+    'exec python3 -c "pass"',
+    '  out="$(python3 -c "pass")"',
+    '  out=`python3 -c "pass"`',
+    '  if python3 -c "pass"; then :; fi',
+]
+must_not_flag = [
+    """    printf 'no usable python3 (bin/firm-python resolves it)\\n' >&2""",
+    """  printf '  Install python3 (a declared firm prerequisite, see docs/INSTALL.md)\\n' >&2""",
+    '''    "A heredoc body fed to a NON-shell (python3 <<'X' ... X) is skipped, so a `git push` line",''',
+]
+missed = [line for line in must_flag if "python3" not in shell_unquoted(line)]
+assert not missed, missed
+false_positives = [line for line in must_not_flag if "python3" in shell_unquoted(line)]
+assert not false_positives, false_positives
 PY
 assert_ok "the PreToolUse guard resolves LAZILY so its zero-subprocess fast path stays free" \
   t_python -c '

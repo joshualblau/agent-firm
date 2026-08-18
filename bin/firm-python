@@ -7,10 +7,20 @@
 #   firm-python --status         print one diagnostic line: p2=<yes|no> argv=<...> reason=<...>
 #   firm-python --require-p2 ... run only if the resolved interpreter satisfies the P2 gate,
 #                                otherwise print why and exit 17 (the write-unsupported class)
+#   firm-python -h | --help      print this header and exit 0
 #
 # Usage as a LIBRARY (this file is sourceable on purpose — one definition, not N copies):
 #   . "$SELF/firm-python"        defines firm_python(), firm_python_resolve(), and the
 #                                FIRM_PYTHON_* variables below. Sourcing resolves once, silently.
+#
+# ENVIRONMENT
+#   $FIRM_PYTHON                 an interpreter to try FIRST. It is probed exactly like every other
+#                                candidate — including the proof-of-execution sentinel below — so
+#                                setting it cannot make a non-compliant interpreter report p2=yes.
+#                                On a host where NOTHING is compliant it becomes the degraded argv,
+#                                but only when it is executable: a typo'd or since-removed path
+#                                falls through to the first executable candidate instead of making
+#                                every firm-* tool exit 127 "command not found".
 #
 # WHY THIS EXISTS
 # Every firm-* tool used to spawn a bare `python3` inherited from $PATH, while the ledger's P2 write
@@ -33,6 +43,19 @@
 # python is sufficient and no script's `#!/usr/bin/env bash` shebang has to change. A child spawned
 # from the arm64 python (the ledger's statfs descriptor helper) inherits arm64, so the whole write
 # path lands on one interpreter.
+#
+# WHAT THE PROBE PROVES, AND WHY AN EXIT STATUS IS NOT ENOUGH
+# A candidate is accepted only when it PROVES it ran the probe: the probe writes a sentinel line to
+# stdout carrying a per-probe nonce it was handed on argv plus the four values it read out of its own
+# process, and this file requires that exact line as well as exit status 0. Status alone was a
+# fail-open: a two-line `#!/bin/sh` + `exit 0` shim named python3 is probed FIRST (it is what
+# `command -v python3` finds), answered 0, and was selected and reported p2=yes — so `--require-p2`
+# ran the shim instead of exiting 17, and firm-doctor printed PASS for jsonschema, pyyaml and the
+# retired-permission scan with no Python executed. This is the same defect bin/firm-merge-guard
+# already refuses (its FIRM_MG_DECISION sentinel, SEC-07/SEC-17); the resolver now holds the same
+# line. The bar is not cryptographic — anything handed a program can replay it — but a shim must now
+# reproduce the format, echo back a nonce it cannot predict, and assert the exact expected row, which
+# no accidental wrapper, `exit 0` stub or busy-box `true` does.
 #
 # HOW IT DEGRADES
 # The probe below tests the INTERPRETER half of the gate only (system/arch/version/implementation/
@@ -57,8 +80,9 @@
 # ---- expectations: the interpreter half of the P2 gate ---------------------
 # Stated once, here. firm-doctor reports "actual vs supported" from these, so its section 10 and this
 # resolver cannot drift apart. The OS-row half is read from SUPPORTED_P2_OS_ROWS in bin/firm-ledger-log
-# by whoever needs it (firm-doctor, tests/test-ledger-platform-gate.sh, .github/workflows/ci.yml) —
-# there is exactly one copy of that set and this file does not add a second.
+# by whoever needs it — there is exactly one copy of that set and this file does not add a second.
+# The readers are not enumerated here because an enumeration goes stale silently (it did: this comment
+# named three and there were already four). `grep -rl SUPPORTED_P2_OS_ROWS .` finds them.
 FIRM_PYTHON_EXPECT_SYSTEM="Darwin"
 FIRM_PYTHON_EXPECT_ARCH="arm64"
 FIRM_PYTHON_EXPECT_VERSION="3.9.6"
@@ -72,28 +96,73 @@ FIRM_PYTHON_REASON="not resolved yet"
 FIRM_PYTHON_TRIED=""
 FIRM_PYTHON_DISPLAY="python3"
 
+# The sentinel token. One spelling, referenced by the probe program and by the shell that checks it,
+# so the two cannot drift. tests/test-python-interpreter.sh drives both the exit-3 and the exit-0
+# shim directions against this.
+_FIRM_PYTHON_PROBE_TOKEN="FIRM_PYTHON_PROBE_OK"
+
+# The probe prints NOTHING unless every clause holds, and then prints exactly one line:
+#   FIRM_PYTHON_PROBE_OK <nonce> <system> <machine> <version> <implementation>
+# The four trailing fields are read back out of the running process (not echoed from argv), so the
+# caller's comparison re-checks the row a second time on the interpreter's own testimony.
 _FIRM_PYTHON_PROBE='
 import os, sys, platform
-system, arch, version, impl = sys.argv[1:5]
+token, nonce, system, arch, version, impl = sys.argv[1:7]
+actual_version = ".".join(str(part) for part in sys.version_info[:3])
+actual_impl = getattr(sys.implementation, "name", "")
 ok = (
     platform.system() == system
     and platform.machine() == arch
-    and ".".join(str(part) for part in sys.version_info[:3]) == version
-    and getattr(sys.implementation, "name", "") == impl
+    and actual_version == version
+    and actual_impl == impl
     and isinstance(sys.executable, str)
     and bool(sys.executable)
     and os.path.isabs(sys.executable)
 )
-sys.exit(0 if ok else 3)
+if not ok:
+    sys.exit(3)
+sys.stdout.write("%s %s %s %s %s %s\n" % (
+    token, nonce, platform.system(), platform.machine(), actual_version, actual_impl))
+sys.exit(0)
 '
 
-# _firm_python_probe <argv...> — rc 0 iff that command is a P2-compliant interpreter. Silent, and
-# stdin is closed so a probe can never consume a caller's heredoc or hang on a terminal.
+# _firm_python_probe <argv...> — rc 0 iff that command PROVED it is a P2-compliant interpreter.
+#
+# rc 0 is necessary and not sufficient (SEC-01/CR-04). The candidate must also return the sentinel
+# line for THIS probe: a nonce it was handed a moment ago plus the four expected values. A candidate
+# that exits 0 without running the program — the `#!/bin/sh` + `exit 0` shim, a wrapper that swallows
+# `-c`, a `true` on PATH under the name python3 — emits nothing and is refused, the same way
+# bin/firm-merge-guard refuses a checker that did not emit FIRM_MG_DECISION.
+#
+# Silent, and stdin is closed so a probe can never consume a caller's heredoc or hang on a terminal.
+# stdout is captured rather than discarded; stderr is still discarded, so a chatty-but-correct
+# interpreter is not rejected for what it writes there.
 _firm_python_probe() {
-  "$@" -c "$_FIRM_PYTHON_PROBE" \
+  # A fresh nonce per probe, so a candidate cannot satisfy this with a constant `echo` and cannot
+  # replay a line it saw earlier in the same resolution. $RANDOM is a bash builtin (no subprocess).
+  _fp_nonce="fp${$}x${RANDOM}${RANDOM}x${RANDOM}${RANDOM}"
+  _fp_want="$_FIRM_PYTHON_PROBE_TOKEN $_fp_nonce $FIRM_PYTHON_EXPECT_SYSTEM $FIRM_PYTHON_EXPECT_ARCH $FIRM_PYTHON_EXPECT_VERSION $FIRM_PYTHON_EXPECT_IMPL"
+  _fp_got="$("$@" -c "$_FIRM_PYTHON_PROBE" \
+    "$_FIRM_PYTHON_PROBE_TOKEN" "$_fp_nonce" \
     "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
     "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" \
-    </dev/null >/dev/null 2>&1
+    </dev/null 2>/dev/null)" || return 1
+  [ "$_fp_got" = "$_fp_want" ] || return 1
+  return 0
+}
+
+# _firm_python_executable <word> — rc 0 iff that word can actually be executed. An absolute or
+# relative path must exist and be executable; a bare name must be findable on PATH. This is applied
+# to EVERY candidate, including the $FIRM_PYTHON fallback, which used to skip it and hand every
+# firm-* tool an argv that exits 127 instead of the documented 17 (SEC-04/CR-09). It is the same test
+# bin/firm-merge-guard's _mg_python_ready re-applies to the resolved argv[0] — which was itself
+# evidence that the check belonged in the resolver.
+_firm_python_executable() {
+  case "$1" in
+    "") return 1 ;;
+    */*) [ -x "$1" ] ;;
+    *)  command -v "$1" >/dev/null 2>&1 ;;
+  esac
 }
 
 # _firm_python_candidates — one interpreter path per line, in preference order.
@@ -101,8 +170,9 @@ _firm_python_probe() {
 # $PATH `python3` is probed FIRST so an operator who has put a compliant interpreter (a venv, a
 # self-hosted CI runner's 3.9.6) in front keeps the packages installed for it; the absolute paths
 # after it are the macOS system interpreters, which is where 3.9.6 actually lives on this OS.
-# $FIRM_PYTHON, when set, jumps the queue — it is still probed like every other candidate, so an
-# override cannot smuggle a non-compliant interpreter past the P2 report.
+# $FIRM_PYTHON, when set, jumps the queue — it is still probed like every other candidate, sentinel
+# included, so setting it cannot make a non-compliant interpreter REPORT p2=yes. It can still be the
+# argv on the degraded path below, where FIRM_PYTHON_P2 is 0 and every P2-dependent path says so.
 _firm_python_candidates() {
   if [ -n "${FIRM_PYTHON:-}" ]; then printf '%s\n' "$FIRM_PYTHON"; fi
   _fp_path="$(command -v python3 2>/dev/null || true)"
@@ -141,7 +211,15 @@ firm_python_resolve() {
     [ -n "$_fp_cand" ] || continue
     case "$_fp_seen" in *"<$_fp_cand>"*) continue ;; esac   # probe each distinct path once
     _fp_seen="$_fp_seen<$_fp_cand>"
-    [ -x "$_fp_cand" ] || continue
+    if ! _firm_python_executable "$_fp_cand"; then
+      # Record an unusable $FIRM_PYTHON so the reason string names it. Skipping it silently is how
+      # `FIRM_PYTHON=/usr/bin/pyhton3` produced a diagnostic that listed three interpreters, none of
+      # them the one the fallback was about to run (SEC-04/CR-09).
+      if [ "$_fp_cand" = "${FIRM_PYTHON:-}" ]; then
+        FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand (not executable)"
+      fi
+      continue
+    fi
     [ -n "$_fp_first" ] || _fp_first="$_fp_cand"
     FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand"
     if [ -n "$_fp_prefix" ]; then
@@ -164,7 +242,7 @@ EOF
   if [ "$FIRM_PYTHON_P2" -ne 1 ]; then
     # Nothing compliant. Keep the firm runnable on a deliberately unsupported host (CI, Linux) with
     # the plain interpreter, and say exactly why every P2-dependent path is about to refuse.
-    if [ -n "${FIRM_PYTHON:-}" ]; then
+    if [ -n "${FIRM_PYTHON:-}" ] && _firm_python_executable "$FIRM_PYTHON"; then
       FIRM_PYTHON_ARGV=("$FIRM_PYTHON")
     elif [ -n "$_fp_first" ]; then
       FIRM_PYTHON_ARGV=("$_fp_first")
@@ -205,7 +283,15 @@ case "${BASH_SOURCE[0]:-$0}" in
         exit 0
         ;;
       -h|--help)
-        sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        # The header, addressed by the END MARKER below rather than by a magic last line number.
+        # `sed -n '2,15p'` stopped on the bare heading "WHY THIS EXISTS" and printed no body, which
+        # reads as a broken install (CC-11); a fixed range truncates again every time the header
+        # grows. This prints everything above the first line of real code.
+        # The command substitution is load-bearing: it strips the trailing blank separator line, so
+        # the last line of --help is always prose.
+        _fp_help="$(sed -n '2,/^# ---- expectations/{/^# ---- expectations/!p;}' "${BASH_SOURCE[0]}" \
+          | sed 's/^# \{0,1\}//')"
+        printf '%s\n' "$_fp_help"
         exit 0
         ;;
       --require-p2) _fp_require=1; shift ;;
