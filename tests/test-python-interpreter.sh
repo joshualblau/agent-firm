@@ -347,6 +347,46 @@ assert not missed, missed
 false_positives = [line for line in must_not_flag if "python3" in shell_unquoted(line)]
 assert not false_positives, false_positives
 PY
+assert_ok "every fixture root that installs a resolver-dependent tool also installs the resolver" \
+  t_python - "$BIN" "$TESTS_DIR" <<'PY'
+import pathlib, re, sys
+bin_dir, tests_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+# CR-03: six test files build a "minimum firm root" by copying a handful of bin/firm-* into a scratch
+# bin/. Every one of those tools sources its sibling firm-python on the way in, so a root without it
+# dies on line 10 with "No such file or directory" and rc 1 -- and rc 1 is what the fail-closed
+# assertions in those files EXPECT, so four assertions in tests/test-bootstrap-dual.sh passed for two
+# commits without reaching the code they name. Seven call sites across six files have to remember the
+# same sibling; this is the check that remembers for them.
+#
+# Method: group `cp`/`ln`/`install` lines by the DIRECTORY they write a firm-* into (source paths
+# under $BIN/$SELF/$FIRM_ROOT/bin are not deliveries), and require any directory that receives a
+# resolver-dependent tool to receive firm-python too. Line continuations are not followed, which is
+# a false-NEGATIVE only; nothing here can turn a real miss into a pass.
+# Two spellings of the same source line are in use: `. "$SELF/firm-python"` and the inline
+# `. "$(cd -P "$(dirname "$__src")" && pwd)/firm-python"`. Match on the trailing path either way.
+sources_python = re.compile(r'^\s*\.\s+\S.*?/firm-python"', re.M)
+needs = {path.name for path in bin_dir.glob("firm-*")
+         if path.name != "firm-python" and sources_python.search(path.read_text())}
+assert {"firm-bootstrap", "firm-bounded-exec", "firm-merge-guard"} <= needs, sorted(needs)
+SOURCE_DIRS = {"$BIN", "$SELF", "$FIRM_ROOT/bin", "$ROOT/bin"}
+place = re.compile(r"""["']([^"'\n]*?)/(firm-[A-Za-z0-9-]+)["']""")
+delivered, wants = set(), {}
+for path in sorted(tests_dir.glob("*.sh")):
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith("#") or not re.match(r"(cp|ln|install)\b", stripped):
+            continue
+        for target_dir, tool in place.findall(line):
+            if target_dir in SOURCE_DIRS:
+                continue
+            key = (path.name, target_dir)
+            if tool == "firm-python":
+                delivered.add(key)
+            elif tool in needs:
+                wants.setdefault(key, []).append((number, tool))
+missing = {key: hits for key, hits in wants.items() if key not in delivered}
+assert not missing, missing
+PY
 assert_ok "the PreToolUse guard resolves LAZILY so its zero-subprocess fast path stays free" \
   t_python -c '
 import pathlib, re, sys
@@ -357,7 +397,10 @@ text = pathlib.Path(sys.argv[1]).read_text()
 assert "_mg_python_ready()" in text
 sources = [line for line in text.splitlines() if line.strip().startswith(". \"$SELF/firm-python\"")]
 assert len(sources) == 1, sources
-assert sources[0].startswith("    "), sources   # indented: inside _mg_python_ready, not at top level
+# INDENTED, i.e. inside _mg_python_ready rather than at top level. The exact indent is not the
+# claim -- it was 4 spaces while the source sat inside an `if`, and that `if` was itself the SEC-03
+# fail-open, so pinning the column would have made removing the vulnerability look like a regression.
+assert sources[0][:1].isspace(), sources
 assert text.count("_mg_python_ready") >= 3      # defined, plus both call sites
 ' "$BIN/firm-merge-guard"
 
