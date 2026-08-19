@@ -135,6 +135,21 @@ case "$*" in
     # The real catalog keys entries `slug`/`display_name`. A reader that only knew `id`/`name`
     # stringified None for every entry and never matched the configured model.
     [ "$STUB_MODE" = incompatible ] && { echo '{"models":[{"slug":"other","display_name":"Other"}]}'; exit 0; }
+    # A READINESS DOCUMENT IS SIZED BY THE PROVIDER, NOT BY THE CONVERSATION. The real catalog is
+    # 284382 bytes on ONE line because it ships full base instructions per model, so the judge's
+    # 64 KiB --max-output default truncated it mid-record and the wrapper BLOCKed on a host whose
+    # catalog listed the configured model. large_catalog reproduces that shape: the configured model
+    # is the LAST entry, so any cap below the document size hides it.
+    if [ "$STUB_MODE" = large_catalog ]; then
+      printf '{"models":['
+      i=0; while [ $i -lt 400 ]; do
+        printf '{"slug":"filler-%s","display_name":"Filler","base_instructions":"' "$i"
+        j=0; while [ $j -lt 8 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; j=$((j+1)); done
+        printf '"},'; i=$((i+1))
+      done
+      printf '{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol"}]}\n'
+      exit 0
+    fi
     echo '{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol"},{"slug":"gpt-5.4","display_name":"GPT-5.4"}]}'; exit 0 ;;
 esac
 out=""
@@ -524,6 +539,52 @@ assert_rc "a verdict violating a projected-away constraint is still refused" 1 \
 badid_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 assert_eq "the refusal is a validation failure, not a judge BLOCK" "invalid" \
   "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUN/09-test-evidence/reviewer-attempts/$badid_attempt/attempt.json")"
+# Deriving the projection is not the same as USING it. Both judge argvs must carry the projection,
+# never the canonical document, or the derivation is decoration.
+: > "$CALLS"
+assert_rc "GPT judge argv is recorded" 0 review_env approve "$GPT"
+assert_rc "Claude judge argv is recorded" 0 review_env approve "$CLAUDE"
+assert_ok "each judge is handed the projection, not the canonical schema" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+codex = [line.split(" args=", 1)[1] for line in records if line.startswith("codex ")]
+claude = [line.split(" args=", 1)[1] for line in records if line.startswith("claude ")]
+judge = max(codex, key=len)
+assert "--output-schema" in judge, judge
+schema_arg = judge.split("--output-schema", 1)[1].split()[0]
+assert schema_arg.endswith("qa-verdict.generation-schema.json"), (
+    "codex was handed %r; the canonical qa-verdict.schema.json is rejected by the structured-output "
+    "API with 'uniqueItems' is not permitted" % schema_arg)
+# claude's judge argv carries the whole qa-judge contract in --system-prompt, so it spans many
+# physical lines in this log; read the raw blob and slice the --json-schema payload out of it.
+blob = open(sys.argv[1], encoding="utf-8").read()
+assert "--json-schema" in blob, "claude was never handed a --json-schema payload"
+payload = blob.split("--json-schema", 1)[1].split("--permission-mode", 1)[0]
+# Match KEYS, not substrings: the carried prose deliberately names the constraint it replaced
+# ("MUST satisfy: uniqueItems True."), so a bare substring test would flag its own fix.
+for rejected in ('"uniqueItems":', '"allOf":', '"$schema":', '"pattern":', '"minLength":', '"minItems":'):
+    assert rejected not in payload, (
+        "claude was handed a schema still carrying the %s keyword; ajv strict mode refuses it "
+        "(measured: 'no schema with key or ref \"https://json-schema.org/draft/2020-12/schema\"' and "
+        "four strictTypes errors)" % rejected)
+assert "MUST satisfy" in payload, "the projected schema lost the carried constraint prose"
+assert "^obj-[A-Za-z0-9._:-]{1,128}$" in payload, "the blocker-id pattern was dropped, not carried"
+PY
+# And the readiness output ceiling: a catalog bigger than the judge's --max-output must still be
+# read whole. Below the fix this is a truncated document and a BLOCK.
+assert_rc "a catalog larger than the judge's output cap is still trusted" 0 \
+  review_env large_catalog "$GPT"
+big_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_ok "the oversized catalog was retained untruncated" t_python - \
+  "$RUN/09-test-evidence/reviewer-attempts/$big_attempt/attempt.json" <<'PY'
+import json, sys
+phases = {p["phase"]: p for p in json.load(open(sys.argv[1], encoding="utf-8"))["phases"]}
+model = phases["model"]
+assert model["output_bytes"] > 65536, model
+assert model["truncated"] is False, model
+assert model["retained_bytes"] == model["output_bytes"], model
+PY
 
 t_case "actual provider commands receive controlled roots and complete native suppression flags"
 : > "$CALLS"
