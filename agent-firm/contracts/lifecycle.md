@@ -128,7 +128,14 @@ candidate generation.
 Both wrappers share `firm-reviewer-common`. Each creates a numbered attempt, a disposable controlled
 root containing the complete judge contract and inert source snapshot, and separately bounded
 discovery, authentication, model-readiness, and judge phases. Only structured readiness output can
-establish availability. The wrappers publish atomically only after the verdict schema and exact
+establish availability, read at the surface the installed CLI actually publishes; a readiness surface
+a provider does not expose is never simulated, and configured-model readiness that cannot be
+established is recorded as not established rather than assumed. The controlled root isolates provider
+configuration and state, not identity: exactly one artifact per provider — the credential file and
+nothing else — is copied by value into the attempt-local provider directory, mode 0400, with the
+operator's own directory opened read-only and never written. The schema handed to a provider is a
+generation projection derived at runtime from the canonical verdict schema, which remains the sole
+validator of what comes back. The wrappers publish atomically only after the verdict schema and exact
 run/full-SHA/generation/provider/attempt identity validate, record every outcome to the explicitly
 targeted run ledger, cap and redact retained diagnostics by default, and remove the controlled root.
 Persistent raw retention is unsupported: every nonzero `--retain-raw-seconds` request is rejected
