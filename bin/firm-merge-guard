@@ -289,21 +289,43 @@ HOOK_BUDGET_MARGIN = 10
 # truncate the string and it does NOT skip the check — a truncated parse is a fail-open (the gated
 # word may be past the cut) and a skipped parse is a permit. Refusing to decide is neither.
 #
-# WHERE THE NUMBER COMES FROM, measured rather than chosen: across 3 296 real Bash command strings in
-# this repo's own run ledgers the median is 291 bytes, p99 is 3 429 and the largest ever observed is
-# 74 187 (a heredoc writing a run artifact). 262 144 is 3.5x that largest real command, so no real
-# command in this project's history comes near it. At the cap the slowest classifier shape measured
-# (nested `$(`) costs 1.3 s, which is what PARSE_BUDGET is sized against.
+# WHERE THE NUMBER COMES FROM. It has TWO constraints and it used to be set from only one of them.
+#
+#   FROM BELOW — real commands. Across 3 296 real Bash command strings in this repo's own run
+#   ledgers the median is 291 bytes, p99 is 3 429 and the largest ever observed is 74 187 (a heredoc
+#   writing a run artifact). Over the cap a benign command BLOCKS, so the cap must stay clear of
+#   real traffic: 131 072 is 1.77x the largest command this project has ever produced and 38x p99.
+#
+#   FROM ABOVE — PARSE_BUDGET, which is the constraint the old value missed. classify() is LINEAR
+#   in the command length, measured at 11.3 microseconds per character for the worst shape on the
+#   resolved P2 interpreter (CPython 3.9.6 arm64):
+#     16 KB 176 ms · 64 KB 677 ms · 128 KB 1 384 ms · 192 KB 2 264 ms · 256 KB 2 955 ms.
+#   The old 262 144 therefore cost 2 955 ms of classify plus ~325 ms of fixed overhead (bash start
+#   72, this script's own 104 KB parse 29, `. bin/firm-python` resolution 120, python start 90,
+#   stdlib imports 9, compiling the embedded checker 4.5) = 3 305 ms against a 4 000 ms budget on an
+#   IDLE host, and 5 640 ms — 41% OVER the budget — with 8 spinners on 8 cores. The header used to
+#   claim 1.3 s for this term; that does not reproduce on either interpreter available here (2.2 s
+#   on PATH's python3, which is what the guard ran before it stopped inheriting its interpreter).
+#   Nothing in the fixed overhead is the problem: pyyaml is not even imported on this path.
+#
+# 131 072 satisfies both: worst case 1 384 + 325 = 1 709 ms idle (2.3x margin) and ~2 900 ms under
+# the same 8-way load (1.4x margin), while still admitting every command this project has produced.
+# Lowering it can only move inputs from "classified" to "cannot evaluate", which is a BLOCK — the
+# fail-closed direction — so it cannot open a bypass; what it costs is over-blocking a hypothetical
+# 128 KB-plus benign command, and none exists in the corpus.
 #
 # Counted in characters — `${#s}` in bash and len() here agree. On a non-ASCII command line that
 # under-counts BYTES, which only means the classifier sees a string whose byte length exceeds the
 # constant's name; the classifier is linear in characters, so that is harmless.
-MAX_COMMAND_BYTES = 262144
+MAX_COMMAND_BYTES = 131072
 # The whole classification phase's share of the hook timeout: the bash/jq prefilter (bounded by
-# MG_MAX_PREFILTER_BYTES, worst case 353 ms), python start-up (~30 ms) and classify() at the cap
-# (worst measured shape 1.3 s) — about 1.7 s, declared at 4 s so a slower machine has ~2.3x headroom.
-# tests/test-merge-guard.sh both puts this in the budget inequality AND drives a worst-case fixture
-# at the cap through the real script, so the number cannot quietly become a fiction.
+# MG_MAX_PREFILTER_BYTES, worst case 353 ms — and note it does NOT stack with the term below, since
+# over 3 072 bytes the prefilter normalises nothing), the ~325 ms of fixed start-up itemised above,
+# and classify() at MAX_COMMAND_BYTES (worst measured shape 1 384 ms) — about 1.7 s, declared at 4 s
+# so a loaded machine has ~2.3x headroom. tests/test-merge-guard.sh both puts this in the budget
+# inequality AND drives a worst-case fixture at the cap through the real script, so the number
+# cannot quietly become a fiction — and at the old cap that measured assertion was already failing
+# under load, which is how the stale 1.3 s claim was caught.
 PARSE_BUDGET = 4
 
 def err(*a):
