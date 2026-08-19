@@ -509,6 +509,53 @@ except Exception as exc:
     atomic_write(empty_mcp, b'{"mcpServers":{}}\n', 0o400)
     controlled_schema = instruction_root / "qa-verdict.schema.json"
     atomic_write(controlled_schema, (root / "agent-firm" / "schemas" / "qa-verdict.schema.json").read_bytes(), 0o400)
+    # THE SCHEMA THAT VALIDATES A VERDICT AND THE SCHEMA A PROVIDER WILL ACCEPT ARE NOT THE SAME
+    # DOCUMENT, and this wrapper handed both jobs to one file. Neither provider would take it.
+    # Measured verbatim: codex refused it with `invalid_json_schema ... 'uniqueItems' is not
+    # permitted`, then `'allOf' is not permitted`, then `'required' ... including every key in
+    # properties. Missing 'blocker_objects'`; claude refused it with `no schema with key or ref
+    # "https://json-schema.org/draft/2020-12/schema"`, then four ajv `strictTypes` errors inside the
+    # allOf/if/then/else branch. So even a perfectly authenticated judge could never have returned a
+    # verdict - both adapters would have died at the judge phase - which nobody had seen because no
+    # judge had ever got past readiness to reach it.
+    #
+    # The fix must not touch the canonical schema. That schema is the VALIDATOR, applied below with
+    # jsonschema to whatever comes back, and every constraint it carries stays exactly as strict as
+    # it was. What the provider gets is a GENERATION PROJECTION derived from it at runtime, so the
+    # two can never drift the way two committed files would: the keywords a structured-output API
+    # rejects are removed, and - this is the part that keeps it honest - each removed constraint is
+    # carried into that node's `description`, which both providers do accept, so the model still sees
+    # `pattern ^obj-...$` and `minLength 1` and is still asked for exactly the document the canonical
+    # schema demands. Nothing is relaxed: a returned document that violates a projected-away
+    # constraint fails canonical validation below and BLOCKs, and that path is exercised.
+    #
+    # `required` becomes every declared property because both APIs demand it. That is safe here
+    # because the canonical schema's only conditionally-required property is `blocker_objects`, and
+    # an APPROVE carrying an empty `blocker_objects` is valid under it.
+    generation_unsupported = ("uniqueItems", "minItems", "maxItems", "minLength", "maxLength",
+                              "pattern", "minimum", "maximum", "multipleOf")
+    generation_dropped = ("allOf", "anyOf", "oneOf", "not", "if", "then", "else",
+                          "$schema", "$id", "title")
+    def generation_projection(node):
+        if isinstance(node, list):
+            return [generation_projection(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        carried = ["%s %s" % (key, node[key]) for key in generation_unsupported if key in node]
+        projected = {key: generation_projection(value) for key, value in node.items()
+                     if key not in generation_unsupported and key not in generation_dropped}
+        if carried:
+            requirement = "MUST satisfy: " + "; ".join(carried) + "."
+            existing = projected.get("description")
+            projected["description"] = (str(existing) + " " + requirement) if existing else requirement
+        if isinstance(projected.get("properties"), dict):
+            projected["required"] = sorted(projected["properties"])
+            projected["additionalProperties"] = False
+        return projected
+    generation_schema = generation_projection(json.loads(controlled_schema.read_text(encoding="utf-8")))
+    generation_schema_path = instruction_root / "qa-verdict.generation-schema.json"
+    atomic_write(generation_schema_path, json_bytes(generation_schema), 0o400)
+    generation_schema_text = json.dumps(generation_schema, separators=(",", ":"))
 
     # Reconstruct committed bytes only. Symlink blobs become inert text evidence, never live links.
     listing = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-rz", "--full-tree", sha])
@@ -876,13 +923,29 @@ except Exception as exc:
     diagnostics = {"schema_version":2, "provider":provider, "attempt_id":attempt_id, "cap_bytes":16384,
                    "content_policy":"allowlisted_metadata_only", "phases":[]}
     raw_files = []
-    def run_phase(name, timeout, command):
+    # A READINESS DOCUMENT IS NOT MODEL OUTPUT AND DOES NOT GET THE MODEL'S BOUND. `--max-output`
+    # exists to bound what a MODEL writes, and its 64 KiB default is sized for that. A readiness
+    # phase reads a machine-generated document whose size the PROVIDER fixes: `codex debug models` is
+    # 278 KiB on codex-cli 0.147.0 (measured: 284382 bytes, one line), because the catalog ships full
+    # base instructions and tool metadata for every model. Retaining only the first 64 KiB of that
+    # left the JSON cut mid-record, so the parse failed and the wrapper BLOCKed with "model readiness
+    # was not trusted structured data" on a host whose catalog listed the configured model - the same
+    # false-negative shape as the rest of this work order, one layer down.
+    #
+    # The readiness bound is therefore firm-bounded-exec's own documented hard ceiling and nothing
+    # invented: 1 MiB is exactly the maximum `--max-output` itself accepts, so this widens no limit
+    # the firm did not already publish. It is a CEILING, not a bypass - a readiness document larger
+    # than 1 MiB is still truncated, still unparseable, and still a BLOCK. The judge phase keeps the
+    # operator's `--max-output` untouched.
+    readiness_output_cap = 1024 * 1024
+    def run_phase(name, timeout, command, output_cap=None):
         raw_path = control / f".{name}.raw"
         result_path = control / f".{name}.result.json"
         raw_files.append(raw_path)
         invocation = [
             str(self_dir / "firm-bounded-exec"), "--phase", name, "--provider", provider,
-            "--timeout", str(timeout), "--grace", str(grace), "--max-output", str(max_output),
+            "--timeout", str(timeout), "--grace", str(grace),
+            "--max-output", str(max_output if output_cap is None else output_cap),
             "--generation", str(generation), "--output", str(raw_path), "--result", str(result_path),
             "--cwd", str(instruction_root), "--"
         ] + command
@@ -940,7 +1003,7 @@ except Exception as exc:
     # controls happen to be top-level today.
     judge_subcommand = ["exec"] if provider == "gpt" else []
     discovery_command = [executable] + judge_subcommand + ["--help"]
-    rc, result, raw = run_phase("discovery", discovery_timeout, discovery_command)
+    rc, result, raw = run_phase("discovery", discovery_timeout, discovery_command, readiness_output_cap)
     if result.get("status") in ("timeout", "turn_limit"):
         finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("bounded capability discovery timed out; BLOCK", 1)
@@ -1020,7 +1083,7 @@ except Exception as exc:
         ([executable, "doctor", "--json"], gpt_authentication, False) if provider == "gpt" else
         ([executable, "auth", "status", "--json"], claude_authentication, True)
     )
-    rc, result, raw = run_phase("authentication", readiness_timeout, auth_command)
+    rc, result, raw = run_phase("authentication", readiness_timeout, auth_command, readiness_output_cap)
     def structured_readiness(payload, reader):
         try:
             data = json.loads(payload.decode("utf-8"))
@@ -1069,7 +1132,7 @@ except Exception as exc:
         diagnostics["model_readiness"] = "not_established:no_structured_catalog"
         atomic_write(attempt_path, json_bytes(attempt), 0o600)
     else:
-        rc, result, raw = run_phase("model", readiness_timeout, model_surface)
+        rc, result, raw = run_phase("model", readiness_timeout, model_surface, readiness_output_cap)
     def structured_models(payload):
         try:
             data = json.loads(payload.decode("utf-8"))
@@ -1119,13 +1182,13 @@ except Exception as exc:
             executable] + judge_subcommand + ["--skip-git-repo-check", "--ignore-user-config",
             "--ignore-rules", "--strict-config", "--ephemeral", "-s", "read-only", "-m", model,
             "-c", 'model_reasoning_effort="xhigh"', "-c", 'approval_policy="never"',
-            "--output-schema", str(schema_path), "-o", str(candidate_verdict), prompt
+            "--output-schema", str(generation_schema_path), "-o", str(candidate_verdict), prompt
         ]
     else:
         command = [
             executable, "-p", prompt, "--safe-mode", "--system-prompt", contract.decode("utf-8"),
             "--strict-mcp-config", str(empty_mcp), "--model", model, "--effort", "xhigh",
-            "--output-format", "json", "--json-schema", schema_text, "--permission-mode", "dontAsk",
+            "--output-format", "json", "--json-schema", generation_schema_text, "--permission-mode", "dontAsk",
             "--tools", "Read,Grep,Glob", "--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch",
             "--no-session-persistence"
         ]

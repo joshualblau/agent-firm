@@ -79,6 +79,12 @@ for provider in ("gpt","claude"):
   d=dict(base); d["provider"]=provider; d["verdict"]=word; d["blockers"]=[] if word=="APPROVE" else ["fixture blocker"]
   if word=="BLOCK": d["blocker_objects"]=[{"id":"obj-fixture","text":"fixture blocker","affected_criteria":[],"affected_paths":[]}]
   json.dump(d,open(os.path.join(w,f"{provider}-{word.lower()}.json"),"w"))
+# A verdict whose blocker id violates the canonical `^obj-...` pattern. That pattern is one of the
+# keywords the GENERATION projection has to remove, because no structured-output API accepts it, so
+# this fixture is what proves removing it from the generation hint did not remove it from the gate.
+bad=dict(base); bad["provider"]="gpt"; bad["verdict"]="BLOCK"; bad["blockers"]=["fixture blocker"]
+bad["blocker_objects"]=[{"id":"BLOCK-001","text":"fixture blocker","affected_criteria":[],"affected_paths":[]}]
+json.dump(bad,open(os.path.join(w,"gpt-badid.json"),"w"))
 PY
 
 # The two provider stubs below are EXTERNAL programs the wrapper spawns, so their bodies stay on
@@ -145,8 +151,12 @@ case "$STUB_MODE" in
   promotion_symlink) rm -f "$STUB_RUN/08-qa-verdict.gpt.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/08-qa-verdict.gpt.json"; src="$STUB_GPT_APPROVE" ;;
   review_blocker) grep -q 'status: open' "$PWD/input/run-evidence/files/07-review-findings.yaml" && src="$STUB_GPT_BLOCK" || src="$STUB_GPT_APPROVE" ;;
   block) src="$STUB_GPT_BLOCK" ;;
+  schema_constraint_violation) src="$STUB_GPT_BADID" ;;
   *) src="$STUB_GPT_APPROVE" ;;
 esac
+# The generation schema the wrapper actually handed this provider, lifted out of the controlled root
+# so the suite can assert on the real bytes rather than on a re-derivation of them.
+[ -n "${STUB_SCHEMA_CAPTURE:-}" ] && cp "$PWD/qa-verdict.generation-schema.json" "$STUB_SCHEMA_CAPTURE" 2>/dev/null
 python3 - "$FIRM_QA_BEHAVIOR_SENTINEL" "$PWD" "$HOME" "$all_args" "$STUB_MODE" "$FIRM_QA_INPUT_MANIFEST" "${STUB_MANIFEST_CAPTURE:-}" <<'PY'
 import json,os,shutil,sys
 sentinel,cwd,home,args,mode,manifest,capture=sys.argv[1:]
@@ -271,6 +281,7 @@ review_env() { # mode wrapper [extra args]
   mode="$1"; wrapper="$2"; shift 2
   env PATH="$STUB:/usr/bin:/bin" STUB_MODE="$mode" STUB_CALLS="$CALLS" STUB_CHILD="$WORK/child.pid" \
     STUB_GPT_APPROVE="$WORK/gpt-approve.json" STUB_GPT_BLOCK="$WORK/gpt-block.json" \
+    STUB_GPT_BADID="$WORK/gpt-badid.json" STUB_SCHEMA_CAPTURE="${STUB_SCHEMA_CAPTURE:-}" \
     STUB_CLAUDE_APPROVE="$WORK/claude-approve.json" STUB_CLAUDE_BLOCK="$WORK/claude-block.json" \
     STUB_CANDIDATE="$RUN/09-test-evidence/qa-candidate.json" \
     STUB_MANIFEST_CAPTURE="${STUB_MANIFEST_CAPTURE:-}" STUB_RUN="$RUN" STUB_REDIRECT="$WORK/redirect-target" \
@@ -435,6 +446,84 @@ assert_rc "Claude records model readiness as NOT established" 0 review_env appro
 claude_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
 assert_eq "Claude model readiness names the absent catalog rather than claiming a pass" "None|False|no_structured_catalog" \
   "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1]))["model_readiness"]; print("%s|%s|%s" % (d["surface"], d["established"], d["reason"]))' "$RUN/09-test-evidence/reviewer-attempts/$claude_attempt/attempt.json")"
+
+t_case "the schema a provider is given is derived from the schema that judges the answer"
+# THE DEFECT THIS PINS: one file was doing two incompatible jobs. The canonical verdict schema is a
+# draft 2020-12 document with uniqueItems, allOf/if/then/else, pattern and minLength; NEITHER
+# structured-output API will accept it. Measured verbatim against the installed CLIs -
+#   codex : invalid_json_schema ... 'uniqueItems' is not permitted
+#           invalid_json_schema ... 'allOf' is not permitted
+#           'required' is required to be supplied and to be an array including every key in
+#           properties. Missing 'blocker_objects'
+#   claude: --json-schema is not a valid JSON Schema: no schema with key or ref
+#           "https://json-schema.org/draft/2020-12/schema"
+#           strict mode: missing type "array" for keyword "minItems" ... (strictTypes) x4
+# so BOTH judges would have died at the judge phase even fully authenticated. Nobody had seen it
+# because no judge had ever reached that phase.
+: > "$CALLS"
+SCHEMA_SEEN="$WORK/generation-schema.json"; rm -f "$SCHEMA_SEEN"
+STUB_SCHEMA_CAPTURE="$SCHEMA_SEEN"; export STUB_SCHEMA_CAPTURE
+assert_rc "GPT run captures the generation schema it was handed" 0 review_env approve "$GPT"
+unset STUB_SCHEMA_CAPTURE
+assert_ok "the generation projection is provider-acceptable and loses no constraint" \
+  t_python - "$SCHEMA_SEEN" "$FIRM_ROOT/agent-firm/schemas/qa-verdict.schema.json" <<'PY'
+import json, sys
+projected = json.load(open(sys.argv[1], encoding="utf-8"))
+canonical = json.load(open(sys.argv[2], encoding="utf-8"))
+
+def keywords(node, seen=None):
+    seen = {} if seen is None else seen
+    if isinstance(node, dict):
+        for key, value in node.items():
+            seen[key] = seen.get(key, 0) + 1
+            keywords(value, seen)
+    elif isinstance(node, list):
+        for value in node:
+            keywords(value, seen)
+    return seen
+
+rejected = ["uniqueItems", "minItems", "maxItems", "minLength", "maxLength", "pattern",
+            "minimum", "maximum", "multipleOf", "allOf", "anyOf", "oneOf", "not",
+            "if", "then", "else", "$schema", "$id"]
+present = keywords(projected)
+left = [name for name in rejected if name in present]
+assert not left, "the generation projection still carries keywords a provider rejects: %r" % left
+
+# Every constraint the projection had to drop must survive as prose the provider DOES accept,
+# otherwise "we removed it from the hint" really would mean "we stopped asking for it".
+def walk(node, out):
+    if isinstance(node, dict):
+        if isinstance(node.get("description"), str):
+            out.append(node["description"])
+        for value in node.values():
+            walk(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value, out)
+prose = []
+walk(projected, prose)
+prose = " ".join(prose)
+for needle in ("^obj-[A-Za-z0-9._:-]{1,128}$", "^[0-9a-f]{40}$", "^AC-[0-9]{3}$",
+               "uniqueItems True", "minLength 1", "minimum 1"):
+    assert needle in prose, "constraint %r was dropped without being carried into a description" % needle
+
+# The canonical schema is untouched: it is still the strict document, and it is still the validator.
+canon = keywords(canonical)
+for name in ("uniqueItems", "allOf", "pattern", "minLength", "minItems", "maxItems"):
+    assert name in canon, "the CANONICAL schema lost %r -- the projection must never edit it" % name
+
+# Everything the canonical schema requires is still required after projection.
+assert set(canonical["required"]).issubset(set(projected["required"])), \
+    "projection dropped a required property"
+PY
+# And the load-bearing half: a constraint the projection had to remove is STILL enforced, because
+# the canonical schema is what validates the answer. Without that, this change would be a quiet
+# relaxation of every pattern/length/uniqueness rule in the verdict contract.
+assert_rc "a verdict violating a projected-away constraint is still refused" 1 \
+  review_env schema_constraint_violation "$GPT"
+badid_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_eq "the refusal is a validation failure, not a judge BLOCK" "invalid" \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUN/09-test-evidence/reviewer-attempts/$badid_attempt/attempt.json")"
 
 t_case "actual provider commands receive controlled roots and complete native suppression flags"
 : > "$CALLS"
