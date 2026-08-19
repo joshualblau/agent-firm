@@ -192,13 +192,16 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
     prompt="\$agent-firm:start $(cat "$d/task.md")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns."
+    # -a never is a parse error on codex exec (0.147.0): --ask-for-approval is interactive-only and
+    # is not a clap global, so this argv used to die at rc 2 without running the eval at all. The
+    # never-ask policy is stated as the typed -c override exec does accept.
     "$BOUNDED" --phase eval --provider codex --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
       env FIRM_PRIMARY_PROVIDER=codex codex exec --ephemeral \
         -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
-        -s workspace-write -a never --json "$prompt"
+        -s workspace-write -c 'approval_policy="never"' --json "$prompt"
     provider_rc=$?
   fi
 

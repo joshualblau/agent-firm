@@ -106,15 +106,30 @@ case "$*" in
     [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'; exit 0; }
     echo '--sandbox --ask-for-approval --model'
     exit 0 ;;
-  "login status --json")
+  # A STUB THAT ANSWERS A SURFACE THE REAL CLI DOES NOT HAVE IS THE DEFECT, NOT THE FIXTURE. These
+  # two cases used to reply with tidy JSON to `login status --json` and `models list --json`; neither
+  # exists on codex-cli 0.147.0, so the suite was green against a CLI shape that has never shipped
+  # while the real firm-gpt-qa died at rc 2. They now emit the exact clap refusals the real binary
+  # emits, which is what makes any regression to those commands fail here instead of in production.
+  "login status --json"|"models list --json")
+    printf "error: unexpected argument '%s' found\n" "$2" >&2; exit 2 ;;
+  "doctor --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth ] && { echo '{"status":"unavailable","reason":"authentication"}'; exit 1; }
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret'; exit 1; }
-    echo '{"status":"authenticated"}'; exit 0 ;;
-  "models list --json")
+    [ "$STUB_MODE" = auth ] && { printf '{"schemaVersion":1,"overallStatus":"fail","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"fail","summary":"no Codex credentials were found"}}}\n'; exit 1; }
+    # `codex doctor` reports the WHOLE installation, so its exit status is not the auth answer.
+    # unrelated_doctor_failure models a host where auth is configured but some other check fails.
+    [ "$STUB_MODE" = unrelated_doctor_failure ] && { printf '{"schemaVersion":1,"overallStatus":"fail","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"},"updates.status":{"id":"updates.status","category":"updates","status":"fail","summary":"update check failed"}}}\n'; exit 1; }
+    # miscategorised_auth keeps the word "ok" but moves the entry out of the auth category, so a
+    # reader that matched on status alone would wrongly say available.
+    [ "$STUB_MODE" = miscategorised_auth ] && { printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"network","status":"ok","summary":"auth is configured"}}}\n'; exit 0; }
+    printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"}}}\n'; exit 0 ;;
+  "debug models")
     [ "$STUB_MODE" = model_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = incompatible ] && { echo '{"models":["other"]}'; exit 0; }
-    echo '{"models":["gpt-5.6-sol"]}'; exit 0 ;;
+    # The real catalog keys entries `slug`/`display_name`. A reader that only knew `id`/`name`
+    # stringified None for every entry and never matched the configured model.
+    [ "$STUB_MODE" = incompatible ] && { echo '{"models":[{"slug":"other","display_name":"Other"}]}'; exit 0; }
+    echo '{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol"},{"slug":"gpt-5.4","display_name":"GPT-5.4"}]}'; exit 0 ;;
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
@@ -181,15 +196,25 @@ case "$*" in
   "exec --help")
     [ "$STUB_MODE" = wrong_surface ] && { echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'; exit 0; }
     echo 'claude has no exec subcommand'; exit 1 ;;
+  # The real document is keyed loggedIn/authMethod, NOT status/authentication. Reading it for
+  # status/authentication is why a logged-in operator was classified as an untrusted result and
+  # firm-claude-qa BLOCKed on a host whose session was fine.
   "auth status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth ] && { echo '{"status":"unavailable","reason":"authentication"}'; exit 1; }
+    [ "$STUB_MODE" = auth ] && { echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; exit 1; }
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not authenticated token=secret'; exit 1; }
-    echo '{"status":"authenticated"}'; exit 0 ;;
+    # loggedIn must be the BOOLEAN, so a stringly-typed document stays untrusted.
+    [ "$STUB_MODE" = stringly_auth ] && { echo '{"loggedIn":"true","authMethod":"claude.ai"}'; exit 0; }
+    echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'; exit 0 ;;
+  # Claude Code 2.1.234 has NO `models` subcommand. `models list --json` is `unknown option`, and
+  # dropping the flag is worse than useless: bare `claude models list` is parsed as the PROMPT and
+  # starts a real session. The stub therefore refuses the first and makes the second an immediate,
+  # loud failure, so no future readiness probe can quietly start a billed session here.
   "models list --json")
-    [ "$STUB_MODE" = model_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = incompatible ] && { echo '{"models":["other"]}'; exit 0; }
-    echo '{"models":["opus"]}'; exit 0 ;;
+    echo "error: unknown option '--json'" >&2; exit 1 ;;
+  "models list"|"models")
+    echo 'STUB FAILURE: a readiness probe sent claude a PROMPT ("'"$*"'") instead of a subcommand' >&2
+    printf 'claude PROMPT-AS-PROBE %s\n' "$*" >> "$STUB_CALLS"; exit 97 ;;
 esac
 echo 'Cookie: session=super-secret request_id=req-123 device_code=987 user@example.com https://oauth.example/login'
 case "$STUB_MODE" in
@@ -197,6 +222,11 @@ case "$STUB_MODE" in
   authphrase_main) echo 'authentication required; unknown model' >&2; exit 1 ;;
   hard_kill) echo 'HARD-KILL-RAW-SECRET-91b7'; sleep 30 ;;
   malformed) echo 'not-json'; exit 0 ;;
+  # Claude publishes no model catalog, so a wrong configured model cannot be caught by a pre-check
+  # and surfaces HERE instead. Measured on Claude Code 2.1.234: an unknown --model is refused
+  # locally with `[claude-code:unrecognized_model]` at duration_api_ms 0 / total_cost_usd 0 / rc 1,
+  # so the BLOCK is immediate and costs nothing. This is the strict outcome, not the lenient one.
+  incompatible) echo '[claude-code:unrecognized_model] {"model":"opus","query_source":"sdk"}' >&2; exit 1 ;;
   hold) sleep 1; src="$STUB_CLAUDE_APPROVE" ;;
   diagnostic_symlink) rm -f "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; src="$STUB_CLAUDE_APPROVE" ;;
   promotion_symlink) rm -f "$STUB_RUN/08-qa-verdict.claude.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/08-qa-verdict.claude.json"; src="$STUB_CLAUDE_APPROVE" ;;
@@ -264,7 +294,17 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_rc "$provider malformed judge output BLOCKs" 1 review_env malformed "$wrapper"
   assert_rc "$provider main timeout BLOCKs" 1 review_env timeout "$wrapper"
   assert_rc "$provider trusted authentication unavailable" 3 review_env auth "$wrapper"
-  assert_rc "$provider trusted model unavailable" 3 review_env incompatible "$wrapper"
+  # A CONFIGURED MODEL THE PROVIDER WILL NOT ACCEPT MUST NEVER BE SILENT, but the two CLIs can only
+  # say so at different moments, so the shared contract is "not silent", not "exit 3". codex
+  # publishes a catalog (`codex debug models`) and is caught before the judge starts, which is the
+  # LENIENT, waivable outcome. claude publishes no catalog, so nothing pre-vouches for the model and
+  # the refusal lands at the judge as a BLOCK - the strict outcome, and free, because claude rejects
+  # an unknown --model locally at duration_api_ms 0.
+  if [ "$provider" = gpt ]; then
+    assert_rc "$provider trusted model unavailable before the judge" 3 review_env incompatible "$wrapper"
+  else
+    assert_rc "$provider unaccepted model is a judge-phase BLOCK, never a pass" 1 review_env incompatible "$wrapper"
+  fi
   assert_rc "$provider unsupported mandatory capability unavailable" 3 review_env capability "$wrapper"
   assert_rc "$provider ambiguous readiness text BLOCKs" 1 review_env ambiguous_auth "$wrapper"
   assert_rc "$provider post-start auth/model phrases remain BLOCK" 1 review_env authphrase_main "$wrapper"
@@ -334,6 +374,67 @@ for provider in gpt claude; do
   assert_eq "$provider records the wrong-surface refusal as an unsupported capability" unsupported_capability \
     "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trusted_reason"])' "$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json")"
 done
+
+t_case "readiness asks each CLI only for surfaces that CLI actually has"
+# THE DEFECT CLASS THIS PINS: a readiness check written against a CLI shape the installed CLI does
+# not emit. Every readiness command in this wrapper was of that kind — `codex login status --json`
+# (clap rc 2), `codex models list --json` (no such subcommand), `claude models list --json` (unknown
+# option, and without the flag a PROMPT that starts a billed session), and a claude auth reader
+# looking for status/authentication in a document keyed loggedIn/authMethod. Each failed as a
+# BLOCK or an untrusted result on a host where both judges were fine, and the suite stayed green
+# because the stubs answered the imaginary surfaces. The stubs now answer only what the real
+# binaries answer, so this case is what makes a re-drift fail here rather than in production.
+: > "$CALLS"
+assert_rc "GPT reaches its judge through the readiness surfaces codex really has" 0 review_env approve "$GPT"
+assert_rc "Claude reaches its judge through the readiness surfaces claude really has" 0 review_env approve "$CLAUDE"
+assert_ok "no readiness phase addressed a subcommand or flag its CLI does not have" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+calls = {}
+for line in records:
+    executable, args = line.split(" ", 1)[0], line.split(" args=", 1)[1].strip()
+    calls.setdefault(executable, []).append(args)
+assert "PROMPT-AS-PROBE" not in open(sys.argv[1], encoding="utf-8").read(), \
+    "a readiness probe was delivered to a provider as a PROMPT; it would have started a real session"
+# Surfaces measured absent on codex-cli 0.147.0 and Claude Code 2.1.234. None of them may appear in
+# any argv the wrapper issues, at any phase.
+absent = {
+    "codex": ["login status", "models list", "models "],
+    "claude": ["models list", "auth status --json --", "doctor --json"],
+}
+for executable, forbidden in absent.items():
+    mine = calls.get(executable) or []
+    assert mine, "no %s call was recorded at all" % executable
+    for needle in forbidden:
+        offending = [args for args in mine if args.startswith(needle.strip()) and needle.strip()]
+        assert not offending, (
+            "%s was asked for %r, a surface it does not have: %r" % (executable, needle.strip(), offending))
+# And the surfaces that DO exist must be the ones actually used.
+assert any(args == "doctor --json" for args in calls["codex"]), \
+    "codex authentication readiness must read `codex doctor --json`, its only structured auth surface: %r" % (calls["codex"],)
+assert any(args == "debug models" for args in calls["codex"]), \
+    "codex model readiness must read `codex debug models`, its only structured catalog: %r" % (calls["codex"],)
+assert any(args == "auth status --json" for args in calls["claude"]), \
+    "claude authentication readiness must read `claude auth status --json`: %r" % (calls["claude"],)
+PY
+# The auth document must be read by its OWN keys and types, not by a shape no CLI emits.
+assert_rc "codex auth is the auth.credentials check, not the whole-installation exit status" 0 \
+  review_env unrelated_doctor_failure "$GPT"
+assert_rc "an ok status outside the auth category is not an auth answer" 1 \
+  review_env miscategorised_auth "$GPT"
+assert_rc "a stringly-typed loggedIn is not a trusted boolean" 1 review_env stringly_auth "$CLAUDE"
+# Configured-model readiness is recorded either way, so an absent pre-check can never be read
+# downstream as a passed one.
+: > "$CALLS"
+assert_rc "GPT records established model readiness" 0 review_env approve "$GPT"
+gpt_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_eq "GPT model readiness is established from a named surface" "debug models|True" \
+  "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1]))["model_readiness"]; print("%s|%s" % (d["surface"], d["established"]))' "$RUN/09-test-evidence/reviewer-attempts/$gpt_attempt/attempt.json")"
+assert_rc "Claude records model readiness as NOT established" 0 review_env approve "$CLAUDE"
+claude_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
+assert_eq "Claude model readiness names the absent catalog rather than claiming a pass" "None|False|no_structured_catalog" \
+  "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1]))["model_readiness"]; print("%s|%s|%s" % (d["surface"], d["established"], d["reason"]))' "$RUN/09-test-evidence/reviewer-attempts/$claude_attempt/attempt.json")"
 
 t_case "actual provider commands receive controlled roots and complete native suppression flags"
 : > "$CALLS"

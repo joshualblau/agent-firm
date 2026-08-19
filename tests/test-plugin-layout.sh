@@ -169,9 +169,14 @@ assert calls == [
     ["claude", "-p", "Reply with exactly: ok", "--model", "opus", "--effort", "xhigh",
      "--output-format", "text", "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"],
     ["codex", "login", "status"],
-    ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-a", "never",
-     "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"', "Reply with exactly: ok"],
+    # `-a never` is NOT here on purpose: --ask-for-approval is interactive-only on codex-cli
+    # 0.147.0, so sending it to `codex exec` is a rc-2 parse error and the probe never reaches the
+    # model. The never-ask policy is the typed -c override, which is what the real judge sends too.
+    ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+     "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"',
+     "-c", 'approval_policy="never"', "Reply with exactly: ok"],
 ], calls
+assert not any("-a" in call for call in calls), calls
 PY
 
 for mismatch in claude codex; do

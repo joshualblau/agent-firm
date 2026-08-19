@@ -524,8 +524,15 @@ if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v codex >/dev/null 2>&1; then
   if run_capped 10 codex login status >/dev/null 2>&1; then
     pass "Codex ChatGPT subscription authentication is ready"
     if [ "$PROBE" = 1 ]; then
-      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
+      # -a/--ask-for-approval is INTERACTIVE-ONLY on codex-cli 0.147.0 and is not a clap global, so
+      # `codex exec ... -a never` is `error: unexpected argument '-a' found` (rc 2) and the probe
+      # never reaches the model. That made --probe report the canonical GPT reviewer failing on a
+      # host where it works perfectly, which is the loudest possible false negative from the
+      # quietest possible cause. The same never-ask policy is stated the way exec does accept it,
+      # as the typed -c override firm-reviewer-common already sends to the real judge.
+      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only \
         -m "$CODEX_REVIEW_MODEL" -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" \
+        -c "approval_policy=\"never\"" \
         "Reply with exactly: ok" >/dev/null 2>&1; then
         pass "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) completed a bounded read-only probe"
       else

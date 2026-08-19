@@ -808,6 +808,71 @@ except Exception as exc:
     for directory in (config_root / "xdg", config_root / "codex", config_root / "claude"):
         os.mkdir(directory, 0o700)
 
+    # THE CONTROLLED ROOT ISOLATES CONFIGURATION AND STATE, NOT IDENTITY. docs/PHASE3.md promises
+    # both halves at once - "isolated attempt-local provider state" AND "subscription authentication
+    # only through the provider-native CLI" - but only the first half was reachable, because for
+    # both CLIs the operator's credential lives INSIDE the same directory as the operator's
+    # configuration. Pointing CODEX_HOME / CLAUDE_CONFIG_DIR at an empty directory therefore withheld
+    # the session as well as the settings, and no judge could ever authenticate: measured here,
+    # `claude auth status --json` under an empty CLAUDE_CONFIG_DIR returns rc 1
+    # {"loggedIn":false,"authMethod":"none"} no matter what the operator's real session is, and
+    # `codex doctor --json` under an empty CODEX_HOME returns auth.credentials `fail`, "no Codex
+    # credentials were found".
+    #
+    # Handing the judge the operator's real provider directory is NOT the fix. That directory also
+    # holds global instructions, plugins, skills, an MCP registry, rollout state and every past
+    # session transcript, all of which the judge could read and none of which the controlled root is
+    # willing to let it inherit; and it is written, not just read - `codex doctor` was measured
+    # creating `tmp/arg0/...` inside whatever CODEX_HOME it is given, which would make this wrapper
+    # alter the operator's provider profile, something it must never do.
+    #
+    # So exactly one artifact crosses the boundary, by value, and it is the credential alone. The
+    # attempt-local provider directory still contains no config.toml, no global instruction file, no
+    # plugins, no skills, no MCP registry, no rollout database and no session history, so there is
+    # nothing there for the judge to inherit; the copy is mode 0400 inside the 0700 attempt tree the
+    # cleanup guardian already owns and destroys; the operator's file is opened O_RDONLY|O_NOFOLLOW
+    # and never written; and any refresh the provider performs lands in the disposable copy. Nothing
+    # here is allowed to *establish* readiness - the authentication phase below re-reads the result
+    # structurally from inside the controlled root, which is the only thing that can.
+    #
+    # Claude has no entry in this table on purpose. On this platform its credential is not a file at
+    # all (bin/firm-doctor already records "auth lives in the login Keychain"), and the only thing in
+    # CLAUDE_CONFIG_DIR that carries the operator's account association is `.claude.json`, which is
+    # also the operator's project configuration, MCP server list and per-project history. There is
+    # no artifact here that is credential-without-configuration, so nothing is copied and the
+    # authentication phase below returns the honest trusted `unavailable`/`authentication` that an
+    # empty CLAUDE_CONFIG_DIR earns. Whether that trade can be broken at all on this platform is an
+    # open Architecture question, deliberately not answered by quietly widening what crosses here.
+    credential_artifacts = ()
+    if provider == "gpt":
+        operator_codex_home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+        credential_artifacts = ((Path(operator_codex_home) / "auth.json", config_root / "codex" / "auth.json"),)
+    credential_state = {"imported":0, "artifacts":[]}
+    for source_credential, destination_credential in credential_artifacts:
+        record = {"artifact":destination_credential.name, "imported":False, "reason":None}
+        try:
+            info = os.lstat(source_credential)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                record["reason"] = "not_regular_file"
+            elif info.st_uid != os.getuid():
+                record["reason"] = "not_owned_by_invoker"
+            elif info.st_size > 262144:
+                record["reason"] = "exceeds_credential_bound"
+            else:
+                fd = os.open(source_credential, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb", closefd=True) as handle:
+                    payload = handle.read(262144)
+                atomic_write(destination_credential, payload, 0o400)
+                record["imported"] = True
+                credential_state["imported"] += 1
+        except FileNotFoundError:
+            record["reason"] = "absent"
+        except OSError as exc:
+            record["reason"] = type(exc).__name__
+        credential_state["artifacts"].append(record)
+    attempt["provider_credential"] = credential_state
+    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+
     diagnostics = {"schema_version":2, "provider":provider, "attempt_id":attempt_id, "cap_bytes":16384,
                    "content_policy":"allowlisted_metadata_only", "phases":[]}
     raw_files = []
@@ -902,56 +967,143 @@ except Exception as exc:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"}, trusted_reason="unsupported_capability", missing_capabilities=missing, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"required provider controls unsupported: {', '.join(missing)} (exit 3)", 3)
 
-    auth_command = [executable, "login", "status", "--json"] if provider == "gpt" else [executable, "auth", "status", "--json"]
+    # READINESS MUST READ WHAT THE INSTALLED CLI ACTUALLY EMITS. Neither readiness command that used
+    # to be here addressed a surface its CLI has. `codex login status --json` is a clap parse error
+    # on codex-cli 0.147.0 - `error: unexpected argument '--json' found`, rc 2, no document at all -
+    # and the only thing bare `codex login status` prints is the sentence "Logged in using ChatGPT",
+    # which is human-facing prose and can never establish availability under
+    # agent-firm/contracts/lifecycle.md. `claude auth status --json` IS structured JSON at rc 0, but
+    # the document is keyed loggedIn/authMethod and this code read status/authentication, so a fully
+    # logged-in operator was classified "not a trusted structured available result".
+    #
+    # Each provider now declares its readiness command together with the reader for that command's
+    # own document shape, the way JUDGE_SUBCOMMAND above ties the surface probed to the surface
+    # invoked, so the two cannot drift apart again. A reader may answer True only from an explicit
+    # affirmative field and False only from an explicit negative one; every other input - absent key,
+    # unknown value, wrong shape, unparseable bytes - is None, which is BLOCK, never "probably fine".
+    def gpt_authentication(data):
+        # `codex doctor --json` is the only structured auth surface this CLI has ("Emit a redacted
+        # machine-readable report"). Measured: schemaVersion 1, checks["auth.credentials"] ->
+        # status "ok" / summary "auth is configured" when logged in, and status "fail" / summary
+        # "no Codex credentials were found" against an empty CODEX_HOME.
+        if data.get("schemaVersion") != 1:
+            return None, None
+        checks = data.get("checks")
+        entry = checks.get("auth.credentials") if isinstance(checks, dict) else None
+        if not isinstance(entry, dict) or entry.get("id") != "auth.credentials" or entry.get("category") != "auth":
+            return None, None
+        status_value = entry.get("status")
+        if status_value == "ok":
+            return True, None
+        if status_value == "fail":
+            return False, "authentication"
+        return None, None
+    def claude_authentication(data):
+        # Measured on Claude Code 2.1.234: rc 0 {"loggedIn":true,"authMethod":"claude.ai",...} and
+        # rc 1 {"loggedIn":false,"authMethod":"none",...}. `loggedIn` is compared against the
+        # booleans themselves, so a string "false" or a missing key is BLOCK rather than an answer.
+        logged_in = data.get("loggedIn")
+        if logged_in is True and str(data.get("authMethod") or "").lower() not in ("", "none"):
+            return True, None
+        if logged_in is False:
+            return False, "authentication"
+        return None, None
+    # `codex doctor --json` reports the WHOLE installation, so its exit status summarises checks that
+    # have nothing to do with authentication (app-server, git, MCP, terminal, updates, network). A
+    # nonzero exit there does not mean "not authenticated" and a zero exit does not mean
+    # "authenticated"; the auth answer is the auth.credentials entry and nothing else, which is why
+    # the reader demands that entry by id AND category and refuses any status it was not taught. For
+    # `claude auth status --json` the exit status IS the auth answer, so that surface additionally
+    # requires exit and document to agree. Neither route can reach "available" without an explicit
+    # affirmative field in a structured document.
+    auth_command, auth_reader, auth_exit_is_the_auth_answer = (
+        ([executable, "doctor", "--json"], gpt_authentication, False) if provider == "gpt" else
+        ([executable, "auth", "status", "--json"], claude_authentication, True)
+    )
     rc, result, raw = run_phase("authentication", readiness_timeout, auth_command)
-    def structured_readiness(payload):
+    def structured_readiness(payload, reader):
         try:
             data = json.loads(payload.decode("utf-8"))
         except Exception:
             return None, None
         if not isinstance(data, dict):
             return None, None
-        status_value = str(data.get("status") or data.get("authentication") or "").lower()
-        reason_value = str(data.get("reason") or "").lower()
-        if status_value in ("ok", "available", "authenticated", "logged_in", "logged-in"):
-            return True, None
-        if status_value == "unavailable" and reason_value in ("authentication", "model"):
-            return False, reason_value
-        return None, None
-    ready, unavailable_reason = structured_readiness(raw)
+        return reader(data)
+    ready, unavailable_reason = structured_readiness(raw, auth_reader)
     if ready is False:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":unavailable_reason}, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"trusted structured authentication readiness is unavailable: {unavailable_reason} (exit 3)", 3)
     if result.get("status") == "timeout":
         finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("authentication readiness timed out; BLOCK", 1)
-    if rc != 0 or ready is not True:
+    if ready is not True or (rc != 0 and auth_exit_is_the_auth_answer):
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("authentication readiness was not a trusted structured available result; BLOCK", 1)
 
-    model_command = [executable, "models", "list", "--json"]
-    rc, result, raw = run_phase("model", readiness_timeout, model_command)
-    try:
-        model_data = json.loads(raw.decode("utf-8"))
-        if isinstance(model_data, dict) and model_data.get("status") == "unavailable" and model_data.get("reason") == "model":
-            models = []
-            model_unavailable = True
-        else:
-            values = model_data.get("models") if isinstance(model_data, dict) else model_data
-            models = [str(item.get("id") or item.get("name")) if isinstance(item,dict) else str(item) for item in values]
-            model_unavailable = model not in models
-    except Exception:
-        models = []
-        model_unavailable = None
-    if result.get("status") == "timeout":
-        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("model readiness timed out; BLOCK", 1)
-    if rc == 0 and model_unavailable is True:
-        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"model"}, trusted_reason="model", diagnostic=str(diagnostic_path.relative_to(run)))
-        stop(f"trusted structured model readiness does not list {model} (exit 3)", 3)
-    if rc != 0 or model_unavailable is None:
-        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("model readiness was not trusted structured data; BLOCK", 1)
+    # `models list --json` exists on NEITHER CLI. On codex-cli 0.147.0 it is `error: unexpected
+    # argument 'list' found` (rc 2); the structured catalog is `codex debug models`, "Render the raw
+    # model catalog as JSON", and its entries are keyed `slug`/`display_name`, not the `id`/`name`
+    # this code used to read. On Claude Code 2.1.234 there is no `models` subcommand at all, so
+    # `claude models list --json` is `error: unknown option '--json'` and, worse, dropping the flag
+    # does not give a listing either - bare `claude models list` is parsed as the PROMPT and starts a
+    # real session against the operator's subscription. A readiness probe must never be able to do
+    # that, so claude declares NO model surface rather than a nearly-right one.
+    #
+    # WHAT THIS PHASE IS FOR DECIDES WHAT ITS ABSENCE MEANS. It exists to turn "the judge failed
+    # because the configured model is not there" into a TRUSTED, WAIVABLE unavailability instead of a
+    # BLOCK - exit 3 is the LENIENT outcome here, not the strict one. So when a CLI publishes no
+    # catalog, declining to pre-check is fail-CLOSED: nothing claims the model is available, and a
+    # bad model can then only surface at the judge, where it is a BLOCK. Measured: claude rejects an
+    # unknown --model locally, before any request (duration_api_ms 0, total_cost_usd 0, rc 1), so
+    # that BLOCK is fast and free. Manufacturing an exit-3 `unsupported_capability` here instead
+    # would be the opposite trade - it would make every Claude second voice waivable-away on a
+    # question this phase never actually asked.
+    #
+    # What must NOT happen is a silent gap, so the attempt records `model_readiness` either way and
+    # nothing downstream may read an absent pre-check as a passed one. The open question - what
+    # configured-model readiness should mean for a CLI that resolves aliases server-side and
+    # publishes no catalog - is recorded for Architecture, not settled here.
+    model_surface = [executable, "debug", "models"] if provider == "gpt" else None
+    if model_surface is None:
+        attempt["model_readiness"] = {"surface":None, "established":False, "reason":"no_structured_catalog"}
+        diagnostics["model_readiness"] = "not_established:no_structured_catalog"
+        atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    else:
+        rc, result, raw = run_phase("model", readiness_timeout, model_surface)
+    def structured_models(payload):
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return None
+        values = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(values, list):
+            return None
+        names = []
+        for item in values:
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = item.get("slug") or item.get("id") or item.get("name")
+            else:
+                return None
+            if not isinstance(name, str) or not name:
+                return None
+            names.append(name)
+        return names
+    if model_surface is not None:
+        models = structured_models(raw)
+        model_unavailable = None if models is None else (model not in models)
+        if result.get("status") == "timeout":
+            finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
+            stop("model readiness timed out; BLOCK", 1)
+        if rc == 0 and model_unavailable is True:
+            finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"model"}, trusted_reason="model", diagnostic=str(diagnostic_path.relative_to(run)))
+            stop(f"trusted structured model readiness does not list {model} (exit 3)", 3)
+        if rc != 0 or model_unavailable is None:
+            finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
+            stop("model readiness was not trusted structured data; BLOCK", 1)
+        attempt["model_readiness"] = {"surface":" ".join(model_surface[1:]), "established":True, "reason":None}
+        atomic_write(attempt_path, json_bytes(attempt), 0o600)
 
     schema_path = controlled_schema
     schema_text = json.dumps(json.loads(schema_path.read_text(encoding="utf-8")), separators=(",", ":"))
