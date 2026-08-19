@@ -89,10 +89,22 @@ cat > "$STUB/codex" <<'SH'
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
 case "$*" in
-  "--help")
+  # THE FLAG SET LIVES AT `exec`, NOT AT THE TOP LEVEL — this stub models codex-cli 0.147.0, where
+  # `codex --help` documents the interactive CLI and `codex exec --help` documents every control the
+  # judge sends. A probe that reads the wrong one of these two gets a wrong answer either way round,
+  # which is the whole point: `wrong_surface` below inverts them.
+  "exec --help")
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = capability ] && { echo '--ephemeral --sandbox --model'; exit 0; }
-    echo '--ignore-user-config --ignore-rules --ephemeral --sandbox --ask-for-approval --model --output-schema --output-last-message'
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--ephemeral --sandbox --model'; exit 0; }
+    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'
+    exit 0 ;;
+  "--help")
+    # The real top level offers --sandbox/--ask-for-approval/--model and NOT the exec-only five.
+    # Under `wrong_surface` it offers the complete set, so a probe that reads here passes when it
+    # must not.
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'; exit 0; }
+    echo '--sandbox --ask-for-approval --model'
     exit 0 ;;
   "login status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
@@ -139,7 +151,8 @@ probe={"agents":hostile("AGENTS.md"),"claude":hostile("CLAUDE.md"),
        "hooks":os.path.exists(os.path.join(cwd,"hooks")),"plugins":os.path.exists(os.path.join(cwd,"plugins")),
        "mcp":os.path.exists(os.path.join(cwd,"mcp")),"skills":os.path.exists(os.path.join(cwd,"skills")),
        "memory":os.path.exists(os.path.join(cwd,"memory")),"network":"-s read-only" not in args,
-       "policy":hostile("AGENTS.md") or hostile("CLAUDE.md"),"approval":"-a never" not in args,
+       "policy":hostile("AGENTS.md") or hostile("CLAUDE.md"),
+       "approval":'approval_policy="never"' not in args,
        "snapshot_write":wrote}
 json.dump(probe,open(sentinel,"w"))
 PY
@@ -156,11 +169,18 @@ cat > "$STUB/claude" <<'SH'
 printf 'claude cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
 case "$*" in
+  # Claude documents its whole judge surface at the TOP level, so this is where the complete set
+  # belongs. `wrong_surface` moves it to `exec --help` — a subcommand claude has no reason to be
+  # probed at — so a probe that drifted to a subcommand for BOTH providers fails here too.
   "--help")
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = capability ] && { echo '--safe-mode --model'; exit 0; }
-    echo '--safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --tools --disallowedTools'
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--safe-mode --model'; exit 0; }
+    echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
     exit 0 ;;
+  "exec --help")
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'; exit 0; }
+    echo 'claude has no exec subcommand'; exit 1 ;;
   "auth status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = auth ] && { echo '{"status":"unavailable","reason":"authentication"}'; exit 1; }
@@ -272,11 +292,60 @@ for phase in discovery_hang authentication_hang model_hang timeout; do
   assert_ok "$phase descendant is gone" sh -c "! kill -0 '$child' 2>/dev/null"
 done
 
+t_case "capability discovery probes the surface the judge invokes, not a neighbouring one"
+# THE DEFECT THIS PINS: the probe ran `codex --help` while every flag the gpt judge sends belongs to
+# `codex exec`, so a fully capable Codex finalised `unavailable` with the trusted reason
+# `unsupported_capability`. That is the most dangerous shape available — it needs only a waiver, so
+# a Claude-primary run silently lost its cross-provider second voice while the Codex-primary
+# direction kept its Claude judge, and the two adapters were not at parity at all.
+# Asserting the exit code alone would not have caught it (exit 3 is a legitimate answer), so this
+# drives BOTH directions: the flags at the judge's own surface must be found, and the SAME flags at
+# the neighbouring surface must NOT satisfy the probe.
+: > "$CALLS"
+assert_rc "GPT reaches its judge when the controls are where the judge sends them" 0 review_env approve "$GPT"
+assert_rc "Claude reaches its judge from its own top-level surface" 0 review_env approve "$CLAUDE"
+assert_ok "each provider probed the exact argv prefix its judge then invoked" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+# The subcommand path each provider's judge is invoked at, and therefore the only --help that can
+# answer a capability question about it. Spelled out here on purpose: this is the pin.
+expected = {"codex": ["exec"], "claude": []}
+for executable, subcommand in expected.items():
+    mine = [line.split(" args=", 1)[1] for line in records if line.startswith(executable + " ")]
+    assert mine, "no %s call was recorded at all" % executable
+    probes = [args for args in mine if args.split() and args.split()[-1] == "--help"]
+    assert len(probes) == 1, "%s: expected exactly one --help probe, got %r" % (executable, probes)
+    probed = probes[0].split()[:-1]
+    assert probed == subcommand, (
+        "%s: capability discovery probed %r but the judge is invoked at %r -- a probe that reads a "
+        "surface the wrapper never invokes cannot answer a capability question about it"
+        % (executable, probed, subcommand))
+    judge = max((args.split() for args in mine), key=len)
+    assert judge[:len(probed)] == probed, (
+        "%s: the judge argv %r does not start with the probed prefix %r" % (executable, judge[:4], probed))
+PY
+# The mutation, both ways round: the complete flag set moved to the OTHER surface must be refused.
+# Without the fix the first of these passes discovery and returns 0 instead of 3.
+assert_rc "GPT controls documented only at the top level are not exec capability" 3 review_env wrong_surface "$GPT"
+assert_rc "Claude controls documented only at a subcommand are not top-level capability" 3 review_env wrong_surface "$CLAUDE"
+for provider in gpt claude; do
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  assert_eq "$provider records the wrong-surface refusal as an unsupported capability" unsupported_capability \
+    "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trusted_reason"])' "$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json")"
+done
+
 t_case "actual provider commands receive controlled roots and complete native suppression flags"
 : > "$CALLS"
 assert_rc "GPT controlled invocation succeeds" 0 review_env approve "$GPT"
 assert_output "GPT suppresses ambient config and rules" "--ignore-user-config --ignore-rules" cat "$CALLS"
-assert_output "GPT is ephemeral read-only and non-interactive" "--ephemeral -s read-only -a never" cat "$CALLS"
+assert_output "GPT is ephemeral and read-only" "--ephemeral -s read-only" cat "$CALLS"
+# `codex exec` has no --ask-for-approval, so the non-interactive posture is stated as the typed
+# config override exec DOES accept, and --strict-config makes an unrecognised key a hard error
+# rather than a silent no-op. Both halves are asserted: the override alone would be a no-op if the
+# key were ever renamed away.
+assert_output "GPT is non-interactive by an override codex validates" 'approval_policy="never"' cat "$CALLS"
+assert_output "GPT rejects unrecognised config keys rather than ignoring them" "--strict-config" cat "$CALLS"
 assert_output "GPT carries explicit model reasoning" 'model_reasoning_effort="xhigh"' cat "$CALLS"
 assert_output "GPT uses wrapper-selected schema/output" "--output-schema" cat "$CALLS"
 : > "$CALLS"

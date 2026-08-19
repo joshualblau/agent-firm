@@ -862,7 +862,19 @@ except Exception as exc:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"cli_missing"}, trusted_reason="cli_missing", diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"{provider} CLI unavailable from the controlled readiness PATH (exit 3)", 3)
 
-    discovery_command = [executable, "--help"]
+    # WHERE THE CAPABILITY PROBE LOOKS IS PART OF THE PROBE. A CLI documents a DIFFERENT flag set
+    # at each subcommand, so "does --help mention this flag" is only a capability answer when the
+    # --help read is the one the judge is about to invoke. It was not: the probe read
+    # `codex --help` (the interactive CLI) while every flag the gpt judge sends belongs to
+    # `codex exec`, so a fully capable Codex reported five of them missing and firm-gpt-qa
+    # finalised `unavailable` with the TRUSTED reason `unsupported_capability` — a Claude-primary
+    # run could never obtain its cross-provider second voice, and it degraded quietly to one voice
+    # instead of erroring. JUDGE_SUBCOMMAND is therefore declared once and used twice, below and at
+    # the launch, so the surface probed and the surface invoked cannot drift apart again; the
+    # claude side declares [] explicitly rather than being accidentally right about a CLI whose
+    # controls happen to be top-level today.
+    judge_subcommand = ["exec"] if provider == "gpt" else []
+    discovery_command = [executable] + judge_subcommand + ["--help"]
     rc, result, raw = run_phase("discovery", discovery_timeout, discovery_command)
     if result.get("status") in ("timeout", "turn_limit"):
         finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
@@ -871,12 +883,21 @@ except Exception as exc:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("capability discovery failed; BLOCK", 1)
     help_text = raw.decode("utf-8", "replace")
+    # Every entry is a control the judge argv below actually sends, spelled the way the probed
+    # --help spells it, and every control the judge sends has an entry. `codex exec` has no
+    # --ask-for-approval on codex-cli 0.147.0 (it is interactive-only and is not a clap global, so
+    # `codex exec -a never` is a parse error, not a policy), so the judge states the same policy as
+    # the typed `-c approval_policy=` override that exec does accept, and --strict-config makes an
+    # unrecognised override key a hard error instead of a silent no-op.
     required_flags = (
-        ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "--ask-for-approval", "--model", "--output-schema", "--output-last-message"]
+        ["--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--strict-config", "--ephemeral", "--sandbox", "--model", "--config", "--output-schema", "--output-last-message"]
         if provider == "gpt" else
-        ["--safe-mode", "--system-prompt", "--strict-mcp-config", "--no-session-persistence", "--model", "--effort", "--output-format", "--json-schema", "--tools", "--disallowedTools"]
+        ["--print", "--safe-mode", "--system-prompt", "--strict-mcp-config", "--no-session-persistence", "--model", "--effort", "--output-format", "--json-schema", "--permission-mode", "--tools", "--disallowedTools"]
     )
-    missing = [flag for flag in required_flags if flag not in help_text]
+    # Token match, not substring: a help text that documented only `--strict-config` must not be
+    # read as also offering `--config`, and `--ignore-user-config` must not answer for either.
+    missing = [flag for flag in required_flags
+               if not re.search(r"(?<![-\w])" + re.escape(flag) + r"(?![-\w])", help_text)]
     if missing:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"}, trusted_reason="unsupported_capability", missing_capabilities=missing, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"required provider controls unsupported: {', '.join(missing)} (exit 3)", 3)
@@ -943,10 +964,10 @@ except Exception as exc:
     candidate_verdict = attempt_dir / "candidate-verdict.json"
     if provider == "gpt":
         command = [
-            executable, "exec", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-            "--ephemeral", "-s", "read-only", "-a", "never", "-m", model,
-            "-c", 'model_reasoning_effort="xhigh"', "--output-schema", str(schema_path),
-            "-o", str(candidate_verdict), prompt
+            executable] + judge_subcommand + ["--skip-git-repo-check", "--ignore-user-config",
+            "--ignore-rules", "--strict-config", "--ephemeral", "-s", "read-only", "-m", model,
+            "-c", 'model_reasoning_effort="xhigh"', "-c", 'approval_policy="never"',
+            "--output-schema", str(schema_path), "-o", str(candidate_verdict), prompt
         ]
     else:
         command = [

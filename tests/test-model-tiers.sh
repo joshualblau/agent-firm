@@ -291,8 +291,12 @@ def literal_values(node):
 resolver = [literal_values(node) for node in lists if "firm-model-resolve" in ast.unparse(node)]
 assert len(resolver) == 1, resolver
 assert resolver[0][1:] == ["--provider", None, "--role", "reviewer", "--format", "json"], resolver[0]
-codex = [node for node in lists if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
-claude = [node for node in lists if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
+# Only INVOCATION literals. An invocation interpolates at least one non-literal (the executable,
+# the model, the prompt); an all-literal list is a declaration -- the required-capability list names
+# the same controls and would otherwise be matched here and read as a second adapter argv.
+argvs = [node for node in lists if any(not isinstance(x, ast.Constant) for x in node.elts)]
+codex = [node for node in argvs if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
+claude = [node for node in argvs if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
           and any(isinstance(x, ast.Constant) and x.value == "--permission-mode" for x in node.elts)]
 assert len(codex) == 1 and len(claude) == 1
 cv, av = literal_values(codex[0]), literal_values(claude[0])
