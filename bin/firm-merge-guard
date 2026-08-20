@@ -677,6 +677,10 @@ SURFACE_COVERED += [
     "  $FIRM_PYTHON is untouched for ordinary firm tooling: what changed is that this control does",
     "  not honour it. `firm-python --trusted-status` prints what this guard would run, which is a",
     "  different question from `firm-python --status`.",
+    "  READ THIS LINE NARROWLY. It covers WHICH PROGRAM renders the decision and nothing else. It is",
+    "  not a claim that $PATH or the environment stops mattering here: `gh` and `git` are still",
+    "  resolved from $PATH, and the interpreter's own module search path is still the caller's. Both",
+    "  are GAPS below, each with its own permit assertion.",
 ]
 
 SURFACE_GAPS = [
@@ -737,12 +741,24 @@ SURFACE_GAPS = [
     "THE INTERPRETER'S OWN ENVIRONMENT, as distinct from WHICH interpreter runs (which is covered",
     "  above). The trusted CPython this guard runs is still started with the caller's environment,",
     "  so $PYTHONPATH, $PYTHONHOME and $HOME steer where it imports `yaml` and the stdlib modules",
-    "  the checker uses from. Selecting the program and controlling what that program loads are two",
-    "  different questions and only the first one moved; this line is here so the COVERED claim",
-    "  above cannot be read as the second. It is NOT closed by running the interpreter with -E/-I:",
-    "  pyyaml lives in the per-user site directory on this OS, so isolating the environment turns",
-    "  the guard into a blanket cannot-evaluate. Same class and same disclosure as every other line",
-    "  on this list: a client-side control cannot outrank a caller who owns the process.",
+    "  the checker uses from. A module named `yaml` on $PYTHONPATH supplies the allowlist parser, and",
+    "  a planted safe_load() reaches a PERMIT. Selecting the program and controlling what that",
+    "  program loads are two different questions and only the first one moved; this line is here so",
+    "  the COVERED claim above cannot be read as the second. It is NOT closed by running the",
+    "  interpreter with -E/-I: pyyaml lives in the per-user site directory on this OS, so isolating",
+    "  the environment turns the guard into a blanket cannot-evaluate. Same class and same",
+    "  disclosure as every other line on this list: a client-side control cannot outrank a caller",
+    "  who owns the process.",
+    "THE IDENTITY PROGRAMS THEMSELVES, for the same reason and by a shorter route. The two identity",
+    "  sources are `gh api user --jq .login` and `git config user.email`, and both binaries are",
+    "  resolved from $PATH. A `gh` and a `git` placed first on $PATH that print an allow-listed",
+    "  login and email reach a PERMIT — no interpreter involved, no file edited. This is the",
+    "  header's existing CLIENT-SIDE disclosure at the level of the two programs it names rather",
+    "  than a new class, and it is why that disclosure says the guard stops an agent and not a",
+    "  determined human; it is spelled out here because the interpreter line above must not be read",
+    "  as $PATH having stopped mattering. Resolving them by absolute path would not close it either",
+    "  (`gh` has no fixed install location, and the answer is a network round trip in any case) —",
+    "  what closes an identity check is the server side: docs/BRANCH-PROTECTION-RUNBOOK.md.",
 ]
 
 class Cannot(Exception):

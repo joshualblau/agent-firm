@@ -1622,6 +1622,32 @@ assert_output "--surface names \$PYTHONPATH specifically, not just 'the environm
 assert_output "  and says why -E/-I is not the fix" "pyyaml lives in the per-user site directory" \
   mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
+# THE SHORTER ROUTE TO THE SAME PLACE, and the reason the COVERED interpreter line has to be read
+# narrowly: the two identity sources are PROGRAMS, and both are resolved from $PATH. This needs no
+# interpreter and no nonce. It is the header's CLIENT-SIDE disclosure at the level of the two
+# binaries it names, and it is asserted here so the new COVERED line cannot be read as "$PATH stopped
+# mattering to this guard". Pre-existing: verified at 9941201 as well as here.
+_mgi_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-idstub.XXXXXX")"; t_track "$_mgi_dir"
+printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$ALLOWED_LOGIN" > "$_mgi_dir/gh"
+{ printf '#!/bin/sh\n'
+  printf 'for a in "$@"; do case "$a" in user.email) printf "%%s\\n" "%s"; exit 0 ;; esac; done\n' \
+    "$ALLOWED_EMAIL"
+  printf 'exec /usr/bin/git "$@"\n'; } > "$_mgi_dir/git"
+chmod +x "$_mgi_dir/gh" "$_mgi_dir/git"
+_mgi_rc=0
+( cd "$REPO_BAD" && PATH="$_mgi_dir:$NOGH_PATH" "$TREE/bin/firm-merge-guard" \
+    --command 'git push origin main' ) >/dev/null 2>&1 || _mgi_rc=$?
+assert_eq "GAP: a \$PATH-supplied gh and git print an allow-listed identity and PERMIT (0)" \
+  "0" "$_mgi_rc"
+assert_output "  and the permit names the identity those two programs invented" "$ALLOWED_LOGIN" \
+  mg_env "$TREE" "$_mgi_dir:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+assert_output "--surface carries that as a named line too" "THE IDENTITY PROGRAMS THEMSELVES" \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "  and points at the server side as what actually closes an identity check" \
+  "BRANCH-PROTECTION-RUNBOOK.md" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "  while the COVERED interpreter line tells the reader to read it narrowly" \
+  "READ THIS LINE NARROWLY" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+
 t_case "WO-16 with NO trusted interpreter the guard reports cannot-evaluate — it never permits"
 # FAIL CLOSED. Removing the caller's ability to choose is only half a fix: the other half is what
 # happens when the fixed list yields nothing. There is deliberately NO degraded fallback here (the
