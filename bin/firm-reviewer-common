@@ -882,14 +882,59 @@ except Exception as exc:
     # here is allowed to *establish* readiness - the authentication phase below re-reads the result
     # structurally from inside the controlled root, which is the only thing that can.
     #
-    # Claude has no entry in this table on purpose. On this platform its credential is not a file at
-    # all (bin/firm-doctor already records "auth lives in the login Keychain"), and the only thing in
-    # CLAUDE_CONFIG_DIR that carries the operator's account association is `.claude.json`, which is
-    # also the operator's project configuration, MCP server list and per-project history. There is
-    # no artifact here that is credential-without-configuration, so nothing is copied and the
-    # authentication phase below returns the honest trusted `unavailable`/`authentication` that an
-    # empty CLAUDE_CONFIG_DIR earns. Whether that trade can be broken at all on this platform is an
-    # open Architecture question, deliberately not answered by quietly widening what crosses here.
+    # CLAUDE'S CREDENTIAL IS NOT A FILE, AND THE CONTROLLED ROOT SEVERS IT TWICE OVER. Measured on
+    # Claude Code 2.1.234 / macOS 25.6.0 with `/usr/bin/security` wrapped so every keychain lookup
+    # the CLI makes was recorded:
+    #
+    #   1. THE CREDENTIAL IS IN THE LOGIN KEYCHAIN, NOT ON DISK. There is no
+    #      `~/.claude/.credentials.json` on this host; `security find-generic-password -a "$USER"
+    #      -s "Claude Code-credentials"` returns the session at rc 0, and `claude` obtains it by
+    #      spawning that exact command. The account it passes is `$USER`, which this environment
+    #      does not export, so inside the controlled root the lookup degrades to `-a unknown`.
+    #   2. THE LOGIN KEYCHAIN IS REACHED THROUGH HOME. The same `security find-generic-password`
+    #      that returns rc 0 under the operator's HOME returns rc 44, "The specified item could not
+    #      be found in the keychain", under any other HOME, because the default keychain search
+    #      list is resolved from the invoking user's home directory. HOME isolation alone therefore
+    #      removes the credential, before configuration is considered at all.
+    #   3. THE SERVICE NAME IS NAMESPACED BY THE CONFIGURATION DIRECTORY. With CLAUDE_CONFIG_DIR
+    #      unset the CLI looks up `Claude Code-credentials`; with it set the CLI looks up
+    #      `Claude Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>` - verified by giving
+    #      it two different directories and getting two different suffixes, each equal to that hash.
+    #      An attempt-local provider directory is thus pointed, by the vendor's own design, at a
+    #      keychain item that has never existed.
+    #
+    # Both severances are correct and neither is worth undoing. Reaching the operator's keychain
+    # item would require handing the judge the operator's real HOME *and* the default configuration
+    # directory - that directory being the operator's whole profile, which is the thing this root
+    # exists to withhold - and would additionally let a token refresh write back into the operator's
+    # own keychain entry, which this wrapper must never do. `--safe-mode` does not change any of
+    # this: measured in an isolated root, `claude -p ... --safe-mode --output-format json` returns
+    # is_error true with result "Not logged in" at duration_api_ms 0, because it disables
+    # customizations and authentication is not a customization. Nor
+    # does any synthesized `.claude.json`: that file never holds a token, and a credential-only
+    # `.credentials.json` cannot be produced from what is on disk here because nothing is.
+    #
+    # WHAT DOES CROSS IS THE VENDOR'S OWN HEADLESS CREDENTIAL. `CLAUDE_CODE_OAUTH_TOKEN` is an
+    # opaque subscription token the OPERATOR mints with `claude setup-token`; docs/PHASE4.md has
+    # recommended it since Phase 4 and bin/firm-doctor already probes for it. It is credential
+    # without configuration by construction - not a file, naming no path, carrying no project list,
+    # MCP registry, plugin, skill, memory or history. Measured in exactly the environment built
+    # above (isolated HOME, isolated CLAUDE_CONFIG_DIR, no USER, empty provider directory):
+    # `claude auth status --json` is rc 0 {"loggedIn":true,"authMethod":"oauth_token"} with the
+    # variable set and rc 1 {"loggedIn":false,"authMethod":"none"} without it, and `claude -p`
+    # carries it to the API. Until now this environment DISCARDED it, so an operator who had done
+    # everything firm-doctor asks still got a trusted `unavailable`. It is forwarded now, and
+    # nothing else is: the wrapper never mints a token - that is the operator's action and stays
+    # theirs - never writes it anywhere, and never records its value, only whether one was supplied
+    # and, when refused, why.
+    #
+    # ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR are
+    # deliberately NOT forwarded and must not be added. The first two are metered API credentials
+    # and would silently move a review off the subscription authentication docs/PHASE3.md promises;
+    # the third names a file-descriptor NUMBER in the operator's process, which means nothing in the
+    # judge's process, so honouring it would make the judge read whichever descriptor happened to
+    # occupy that slot.
+    credential_bound = 262144
     credential_artifacts = ()
     if provider == "gpt":
         operator_codex_home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
@@ -903,12 +948,12 @@ except Exception as exc:
                 record["reason"] = "not_regular_file"
             elif info.st_uid != os.getuid():
                 record["reason"] = "not_owned_by_invoker"
-            elif info.st_size > 262144:
+            elif info.st_size > credential_bound:
                 record["reason"] = "exceeds_credential_bound"
             else:
                 fd = os.open(source_credential, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 with os.fdopen(fd, "rb", closefd=True) as handle:
-                    payload = handle.read(262144)
+                    payload = handle.read(credential_bound)
                 atomic_write(destination_credential, payload, 0o400)
                 record["imported"] = True
                 credential_state["imported"] += 1
@@ -916,6 +961,29 @@ except Exception as exc:
             record["reason"] = "absent"
         except OSError as exc:
             record["reason"] = type(exc).__name__
+        credential_state["artifacts"].append(record)
+    if provider == "claude":
+        # The env credential gets the same discipline the file credential gets, in the only terms an
+        # environment variable has: it is bounded by the same credential_bound, it must be one line
+        # of printable non-space bytes (a token is opaque - anything holding whitespace, a newline or
+        # a control byte is not one, and forwarding it would just be forwarding whatever the shell
+        # left in the variable), it is placed only in the child environment and never on disk, and
+        # its VALUE is never written to the attempt, the diagnostic, the ledger or the argv. A
+        # refusal is recorded with its reason and then behaves exactly like no credential at all, so
+        # the authentication phase below - not this block - is still the only thing that can say the
+        # judge is ready.
+        record = {"artifact":"CLAUDE_CODE_OAUTH_TOKEN", "imported":False, "reason":None}
+        supplied = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+        if not supplied:
+            record["reason"] = "absent"
+        elif len(supplied.encode("utf-8", "surrogateescape")) > credential_bound:
+            record["reason"] = "exceeds_credential_bound"
+        elif not re.fullmatch(r"[!-~]+", supplied):
+            record["reason"] = "not_opaque_single_line"
+        else:
+            phase_environment["CLAUDE_CODE_OAUTH_TOKEN"] = supplied
+            record["imported"] = True
+            credential_state["imported"] += 1
         credential_state["artifacts"].append(record)
     attempt["provider_credential"] = credential_state
     atomic_write(attempt_path, json_bytes(attempt), 0o600)

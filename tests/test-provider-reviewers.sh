@@ -94,6 +94,12 @@ cat > "$STUB/codex" <<'SH'
 #!/bin/sh
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
+if [ -n "${STUB_ENV_CAPTURE:-}" ]; then
+  printf 'codex phase=%s oauth=%s apikey=%s authtok=%s fd=%s\n' "${1:-none}" \
+    "${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}" "${ANTHROPIC_API_KEY:-<unset>}" \
+    "${ANTHROPIC_AUTH_TOKEN:-<unset>}" "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-<unset>}" \
+    >> "$STUB_ENV_CAPTURE"
+fi
 case "$*" in
   # THE FLAG SET LIVES AT `exec`, NOT AT THE TOP LEVEL — this stub models codex-cli 0.147.0, where
   # `codex --help` documents the interactive CLI and `codex exec --help` documents every control the
@@ -208,6 +214,16 @@ cat > "$STUB/claude" <<'SH'
 #!/bin/sh
 printf 'claude cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
+# WHAT THE CHILD WAS HANDED IS THE ONLY PLACE THE CREDENTIAL BOUNDARY IS OBSERVABLE. The wrapper
+# builds the judge's environment from scratch, so a claim about what crosses can only be checked
+# from inside the child. Recorded per phase, and deliberately including the three variables that
+# must NEVER cross, so widening the passthrough fails a test instead of shipping.
+if [ -n "${STUB_ENV_CAPTURE:-}" ]; then
+  printf 'claude phase=%s oauth=%s apikey=%s authtok=%s fd=%s\n' "${1:-none}" \
+    "${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}" "${ANTHROPIC_API_KEY:-<unset>}" \
+    "${ANTHROPIC_AUTH_TOKEN:-<unset>}" "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-<unset>}" \
+    >> "$STUB_ENV_CAPTURE"
+fi
 case "$*" in
   # Claude documents its whole judge surface at the TOP level, so this is where the complete set
   # belongs. `wrong_surface` moves it to `exec --help` — a subcommand claude has no reason to be
@@ -230,6 +246,17 @@ case "$*" in
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not authenticated token=secret'; exit 1; }
     # loggedIn must be the BOOLEAN, so a stringly-typed document stays untrusted.
     [ "$STUB_MODE" = stringly_auth ] && { echo '{"loggedIn":"true","authMethod":"claude.ai"}'; exit 0; }
+    # Measured on Claude Code 2.1.234 in exactly the controlled root's shape (isolated HOME,
+    # isolated CLAUDE_CONFIG_DIR, no USER, empty provider directory): rc 0
+    # {"loggedIn":true,"authMethod":"oauth_token"} when CLAUDE_CODE_OAUTH_TOKEN is set, rc 1
+    # {"loggedIn":false,"authMethod":"none"} when it is not. The token is the ONLY input to that
+    # difference, which is what makes it credential-without-configuration.
+    if [ "$STUB_MODE" = oauth_token ]; then
+      if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        echo '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}'; exit 0
+      fi
+      echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; exit 1
+    fi
     echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'; exit 0 ;;
   # Claude Code 2.1.234 has NO `models` subcommand. `models list --json` is `unknown option`, and
   # dropping the flag is worse than useless: bare `claude models list` is parsed as the PROMPT and
@@ -300,6 +327,10 @@ review_env() { # mode wrapper [extra args]
     STUB_CLAUDE_APPROVE="$WORK/claude-approve.json" STUB_CLAUDE_BLOCK="$WORK/claude-block.json" \
     STUB_CANDIDATE="$RUN/09-test-evidence/qa-candidate.json" \
     STUB_MANIFEST_CAPTURE="${STUB_MANIFEST_CAPTURE:-}" STUB_RUN="$RUN" STUB_REDIRECT="$WORK/redirect-target" \
+    STUB_ENV_CAPTURE="${STUB_ENV_CAPTURE:-}" \
+    CLAUDE_CODE_OAUTH_TOKEN="${STUB_OAUTH_TOKEN:-}" \
+    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="${STUB_OAUTH_TOKEN_FD:-}" \
+    ANTHROPIC_API_KEY="${STUB_ANTHROPIC_API_KEY:-}" ANTHROPIC_AUTH_TOKEN="${STUB_ANTHROPIC_AUTH_TOKEN:-}" \
     FIRM_GPT_QA_DISCOVERY_TIMEOUT=2 FIRM_GPT_QA_READINESS_TIMEOUT=2 FIRM_GPT_QA_TIMEOUT=2 \
     FIRM_CLAUDE_QA_DISCOVERY_TIMEOUT=2 FIRM_CLAUDE_QA_READINESS_TIMEOUT=2 FIRM_CLAUDE_QA_TIMEOUT=2 \
     FIRM_QA_KILL_GRACE=1 "$wrapper" "$@" "$RUN"
@@ -992,5 +1023,105 @@ for failed_control in "$REPO/.agent-firm/private-reviewer-control/$RUN_ID"/gpt-c
   rm -rf "$failed_control"
 done
 rm -f "$failure_marker"
+
+# ==========================================================================================
+# THE CLAUDE CREDENTIAL BOUNDARY
+#
+# codex's credential is a FILE, so the wrapper can copy exactly it and nothing else. claude's is
+# not: on macOS it is a login-Keychain item that `claude` fetches with
+# `security find-generic-password -a "$USER" -s <service>`, where <service> is
+# "Claude Code-credentials" only while CLAUDE_CONFIG_DIR is unset and
+# "Claude Code-credentials-<sha256(dir)|8>" once it is set, and where the login keychain itself is
+# resolved through HOME (the identical lookup returns rc 44 under any other HOME). The controlled
+# root isolates BOTH, so no keychain route into it exists that does not also hand over the
+# operator's whole profile.
+#
+# The one credential that is not also configuration is CLAUDE_CODE_OAUTH_TOKEN, which the operator
+# mints with `claude setup-token` and which the wrapper may only CONSUME. These cases pin the whole
+# boundary: it crosses when supplied, it is refused when it is not credential-shaped, it never
+# reaches the other provider, it never lands in an artifact, and its absence is still an honest
+# trusted unavailability rather than a guess.
+# ==========================================================================================
+t_case "the Claude judge consumes an operator-supplied CLAUDE_CODE_OAUTH_TOKEN and nothing else"
+
+TOKEN_FIXTURE='sk-ant-oat01-FIXTURE-TOKEN-8c1d4a9f0e2b'
+ENVCAP="$WORK/credential-env.log"
+STUB_ENV_CAPTURE="$ENVCAP"
+
+latest_attempt() { find "$RUN/09-test-evidence/reviewer-attempts" -type d -name "$1-c*-a*" | sort | tail -1; }
+credential_field() { # attempt-dir field
+  t_python -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/attempt.json"))["provider_credential"]
+m=[a for a in d["artifacts"] if a["artifact"]=="CLAUDE_CODE_OAUTH_TOKEN"]
+print(m[0][sys.argv[2]] if m else "NO-RECORD")' "$1" "$2"
+}
+
+# 1. NO TOKEN. The honest outcome, unchanged: a trusted authentication unavailability, exit 3 — not
+#    a BLOCK, and not a guess. This is the negative half of the trust contract and it must survive
+#    every other case below.
+STUB_OAUTH_TOKEN=""; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "absent operator token remains a trusted authentication unavailability" 3 review_env oauth_token "$CLAUDE"
+absent_attempt="$(latest_attempt claude)"
+assert_eq "absent token is recorded as absent" "absent" "$(credential_field "$absent_attempt" reason)"
+assert_eq "absent token is not recorded as imported" "False" "$(credential_field "$absent_attempt" imported)"
+assert_eq "the judge phase never started without a credential" "" "$(grep -c 'phase=-p' "$ENVCAP" | grep -v '^0$')"
+
+# 2. TOKEN SUPPLIED. It reaches the judge, byte for byte, and that is the only thing that changed.
+STUB_OAUTH_TOKEN="$TOKEN_FIXTURE"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an operator-supplied token carries the Claude judge to a verdict" 0 review_env oauth_token "$CLAUDE"
+supplied_attempt="$(latest_attempt claude)"
+assert_eq "supplied token is recorded as imported" "True" "$(credential_field "$supplied_attempt" imported)"
+assert_eq "an imported token records no refusal reason" "None" "$(credential_field "$supplied_attempt" reason)"
+assert_output "the judge phase received the exact token" "oauth=$TOKEN_FIXTURE" grep 'phase=-p' "$ENVCAP"
+assert_output "the authentication phase received the exact token" "oauth=$TOKEN_FIXTURE" grep 'phase=auth' "$ENVCAP"
+
+# 3. THE VALUE IS NEVER AN ARTIFACT. Everything the run keeps is searched, including the attempt
+#    record that says a token WAS supplied — saying so must not mean saying what it was.
+assert_ok "the token value is absent from every artifact the run keeps" sh -c \
+  "! grep -R -q -F '$TOKEN_FIXTURE' '$RUN' 2>/dev/null"
+assert_ok "the token value is absent from the private reviewer control tree" sh -c \
+  "! grep -R -q -F '$TOKEN_FIXTURE' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
+
+# 4. IT IS CLAUDE'S CREDENTIAL, NOT THE FIRM'S. A Claude token must never be handed to codex.
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "gpt still reviews normally while a Claude token is exported" 0 review_env approve "$GPT"
+assert_ok "the codex judge never sees the Claude token" sh -c \
+  "! grep -q -F '$TOKEN_FIXTURE' '$ENVCAP'"
+assert_output "codex is handed no Claude token at all" "oauth=<unset>" grep 'codex phase' "$ENVCAP"
+
+# 5. NOT EVERY STRING IS A CREDENTIAL. A value carrying whitespace is whatever the shell left in the
+#    variable, not an opaque token; it is refused, recorded, and then behaves exactly like absence —
+#    which is exit 3, because refusing to forward can never be allowed to look like readiness.
+STUB_OAUTH_TOKEN="not a token"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "a token that is not one opaque line is refused, not forwarded" 3 review_env oauth_token "$CLAUDE"
+assert_eq "the refusal reason is recorded" "not_opaque_single_line" "$(credential_field "$(latest_attempt claude)" reason)"
+assert_ok "a refused token never reaches the provider" sh -c \
+  "! grep -q -F 'not a token' '$ENVCAP'"
+
+# 6. THE SAME BOUND THE FILE CREDENTIAL GETS. 262144 bytes is the credential bound; one byte more is
+#    not a credential.
+STUB_OAUTH_TOKEN="$(t_python -c 'import sys; sys.stdout.write("a"*262145)')"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an oversized token is refused, not forwarded" 3 review_env oauth_token "$CLAUDE"
+assert_eq "the oversize refusal reason is recorded" "exceeds_credential_bound" "$(credential_field "$(latest_attempt claude)" reason)"
+assert_output "an oversized token never reaches the provider" "oauth=<unset>" grep 'claude phase' "$ENVCAP"
+
+# 7. THE VARIABLES THAT MUST NOT CROSS. ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are METERED API
+#    credentials and would silently move a review off the subscription authentication the lifecycle
+#    contract promises; CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR names a descriptor number in the
+#    OPERATOR's process, which in the judge's process is whatever happens to occupy that slot.
+STUB_OAUTH_TOKEN="$TOKEN_FIXTURE"
+STUB_ANTHROPIC_API_KEY='sk-ant-api03-FIXTURE-METERED-KEY'
+STUB_ANTHROPIC_AUTH_TOKEN='FIXTURE-AUTH-TOKEN'
+STUB_OAUTH_TOKEN_FD='9'
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "the metered and descriptor variables do not change the outcome" 0 review_env oauth_token "$CLAUDE"
+assert_ok "no metered API key crosses into the judge" sh -c \
+  "! grep -q -F 'sk-ant-api03-FIXTURE-METERED-KEY' '$ENVCAP'"
+assert_ok "no ambient auth token crosses into the judge" sh -c \
+  "! grep -q -F 'FIXTURE-AUTH-TOKEN' '$ENVCAP'"
+assert_output "the judge is handed no API key, auth token, or token descriptor" \
+  "apikey=<unset> authtok=<unset> fd=<unset>" grep 'phase=-p' "$ENVCAP"
+STUB_ANTHROPIC_API_KEY=""; STUB_ANTHROPIC_AUTH_TOKEN=""; STUB_OAUTH_TOKEN_FD=""
+STUB_OAUTH_TOKEN=""; STUB_ENV_CAPTURE=""
 
 t_summary
