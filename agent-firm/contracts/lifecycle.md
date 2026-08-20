@@ -131,11 +131,15 @@ discovery, authentication, model-readiness, and judge phases. Only structured re
 establish availability, read at the surface the installed CLI actually publishes; a readiness surface
 a provider does not expose is never simulated, and configured-model readiness that cannot be
 established is recorded as not established rather than assumed. The controlled root isolates provider
-configuration and state, not identity: exactly one artifact per provider — the credential file and
-nothing else — is copied by value into the attempt-local provider directory, mode 0400, with the
-operator's own directory opened read-only and never written. The schema handed to a provider is a
-generation projection derived at runtime from the canonical verdict schema, which remains the sole
-validator of what comes back. The wrappers publish atomically only after the verdict schema and exact
+configuration and state, not identity: exactly one credential per provider crosses, and nothing else
+does. Where that credential is a file it is copied by value into the attempt-local provider directory,
+mode 0400, with the operator's own directory opened read-only and never written; where the provider
+has no credential file it is the single operator-supplied credential environment variable, forwarded
+only into the judge's own environment, size-bounded, never written to disk, and never recorded by
+value. The wrappers never create a credential — minting one stays an operator action — and no
+credential can establish readiness by itself: only the structured authentication phase can. The schema
+handed to a provider is a generation projection derived at runtime from the canonical verdict schema,
+which remains the sole validator of what comes back. The wrappers publish atomically only after the verdict schema and exact
 run/full-SHA/generation/provider/attempt identity validate, record every outcome to the explicitly
 targeted run ledger, cap and redact retained diagnostics by default, and remove the controlled root.
 Persistent raw retention is unsupported: every nonzero `--retain-raw-seconds` request is rejected

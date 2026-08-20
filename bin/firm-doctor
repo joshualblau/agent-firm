@@ -216,12 +216,22 @@ else
   if [ "$SUB" = 1 ]; then warn "CLAUDE_CONFIG_DIR unset in a subscription project — set it via .envrc (CLAUDE_CONFIG_DIR=\$HOME/.claude-\$FIRM_PROFILE)."
   else info "CLAUDE_CONFIG_DIR unset (using the default ~/.claude)."; fi
 fi
-info "macOS caveat: CLAUDE_CONFIG_DIR isolates SETTINGS but does NOT switch the subscription account (auth lives in the login Keychain)."
+# macOS auth storage, re-measured on Claude Code 2.1.234 (the old text here predates it and was
+# wrong in both directions). The credential is in the login Keychain, and `claude` fetches it by
+# spawning `security find-generic-password -a "$USER" -s <service>`. TWO things scope that lookup:
+#   * HOME — the default keychain search list is resolved from the invoking user's home directory,
+#     so the identical lookup that succeeds under your HOME fails with rc 44 under any other one.
+#   * CLAUDE_CONFIG_DIR — <service> is "Claude Code-credentials" only while CLAUDE_CONFIG_DIR is
+#     UNSET. Set it, and the service becomes "Claude Code-credentials-<sha256(dir) first 8 hex>",
+#     a per-directory namespace. So on this version CLAUDE_CONFIG_DIR DOES switch the account: each
+#     config dir has its own keychain entry and its own /login. The entry is shared only across
+#     config-dir-unset invocations.
+info "macOS: the Claude credential is in the login Keychain, keyed by \$USER and namespaced per CLAUDE_CONFIG_DIR (unset ⇒ 'Claude Code-credentials'; set ⇒ '…-<sha256(dir)|8>'). It is NOT reachable from an isolated HOME."
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  pass "CLAUDE_CODE_OAUTH_TOKEN present — overrides the shared Keychain so THIS account is used (real per-project switch)"
+  pass "CLAUDE_CODE_OAUTH_TOKEN present — the one credential that needs no config dir and no Keychain, so it pins THIS account and is what firm-claude-qa's controlled root can use"
 else
-  if [ "$SUB" = 1 ]; then warn "CLAUDE_CODE_OAUTH_TOKEN not set — on macOS the account won't switch per project. Run 'claude setup-token' for this account, store it in op, and reference it from .env.op."
-  else info "CLAUDE_CODE_OAUTH_TOKEN not set."; fi
+  if [ "$SUB" = 1 ]; then warn "CLAUDE_CODE_OAUTH_TOKEN not set — firm-claude-qa's controlled root isolates HOME, which severs the Keychain, so the Claude judge will report a trusted 'unavailable' (exit 3). Run 'claude setup-token' for this account, store it in op, and reference it from .env.op."
+  else info "CLAUDE_CODE_OAUTH_TOKEN not set — firm-claude-qa's Claude judge will report a trusted 'unavailable' (exit 3) until it is."; fi
 fi
 if [ "$PROBE" = 1 ] && command -v claude >/dev/null 2>&1; then
   info "probe: run 'claude' then /status to confirm auth is subscription-OAuth-token (not an API key)."
