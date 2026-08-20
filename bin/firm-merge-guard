@@ -196,14 +196,40 @@ POLICY="$ROOT/agent-firm/policy/merge-authority.yaml"
 # one of the three call sites is reached per invocation, so this costs nothing that was not already
 # being paid. It is the same reasoning the header gives for not memoising a PERMIT decision: a cache
 # on a fail-closed control is an authorisation surface.
+#
+# AND EXECUTABLE IS NOT THE BAR — P2 IS (AC-107). This used to end at `[ -x ]`, which is the test
+# for "can this be run", not for "may this be believed". On a host where bin/firm-python finds
+# nothing compliant it degrades to $FIRM_PYTHON or $PATH's python3 and says so (FIRM_PYTHON_P2=0);
+# this function never read that variable, so it ran the degraded program anyway and _mg_report_rc
+# then accepted its exit status as a decision. Reproduced on a modelled no-P2 host: with a
+# non-allow-listed identity, `--command 'git push origin main'` blocked; the same command with
+# FIRM_PYTHON=<two-line shim printing the permit sentinel> exited 0 — PERMITTED — and so did the
+# --hook adapter, and so did the same shim placed first on $PATH with no FIRM_PYTHON set at all.
+# Same class as SEC-03 and the same shape: the front door was closed and the side door was not.
+#
+# So the requirement is FIRM_PYTHON_P2=1, and it is checked with a string comparison against the
+# value the resolver sets, defaulting to 0 when the variable is absent — a firm-python that did not
+# assign it (an old copy in a plugin cache, a truncated file) is unknown, and unknown is a BLOCK.
+# The consequence on a genuinely unsupported host is that every GATED command is cannot-evaluate;
+# that is the direction AC-107 requires ("every indeterminate path blocks, including a missing or
+# unusable interpreter resolver"), it is what the three call sites already print a remedy for, and
+# it costs the 98.73% structural fast path nothing because this function is never reached there.
 _mg_python_ready() {
-  unset FIRM_PYTHON_ARGV FIRM_PYTHON_DISPLAY FIRM_PYTHON_P2 FIRM_PYTHON_REASON FIRM_PYTHON_TRIED
+  unset FIRM_PYTHON_ARGV FIRM_PYTHON_DISPLAY FIRM_PYTHON_P2 FIRM_PYTHON_LIVE \
+        FIRM_PYTHON_REASON FIRM_PYTHON_TRIED
+  MG_PY_UNREADY="bin/firm-python is missing next to this script, or it resolved no usable interpreter"
   . "$SELF/firm-python" || return 1
   case "${FIRM_PYTHON_ARGV[0]:-}" in
     "")  return 1 ;;
     /*)  [ -x "${FIRM_PYTHON_ARGV[0]}" ] || return 1 ;;
     *)   command -v "${FIRM_PYTHON_ARGV[0]}" >/dev/null 2>&1 || return 1 ;;
   esac
+  if [ "${FIRM_PYTHON_P2:-0}" != "1" ]; then
+    MG_PY_UNREADY="no P2-compliant interpreter on this host, so the program that would render this
+  decision is whatever \$FIRM_PYTHON or \$PATH supplies, and this guard will not take a decision
+  from an interpreter it cannot vouch for: ${FIRM_PYTHON_REASON:-firm-python reported no reason}"
+    return 1
+  fi
   return 0
 }
 
@@ -243,8 +269,45 @@ done
 # allowlist load, identity resolution, message, ledger append. Data arrives via the environment
 # (NOT argv) so a command line containing a secret is not exposed in `ps` output.
 # ---------------------------------------------------------------------------------------------
+
+# _mg_nonce_new — a fresh per-invocation liveness nonce for the decision sentinel (AC-107).
+#
+# The sentinel was a FIXED string, so it proved "some program printed the expected token", not "the
+# checker ran and reached this decision". Those differ exactly where it matters: a program that
+# never reads stdin can print `FIRM_MG_DECISION=permit` and exit 0, and one that saw the line once
+# can replay it forever. bin/firm-python's own interpreter probe had already been given a nonce for
+# this reason (SEC-01) and this file's sentinel — which that probe's comments cite as the design
+# they were copied FROM — had not been.
+#
+# $RANDOM is a bash builtin, so this costs no subprocess, and it is spent only on calls that were
+# already going to start a python. It is NOT a secret and this is not a cryptographic control: the
+# nonce is inside the program the checker is handed, so a program that reads its own stdin can find
+# it, exactly as the resolver's probe can be answered by a program that reads its own argv. What it
+# closes is the gap between "printed the token" and "consumed the checker": a hardcoded sentinel, a
+# replayed sentinel, and every program that never reads the program it was given.
+#
+# `unset` FIRST, and this matters. An attacker who exports _MG_NONCE gives the variable the export
+# attribute, and a later assignment KEEPS it — which would publish each fresh nonce into the
+# checker's environment, where a program that ignores stdin could read it back. unset drops the
+# attribute along with the value, so the assignment below creates a plain shell variable.
+_mg_nonce_new() {
+  unset _MG_NONCE
+  _MG_NONCE="mg${$}x${RANDOM}${RANDOM}x${RANDOM}${RANDOM}"
+}
+
 _mg_py() {
-  "${FIRM_PYTHON_ARGV[@]}" - <<'PYEOF'
+  # No nonce, no decision. A call site that forgot to mint one must not reach a checker whose
+  # sentinel the wrapper then cannot bind, so this fails closed as cannot-evaluate (2).
+  [ -n "${_MG_NONCE:-}" ] || return 2
+  # The nonce reaches the checker as the FIRST LINE OF THE PROGRAM ITSELF, on stdin — not on argv
+  # and not in the environment, both of which a program can read without consuming a byte of the
+  # check it is supposed to be running. Everything below the prefix is the same quoted heredoc it
+  # has always been; `${PIPESTATUS[1]}` is returned so the CHECKER's own exit status stays the
+  # contract the wrapper reads, unchanged by `pipefail` and by whether the interpreter drained
+  # stdin. (A `return "$?"` here would report 141 for a checker that exits 0 without reading, and
+  # tests/test-merge-guard.sh asserts that case is reported as an unproven PERMIT, not as a crash.)
+  { printf 'FIRM_MG_NONCE = "%s"\n' "$_MG_NONCE"
+    cat <<'PYEOF'
 import json, os, re, subprocess, sys
 
 MODE    = os.environ.get("FIRM_MG_MODE", "")
@@ -265,9 +328,15 @@ PROCESS_EXIT = {PERMIT: 0, REFUSE: 3, CANNOT: 2}
 # So every decision also writes this sentinel to STDOUT (stderr is left strictly alone: it carries
 # the human-readable block message and must reach the agent verbatim). The wrapper honours 0 and 3
 # ONLY when the sentinel names the same decision, and reports anything else as cannot-evaluate.
-SENTINEL = {PERMIT: "FIRM_MG_DECISION=permit",
-            REFUSE: "FIRM_MG_DECISION=refuse",
-            CANNOT: "FIRM_MG_DECISION=cannot"}
+#
+# AND IT CARRIES THE PER-INVOCATION NONCE (AC-107). A fixed token proves only that SOMETHING printed
+# it. FIRM_MG_NONCE is prepended to this program by _mg_nonce_new/_mg_py a moment before it runs, so
+# it can only be known by a program that actually read the checker source it was handed, and it is
+# different on every invocation, so yesterday's captured line is worth nothing today. The wrapper
+# compares against the exact nonce it minted.
+SENTINEL = {PERMIT: "FIRM_MG_DECISION=permit " + FIRM_MG_NONCE,
+            REFUSE: "FIRM_MG_DECISION=refuse " + FIRM_MG_NONCE,
+            CANNOT: "FIRM_MG_DECISION=cannot " + FIRM_MG_NONCE}
 
 # Bounded waits. tests/test-merge-guard.sh parses this exact line and asserts
 # PARSE_BUDGET + GH_TIMEOUT + GIT_TIMEOUT + 2*KILL_GRACE + HOOK_BUDGET_MARGIN <= the registered hook
@@ -551,13 +620,26 @@ SURFACE_GAPS = [
     "A heredoc body fed to a NON-shell (python3 <<'PY' ... PY) is skipped, so a `git push` line",
     "  inside a python/text heredoc is neither matched nor a false positive. Deliberate: this",
     "  repo's own docs and tests are full of the literal string `git push`.",
-    "INTERPRETER SELECTION on a host with NO P2-compliant interpreter. This guard renders its",
-    "  decision inside a python program, and bin/firm-python chooses which python runs it. On a",
-    "  compliant host that is not a lever: a candidate is selected only if it PROVES it executed",
-    "  the probe (a per-probe nonce echoed back with the four expected values), so neither $PATH",
-    "  nor $FIRM_PYTHON can substitute a shim. On a host where NOTHING is compliant the resolver",
-    "  degrades to the first executable candidate — $FIRM_PYTHON, else $PATH's python3 — and",
-    "  whoever controls those controls the program that renders the decision. $FIRM_PYTHON_ARGV /",
+    "INTERPRETER SELECTION, narrowed to a PROXY. This guard renders its decision inside a python",
+    "  program and bin/firm-python chooses which python runs it, so whoever chooses that program",
+    "  is inside the control. Two of the three ways to choose it are now closed and one is not.",
+    "  CLOSED — a host with NO P2-compliant interpreter. The resolver degrades to $FIRM_PYTHON or",
+    "  $PATH's python3 there and reports p2=no, and this guard used to run that program anyway and",
+    "  believe its exit status: on such a host a two-line shim printing the permit sentinel turned",
+    "  a blocked `git push` into a PERMIT, through --command and through the --hook adapter alike.",
+    "  _mg_python_ready now requires FIRM_PYTHON_P2=1, so every gated command on such a host is",
+    "  cannot-evaluate (a BLOCK) instead. CLOSED — a replayed or hardcoded decision sentinel. The",
+    "  sentinel carries a nonce minted per invocation and delivered only inside the checker source",
+    "  on stdin, so a program that never read the check, or that repeats a line it captured",
+    "  earlier, names the wrong invocation and is reported unproven. STILL A GAP — a $FIRM_PYTHON",
+    "  (or a $PATH python3) deliberately written to PROXY a real interpreter: it can pass the",
+    "  resolver's P2 probe by forwarding -c to a compliant interpreter, then read the checker off",
+    "  its own stdin, lift the nonce out of it and answer with a permit. Neither sentinel is",
+    "  cryptographic and neither can be: anything handed a program can be replayed by that program.",
+    "  What they buy is that no ACCIDENT reaches a permit — no wrapper, no `exit 0` stub, no",
+    "  interpreter that ignores stdin — only a program written for this purpose does, and a caller",
+    "  who can set $FIRM_PYTHON in this guard's environment can already edit the guard (see the",
+    "  CLIENT-SIDE disclosure in this file's header). $FIRM_PYTHON_ARGV /",
     "  $FIRM_PYTHON_DISPLAY are NOT in this gap: they used to be (a non-empty DISPLAY skipped",
     "  resolution and the inherited ARGV was run, which permitted a push this guard blocks), and",
     "  they are now unset before every resolution, with an assertion in tests/test-merge-guard.sh.",
@@ -1536,6 +1618,8 @@ except Exception as e:                   # an internal error is not a permit
         % (type(e).__name__, e))
     sys.exit(finish(CANNOT))
 PYEOF
+  } | "${FIRM_PYTHON_ARGV[@]}" -
+  return "${PIPESTATUS[1]}"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1665,8 +1749,10 @@ _mg_may_match() {
 if [ "$MODE" = "surface" ]; then
   if ! _mg_python_ready; then
     printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to print the covered surface.\n' >&2
+    printf '  %s\n' "$MG_PY_UNREADY" >&2
     exit 2
   fi
+  _mg_nonce_new
   FIRM_MG_MODE=surface FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="" _mg_py
   exit $?
 fi
@@ -1682,11 +1768,17 @@ fi
 # it, a python3 stub exiting 3 was reported as "identity resolved and not allow-listed" (SEC-17)
 # and — far worse — a python3 stub exiting 0 was reported as PERMITTED, which is a fail-open on a
 # control whose entire value is that it fails closed. 2 needs no sentinel: it blocks either way.
+#
+# AND THE SENTINEL IS BOUND TO THIS INVOCATION (AC-107). The token was fixed, so it certified that
+# SOMETHING printed the right string — which a program that never read the checker can do, and
+# which a program that saw one real line can repeat for ever. The comparison is now against the
+# nonce this process minted moments ago in _mg_nonce_new, so a hardcoded or replayed sentinel names
+# a different invocation and is reported as unproven.
 _mg_report_rc() {
   case "$1" in
-    0) if [ "$2" = "FIRM_MG_DECISION=permit" ]; then exit 0; fi
+    0) if [ "$2" = "FIRM_MG_DECISION=permit ${_MG_NONCE:-}" ]; then exit 0; fi
        _mg_unproven "$1" "permit" ;;
-    3) if [ "$2" = "FIRM_MG_DECISION=refuse" ]; then exit "$3"; fi
+    3) if [ "$2" = "FIRM_MG_DECISION=refuse ${_MG_NONCE:-}" ]; then exit "$3"; fi
        _mg_unproven "$1" "refuse" ;;
     2) exit 2 ;;
     *) printf 'firm-merge-guard: CANNOT EVALUATE — the checker itself exited %s (no decision was\n' "$1" >&2
@@ -1709,10 +1801,16 @@ if [ "$MODE" = "command" ]; then
   _mg_may_match "$CMD" || exit 0
   if ! _mg_python_ready; then
     printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to inspect this command.\n' >&2
+    printf '  %s\n' "$MG_PY_UNREADY" >&2
+    printf '  Blocking. Verify the resolved interpreter with: firm-python --status\n' >&2
     exit 2
   fi
   # stdout is captured because it carries the decision SENTINEL and nothing else; stderr is NOT
   # captured, so the human-readable block message still reaches the caller verbatim.
+  # The nonce is minted HERE, in the parent, because _mg_py runs inside the command substitution
+  # below: a nonce generated in that subshell would die with it and _mg_report_rc would have
+  # nothing to compare against.
+  _mg_nonce_new
   _mg_out="$(FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" \
              FIRM_MG_COMMAND="$CMD" _mg_py)"
   _mg_report_rc "$?" "$_mg_out" 1
@@ -1769,7 +1867,7 @@ if ! _mg_python_ready; then
   # agent that removing the control is one of its two options is not a remedy, it is the bypass.
   printf 'firm-merge-guard: BLOCKED (cannot evaluate) — the interpreter could not be resolved, so\n' >&2
   printf '  this command cannot be checked against the merge-authority allowlist.\n' >&2
-  printf '  bin/firm-python is missing next to this script, or it resolved no usable interpreter.\n' >&2
+  printf '  %s\n' "$MG_PY_UNREADY" >&2
   printf '  Check it with: firm-python --status  (and see docs/INSTALL.md for the python3\n' >&2
   printf '  prerequisite itself). If this guard is running from a plugin cache, refresh it with\n' >&2
   printf '  `firm-version --local-refresh`. Ask the human operator to run the command if it is\n' >&2
@@ -1777,6 +1875,7 @@ if ! _mg_python_ready; then
   exit 2
 fi
 
+_mg_nonce_new
 _mg_out="$(FIRM_MG_MODE=hook FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="$payload" \
            FIRM_MG_COMMAND="" _mg_py)"
 # THE CALLER CONTRACT (AC-016): anything other than 0 is a block, and a PreToolUse hook only

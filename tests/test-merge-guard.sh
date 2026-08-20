@@ -1228,6 +1228,162 @@ assert_output "--surface declares interpreter selection as a named gap" "INTERPR
 assert_output "--surface records that the two inherited variables are NOT one" 'FIRM_PYTHON_DISPLAY are NOT in this gap' \
   mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
+t_case "AC-107 on a host with NO P2 interpreter the guard refuses to DECIDE, it does not permit"
+# SEC-03 closed the front door: the two inherited interpreter-selection variables. This is the same
+# defect surviving in the fallback, and it took a cross-provider judge reading the source to find it.
+#
+# bin/firm-python degrades on a host where nothing is compliant -- deliberately, so the firm stays
+# usable on CI -- and reports p2=no while doing it. _mg_python_ready never read that: it checked
+# only that argv[0] was EXECUTABLE, which a two-line `#!/bin/sh` shim is. So the guard ran a
+# caller-controlled program to decide a merge or a push and read its exit status as the decision.
+# Reproduced against the accepted base: with a non-allow-listed identity, `--command 'git push
+# origin main'` blocked (2); the same command with FIRM_PYTHON=<shim printing the permit sentinel>
+# exited 0 -- PERMITTED -- and so did the --hook adapter, and so did the same shim first on $PATH
+# with FIRM_PYTHON not set at all. Three vectors, no file edit.
+#
+# THE HOST IS MODELLED, because this machine has four real system interpreters at absolute paths and
+# the resolver finds one of them first, so the branch is unreachable here. The model is the copy
+# tests/test-python-interpreter.sh already uses for "a host with NO compliant interpreter": a
+# firm-python whose expected version no interpreter anywhere can satisfy. That changes the HOST the
+# guard sees, not the guard and not the resolver's logic.
+_mg107_tree="$(mk_guard_tree)"
+sed 's/^FIRM_PYTHON_EXPECT_VERSION=.*/FIRM_PYTHON_EXPECT_VERSION="0.0.0"/' \
+  "$BIN/firm-python" > "$_mg107_tree/bin/firm-python"
+chmod +x "$_mg107_tree/bin/firm-python"
+assert_output "precondition: the modelled host really has no P2 interpreter" "p2=no" \
+  "$_mg107_tree/bin/firm-python" --status
+assert_output "precondition: and the guard tree is otherwise the real one" "p2=yes" \
+  "$TREE/bin/firm-python" --status
+_mg107_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-ac107.XXXXXX")"; t_track "$_mg107_dir"
+{ printf '#!/bin/sh\n'
+  printf 'printf "FIRM_MG_DECISION=permit\\n"\n'
+  printf 'echo MG-AC107-SHIM-EXECUTED >&2\n'
+  printf 'exit 0\n'; } > "$_mg107_dir/python3"
+chmod +x "$_mg107_dir/python3"
+assert_output "precondition: the shim IS an authorisation if anything runs it" "FIRM_MG_DECISION=permit" \
+  "$_mg107_dir/python3"
+mg107() {   # <FIRM_PYTHON value or empty> <PATH> <args...> — the guard on the modelled host
+  local fp="$1" pth="$2"; shift 2
+  if [ -n "$fp" ]; then
+    ( cd "$REPO_BAD" && PATH="$pth" FIRM_PYTHON="$fp" "$_mg107_tree/bin/firm-merge-guard" "$@" )
+  else
+    ( cd "$REPO_BAD" && PATH="$pth" "$_mg107_tree/bin/firm-merge-guard" "$@" )
+  fi
+}
+assert_rc "a caller-controlled \$FIRM_PYTHON cannot permit a gated push there" 2 \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+assert_rc "  nor a gated merge" 2 mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
+assert_rc "  nor an identity rewrite" 2 \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command "git config user.email $ALLOWED_EMAIL"
+assert_not_output "  and the shim is never executed at all" "MG-AC107-SHIM-EXECUTED" \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+assert_output "  and the block says the interpreter could not be vouched for" \
+  "will not take a decision" mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+assert_output "  and quotes the resolver's own reason" "no interpreter on this host is" \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+# Through the hook adapter, which is the surface that actually stops the tool call.
+_mg107_payload="$(mk_payload 'git push origin main')"
+_mg107_rc=0
+( cd "$REPO_BAD" && printf '%s' "$_mg107_payload" | PATH="$NOGH_PATH" \
+    FIRM_PYTHON="$_mg107_dir/python3" "$_mg107_tree/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
+  || _mg107_rc=$?
+assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mg107_rc"
+# The $PATH vector, with FIRM_PYTHON unset entirely: the same shim, reached as `command -v python3`.
+assert_rc "the same shim first on \$PATH, with no \$FIRM_PYTHON, is refused too" 2 \
+  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git push origin main'
+assert_not_output "  and that one is not executed either" "MG-AC107-SHIM-EXECUTED" \
+  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git push origin main'
+# CONTROLS. Without these the eight rows above would pass just as loudly on a guard that had simply
+# stopped permitting anything, or on a modelled tree too broken to run.
+assert_rc "CONTROL: the REAL tree still permits an allow-listed identity" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "CONTROL: and the modelled host still SKIPS an ungated command without blocking it" 0 \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'ls -la'
+assert_output "--surface names the closed half rather than declaring it a live gap" \
+  "_mg_python_ready now requires FIRM_PYTHON_P2=1" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+
+t_case "AC-107 the decision sentinel is bound to THIS invocation by a liveness nonce"
+# The third link. Even with the two above, the wrapper accepted a FIXED string: `rc=0` plus
+# `FIRM_MG_DECISION=permit` was a permit, so a program that never read the checker could author one
+# and a program that saw one real line could replay it for ever. bin/firm-python's own interpreter
+# probe had carried a per-probe nonce since SEC-01 and this sentinel -- which that probe's comments
+# name as the design they copied -- had not.
+#
+# These doubles run on the REAL tree and the REAL host, so _mg_python_ready is satisfied and the
+# sentinel is the only thing left between them and a permit. They pass the resolver's P2 probe the
+# same way mk_py_double does (delegate -c to a real interpreter) and betray only the checker run.
+_mgn_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-nonce.XXXXXX")"; t_track "$_mgn_dir"
+_mgn_seen="$_mgn_dir/seen-nonce"
+{ printf '#!/bin/sh\n'
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+  # Read the checker off stdin, lift the nonce out of it, answer with a permit.
+  printf 'sed -n '"'"'s/^FIRM_MG_NONCE = "\\(.*\\)"$/\\1/p'"'"' > "%s"\n' "$_mgn_seen"
+  printf 'printf "FIRM_MG_DECISION=permit %%s\\n" "$(cat "%s")"\n' "$_mgn_seen"
+  printf 'exit 0\n'; } > "$_mgn_dir/harvest"
+chmod +x "$_mgn_dir/harvest"
+{ printf '#!/bin/sh\n'
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+  printf 'printf "FIRM_MG_DECISION=permit %%s\\n" "$(cat "%s" 2>/dev/null)"\n' "$_mgn_seen"
+  printf 'exit 0\n'; } > "$_mgn_dir/replay"
+chmod +x "$_mgn_dir/replay"
+{ printf '#!/bin/sh\n'
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+  printf 'printf "FIRM_MG_DECISION=permit\\n"\n'
+  printf 'exit 0\n'; } > "$_mgn_dir/hardcoded"
+chmod +x "$_mgn_dir/hardcoded"
+{ printf '#!/bin/sh\n'
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+  # A program that reads the ENVIRONMENT instead of the checker. The nonce must not be there.
+  printf 'printf "FIRM_MG_DECISION=permit %%s\\n" "${_MG_NONCE:-NONE}"\n'
+  printf 'exit 0\n'; } > "$_mgn_dir/envonly"
+chmod +x "$_mgn_dir/envonly"
+mgn() {   # <double> <args...> — the guard on the real tree, with that double as $FIRM_PYTHON
+  local dbl="$1"; shift
+  ( cd "$REPO_BAD" && PATH="$NOGH_PATH" FIRM_PYTHON="$_mgn_dir/$dbl" \
+      "$TREE/bin/firm-merge-guard" "$@" )
+}
+# CONTROL FIRST, and it is the row that makes the three negatives mean something: a double that
+# genuinely READS the checker it was handed can answer this invocation's nonce, and IS believed.
+# This is the residual --surface declares (a deliberate proxy), and asserting it here is what proves
+# the three refusals below are about the NONCE and not about the doubles being broken.
+assert_rc "CONTROL: a double that reads the checker and answers THIS nonce is believed (0)" 0 \
+  mgn harvest --command 'git push origin main'
+assert_file "  and it really captured a nonce off stdin" "$_mgn_seen"
+assert_ne "  which is not empty" "" "$(cat "$_mgn_seen" 2>/dev/null)"
+assert_rc "REPLAY: that same, previously-valid sentinel on a later invocation is refused" 2 \
+  mgn replay --command 'git push origin main'
+assert_output "  and is reported as unproven, not as a decision" \
+  "did not emit its proof-of-execution sentinel" mgn replay --command 'git push origin main'
+assert_rc "HARDCODED: the fixed sentinel that used to be sufficient is refused" 2 \
+  mgn hardcoded --command 'git push origin main'
+assert_rc "ENVIRONMENT: the nonce is not in the checker's environment to be read from" 2 \
+  mgn envonly --command 'git push origin main'
+# ...and an attacker who exports the variable does not plant one either: `unset` in _mg_nonce_new
+# drops the export attribute the assignment would otherwise inherit.
+_mgn_planted_rc=0
+( cd "$REPO_BAD" && PATH="$NOGH_PATH" _MG_NONCE=attacker-chosen FIRM_PYTHON="$_mgn_dir/envonly" \
+    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 \
+  || _mgn_planted_rc=$?
+assert_eq "  nor by exporting _MG_NONCE into the guard's own environment" "2" "$_mgn_planted_rc"
+# The nonce really is per invocation: two runs of the harvesting double must not see the same one.
+_mgn_first="$(cat "$_mgn_seen")"
+mgn harvest --command 'git push origin main' >/dev/null 2>&1
+assert_ne "the nonce differs between two invocations" "$_mgn_first" "$(cat "$_mgn_seen")"
+# Through the hook adapter as well, since that is the enforcement surface.
+_mgn_hook_rc=0
+( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git push origin main')" | PATH="$NOGH_PATH" \
+    FIRM_PYTHON="$_mgn_dir/replay" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
+  || _mgn_hook_rc=$?
+assert_eq "a replayed sentinel BLOCKS through the hook too" "2" "$_mgn_hook_rc"
+# CONTROL: the real interpreter still reaches both real decisions with the nonce in place.
+assert_rc "CONTROL: the REAL checker still reaches permit (0)" 0 \
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "CONTROL: and still reaches refuse (1)" 1 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+# The nonce must not leak onto the caller's stdout with the sentinel it rides on.
+assert_eq "the nonce is not leaked onto the caller's stdout" "" \
+  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main' 2>/dev/null)"
+
 t_case "AC-016/SEC-08 --command with no value is cannot-evaluate, not an authorisation"
 # `firm-merge-guard --command \"\$CMD\"` with an unset variable used to yield exit 0. Every other
 # unreadable input in this script exits 2; this is the same class of input.
@@ -1402,6 +1558,22 @@ assert_output "the row states the position-independence claim" "at any position 
 assert_output "  and that the ANSI-C escapes are decoded" "ANSI-C escapes decoded" cat "$ENFORCEMENT"
 assert_output "  and that each layer is mutation-tested independently" \
   "mutation-tested independently" cat "$ENFORCEMENT"
+# AC-107. The same claim-surface rule applied to the interpreter-selection row, which is the one the
+# Codex judge read and found overclaiming in the other direction: the doc described the degraded-host
+# fail-open as a LIVE gap while the criterion said every indeterminate path blocks. Now that it is
+# closed the doc has to say so, and has to keep saying what is NOT closed. The behaviour behind all
+# three sentences is driven in the two AC-107 cases above; these rows exist so the prose and the
+# behaviour cannot drift apart. Single-quoted needles: the phrases contain backticks, and an
+# unescaped backtick in a double-quoted assertion string is command substitution (see the AC-013
+# note further up, where that really happened).
+assert_output "  and that a host with no P2 interpreter is cannot-evaluate, not a permit" \
+  'requires `FIRM_PYTHON_P2=1`' cat "$ENFORCEMENT"
+assert_output "  and that the decision sentinel carries a per-invocation nonce" \
+  'per-invocation nonce delivered only inside the checker source on stdin' cat "$ENFORCEMENT"
+assert_output "  and still names the residual it does NOT close (a proxying \$FIRM_PYTHON)" \
+  'proxy** a compliant interpreter through the resolver' cat "$ENFORCEMENT"
+assert_not_output "  and no longer calls the degraded host a live gap" \
+  'carries the residual interpreter-selection gap' cat "$ENFORCEMENT"
 for c in "git pu\$'s'h origin main" "g\$'i't push origin main" \
          "git co\$'n'fig --global user.email a@b.c" "git pu\$\"s\"h origin main" \
          "\$'\\x67it' push origin main" "git \$'\\160ush' origin main" \
@@ -2119,16 +2291,44 @@ assert_eq "and none of them spawned gh/git/python3" "" \
 # a brew 3.12 -- a 3.10+ construct compiles green here and raises SyntaxError at hook time. That is a
 # false green on a fail-closed control.
 t_case "the embedded python checker compiles cleanly, with warnings as errors"
+# The anchor is the heredoc itself, not the `- ` that used to precede it. The checker is no longer
+# handed to the interpreter directly: a one-line `FIRM_MG_NONCE = "..."` prefix is printed ahead of
+# it so the per-invocation liveness nonce arrives INSIDE the program (AC-107), which means the
+# heredoc is now introduced by `cat` and the old anchor matched nothing. The claim is unchanged --
+# extract the embedded program, compile it with warnings as errors -- and the two assertions below
+# are added so the split halves cannot drift apart silently: the shell must prepend exactly one
+# nonce line, and the program must actually use the name it defines.
 assert_ok "extractable, syntactically valid, and warning-free" t_python -c "
 import re, sys, warnings
 src = open('$GUARD').read()
-m = re.search(r\"- <<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)
+m = re.search(r\"<<'PYEOF'\n(.*?)\nPYEOF\", src, re.S)
 assert m, 'the embedded checker could not be extracted from the guard'
 prog = m.group(1)
 assert 'def classify(' in prog and 'FIRM_MG_DECISION' in prog, prog[:200]
 with warnings.catch_warnings():
     warnings.simplefilter('error')
     compile(prog, 'firm-merge-guard(embedded)', 'exec')
+print('ok')
+"
+# THE BODY HALF IS AN AST QUESTION, NOT A SUBSTRING ONE. A `'FIRM_MG_NONCE' in body` test reads as
+# the same claim and is BLIND: the checker's own comments name the variable, so that test stays
+# green against a SENTINEL that has stopped using it -- the exact shape of blindness WO-12 found in
+# one of its own new assertions. Parsing and asking which names are LOADED and which are STORED
+# cannot be satisfied by a comment or by a string literal, and it is the real claim: the program
+# must read the nonce the shell prepends and must not define one of its own (which would make the
+# prefix inert while every behaviour row above still passed).
+assert_ok "the nonce prefix that completes it is printed exactly once, ahead of the heredoc" \
+  t_python -c "
+import ast, re
+src = open('$GUARD').read()
+prefix = re.findall(r'^\s*\{ printf .FIRM_MG_NONCE = ..s.\\\\n. \"\\\$_MG_NONCE\"\$', src, re.M)
+assert len(prefix) == 1, prefix
+body = re.search(r\"<<'PYEOF'\n(.*?)\nPYEOF\", src, re.S).group(1)
+tree = ast.parse(body)
+loads = set(n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+stores = set(n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+assert 'FIRM_MG_NONCE' in loads, 'the embedded checker never READS the nonce it is handed'
+assert 'FIRM_MG_NONCE' not in stores, 'the checker assigns its own nonce, so the prefix is inert'
 print('ok')
 "
 

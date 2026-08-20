@@ -4,7 +4,8 @@
 # Usage as a COMMAND (it is executable, so firm-link puts it on PATH):
 #   firm-python [args...]        exec the resolved interpreter with args (firm-python -c 'import sys')
 #   firm-python --print-argv     print the resolved argv, one word per line, and exit 0
-#   firm-python --status         print one diagnostic line: p2=<yes|no> argv=<...> reason=<...>
+#   firm-python --status         print one diagnostic line:
+#                                p2=<yes|no> live=<yes|no> argv=<...> reason=<...>
 #   firm-python --require-p2 ... run only if the resolved interpreter satisfies the P2 gate,
 #                                otherwise print why and exit 17 (the write-unsupported class)
 #   firm-python -h | --help      print this header and exit 0
@@ -73,6 +74,20 @@
 #     deliberately unsupported CI hosts (see .github/workflows/ci.yml).
 # Falling back is therefore never silent: every path that depends on P2 says so out loud.
 #
+# AND THE FALLBACK ITSELF IS PROBED (AC-107). Selecting the degraded argv on `[ -x ]` alone was a
+# fail-open in the same class as SEC-03 — closed at the front door, left open at the side. `[ -x ]`
+# is true of a two-line `#!/bin/sh` + `exit 0` shim; bin/firm-merge-guard ran the degraded argv to
+# render a merge/push decision and believed its exit status, so on a host with no compliant
+# interpreter a caller-controlled $FIRM_PYTHON or $PATH python3 turned a BLOCK into a PERMIT. The
+# degraded branch now re-applies the proof-of-execution half of the same probe to the argv it
+# actually chose and publishes the answer as FIRM_PYTHON_LIVE, so no consumer has to guess:
+#   · FIRM_PYTHON_P2=1  — proved it executes python AND is the admitted row. Trustworthy.
+#   · P2=0, LIVE=1      — proved it executes python; wrong row. Usable, never vouched for. This is
+#                         the ordinary CI/Linux host and why the firm still runs there.
+#   · P2=0, LIVE=0      — proved nothing. It may not be an interpreter at all. Every control that
+#                         needs one must BLOCK, which is what bin/firm-merge-guard now does — and
+#                         it requires P2, not LIVE, because a decision is a trust question.
+#
 # bash 3.2 safe (macOS ships 3.2.57): no associative arrays, no mapfile, no process substitution, and
 # FIRM_PYTHON_ARGV is never left empty because `"${arr[@]}"` on an empty array is an unbound-variable
 # error under `set -u` in 3.2.
@@ -95,16 +110,37 @@ FIRM_PYTHON_P2=0
 FIRM_PYTHON_REASON="not resolved yet"
 FIRM_PYTHON_TRIED=""
 FIRM_PYTHON_DISPLAY="python3"
+# FIRM_PYTHON_LIVE — did the SELECTED argv prove it executes a Python program it is handed?
+# 1 implies nothing about P2 and P2=1 implies LIVE=1 (the P2 probe is the same proof plus the row).
+# It exists for the degraded path, where P2 is 0 for every candidate and the only remaining question
+# about the argv every firm-* tool is about to run is whether it is an interpreter at all.
+#
+# NO CONTROL READS THIS INSTEAD OF FIRM_PYTHON_P2, and none should: bin/firm-merge-guard requires
+# P2 because a decision is a trust question, not a liveness one. Its consumers today are the two
+# places that have to TELL somebody — `--status`, and FIRM_PYTHON_REASON, which names the fallback
+# it could not vouch for and which firm-doctor prints verbatim in section 10 on any host where P2
+# is 0. So the degraded diagnosis reaches an operator without a second copy of this logic.
+FIRM_PYTHON_LIVE=0
 
 # The sentinel token. One spelling, referenced by the probe program and by the shell that checks it,
 # so the two cannot drift. tests/test-python-interpreter.sh drives both the exit-3 and the exit-0
 # shim directions against this.
 _FIRM_PYTHON_PROBE_TOKEN="FIRM_PYTHON_PROBE_OK"
 
-# The probe prints NOTHING unless every clause holds, and then prints exactly one line:
+# ONE probe program, read at TWO bars (AC-107). It prints exactly one line:
 #   FIRM_PYTHON_PROBE_OK <nonce> <system> <machine> <version> <implementation>
-# The four trailing fields are read back out of the running process (not echoed from argv), so the
-# caller's comparison re-checks the row a second time on the interpreter's own testimony.
+# and then exits 0 if the interpreter half of the P2 row holds and 3 if it does not. The four
+# trailing fields are read back out of the running process (not echoed from argv), so the caller's
+# comparison re-checks the row a second time on the interpreter's own testimony.
+#
+# THE LINE IS PRINTED BEFORE THE ROW IS JUDGED, DELIBERATELY. The row verdict is the EXIT STATUS;
+# the line is PROOF OF EXECUTION and nothing else. Those are two different questions and the
+# degraded path below needs the second one answered even when the first one is no — a real
+# CPython 3.13 on Linux is not P2, but it did run the program, and a `#!/bin/sh` + `exit 0` shim
+# did not. Printing only on success collapsed them into one silence, which is why the fallback had
+# no way to tell them apart and vouched for both (the AC-107 chain). Nothing about the P2 bar
+# changes: _firm_python_probe still requires status 0 AND the exact expected line, and status 0 is
+# still only reachable when every clause holds.
 _FIRM_PYTHON_PROBE='
 import os, sys, platform
 token, nonce, system, arch, version, impl = sys.argv[1:7]
@@ -119,11 +155,9 @@ ok = (
     and bool(sys.executable)
     and os.path.isabs(sys.executable)
 )
-if not ok:
-    sys.exit(3)
 sys.stdout.write("%s %s %s %s %s %s\n" % (
     token, nonce, platform.system(), platform.machine(), actual_version, actual_impl))
-sys.exit(0)
+sys.exit(0 if ok else 3)
 '
 
 # _firm_python_probe <argv...> — rc 0 iff that command PROVED it is a P2-compliant interpreter.
@@ -149,6 +183,44 @@ _firm_python_probe() {
     </dev/null 2>/dev/null)" || return 1
   [ "$_fp_got" = "$_fp_want" ] || return 1
   return 0
+}
+
+# _firm_python_live_probe <argv...> — rc 0 iff that command PROVED it EXECUTED the probe program.
+# Not "is it P2": that is _firm_python_probe above and it is a strictly stronger bar. This is the
+# weaker half on its own, and it exists because the degraded branch of firm_python_resolve has no
+# use for the stronger one — on a host where nothing is compliant, EVERY candidate fails the P2
+# bar, so re-running it there answers a question whose answer is already known and tells the
+# fallback nothing about the program it is about to hand every firm-* tool.
+#
+# WHY THE FALLBACK NEEDS AN ANSWER AT ALL (AC-107, the same class as SEC-03). The degraded branch
+# used to select $FIRM_PYTHON or $PATH's python3 on the strength of `[ -x ]` alone. `[ -x ]` is
+# true of a two-line `#!/bin/sh` + `exit 0` shim, and bin/firm-merge-guard then ran that program to
+# render a merge/push decision and believed its exit status — so on a host with no compliant
+# interpreter a caller-controlled program could turn a BLOCK into a PERMIT. The front door (the P2
+# probe) had been closed against exactly that shim; the fallback had not.
+#
+# THE BAR, STATED HONESTLY. The candidate must echo back a nonce it was handed a moment ago, in the
+# probe's own line format, having been given nothing but a Python program to read it from. That
+# refuses `exit 0`, `true`, a wrapper that swallows -c, a constant `echo` of the sentinel, and a
+# replay of a line from an earlier probe. It does NOT refuse a program deliberately written to
+# proxy a real interpreter — nothing a caller hands a program can, and this file has never claimed
+# otherwise (see the header). It is the same non-cryptographic bar the P2 probe holds, applied to
+# the one path that did not hold it.
+#
+# The exit STATUS is deliberately ignored here: 3 means "ran the program and is not P2", which is
+# the ordinary answer on an unsupported host and is exactly the case this predicate must accept.
+_firm_python_live_probe() {
+  _fp_nonce="fp${$}x${RANDOM}${RANDOM}x${RANDOM}${RANDOM}"
+  _fp_got="$("$@" -c "$_FIRM_PYTHON_PROBE" \
+    "$_FIRM_PYTHON_PROBE_TOKEN" "$_fp_nonce" \
+    "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
+    "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" \
+    </dev/null 2>/dev/null)"
+  # The nonce is alphanumeric by construction, so it carries no glob metacharacter into the pattern.
+  case "$_fp_got" in
+    "$_FIRM_PYTHON_PROBE_TOKEN $_fp_nonce "*) return 0 ;;
+  esac
+  return 1
 }
 
 # _firm_python_executable <word> — rc 0 iff that word can actually be executed. An absolute or
@@ -184,10 +256,12 @@ _firm_python_candidates() {
     /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
 }
 
-# firm_python_resolve — set FIRM_PYTHON_ARGV / _P2 / _REASON / _TRIED / _DISPLAY. Always rc 0: the
-# verdict is the variables, not the exit status, so a caller under `set -e` decides what to do.
+# firm_python_resolve — set FIRM_PYTHON_ARGV / _P2 / _LIVE / _REASON / _TRIED / _DISPLAY. Always
+# rc 0: the verdict is the variables, not the exit status, so a caller under `set -e` decides what
+# to do.
 firm_python_resolve() {
   FIRM_PYTHON_P2=0
+  FIRM_PYTHON_LIVE=0
   FIRM_PYTHON_REASON=""
   FIRM_PYTHON_TRIED=""
   _fp_prefix=""
@@ -226,12 +300,14 @@ firm_python_resolve() {
       if _firm_python_probe /usr/bin/arch -arm64 "$_fp_cand"; then
         FIRM_PYTHON_ARGV=(/usr/bin/arch -arm64 "$_fp_cand")
         FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1     # the P2 bar IS the liveness bar plus the row; passing it proves both
         break
       fi
     else
       if _firm_python_probe "$_fp_cand"; then
         FIRM_PYTHON_ARGV=("$_fp_cand")
         FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1
         break
       fi
     fi
@@ -249,8 +325,21 @@ EOF
     else
       FIRM_PYTHON_ARGV=(python3)
     fi
+    # AND THE FALLBACK IS PROBED TOO (AC-107). The candidate loop above proved only that this argv
+    # is not P2 — on this branch nothing is — so without a second question the fallback is selected
+    # on `[ -x ]`, which a `#!/bin/sh` + `exit 0` shim satisfies. The proof-of-execution half of the
+    # same probe is therefore re-applied to the argv that was actually chosen, and the answer is
+    # published rather than assumed: LIVE=1 means a real interpreter that is not the P2 row, LIVE=0
+    # means the firm has no idea what this program is and no caller may vouch for it.
+    if _firm_python_live_probe "${FIRM_PYTHON_ARGV[@]}"; then
+      FIRM_PYTHON_LIVE=1
+      _fp_live_note=""
+    else
+      FIRM_PYTHON_LIVE=0
+      _fp_live_note=" — and the fallback ${FIRM_PYTHON_ARGV[*]} did not prove it executes python at all"
+    fi
     FIRM_PYTHON_REASON="no interpreter on this host is $FIRM_PYTHON_EXPECT_SYSTEM/$FIRM_PYTHON_EXPECT_ARCH \
-$FIRM_PYTHON_EXPECT_IMPL $FIRM_PYTHON_EXPECT_VERSION with an absolute sys.executable; probed: ${FIRM_PYTHON_TRIED:-none}"
+$FIRM_PYTHON_EXPECT_IMPL $FIRM_PYTHON_EXPECT_VERSION with an absolute sys.executable; probed: ${FIRM_PYTHON_TRIED:-none}$_fp_live_note"
   fi
 
   FIRM_PYTHON_DISPLAY="${FIRM_PYTHON_ARGV[*]}"
@@ -277,8 +366,9 @@ case "${BASH_SOURCE[0]:-$0}" in
         exit 0
         ;;
       --status)
-        printf 'p2=%s argv=%s reason=%s\n' \
+        printf 'p2=%s live=%s argv=%s reason=%s\n' \
           "$( [ "$FIRM_PYTHON_P2" -eq 1 ] && printf yes || printf no )" \
+          "$( [ "$FIRM_PYTHON_LIVE" -eq 1 ] && printf yes || printf no )" \
           "$FIRM_PYTHON_DISPLAY" "${FIRM_PYTHON_REASON:-none}"
         exit 0
         ;;

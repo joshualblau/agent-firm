@@ -197,6 +197,81 @@ assert_eq "--require-p2 runs no program at all" "" \
 assert_output "the reason names what it probed rather than claiming compliance" "probed:" \
   env PATH="$OPEN_DIR:/usr/bin:/bin" "$ONLY" --status
 
+t_case "AC-107 the DEGRADED fallback is probed too, and the resolver publishes what it proved"
+# The half the exit-0-shim work above did NOT reach. Everything so far is about SELECTION: a shim
+# cannot be selected as the P2 interpreter. But when nothing is compliant the resolver still has to
+# hand every firm-* tool an argv, and that argv used to be chosen on `[ -x ]` alone -- which is true
+# of a two-line `#!/bin/sh` + `exit 0` shim. bin/firm-merge-guard then ran it to decide a merge or a
+# push and believed its exit status, so on such a host a caller-controlled $FIRM_PYTHON turned a
+# BLOCK into a PERMIT (AC-107; the merge-guard half is driven in tests/test-merge-guard.sh).
+#
+# The resolver now re-probes the argv it actually chose and publishes FIRM_PYTHON_LIVE. The two bars
+# are DIFFERENT QUESTIONS and the pair below is what proves that rather than asserting it: the SAME
+# real interpreter, through the SAME probe program, fails the P2 bar on the unsatisfiable copy and
+# passes the liveness bar. If liveness were secretly the P2 bar the second row would go red; if it
+# were a no-op the shim rows would.
+_unsat_p2_rc()   { ( . "$UNSAT" >/dev/null 2>&1; _firm_python_probe "$@"      >/dev/null 2>&1; printf '%s' "$?" ); }
+_unsat_live_rc() { ( . "$UNSAT" >/dev/null 2>&1; _firm_python_live_probe "$@" >/dev/null 2>&1; printf '%s' "$?" ); }
+REAL_PY="$(t_python -c 'import sys; print(sys.executable)')"
+assert_ne "precondition: a REAL interpreter fails the unsatisfiable copy's P2 bar" "0" \
+  "$(_unsat_p2_rc "$REAL_PY")"
+assert_eq "  ...and the SAME interpreter passes the liveness bar (P2 and live are not one question)" "0" \
+  "$(_unsat_live_rc "$REAL_PY")"
+assert_ne "an exit-0 shim does NOT satisfy the liveness probe (the fail-open direction)" "0" \
+  "$(_unsat_live_rc "$OPEN_DIR/python3")"
+assert_ne "an exit-3 shim does NOT satisfy it either" "0" "$(_unsat_live_rc "$SHIM_DIR/python3")"
+assert_ne "a constant echo of the sentinel does NOT satisfy it — the nonce is fresh per probe" "0" \
+  "$(_unsat_live_rc "$GUESS_DIR/python3")"
+# A shim that replays a sentinel line captured from an EARLIER probe of this same resolver. This is
+# the assertion the constant-echo row cannot make: the format and all four values are correct and
+# were observed, not guessed -- only the nonce is stale.
+REPLAY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-replay.XXXXXX")"; t_track "$REPLAY_DIR"
+_replay_seen="$REPLAY_DIR/seen"
+{ printf '#!/bin/sh\n'
+  printf '# harvest THIS probe'"'"'s nonce off argv, then answer it correctly\n'
+  printf 'for a in "$@"; do case "$a" in fp*) printf "%%s" "$a" > "%s" ;; esac; done\n' "$_replay_seen"
+  printf 'printf "FIRM_PYTHON_PROBE_OK %%s Darwin arm64 0.0.0 cpython\\n" "$(cat "%s")"\n' "$_replay_seen"
+  printf 'exit 0\n'; } > "$REPLAY_DIR/harvest"
+chmod +x "$REPLAY_DIR/harvest"
+{ printf '#!/bin/sh\n'
+  printf 'printf "FIRM_PYTHON_PROBE_OK %%s Darwin arm64 0.0.0 cpython\\n" "$(cat "%s")"\n' "$_replay_seen"
+  printf 'exit 0\n'; } > "$REPLAY_DIR/replay"
+chmod +x "$REPLAY_DIR/replay"
+# CONTROL FIRST: the harvesting shim answers the nonce it was just handed, so the bar is reachable
+# and the two negatives below are not passing because the format itself is wrong.
+assert_eq "CONTROL: a shim that echoes back THIS probe's own nonce does satisfy it" "0" \
+  "$(_unsat_live_rc "$REPLAY_DIR/harvest")"
+assert_file "  and it really captured a nonce" "$_replay_seen"
+assert_ne "REPLAY: the same, previously-valid line on a LATER probe does not" "0" \
+  "$(_unsat_live_rc "$REPLAY_DIR/replay")"
+
+# End to end through --status, on the resolver copy no host can satisfy. $FIRM_PYTHON is pinned to a
+# real interpreter and then to the shim, so both rows are deterministic on every host rather than
+# depending on what this machine happens to have first on PATH.
+assert_output "a degraded host whose fallback IS an interpreter reports live=yes" "live=yes" \
+  env FIRM_PYTHON="$REAL_PY" "$UNSAT" --status
+assert_output "  and still refuses to call it P2" "p2=no" \
+  env FIRM_PYTHON="$REAL_PY" "$UNSAT" --status
+assert_output "a degraded host whose fallback is a SHIM reports live=no" "live=no" \
+  env FIRM_PYTHON="$OPEN_DIR/python3" "$UNSAT" --status
+assert_output "  and the reason names the fallback it could not vouch for" \
+  "did not prove it executes python at all" env FIRM_PYTHON="$OPEN_DIR/python3" "$UNSAT" --status
+# The program name has to be bound to the LIVE verdict, not merely present somewhere in the line:
+# FIRM_PYTHON_TRIED already lists every candidate, so `assert_output ... "$OPEN_DIR/python3"` alone
+# stays green against a resolver that vouches for the shim without probing it. Checked by mutation.
+assert_output "  and names WHICH program that was" \
+  "$OPEN_DIR/python3 did not prove it executes python at all" \
+  env FIRM_PYTHON="$OPEN_DIR/python3" "$UNSAT" --status
+# The compliant host says yes to both, so `live=` is not a field that is always no.
+if [ "$host_row" = exact ]; then
+  assert_output "CONTROL: a compliant host reports live=yes" "live=yes" "$FP" --status
+  assert_output "CONTROL: and p2=yes with it" "p2=yes" "$FP" --status
+fi
+# Degrading is still not refusing: a real-but-wrong interpreter must stay runnable, which is what
+# keeps the deliberately unsupported CI hosts usable.
+assert_rc "a live-but-not-P2 fallback still runs programs (CI hosts stay usable)" 0 \
+  env FIRM_PYTHON="$REAL_PY" "$UNSAT" -c 'pass'
+
 t_case "an unusable \$FIRM_PYTHON degrades to a working interpreter, and is named"
 # SEC-04 / CR-09: the fallback used to take $FIRM_PYTHON without the `[ -x ]` test every other
 # candidate gets, so a typo made every firm-* tool exit 127 "command not found" -- not the documented
