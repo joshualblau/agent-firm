@@ -816,12 +816,97 @@ except Exception as exc:
             yield value
     for origin in artifact_strings(primary_doc):
         add_source(origin)
+
+    # THE VERDICT'S OWN ARTIFACT LIST, NOT ONLY ITS 09-test-evidence SUBSET.
+    #
+    # The sweep above walks the WHOLE primary verdict and forwards any string beginning
+    # "09-test-evidence/". That prefix was the entire admission rule, so a run-relative artifact
+    # anywhere else in the run directory could not reach the judge under ANY artifact list a QA
+    # tester could write - and the judge is required to BLOCK on an omission. Measured consequence
+    # on run 20260818T182930Z: the primary verdict named 07-review-disposition.yaml and the three
+    # canonical panel files 07-review-findings.<lens>.yaml; none of them could cross; the judge
+    # blocked because the manifest omitted exactly the canonical review findings its own contract
+    # requires the manifest to inventory. That is a wrapper defect manufacturing a blocker, and
+    # curating evidence differently could not have fixed it.
+    #
+    # WHY NOT SIMPLY BROADEN THE PREFIX. Because the sweep's input is every string in the document,
+    # and a verdict is full of strings that LOOK like paths and are not run artifacts:
+    # blocker_objects[].affected_paths carries "bin/firm-merge-guard", commands_run[].cmd carries
+    # command lines. Admitting "any relative-looking string" would make the wrapper try to open
+    # repository files as run evidence and abort the attempt when they are not there - trading one
+    # manufactured blocker for a worse one. So the SOURCE is narrowed instead of the filter: the
+    # verdict's `artifacts` array is the one field whose declared meaning ("paths to logs,
+    # screenshots, reports", qa-verdict.schema.json) is a curated list of the evidence backing this
+    # verdict. It is read as a list of run-relative artifacts; every other string in the document is
+    # still only eligible under the original prefix.
+    #
+    # NOTHING ABOUT THE CONTROLLED ROOT IS RELAXED. Each crossing artifact goes through the same
+    # add_payload as every other entry: resolved strictly under the run directory with every path
+    # component lstat-ed for symlinks, required to be a regular file, redacted, written 0400 into
+    # the disposable attempt tree, counted against the same 8 MiB bound, and inventoried in
+    # input-manifest.json with source digest/size/mode and controlled digest/size/transform. The
+    # traceability references above keep their STRICTER ledger-producer binding; this mechanism does
+    # not weaken that and does not extend it, because the artifacts it exists to carry (a human
+    # disposition, a review panel's findings) are authored decisions with no producing ledger event,
+    # so demanding one would leave them exactly as unreachable as the prefix did.
+    #
+    # AND AN ARTIFACT THAT CANNOT CROSS IS NAMED RATHER THAN DROPPED. Previously a non-matching
+    # string was silently ignored, which is what made the defect invisible from both ends: QA could
+    # not tell its evidence had not been supplied and the judge could not tell whether a file was
+    # missing from the run or merely withheld by the wrapper. Anything the verdict declares and this
+    # mechanism does not carry is recorded in the manifest with a reason. That is deliberately NOT a
+    # new way for the wrapper to refuse: it neither aborts the attempt nor decides the question, it
+    # hands the judge the fact and the judge's own contract already says an omission is uncertainty
+    # and therefore a BLOCK.
+    declared_artifacts = primary_doc.get("artifacts")
+    unresolved_artifacts = []
+    unresolved_seen = set()
+    def note_unresolved(origin, reason):
+        shown = (origin if isinstance(origin, str) else repr(origin))[:256]
+        if shown in unresolved_seen:
+            return                                    # a list may repeat itself; the record does not
+        unresolved_seen.add(shown)
+        unresolved_artifacts.append({"origin_path": shown, "reason": reason})
+    if declared_artifacts is not None and not isinstance(declared_artifacts, list):
+        stop("primary verdict artifacts must be a list", 1)
+    for origin in (declared_artifacts or []):
+        if len(unresolved_artifacts) + len(seen_origins) > 1024:
+            stop("primary verdict declares more artifacts than the controlled root will inventory", 1)
+        if origin in seen_origins:
+            continue                                  # already carried by a stricter mechanism
+        if (not isinstance(origin, str) or not origin or os.path.isabs(origin)
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in origin)
+                or any(part in ("", ".", "..") for part in Path(origin).parts)):
+            note_unresolved(origin, "not a run-relative path")
+            continue
+        # `probe`, not `current`: os.walk further down rebinds a name of its own and reading two
+        # different cursors under one name is how a later edit introduces a defect for free.
+        probe = run
+        problem = None
+        for part in Path(origin).parts:
+            probe = probe / part
+            try:
+                info = os.lstat(probe)
+            except OSError:
+                problem = "not present in the run directory"
+                break
+            if stat.S_ISLNK(info.st_mode):
+                problem = "a path component is a symlink"
+                break
+        if problem is None and not stat.S_ISREG(os.lstat(probe).st_mode):
+            problem = "not a regular file"
+        if problem is not None:
+            note_unresolved(origin, problem)
+            continue
+        add_payload(origin, probe.read_bytes(), os.lstat(probe).st_mode)
+
     diff = subprocess.check_output(["git", "-C", str(repo), "diff", "--no-ext-diff", "--no-color", candidate["base_sha"], sha, "--"], stderr=subprocess.DEVNULL)
     if len(diff) > 2 * 1024 * 1024:
         stop("trusted candidate diff exceeds 2 MiB controlled-root bound", 1)
     add_payload("candidate.diff", diff, 0o400)
     manifest = {"schema_version":1, "run_id":run.name, "candidate_sha":sha, "generation":generation,
-                "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"])}
+                "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"]),
+                "unresolved_artifacts":sorted(unresolved_artifacts, key=lambda item:(item["origin_path"], item["reason"]))}
     atomic_write(run_snapshot / "input-manifest.json", json_bytes(manifest), 0o400)
 
     for current, dirs, files in os.walk(instruction_root, topdown=False):

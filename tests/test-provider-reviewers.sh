@@ -755,6 +755,114 @@ import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="resolved"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
 
+t_case "a run-relative artifact the verdict declares reaches the judge, wherever it lives in the run"
+# The wrapper used to admit ONLY strings beginning "09-test-evidence/", so a root-level run artifact
+# could not reach the judge under ANY artifact list a QA tester could write. Measured consequence on
+# run 20260818T182930Z: the primary verdict named 07-review-disposition.yaml and three canonical
+# 07-review-findings.<lens>.yaml panel files, none of them could cross, and the judge BLOCKED because
+# the manifest omitted exactly the canonical review findings its own contract requires it to
+# inventory. A wrapper defect manufacturing a blocker, uncurable by curating evidence.
+#
+# The names below are the real ones, because the shape being fixed is "a root-level run artifact",
+# and a fixture that used 09-test-evidence/something would pass against the unfixed wrapper.
+printf 'schema_version: 1\ndispositions:\n  - id: fixture-review\n    disposition: fixed\n' \
+  > "$RUN/07-review-disposition.yaml"
+printf 'schema_version: 1\nlens: security-fail-closed\nfindings: []\n' \
+  > "$RUN/07-review-findings.security-fail-closed.yaml"
+mkdir -p "$RUN/09-test-evidence/nested"
+cp "$RUN/08-qa-verdict.json" "$WORK/primary-before-artifacts.json"
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"] = ["09-test-evidence/nested/proof.log",
+                  "07-review-disposition.yaml",
+                  "07-review-findings.security-fail-closed.yaml",
+                  "07-review-findings.does-not-exist.yaml",
+                  "/etc/hosts",
+                  "../outside-the-run.txt",
+                  "integration-summaries"]
+json.dump(d,open(p,"w"),indent=2)
+PY
+manifest_b="$WORK/input-manifest-taskb.json"; STUB_MANIFEST_CAPTURE="$manifest_b"; export STUB_MANIFEST_CAPTURE
+: > "$CALLS"
+assert_rc "the attempt still runs with a mixed artifact list" 0 review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "the two root-level review artifacts crossed, with exact source digest/size/mode" \
+  t_python - "$manifest_b" "$RUN" <<'PY'
+import hashlib,json,os,sys
+manifest,run=sys.argv[1:]
+d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
+for origin in ("07-review-disposition.yaml","07-review-findings.security-fail-closed.yaml"):
+    assert origin in entries, (origin, sorted(entries))
+    item=entries[origin]; raw=open(os.path.join(run,origin),"rb").read()
+    assert item["source_sha256"]==hashlib.sha256(raw).hexdigest(), origin
+    assert item["source_bytes"]==len(raw), origin
+    assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o"), origin
+    assert item["controlled_sha256"] and item["controlled_bytes"], origin
+    assert item["transform"]=="redacted_utf8", origin
+    # It lands inside the disposable attempt tree, addressed relative to the controlled root.
+    assert item["controlled_path"].startswith("input/run-evidence/files/"), item["controlled_path"]
+PY
+assert_ok "and everything that could NOT cross is named with its reason, not dropped silently" \
+  t_python - "$manifest_b" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+got={x["origin_path"]:x["reason"] for x in d["unresolved_artifacts"]}
+assert got.get("07-review-findings.does-not-exist.yaml")=="not present in the run directory", got
+assert got.get("/etc/hosts")=="not a run-relative path", got
+assert got.get("../outside-the-run.txt")=="not a run-relative path", got
+assert got.get("integration-summaries")=="not a regular file", got
+# ...and none of them is in the manifest as a crossing entry.
+crossed={x["origin_path"] for x in d["entries"]}
+assert not (set(got) & crossed), set(got) & crossed
+PY
+# A symlinked component is recorded and refused: the redirect target must not cross by any name.
+ln -s "$WORK/redirect-target" "$RUN/07-review-findings.redirected.yaml"
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"].append("07-review-findings.redirected.yaml"); json.dump(d,open(p,"w"),indent=2)
+PY
+STUB_MANIFEST_CAPTURE="$WORK/input-manifest-symlink.json"; export STUB_MANIFEST_CAPTURE
+assert_rc "a symlinked declared artifact does not abort the attempt" 0 review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "  and is refused with a reason rather than followed" t_python - \
+  "$WORK/input-manifest-symlink.json" "$REDIRECT_SHA" <<'PY'
+import json,sys
+manifest,redirect_sha=sys.argv[1:]
+d=json.load(open(manifest))
+got={x["origin_path"]:x["reason"] for x in d["unresolved_artifacts"]}
+assert got.get("07-review-findings.redirected.yaml")=="a path component is a symlink", got
+for item in d["entries"]:
+    assert item["source_sha256"]!=redirect_sha, item
+PY
+rm "$RUN/07-review-findings.redirected.yaml"
+# The strings that are NOT in `artifacts` keep the original narrow rule: a path-shaped value
+# somewhere else in the verdict is not an admission ticket, or the wrapper would try to open
+# repository files as run evidence and abort on every real verdict.
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"]=["09-test-evidence/nested/proof.log"]
+d["blocker_objects"]=[{"id":"obj-fixture","text":"fixture","affected_criteria":[],
+                       "affected_paths":["bin/firm-merge-guard","07-review-disposition.yaml"]}]
+json.dump(d,open(p,"w"),indent=2)
+PY
+STUB_MANIFEST_CAPTURE="$WORK/input-manifest-elsewhere.json"; export STUB_MANIFEST_CAPTURE
+assert_rc "a path-shaped string outside \`artifacts\` neither crosses nor aborts" 0 \
+  review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "  and really did not cross" t_python - "$WORK/input-manifest-elsewhere.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+crossed={x["origin_path"] for x in d["entries"]}
+assert "bin/firm-merge-guard" not in crossed, crossed
+assert "07-review-disposition.yaml" not in crossed, crossed
+assert d["unresolved_artifacts"]==[], d["unresolved_artifacts"]
+PY
+cp "$WORK/primary-before-artifacts.json" "$RUN/08-qa-verdict.json"
+rm "$RUN/07-review-disposition.yaml" "$RUN/07-review-findings.security-fail-closed.yaml"
+
 t_case "manifest omission, total cap, and nested symlink fail before provider execution"
 cp "$RUN/run-baseline.json" "$WORK/run-baseline.json"
 rm "$RUN/run-baseline.json"
