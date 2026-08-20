@@ -49,6 +49,43 @@ mk_guard_tree() {
   printf '%s' "$_d"
 }
 
+# mk_trusted_tree <absolute interpreter path> — a guard tree whose bin/firm-python resolves EXACTLY
+# that program as its one TRUSTED candidate. Echoes the tree root.
+#
+# WHY EVERY INTERPRETER-DOUBLE FIXTURE HAD TO MOVE HERE (WO-16). Until this work order a double was
+# handed to the guard through $PATH or $FIRM_PYTHON, because that is how the guard chose its
+# interpreter. It no longer is: the guard sets FIRM_PYTHON_TRUSTED_ONLY=1 and resolves only from
+# bin/firm-python's fixed absolute list, so a $PATH double is now IGNORED — which is the fix, and
+# which would have silently turned a dozen assertions about the checker contract (SEC-07/SEC-17,
+# the nonce, the pyyaml paths) into assertions about a double that never ran. Several of them would
+# still have been GREEN, for the wrong reason, because their expected rc is 2 and an unrelated
+# failure also yields 2.
+#
+# So the double is delivered by MODELLING THE HOST instead: the trusted list in the tree's OWN copy
+# of bin/firm-python is rewritten to name it. That is a FILE EDIT, which is exactly the right threat
+# model — after this work order, being the guard's interpreter requires replacing a file next to the
+# guard (or an absolute system path), not exporting a variable. It is the same modelling idiom the
+# AC-107 case already uses for "a host with no compliant interpreter", and it changes the HOST the
+# guard sees, not the guard and not the resolver's logic.
+#
+# The rewrite ASSERTS it found the list (rather than sed-ing best-effort), so if the function is
+# renamed or reshaped these fixtures fail loudly instead of modelling nothing and passing.
+mk_trusted_tree() {
+  local py="$1" t
+  t="$(mk_guard_tree)" || return 1
+  t_python - "$t/bin/firm-python" "$py" <<'PY' || return 1
+import re, sys
+path, py = sys.argv[1], sys.argv[2]
+assert py.startswith("/"), "a trusted candidate must be an absolute path: " + py
+src = open(path, encoding="utf-8").read()
+new = "_firm_python_trusted_candidates() {\n  printf '%s\\n' \\\n    " + py + "\n}"
+src, n = re.subn(r"_firm_python_trusted_candidates\(\) \{.*?\n\}", new, src, count=1, flags=re.S)
+assert n == 1, "the trusted candidate list was not found in bin/firm-python"
+open(path, "w", encoding="utf-8").write(src)
+PY
+  printf '%s' "$t"
+}
+
 # mk_stub_gh <mode> [login] — a PATH dir holding a `gh` stub. Echoes the dir.
 mk_stub_gh() {
   _s="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-stub.XXXXXX")"
@@ -857,11 +894,17 @@ NOYAML="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-noyaml.XXXXXX")"; t_track "$NOYAML"
 # real one -- with its real pyyaml -- reachable, and this case would pass while testing nothing.
 REALPY="$(t_python -c 'import sys; print(sys.executable)')"
 printf '#!/bin/sh\nexec %s -S "$@"\n' "$REALPY" > "$NOYAML/python3"; chmod +x "$NOYAML/python3"
+TREE_NOYAML="$(mk_trusted_tree "$NOYAML/python3")"
 if [ "$("$NOYAML/python3" -c "import importlib.util; print(importlib.util.find_spec('yaml') is None)" 2>/dev/null)" = "True" ]; then
+  # The wrapper reaches the guard as its TRUSTED interpreter, not through $PATH: since WO-16 the
+  # guard ignores $PATH entirely, so a PATH-delivered wrapper would leave the real interpreter —
+  # with its real pyyaml — running the check, and this case would have gone green while the guard
+  # PERMITTED. It did, before this fixture moved. (Both rows below expect 2, and 2 is also what an
+  # unrelated failure yields, so the second assertion's needle is what keeps them honest.)
   assert_rc "pyyaml ABSENT -> cannot evaluate" 2 \
-    mg "$TREE" "$GH_OK:$NOYAML" "$REPO_OK" --command 'git push origin main'
+    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git push origin main'
   assert_output "  and says pyyaml is not installed" "pyyaml is not installed" \
-    mg "$TREE" "$GH_OK:$NOYAML" "$REPO_OK" --command 'git push origin main'
+    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 else
   _t_no "pyyaml-absent fixture could not be built (python3 -S still imports yaml)" \
         "skipping would hide the case, so this is a FAIL not a skip"
@@ -1076,6 +1119,12 @@ t_case "AC-016/SEC-07 an interpreter that dies with status 1 is cannot-evaluate,
 # which is precisely the SEC-17 threat: a shim that passes for python3 without running the program it
 # was handed. (The stronger property the resolver adds — a double that cannot even answer the probe is
 # refused rather than trusted — is asserted separately below.)
+#
+# AND SINCE WO-16 IT REACHES THE GUARD AS THE HOST'S TRUSTED INTERPRETER, not on $PATH: the guard
+# ignores $PATH and $FIRM_PYTHON now, so mk_py_double's directory is paired with a mk_trusted_tree
+# whose bin/firm-python names the double. What is under test here is the CHECKER CONTRACT (an exit
+# status is not a decision), which is a property of _mg_report_rc and is unrelated to how the
+# interpreter was chosen — but it can only be driven by a double the guard will actually run.
 MG_REALPY="$(t_python -c 'import sys; print(sys.executable)')"
 mk_py_double() {   # <exit-code> [extra shell line before exit] -> echoes a PATH dir holding it
   _d="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pydouble.XXXXXX")"
@@ -1094,16 +1143,25 @@ mk_py_double() {   # <exit-code> [extra shell line before exit] -> echoes a PATH
 }
 PYFAIL1="$(mk_py_double 1)"
 PYFAIL99="$(mk_py_double 99)"
+TREE_FAIL1="$(mk_trusted_tree "$PYFAIL1/python3")"
+TREE_FAIL99="$(mk_trusted_tree "$PYFAIL99/python3")"
+# The doubles really are reachable in these trees, asserted positively: every row below expects a 2,
+# and a tree too broken to resolve ANY interpreter also answers 2. Without this the whole case could
+# pass while proving nothing about the checker contract.
+assert_output "precondition: the modelled host resolves the double as its trusted interpreter" \
+  "trusted=yes" "$TREE_FAIL1/bin/firm-python" --trusted-status
+assert_output "  and it is the double, not a real interpreter" "$PYFAIL1/python3" \
+  "$TREE_FAIL1/bin/firm-python" --trusted-status
 assert_rc "python3 exits 1 -> 2 (cannot evaluate), NOT 1 (a refusal)" 2 \
-  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and it says the checker itself failed" "the checker itself exited 1" \
-  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and says no ledger event was reached (so the silence is explained)" \
   "nothing was recorded in the ledger" \
-  mg "$TREE" "$PYFAIL1" "$REPO_OK" --command 'git push origin main'
-assert_rc "python3 exits 99 -> 2" 2 mg "$TREE" "$PYFAIL99" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "python3 exits 99 -> 2" 2 mg "$TREE_FAIL99" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_rc "python3 exits 1, hook mode -> 2 (blocks)" 2 \
-  mg_hook "$TREE" "$PYFAIL1" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE_FAIL1" "$GH_OK" "$REPO_OK" 'git push origin main'
 # The real refusal path must still report 1 through the wrapper — the 3->1 mapping is load-bearing.
 assert_rc "a REAL refusal is still reported as 1, not 3" 1 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
@@ -1124,23 +1182,26 @@ t_case "AC-015/AC-016/SEC-17 an exit CODE alone cannot author a decision — the
 PYEXIT0="$(mk_py_double 0)"
 PYEXIT3="$(mk_py_double 3)"
 PYQUIET="$(mk_py_double 0 'cat >/dev/null')"
+TREE_EXIT0="$(mk_trusted_tree "$PYEXIT0/python3")"
+TREE_EXIT3="$(mk_trusted_tree "$PYEXIT3/python3")"
+TREE_QUIET="$(mk_trusted_tree "$PYQUIET/python3")"
 assert_rc "python3 exits 0 with no sentinel -> 2, NOT 0 (this was a FAIL-OPEN)" 2 \
-  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_rc "  and through the hook it BLOCKS" 2 \
-  mg_hook "$TREE" "$PYEXIT0" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE_EXIT0" "$GH_OK" "$REPO_OK" 'git push origin main'
 assert_rc "a python3 that swallows the program and exits 0 -> 2" 2 \
-  mg "$TREE" "$PYQUIET" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_QUIET" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_rc "python3 exits 3 with no sentinel -> 2, NOT 1 (SEC-17)" 2 \
-  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and says the exit could not be read as a decision" \
   "did not emit its proof-of-execution sentinel" \
-  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and names which decision that code would have meant" 'would mean "refuse"' \
-  mg "$TREE" "$PYEXIT3" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and the 0 case names the permit it refused to honour" 'would mean "permit"' \
-  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 assert_output "  and says nothing was recorded in the ledger" "nothing was recorded in the" \
-  mg "$TREE" "$PYEXIT0" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
 # CONTROL: with the real python3, both decisions are still reachable. Without these, the four
 # assertions above would also pass on a guard that had simply stopped permitting anything.
 assert_rc "control: the REAL checker can still reach permit (0)" 0 \
@@ -1222,11 +1283,15 @@ _mg_ctl_rc=0
     FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
     "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mg_ctl_rc=$?
 assert_eq "CONTROL: an allow-listed identity is still permitted with them exported" "0" "$_mg_ctl_rc"
-# And the guard says so in the one place it claims scope.
-assert_output "--surface declares interpreter selection as a named gap" "INTERPRETER SELECTION" \
-  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
-assert_output "--surface records that the two inherited variables are NOT one" 'FIRM_PYTHON_DISPLAY are NOT in this gap' \
-  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+# And the guard says so in the one place it claims scope. The row MOVED at WO-16 — interpreter
+# selection is a COVERED line now, not a gap — so these needles moved with it. That is the whole
+# discipline of this file: a claim surface that did not move when the behaviour did is the defect.
+assert_output "--surface claims interpreter selection as COVERED, not as a gap" \
+  "THE INTERPRETER THIS GUARD RUNS" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "--surface records that the two inherited variables are covered by it" \
+  'unset before every' mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_not_output "--surface no longer declares interpreter selection a live gap" \
+  "INTERPRETER SELECTION, narrowed to a PROXY" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
 t_case "AC-107 on a host with NO P2 interpreter the guard refuses to DECIDE, it does not permit"
 # SEC-03 closed the front door: the two inherited interpreter-selection variables. This is the same
@@ -1279,7 +1344,10 @@ assert_not_output "  and the shim is never executed at all" "MG-AC107-SHIM-EXECU
   mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
 assert_output "  and the block says the interpreter could not be vouched for" \
   "will not take a decision" mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
-assert_output "  and quotes the resolver's own reason" "no interpreter on this host is" \
+assert_output "  and quotes the resolver's own reason" "no TRUSTED interpreter is" \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+assert_output "  which says the caller's own selectors were not consulted at all" \
+  'are deliberately NOT consulted in trusted-only mode' \
   mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
 # Through the hook adapter, which is the surface that actually stops the tool call.
 _mg107_payload="$(mk_payload 'git push origin main')"
@@ -1300,7 +1368,7 @@ assert_rc "CONTROL: the REAL tree still permits an allow-listed identity" 0 \
 assert_rc "CONTROL: and the modelled host still SKIPS an ungated command without blocking it" 0 \
   mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'ls -la'
 assert_output "--surface names the closed half rather than declaring it a live gap" \
-  "_mg_python_ready now requires FIRM_PYTHON_P2=1" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+  "requires TRUSTED=1 AND" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 
 t_case "AC-107 the decision sentinel is bound to THIS invocation by a liveness nonce"
 # The third link. Even with the two above, the wrapper accepted a FIXED string: `rc=0` plus
@@ -1337,15 +1405,40 @@ chmod +x "$_mgn_dir/hardcoded"
   printf 'printf "FIRM_MG_DECISION=permit %%s\\n" "${_MG_NONCE:-NONE}"\n'
   printf 'exit 0\n'; } > "$_mgn_dir/envonly"
 chmod +x "$_mgn_dir/envonly"
-mgn() {   # <double> <args...> — the guard on the real tree, with that double as $FIRM_PYTHON
-  local dbl="$1"; shift
-  ( cd "$REPO_BAD" && PATH="$NOGH_PATH" FIRM_PYTHON="$_mgn_dir/$dbl" \
-      "$TREE/bin/firm-merge-guard" "$@" )
+# ONE MODELLED HOST PER DOUBLE (WO-16). These used to arrive as $FIRM_PYTHON on the real tree. They
+# cannot any more — that is precisely the vector this engagement closed last, and it was reproduced
+# with THIS harvesting double: at 9941201, `FIRM_PYTHON=<harvest>` turned a refused `git push` into
+# rc 0 through --command and through --hook. Delivering it that way now would mean the guard ignored
+# it and ran the real checker, and with NOGH_PATH that answers 2 — so REPLAY / HARDCODED / ENVIRONMENT
+# below would all have stayed green while asserting nothing whatsoever about the nonce.
+#
+# So each double is now the modelled host's TRUSTED interpreter, which takes a file edit. That is the
+# threat the nonce still defends against and the reason it stays: if one of the fixed absolute paths
+# is ever itself replaced, a program that does not read the checker it was handed still cannot author
+# a decision.
+_mgn_tree_harvest="$(mk_trusted_tree "$_mgn_dir/harvest")"
+_mgn_tree_replay="$(mk_trusted_tree "$_mgn_dir/replay")"
+_mgn_tree_hardcoded="$(mk_trusted_tree "$_mgn_dir/hardcoded")"
+_mgn_tree_envonly="$(mk_trusted_tree "$_mgn_dir/envonly")"
+assert_output "precondition: a modelled host really resolves its double as the trusted interpreter" \
+  "$_mgn_dir/hardcoded" "$_mgn_tree_hardcoded/bin/firm-python" --trusted-status
+mgn() {   # <double> <args...> — the guard on the host modelled to run that double
+  local dbl="$1" t; shift
+  case "$dbl" in
+    harvest)   t="$_mgn_tree_harvest" ;;
+    replay)    t="$_mgn_tree_replay" ;;
+    hardcoded) t="$_mgn_tree_hardcoded" ;;
+    envonly)   t="$_mgn_tree_envonly" ;;
+    *) printf 'mgn: unknown double %s\n' "$dbl" >&2; return 99 ;;
+  esac
+  ( cd "$REPO_BAD" && PATH="$NOGH_PATH" "$t/bin/firm-merge-guard" "$@" )
 }
 # CONTROL FIRST, and it is the row that makes the three negatives mean something: a double that
 # genuinely READS the checker it was handed can answer this invocation's nonce, and IS believed.
-# This is the residual --surface declares (a deliberate proxy), and asserting it here is what proves
-# the three refusals below are about the NONCE and not about the doubles being broken.
+# It is also the row that proves these modelled hosts are LIVE — every negative below expects 2, and
+# a tree that resolved no interpreter at all would answer 2 as well. Note what it now takes to reach
+# this row: the double must BE one of bin/firm-python's fixed absolute candidates. As an environment
+# variable, which is how it was reached until WO-16, it no longer gets here at all.
 assert_rc "CONTROL: a double that reads the checker and answers THIS nonce is believed (0)" 0 \
   mgn harvest --command 'git push origin main'
 assert_file "  and it really captured a nonce off stdin" "$_mgn_seen"
@@ -1361,8 +1454,8 @@ assert_rc "ENVIRONMENT: the nonce is not in the checker's environment to be read
 # ...and an attacker who exports the variable does not plant one either: `unset` in _mg_nonce_new
 # drops the export attribute the assignment would otherwise inherit.
 _mgn_planted_rc=0
-( cd "$REPO_BAD" && PATH="$NOGH_PATH" _MG_NONCE=attacker-chosen FIRM_PYTHON="$_mgn_dir/envonly" \
-    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 \
+( cd "$REPO_BAD" && PATH="$NOGH_PATH" _MG_NONCE=attacker-chosen \
+    "$_mgn_tree_envonly/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 \
   || _mgn_planted_rc=$?
 assert_eq "  nor by exporting _MG_NONCE into the guard's own environment" "2" "$_mgn_planted_rc"
 # The nonce really is per invocation: two runs of the harvesting double must not see the same one.
@@ -1372,7 +1465,7 @@ assert_ne "the nonce differs between two invocations" "$_mgn_first" "$(cat "$_mg
 # Through the hook adapter as well, since that is the enforcement surface.
 _mgn_hook_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git push origin main')" | PATH="$NOGH_PATH" \
-    FIRM_PYTHON="$_mgn_dir/replay" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
+    "$_mgn_tree_replay/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
   || _mgn_hook_rc=$?
 assert_eq "a replayed sentinel BLOCKS through the hook too" "2" "$_mgn_hook_rc"
 # CONTROL: the real interpreter still reaches both real decisions with the nonce in place.
@@ -1383,6 +1476,237 @@ assert_rc "CONTROL: and still reaches refuse (1)" 1 \
 # The nonce must not leak onto the caller's stdout with the sentinel it rides on.
 assert_eq "the nonce is not leaked onto the caller's stdout" "" \
   "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main' 2>/dev/null)"
+
+t_case "WO-16 the guard's interpreter comes from TRUSTED absolute paths — a PROXY cannot be it"
+# THE LAST VECTOR, and the one no sentinel could close. SEC-03 removed an inherited resolution cache,
+# AC-107 added proof-of-execution to the resolver's probe and a per-invocation liveness nonce to the
+# decision sentinel. Each closed real exploits. None closes this one, because the attacker's program
+# satisfies every check HONESTLY: it forwards the resolver's `-c` probe to a real CPython 3.9.6 (so
+# p2=yes is TRUE of it), then reads the checker off its own stdin, lifts the nonce out of the source
+# it was handed, and prints the matching permit sentinel. Found by the Codex judge
+# (obj-ac107-proxy-fail-open) and independently by primary QA, which reproduced it as the CONTROL of
+# its own verification and then withdrew its "covered" score.
+#
+# REPRODUCED FIRST, against the accepted base 9941201, with the proxy below and a non-allow-listed
+# identity. `--command 'git push origin main'` exited 0 -- PERMITTED -- and so did the --hook adapter,
+# and so did the same program placed first on $PATH with $FIRM_PYTHON never set. Four permits on a
+# control whose whole value is that it fails closed, with no file edited.
+#
+# THE FIX IS STRUCTURAL, NOT A BETTER SENTINEL. Anything the guard hands the program it is asking to
+# run, that program has. So the guard stopped accepting an interpreter from the environment it exists
+# to police: FIRM_PYTHON_TRUSTED_ONLY=1 before the source, resolution from bin/firm-python's fixed
+# absolute list only, and TRUSTED=1 + P2=1 + an absolute argv required before any decision is taken.
+_mgt_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-proxy.XXXXXX")"; t_track "$_mgt_dir"
+_mgt_ran="$_mgt_dir/it-ran"
+{ printf '#!/bin/sh\n'
+  # The marker is written on EVERY invocation, INCLUDING the resolver's `-c` probe. That is what
+  # makes "never executed" a checkable claim: the stderr marker below is only reachable on the
+  # checker path, so a proxy that was merely PROBED and rejected would leave it silent -- an
+  # assertion that cannot see the thing it forbids. (Found by mutation m7, which moved the guard's
+  # trusted-only request after the source so the ordinary resolution probed the proxy first: the
+  # stderr row stayed green.)
+  printf 'printf x >> "%s"\n' "$_mgt_ran"
+  # Delegate the P2 probe to a real compliant interpreter: this program passes it TRUTHFULLY.
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$MG_REALPY"
+  # Anything else is the checker arriving on stdin. Read it and lift this invocation's nonce.
+  printf 'nonce="$(sed -n '"'"'s/^FIRM_MG_NONCE = "\\(.*\\)"$/\\1/p'"'"')"\n'
+  printf 'printf "FIRM_MG_DECISION=permit %%s\\n" "$nonce"\n'
+  printf 'echo MG-PROXY-EXECUTED >&2\n'
+  printf 'exit 0\n'; } > "$_mgt_dir/python3"
+chmod +x "$_mgt_dir/python3"
+# PRECONDITION, and it is the row that makes every refusal below mean something: this program really
+# IS an authorisation wherever the guard runs it. Proven by modelling a host whose one trusted
+# absolute interpreter IS the proxy -- which takes a file edit, the threat model the guard's own
+# header has always disclosed -- and watching the same non-allow-listed push come back 0.
+_mgt_tree_is_trusted="$(mk_trusted_tree "$_mgt_dir/python3")"
+assert_rc "precondition: the proxy DOES author a permit when it is the trusted interpreter" 0 \
+  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+assert_output "  by genuinely reading the checker off stdin, not by luck" "MG-PROXY-EXECUTED" \
+  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+
+# THE FOUR REPRODUCED PERMITS, now refused. Note the rc: 1, not 2. The guard does not merely fail to
+# evaluate -- it ignores the proxy, resolves its own interpreter and reaches its REAL refusal.
+mgt() {   # <FIRM_PYTHON value or empty> <PATH> <args...> — the real tree, real host
+  local fp="$1" pth="$2"; shift 2
+  if [ -n "$fp" ]; then
+    ( cd "$REPO_BAD" && PATH="$pth" FIRM_PYTHON="$fp" "$TREE/bin/firm-merge-guard" "$@" )
+  else
+    ( cd "$REPO_BAD" && PATH="$pth" "$TREE/bin/firm-merge-guard" "$@" )
+  fi
+}
+assert_rc "a proxying \$FIRM_PYTHON cannot permit a gated push (it is REFUSED, 1)" 1 \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+assert_rc "  nor a gated merge" 1 \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
+# The email is read from the policy, never spelled here (AC-018).
+assert_rc "  nor an identity rewrite" 1 \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command "git config user.email $ALLOWED_EMAIL"
+assert_output "  and the guard reaches its own refusal instead" "NOT allow-listed" \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+# NOT MERELY DISBELIEVED — NOT RUN. The guard never executes the caller's program, not even to probe
+# and reject it, because it runs under a registered hook timeout that is MEASURED to fail OPEN when
+# overrun: a $FIRM_PYTHON that merely slept would otherwise be a permit.
+assert_not_output "  and the proxy never renders the decision" "MG-PROXY-EXECUTED" \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+rm -f "$_mgt_ran"
+mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main' >/dev/null 2>&1
+assert_no_file "  and is never EXECUTED at all, not even probed and rejected" "$_mgt_ran"
+# Through the hook adapter, which is the surface that actually stops the tool call.
+_mgt_payload="$(mk_payload 'git push origin main')"
+_mgt_rc=0
+( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$GH_OK:$NOGH_PATH" \
+    FIRM_PYTHON="$_mgt_dir/python3" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mgt_rc=$?
+assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mgt_rc"
+# The $PATH vector, with $FIRM_PYTHON unset entirely. It is a distinct exploit -- it needs no
+# variable the guard could have been taught to ignore by name -- and it was a permit too.
+assert_rc "the same proxy first on \$PATH, with no \$FIRM_PYTHON, is refused too" 1 \
+  mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git push origin main'
+rm -f "$_mgt_ran"
+mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git push origin main' >/dev/null 2>&1
+assert_no_file "  and that one is not executed either, probe included" "$_mgt_ran"
+_mgt_path_hook_rc=0
+( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$_mgt_dir:$GH_OK:$NOGH_PATH" \
+    "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mgt_path_hook_rc=$?
+assert_eq "  and blocks through the hook as well" "2" "$_mgt_path_hook_rc"
+# CONTROL: an allow-listed identity is STILL PERMITTED, with the proxy exported and on $PATH. Without
+# this row every assertion above would pass just as loudly on a guard that had become a blanket
+# blocker -- which is the failure mode a fail-closed fix invites.
+_mgt_ok_rc=0
+( cd "$REPO_OK" && PATH="$_mgt_dir:$GH_OK:$NOGH_PATH" FIRM_PYTHON="$_mgt_dir/python3" \
+    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mgt_ok_rc=$?
+assert_eq "CONTROL: an allow-listed identity is still PERMITTED with the proxy in place" "0" "$_mgt_ok_rc"
+assert_rc "CONTROL: and an ungated command is still skipped, not blocked" 0 \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'ls -la'
+# And the resolver really did ignore the caller: the interpreter that ran is an absolute system path.
+assert_output "the interpreter the guard resolves is absolute, and is not the proxy" "trusted=yes" \
+  "$TREE/bin/firm-python" --trusted-status
+assert_not_output "  even with \$FIRM_PYTHON pointing at the proxy" "$_mgt_dir" \
+  env FIRM_PYTHON="$_mgt_dir/python3" "$TREE/bin/firm-python" --trusted-status
+
+t_case "WO-16 the DECLARED gap that replaced it: the trusted interpreter's own environment"
+# THIS ASSERTS A FAIL-OPEN AS A GAP, ON PURPOSE, because that is what this file owes a GAP line: a
+# covered line has a test that it BLOCKS and a gap line has a test that it does NOT, so neither list
+# can drift away from the behaviour. WO-14 established the same discipline for the residual it left.
+#
+# WHAT MOVED AND WHAT DID NOT. WO-16 fixed WHICH interpreter runs. It did not isolate what that
+# interpreter LOADS: the trusted CPython is still started with the caller's environment, so a
+# $PYTHONPATH carrying a module named `yaml` supplies the allowlist parser, and a planted
+# safe_load() can return any allowlist it likes. Verified pre-existing at 9941201 as well as here,
+# so it is a residual this work order disclosed rather than one it introduced.
+#
+# It is NOT closed by -E/-I: pyyaml lives in the per-user site directory on this OS, so isolating
+# the environment would make every gated command cannot-evaluate — trading a disclosed gap for a
+# blanket block. Left as a named gap, reported, and asserted here so it cannot be forgotten in
+# either direction: if someone closes it, this row goes red and the --surface text must move with it.
+_mge_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pypath.XXXXXX")"; t_track "$_mge_dir"
+{ printf 'def safe_load(stream):\n'
+  printf '    return {"allowed": [{"gh_login": "some-other-account",\n'
+  printf '                         "git_emails": ["nobody@example.com"], "note": "planted"}]}\n'
+  printf 'class YAMLError(Exception):\n    pass\n'; } > "$_mge_dir/yaml.py"
+# CONTROL FIRST: the same identity, same tree, same everything, is REFUSED without the plant. Without
+# this row the gap row below could pass on a guard that permitted everything.
+assert_rc "CONTROL: that identity is refused when the real pyyaml parses the real allowlist" 1 \
+  mg "$TREE" "$GH_BAD" "$REPO_BAD" --command 'git push origin main'
+_mge_rc=0
+( cd "$REPO_BAD" && PATH="$GH_BAD:$NOGH_PATH" PYTHONPATH="$_mge_dir" \
+    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mge_rc=$?
+assert_eq "GAP: a planted \$PYTHONPATH yaml module reaches a PERMIT (0) — declared, not closed" \
+  "0" "$_mge_rc"
+_mge_hook_rc=0
+( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git push origin main')" | PATH="$GH_BAD:$NOGH_PATH" \
+    PYTHONPATH="$_mge_dir" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mge_hook_rc=$?
+assert_eq "GAP: and through the hook adapter as well" "0" "$_mge_hook_rc"
+# And the guard says so where it claims scope, in the words the behaviour above justifies.
+assert_output "--surface names \$PYTHONPATH specifically, not just 'the environment'" '$PYTHONPATH' \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "  and says why -E/-I is not the fix" "pyyaml lives in the per-user site directory" \
+  mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+
+t_case "WO-16 with NO trusted interpreter the guard reports cannot-evaluate — it never permits"
+# FAIL CLOSED. Removing the caller's ability to choose is only half a fix: the other half is what
+# happens when the fixed list yields nothing. There is deliberately NO degraded fallback here (the
+# ordinary resolver has one, so the firm stays usable on unsupported CI hosts), because "run
+# something we could not vouch for" is the defect, not the remedy.
+_mgt_none_tree="$(mk_trusted_tree "/nonexistent/firm-wo16/python3")"
+assert_output "precondition: the modelled host really resolves no trusted interpreter" "trusted=no" \
+  "$_mgt_none_tree/bin/firm-python" --trusted-status
+mgt_none() { ( cd "$REPO_BAD" && PATH="$1" "$_mgt_none_tree/bin/firm-merge-guard" "${@:2}" ); }
+assert_rc "a gated push is cannot-evaluate (2), never a permit" 2 \
+  mgt_none "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+assert_rc "  and so is it with an ALLOW-LISTED identity: no decision is reachable at all" 2 \
+  bash -c '( cd "$1" && PATH="$2" "$3/bin/firm-merge-guard" --command "git push origin main" )' _ \
+    "$REPO_OK" "$GH_OK:$NOGH_PATH" "$_mgt_none_tree"
+assert_rc "  and a proxying \$FIRM_PYTHON does not become the fallback" 2 \
+  bash -c '( cd "$1" && PATH="$2" FIRM_PYTHON="$3" "$4/bin/firm-merge-guard" --command "git push origin main" )' _ \
+    "$REPO_BAD" "$GH_OK:$NOGH_PATH" "$_mgt_dir/python3" "$_mgt_none_tree"
+rm -f "$_mgt_ran"
+( cd "$REPO_BAD" && PATH="$GH_OK:$NOGH_PATH" FIRM_PYTHON="$_mgt_dir/python3" \
+    "$_mgt_none_tree/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1
+assert_no_file "  and it is not executed to find that out" "$_mgt_ran"
+assert_output "  and says which absolute paths it probed, so the repair is actionable" \
+  "/nonexistent/firm-wo16/python3" mgt_none "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+_mgt_none_hook_rc=0
+( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$GH_OK:$NOGH_PATH" \
+    "$_mgt_none_tree/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mgt_none_hook_rc=$?
+assert_eq "  and the hook adapter blocks (2)" "2" "$_mgt_none_hook_rc"
+# CONTROL: the fail-closed host is not simply a dead script — an UNGATED command still costs nothing
+# and is still permitted, because _mg_python_ready is never reached on the structural fast path.
+assert_rc "CONTROL: an ungated command on that host is still permitted, with no interpreter at all" 0 \
+  mgt_none "$NOGH_PATH" --command 'ls -la'
+
+t_case "WO-16 the guard requires PROVENANCE and an ABSOLUTE argv, not just a passing probe"
+# The two links that are not "TRUSTED=1 happened to be set". Both are reached by a REAL deployment
+# state, not by a hypothetical: a bin/firm-python older than this guard cannot answer the provenance
+# question at all, which is exactly the ${CLAUDE_PLUGIN_ROOT} plugin-cache case CC-10 exists for.
+#
+# The modelled old resolver is this file's own bin/firm-python with the FIRM_PYTHON_TRUSTED
+# assignments removed — so it still resolves a perfectly good interpreter and still reports p2=yes,
+# and the ONLY thing it cannot do is vouch for where that interpreter came from.
+_mgt_old_tree="$(mk_guard_tree)"
+{ cat "$BIN/firm-python"
+  printf '\n# MODELLED: a bin/firm-python predating WO-16. It resolves the caller-supplied interpreter\n'
+  printf '# exactly as the old one did -- honouring $FIRM_PYTHON and $PATH, ignoring the trusted-only\n'
+  printf '# request it has never heard of -- and it cannot answer the provenance question at all.\n'
+  printf 'firm_python_resolve\n'
+  printf 'unset FIRM_PYTHON_TRUSTED\n'; } > "$_mgt_old_tree/bin/firm-python"
+chmod +x "$_mgt_old_tree/bin/firm-python"
+assert_output "precondition: the modelled old resolver still finds a P2 interpreter" "p2=yes" \
+  "$_mgt_old_tree/bin/firm-python" --status
+# ...and it really does select the caller's program, so the block below is the TRUSTED requirement
+# doing the work and not the fixture failing to load. This is the pre-WO-16 exploit, exactly.
+assert_output "precondition: and it selects the caller's \$FIRM_PYTHON, which is the proxy" \
+  "$_mgt_dir/python3" env FIRM_PYTHON="$_mgt_dir/python3" "$_mgt_old_tree/bin/firm-python" --status
+mgt_old() {   # <cwd> <args...> — the stale-resolver tree with the proxy offered as $FIRM_PYTHON
+  local cwd="$1"; shift
+  ( cd "$cwd" && PATH="$GH_OK:$NOGH_PATH" FIRM_PYTHON="$_mgt_dir/python3" \
+      "$_mgt_old_tree/bin/firm-merge-guard" "$@" )
+}
+assert_rc "an old bin/firm-python that cannot vouch for provenance is a BLOCK, not a permit" 2 \
+  mgt_old "$REPO_BAD" --command 'git push origin main'
+assert_output "  and says the interpreter was not resolved from a trusted absolute path" \
+  "NOT resolved from a trusted" mgt_old "$REPO_BAD" --command 'git push origin main'
+assert_output "  and names the stale resolver as the usual cause, which is the actual repair" \
+  "older than this guard" mgt_old "$REPO_BAD" --command 'git push origin main'
+assert_rc "  and it blocks an ALLOW-LISTED identity too: unknown provenance is not a decision" 2 \
+  mgt_old "$REPO_OK" --command 'git push origin main'
+# THE ABSOLUTE-ARGV LINK, driven where it can actually FAIL OPEN if it is missing. A resolver that
+# publishes TRUSTED=1 and P2=1 beside a BARE NAME sends the guard back to $PATH for its interpreter —
+# so the proxy is put first on $PATH here, and without this check the answer is a permit.
+_mgt_rel_tree="$(mk_guard_tree)"
+cp "$BIN/firm-python" "$_mgt_rel_tree/bin/firm-python"
+{ printf '\n# modelled: a resolver that vouches for a RELATIVE argv\n'
+  printf 'FIRM_PYTHON_ARGV=(python3)\n'
+  printf 'FIRM_PYTHON_P2=1\nFIRM_PYTHON_LIVE=1\nFIRM_PYTHON_TRUSTED=1\n'
+  printf 'FIRM_PYTHON_DISPLAY=python3\n'; } >> "$_mgt_rel_tree/bin/firm-python"
+chmod +x "$_mgt_rel_tree/bin/firm-python"
+assert_rc "a TRUSTED=1 vouch for a bare \`python3\` is refused (it is a \$PATH lookup in disguise)" 2 \
+  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+assert_output "  and names the non-absolute word it refused" "non-absolute word" \
+  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+rm -f "$_mgt_ran"
+mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main' \
+  >/dev/null 2>&1
+assert_no_file "  and the \$PATH program it would have run is never executed" "$_mgt_ran"
 
 t_case "AC-016/SEC-08 --command with no value is cannot-evaluate, not an authorisation"
 # `firm-merge-guard --command \"\$CMD\"` with an unset variable used to yield exit 0. Every other
@@ -1570,10 +1894,26 @@ assert_output "  and that a host with no P2 interpreter is cannot-evaluate, not 
   'requires `FIRM_PYTHON_P2=1`' cat "$ENFORCEMENT"
 assert_output "  and that the decision sentinel carries a per-invocation nonce" \
   'per-invocation nonce delivered only inside the checker source on stdin' cat "$ENFORCEMENT"
-assert_output "  and still names the residual it does NOT close (a proxying \$FIRM_PYTHON)" \
-  'proxy** a compliant interpreter through the resolver' cat "$ENFORCEMENT"
 assert_not_output "  and no longer calls the degraded host a live gap" \
   'carries the residual interpreter-selection gap' cat "$ENFORCEMENT"
+# WO-16. The proxy was the residual this row NAMED as open, and it is closed now, so the row has to
+# stop naming it as open — and has to say what the new boundary is, because "closed" without a
+# mechanism is a claim nobody can check. Both directions are asserted: the doc must state the fixed
+# absolute list AND must not still be carrying the proxy as something left over.
+assert_output "  and states that the interpreter comes from a fixed absolute list" \
+  'fixed absolute candidate list' cat "$ENFORCEMENT"
+assert_output "  and that neither \$FIRM_PYTHON nor PATH is consulted for it" \
+  'consults neither `$FIRM_PYTHON` nor `PATH`' cat "$ENFORCEMENT"
+assert_output "  and that with none available it is cannot-evaluate, with no degraded fallback" \
+  'no** degraded fallback' cat "$ENFORCEMENT"
+assert_not_output "  and no longer carries the proxy as an open residual" \
+  'the narrower residual that is left' cat "$ENFORCEMENT"
+# ...and the gap that REPLACED it is stated, because the fix moved the boundary rather than removing
+# it: the guard now fixes WHICH interpreter runs, not what that interpreter loads.
+assert_output "  and names the gap that replaced it (the interpreter's own environment)" \
+  'that interpreter'"'"'s own environment is not isolated' cat "$ENFORCEMENT"
+assert_output "--surface carries that same gap as a named line" \
+  "THE INTERPRETER'S OWN ENVIRONMENT" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 for c in "git pu\$'s'h origin main" "g\$'i't push origin main" \
          "git co\$'n'fig --global user.email a@b.c" "git pu\$\"s\"h origin main" \
          "\$'\\x67it' push origin main" "git \$'\\160ush' origin main" \
@@ -1994,9 +2334,9 @@ assert_rc "over the bound, a benign command is still permitted (the bound is not
 # double answers the probe and then betrays the checker run, so a 2 plus its marker is positive proof
 # that the classifier was reached.
 assert_rc "  and it got there by REACHING the classifier (a python double that betrays its run)" 2 \
-  mg "$TREE" "$PYFAIL99" "$REPO_OK" --command "$PF_OVER"
+  mg "$TREE_FAIL99" "$GH_OK" "$REPO_OK" --command "$PF_OVER"
 assert_output "  ...and the double really ran" "MG-PY-DOUBLE-EXECUTED" \
-  mg "$TREE" "$PYFAIL99" "$REPO_OK" --command "$PF_OVER"
+  mg "$TREE_FAIL99" "$GH_OK" "$REPO_OK" --command "$PF_OVER"
 assert_rc "  while the same string one byte SHORTER is still decided in bash, zero subprocesses" 0 \
   mg "$TREE" "$EXPLODE" "$REPO_OK" --command "$PF_UNDER"
 assert_eq "  ...and really spawned nothing to do it" "" \

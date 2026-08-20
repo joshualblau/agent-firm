@@ -37,8 +37,10 @@
 # FAILS CLOSED, ALWAYS. Anything that cannot be evaluated is a BLOCK, never a pass: no network,
 # `gh` absent, `gh` unauthenticated, empty/malformed/non-login `gh` output, `git` absent,
 # `user.email` unset or empty, allowlist missing/unreadable/unparseable/empty/unknown-key, no
-# usable YAML parser, no python3, an unlexable command string, an unrecognised hook payload,
-# `--command` with no value, and any exit code from the embedded checker outside its own contract.
+# usable YAML parser, no P2-compliant python3 AT A TRUSTED ABSOLUTE PATH (this guard resolves its
+# own interpreter and does not consult `$FIRM_PYTHON` or `$PATH` — see _mg_python_ready), an
+# unlexable command string, an unrecognised hook payload, `--command` with no value, and any exit
+# code from the embedded checker outside its own contract.
 #
 # EXIT CONTRACT (check modes — the firm's three-way gate contract; AC-016)
 #   0  identity resolved AND allow-listed                     -> permitted
@@ -214,10 +216,66 @@ POLICY="$ROOT/agent-firm/policy/merge-authority.yaml"
 # that is the direction AC-107 requires ("every indeterminate path blocks, including a missing or
 # unusable interpreter resolver"), it is what the three call sites already print a remedy for, and
 # it costs the 98.73% structural fast path nothing because this function is never reached there.
+#
+# AND THE CALLER NO LONGER CHOOSES THE INTERPRETER AT ALL (WO-16). P2 was still the wrong SHAPE of
+# requirement: it asked "is this program the admitted interpreter row", and a program can answer
+# that honestly while being the attacker's. A $FIRM_PYTHON (or a $PATH `python3`) written to PROXY
+# forwards the resolver's `-c` probe to a real CPython 3.9.6 — so it passes P2 truthfully — then
+# reads the checker off its own stdin, lifts the per-invocation nonce out of the source it was
+# handed, and prints a permit. Reproduced at 9941201 under a non-allow-listed identity, four ways:
+# `--command` and `--hook`, each via $FIRM_PYTHON and via $PATH with $FIRM_PYTHON never set. All
+# four exited 0 — PERMITTED.
+#
+# THAT IS NOT FIXABLE WITH A BETTER SENTINEL, and three rounds of trying is the evidence: SEC-03
+# removed an inherited cache, AC-107 added proof-of-execution, then a liveness nonce. Each closed
+# real vectors. None can close this one, because the proxy satisfies every check HONESTLY — it
+# really does delegate to a compliant interpreter and it really does read the checker. Any secret
+# the guard hands the program it is asking to run is a secret that program has. So the boundary
+# moves instead of the bar: A SECURITY CONTROL DOES NOT ACCEPT AN INTERPRETER FROM THE ENVIRONMENT
+# IT EXISTS TO POLICE. This function resolves from bin/firm-python's FIXED ABSOLUTE candidate list
+# and nothing else, by setting FIRM_PYTHON_TRUSTED_ONLY before the source; there is no longer
+# anything for a proxy to be selected BY.
+#
+# The flag is set BEFORE the source because sourcing RESOLVES, and the ordinary resolution EXECUTES
+# $FIRM_PYTHON to probe it. Probing is not safe here even though its verdict would be discarded:
+# this guard runs under a registered hook timeout that is MEASURED to fail OPEN when overrun (see
+# the header), so a $FIRM_PYTHON that merely sleeps would be a permit. The control must not run the
+# caller's program at all, not even to reject it.
+#
+# THREE INDEPENDENT REQUIREMENTS, because each is a different question and each defaults to no:
+#   1. FIRM_PYTHON_P2=1 — the admitted interpreter ROW. Unchanged from AC-107.
+#   2. FIRM_PYTHON_TRUSTED=1 — PROVENANCE: the argv came from bin/firm-python's fixed absolute list.
+#      Absent reads as 0, so an old bin/firm-python in a ${CLAUDE_PLUGIN_ROOT} plugin cache that
+#      predates the variable BLOCKS rather than being taken for a promise it never made. Same
+#      reasoning as the FIRM_PYTHON_P2 default above, and it is the case this check is REACHED by:
+#      such a copy still resolves a real interpreter, so it answers question 1 yes and this one no.
+#   3. Every word of the argv is an absolute path or a flag, verified HERE. This is the one check
+#      that does not take the resolver's word for anything: it is a shape the trusted list cannot
+#      fail to satisfy and a $PATH-resolved bare `python3` cannot satisfy, so if a future edit ever
+#      publishes TRUSTED=1 beside a relative argv, this refuses without needing a second copy of
+#      the list. `/usr/bin/arch -arm64 /usr/bin/python3` is the reason flags are admitted.
+#   FIRM_PYTHON_TRUSTED is unset with the rest before the source: an attacker who EXPORTS it must
+#   not be able to answer question 2 from the environment. That is SEC-03's lesson applied to the
+#   new variable on the day it is introduced rather than two work orders later.
+#
+#   THE ORDER IS 1-BEFORE-2 SO THAT BOTH ARE REACHABLE, which is a property worth stating because
+#   the current bin/firm-python sets TRUSTED and P2 together: with 2 first, 1 would be unreachable
+#   dead code on every host. As written, a no-P2 host stops at 1 with a message about the ROW, and a
+#   stale resolver stops at 2 with a message about PROVENANCE — the two real deployments, each
+#   getting the diagnosis that fits it. tests/test-merge-guard.sh drives both.
+#
+# WHAT THIS COSTS, STATED PLAINLY. On a host whose only P2-compliant interpreter is a venv or a
+# pyenv build on $PATH — legitimate, and exactly what $FIRM_PYTHON exists to serve — every GATED
+# command is now cannot-evaluate. That is a real over-block and it is the fail-closed direction; the
+# ungated 98.73% fast path is untouched, and `firm-python --trusted-status` (which this function's
+# three call sites name) tells the operator which absolute paths were probed so the repair is
+# actionable. $FIRM_PYTHON keeps working for every other firm-* tool: what changed is that THIS
+# control does not honour it, not that the option went away.
 _mg_python_ready() {
   unset FIRM_PYTHON_ARGV FIRM_PYTHON_DISPLAY FIRM_PYTHON_P2 FIRM_PYTHON_LIVE \
-        FIRM_PYTHON_REASON FIRM_PYTHON_TRIED
+        FIRM_PYTHON_REASON FIRM_PYTHON_TRIED FIRM_PYTHON_TRUSTED
   MG_PY_UNREADY="bin/firm-python is missing next to this script, or it resolved no usable interpreter"
+  FIRM_PYTHON_TRUSTED_ONLY=1
   . "$SELF/firm-python" || return 1
   case "${FIRM_PYTHON_ARGV[0]:-}" in
     "")  return 1 ;;
@@ -225,11 +283,28 @@ _mg_python_ready() {
     *)   command -v "${FIRM_PYTHON_ARGV[0]}" >/dev/null 2>&1 || return 1 ;;
   esac
   if [ "${FIRM_PYTHON_P2:-0}" != "1" ]; then
-    MG_PY_UNREADY="no P2-compliant interpreter on this host, so the program that would render this
-  decision is whatever \$FIRM_PYTHON or \$PATH supplies, and this guard will not take a decision
-  from an interpreter it cannot vouch for: ${FIRM_PYTHON_REASON:-firm-python reported no reason}"
+    MG_PY_UNREADY="no P2-compliant interpreter at a trusted absolute path on this host, so the
+  program that would render this decision cannot be vouched for and this guard
+  will not take a decision from it: ${FIRM_PYTHON_REASON:-firm-python reported no reason}"
     return 1
   fi
+  if [ "${FIRM_PYTHON_TRUSTED:-0}" != "1" ]; then
+    MG_PY_UNREADY="the interpreter that would render this decision was NOT resolved from a trusted
+  absolute path, and this guard will not take a decision from an interpreter the caller may have
+  chosen — \$FIRM_PYTHON and \$PATH are not consulted here. The usual cause is a bin/firm-python
+  older than this guard, which cannot answer the question at all: ${FIRM_PYTHON_REASON:-firm-python reported no reason}"
+    return 1
+  fi
+  for _mg_word in "${FIRM_PYTHON_ARGV[@]}"; do
+    case "$_mg_word" in
+      /*) [ -x "$_mg_word" ] || { MG_PY_UNREADY="the resolved interpreter argv names \
+$_mg_word, which is not executable"; return 1 ;} ;;
+      -*) ;;
+      *)  MG_PY_UNREADY="the resolved interpreter argv contains the non-absolute word \
+'$_mg_word', so it was not resolved from a trusted absolute path after all"
+          return 1 ;;
+    esac
+  done
   return 0
 }
 
@@ -371,6 +446,13 @@ HOOK_BUDGET_MARGIN = 10
 #     16 KB 176 ms · 64 KB 677 ms · 128 KB 1 384 ms · 192 KB 2 264 ms · 256 KB 2 955 ms.
 #   The old 262 144 therefore cost 2 955 ms of classify plus ~325 ms of fixed overhead (bash start
 #   72, this script's own 104 KB parse 29, `. bin/firm-python` resolution 120, python start 90,
+#   — and that 120 ms term is now CONSERVATIVE rather than current: WO-16 made the guard resolve in
+#   trusted-only mode, which probes the fixed absolute list and never probes $PATH's python3, so on
+#   the machine this was measured on it dropped (whole-process `firm-python --status` 165.8 ms vs
+#   `--trusted-status` 114.8 ms, 20 iterations each; end to end a gated --command went 261.1 -> 267.1
+#   ms, i.e. unchanged within run-to-run noise). It is left at 120 because an over-estimate in a
+#   budget is the fail-closed direction, and because the measured PARSE_BUDGET assertion in
+#   tests/test-merge-guard.sh drives the real thing rather than this arithmetic —
 #   stdlib imports 9, compiling the embedded checker 4.5) = 3 305 ms against a 4 000 ms budget on an
 #   IDLE host, and 5 640 ms — 41% OVER the budget — with 8 spinners on 8 cores. The header used to
 #   claim 1.3 s for this term; that does not reproduce on either interpreter available here (2.2 s
@@ -565,6 +647,38 @@ def _wrap_words(words, width=92, indent="    "):
 # Printed, and then driven name-by-name by tests/test-merge-guard.sh, so the set the doc CLAIMS
 # and the set the code USES cannot come apart. An unlisted launcher is a declared GAP, below.
 SURFACE_COVERED += ["the launcher set, in full (a NAME LIST, not a rule):"] + _wrap_words(WRAPPERS)
+
+# The one COVERED entry that is not a command SHAPE (WO-16). It is here rather than in the GAPS list
+# below because it used to be a gap and is not one any more, and the rule this file lives by is that
+# the two lists move with the behaviour: tests/test-merge-guard.sh drives a real proxying interpreter
+# against this claim and asserts a BLOCK, which is what a COVERED line owes.
+SURFACE_COVERED += [
+    "THE INTERPRETER THIS GUARD RUNS, which is not a command shape and is on this list because the",
+    "  decision is rendered INSIDE a python program: whoever chooses that program chooses the",
+    "  decision. It is chosen from bin/firm-python's FIXED ABSOLUTE candidate list and from nothing",
+    "  else — $FIRM_PYTHON and $PATH are not consulted, not even probed, on this path",
+    "  (FIRM_PYTHON_TRUSTED_ONLY=1 before the source; _mg_python_ready then requires TRUSTED=1 AND",
+    "  P2=1 AND an argv of absolute paths). If no trusted absolute interpreter qualifies, every",
+    "  gated command is cannot-evaluate (exit 2); there is no degraded fallback, because running",
+    "  something the guard cannot vouch for IS the defect. THIS REPLACED A SENTINEL ARMS RACE, and",
+    "  the history is the argument: an inherited-resolution cache (SEC-03), a bare `[ -x ]` fallback",
+    "  and a FIXED decision sentinel (AC-107) were each closed in turn, and a $FIRM_PYTHON written to",
+    "  PROXY still walked through all three — it forwards `-c` to a real CPython so the P2 probe is",
+    "  answered HONESTLY, then reads the checker off its own stdin, lifts the per-invocation nonce",
+    "  out of it and prints a permit. Four reproduced permits at 9941201: --command and --hook, each",
+    "  via $FIRM_PYTHON and via $PATH with $FIRM_PYTHON unset. No sentinel can close that, because",
+    "  the proxy passes every check truthfully; only removing the caller's ability to BE the",
+    "  interpreter can. The liveness nonce STAYS — it is what still refuses a shim, a replay or a",
+    "  hardcoded sentinel if a trusted absolute path is ever itself replaced.",
+    "  $FIRM_PYTHON_ARGV / $FIRM_PYTHON_DISPLAY are covered by this same line and were its first",
+    "  half: a non-empty DISPLAY used to skip resolution entirely and the inherited ARGV was then",
+    "  run, which permitted a push this guard blocks (SEC-03). They are unset before every",
+    "  resolution, together with FIRM_PYTHON_TRUSTED, so no answer here comes from the environment.",
+    "  $FIRM_PYTHON is untouched for ordinary firm tooling: what changed is that this control does",
+    "  not honour it. `firm-python --trusted-status` prints what this guard would run, which is a",
+    "  different question from `firm-python --status`.",
+]
+
 SURFACE_GAPS = [
     "A launcher NOT in the set printed above — a custom wrapper script, `proot`, a new coreutils",
     "  launcher: `mywrap git push origin main` is NOT matched. The set is a name list and a name",
@@ -620,29 +734,15 @@ SURFACE_GAPS = [
     "A heredoc body fed to a NON-shell (python3 <<'PY' ... PY) is skipped, so a `git push` line",
     "  inside a python/text heredoc is neither matched nor a false positive. Deliberate: this",
     "  repo's own docs and tests are full of the literal string `git push`.",
-    "INTERPRETER SELECTION, narrowed to a PROXY. This guard renders its decision inside a python",
-    "  program and bin/firm-python chooses which python runs it, so whoever chooses that program",
-    "  is inside the control. Two of the three ways to choose it are now closed and one is not.",
-    "  CLOSED — a host with NO P2-compliant interpreter. The resolver degrades to $FIRM_PYTHON or",
-    "  $PATH's python3 there and reports p2=no, and this guard used to run that program anyway and",
-    "  believe its exit status: on such a host a two-line shim printing the permit sentinel turned",
-    "  a blocked `git push` into a PERMIT, through --command and through the --hook adapter alike.",
-    "  _mg_python_ready now requires FIRM_PYTHON_P2=1, so every gated command on such a host is",
-    "  cannot-evaluate (a BLOCK) instead. CLOSED — a replayed or hardcoded decision sentinel. The",
-    "  sentinel carries a nonce minted per invocation and delivered only inside the checker source",
-    "  on stdin, so a program that never read the check, or that repeats a line it captured",
-    "  earlier, names the wrong invocation and is reported unproven. STILL A GAP — a $FIRM_PYTHON",
-    "  (or a $PATH python3) deliberately written to PROXY a real interpreter: it can pass the",
-    "  resolver's P2 probe by forwarding -c to a compliant interpreter, then read the checker off",
-    "  its own stdin, lift the nonce out of it and answer with a permit. Neither sentinel is",
-    "  cryptographic and neither can be: anything handed a program can be replayed by that program.",
-    "  What they buy is that no ACCIDENT reaches a permit — no wrapper, no `exit 0` stub, no",
-    "  interpreter that ignores stdin — only a program written for this purpose does, and a caller",
-    "  who can set $FIRM_PYTHON in this guard's environment can already edit the guard (see the",
-    "  CLIENT-SIDE disclosure in this file's header). $FIRM_PYTHON_ARGV /",
-    "  $FIRM_PYTHON_DISPLAY are NOT in this gap: they used to be (a non-empty DISPLAY skipped",
-    "  resolution and the inherited ARGV was run, which permitted a push this guard blocks), and",
-    "  they are now unset before every resolution, with an assertion in tests/test-merge-guard.sh.",
+    "THE INTERPRETER'S OWN ENVIRONMENT, as distinct from WHICH interpreter runs (which is covered",
+    "  above). The trusted CPython this guard runs is still started with the caller's environment,",
+    "  so $PYTHONPATH, $PYTHONHOME and $HOME steer where it imports `yaml` and the stdlib modules",
+    "  the checker uses from. Selecting the program and controlling what that program loads are two",
+    "  different questions and only the first one moved; this line is here so the COVERED claim",
+    "  above cannot be read as the second. It is NOT closed by running the interpreter with -E/-I:",
+    "  pyyaml lives in the per-user site directory on this OS, so isolating the environment turns",
+    "  the guard into a blanket cannot-evaluate. Same class and same disclosure as every other line",
+    "  on this list: a client-side control cannot outrank a caller who owns the process.",
 ]
 
 class Cannot(Exception):
@@ -1748,8 +1848,10 @@ _mg_may_match() {
 
 if [ "$MODE" = "surface" ]; then
   if ! _mg_python_ready; then
-    printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to print the covered surface.\n' >&2
+    printf 'firm-merge-guard: CANNOT EVALUATE — no TRUSTED python3 (bin/firm-python resolves it from\n' >&2
+    printf '  fixed absolute paths; $FIRM_PYTHON and $PATH are not consulted) to print the covered surface.\n' >&2
     printf '  %s\n' "$MG_PY_UNREADY" >&2
+    printf '  See which absolute paths were probed with: firm-python --trusted-status\n' >&2
     exit 2
   fi
   _mg_nonce_new
@@ -1792,17 +1894,20 @@ _mg_unproven() {
   printf '  did not emit its proof-of-execution sentinel, so that exit status cannot be read as a\n' >&2
   printf '  decision. A python3 that is a stub, a shim, or the wrong interpreter can return any\n' >&2
   printf '  status without running the check. Blocking, and nothing was recorded in the ledger.\n' >&2
-  printf '  Verify the resolved interpreter with: firm-python --status  (python3 is a declared firm\n' >&2
-  printf '  prerequisite, see docs/INSTALL.md).\n' >&2
+  printf '  Verify the interpreter THIS guard resolves with: firm-python --trusted-status (which is\n' >&2
+  printf '  a different question from firm-python --status: the guard consults only fixed absolute\n' >&2
+  printf '  paths, never $FIRM_PYTHON or $PATH). python3 is a declared firm prerequisite; see\n' >&2
+  printf '  docs/INSTALL.md.\n' >&2
   exit 2
 }
 
 if [ "$MODE" = "command" ]; then
   _mg_may_match "$CMD" || exit 0
   if ! _mg_python_ready; then
-    printf 'firm-merge-guard: CANNOT EVALUATE — no usable python3 (bin/firm-python resolves it) to inspect this command.\n' >&2
+    printf 'firm-merge-guard: CANNOT EVALUATE — no TRUSTED python3 (bin/firm-python resolves it from\n' >&2
+    printf '  fixed absolute paths; $FIRM_PYTHON and $PATH are not consulted) to inspect this command.\n' >&2
     printf '  %s\n' "$MG_PY_UNREADY" >&2
-    printf '  Blocking. Verify the resolved interpreter with: firm-python --status\n' >&2
+    printf '  Blocking. See which absolute paths were probed with: firm-python --trusted-status\n' >&2
     exit 2
   fi
   # stdout is captured because it carries the decision SENTINEL and nothing else; stderr is NOT
@@ -1868,7 +1973,9 @@ if ! _mg_python_ready; then
   printf 'firm-merge-guard: BLOCKED (cannot evaluate) — the interpreter could not be resolved, so\n' >&2
   printf '  this command cannot be checked against the merge-authority allowlist.\n' >&2
   printf '  %s\n' "$MG_PY_UNREADY" >&2
-  printf '  Check it with: firm-python --status  (and see docs/INSTALL.md for the python3\n' >&2
+  printf '  Check it with: firm-python --trusted-status  (NOT --status: this guard resolves its\n' >&2
+  printf '  interpreter from fixed absolute paths only, never from $FIRM_PYTHON or $PATH, so the two\n' >&2
+  printf '  can disagree — and see docs/INSTALL.md for the python3\n' >&2
   printf '  prerequisite itself). If this guard is running from a plugin cache, refresh it with\n' >&2
   printf '  `firm-version --local-refresh`. Ask the human operator to run the command if it is\n' >&2
   printf '  legitimate — do NOT remove or edit this guard to get past it.\n' >&2

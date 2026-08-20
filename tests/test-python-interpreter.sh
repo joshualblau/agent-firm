@@ -272,6 +272,138 @@ fi
 assert_rc "a live-but-not-P2 fallback still runs programs (CI hosts stay usable)" 0 \
   env FIRM_PYTHON="$REAL_PY" "$UNSAT" -c 'pass'
 
+t_case "WO-16 trusted-only resolution consults the FIXED list and nothing the caller supplies"
+# The last interpreter-selection vector, at the resolver level. bin/firm-merge-guard renders its
+# merge/push decision INSIDE a python program, so whoever chooses the python chooses the decision --
+# and every defence built for that so far was a bar the chosen program had to clear. A program that
+# PROXIES clears all of them honestly: it forwards `-c` to a real CPython 3.9.6 (so the probe above
+# is answered truthfully, p2 and all), then reads whatever it is handed on stdin. So the resolver
+# grew a mode with no bar to clear, because there is no candidate from the caller at all.
+#
+# THE MODE IS THE POINT, NOT A STRICTER PROBE. Everything below is about ABSENCE: what is not read,
+# what is not run, what is not published.
+PROXY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firm-python-proxy.XXXXXX")"; t_track "$PROXY_DIR"
+PROXY_RAN="$PROXY_DIR/it-ran"
+{ printf '#!/bin/sh\n'
+  # The marker is written on EVERY invocation, INCLUDING the probe, so "was it executed at all" is a
+  # question this fixture can answer. A double that only marked the non-probe path could not.
+  printf 'printf x >> "%s"\n' "$PROXY_RAN"
+  printf 'case "$1" in -c) exec %s "$@" ;; esac\n' "$REAL_PY"
+  printf 'exit 0\n'; } > "$PROXY_DIR/python3"
+chmod +x "$PROXY_DIR/python3"
+if [ "$host_row" = exact ]; then
+  # PRECONDITION 1: the proxy really does pass the ordinary resolution's P2 probe. This is what makes
+  # the vector real rather than theoretical -- and it is why no better sentinel closes it.
+  # The needle is the proxy's PATH inside the argv, not "argv=<proxy>": on a translated parent the
+  # compliant form is `/usr/bin/arch -arm64 <path>` and the proxy is the last word, not the first.
+  assert_output "precondition: the proxy passes the ORDINARY resolution and is selected" \
+    "$PROXY_DIR/python3" env FIRM_PYTHON="$PROXY_DIR/python3" "$FP" --status
+  assert_output "precondition: and is reported p2=yes, truthfully, because it delegates" "p2=yes" \
+    env FIRM_PYTHON="$PROXY_DIR/python3" "$FP" --status
+  # ...and $FIRM_PYTHON stays a working operator convenience for ordinary tooling. This work order
+  # removed it from ONE control, not from the firm.
+  assert_output "  \$FIRM_PYTHON still works for ordinary firm tooling (it was not withdrawn)" \
+    "proxy-ran-the-program" env FIRM_PYTHON="$PROXY_DIR/python3" "$FP" -c 'print("proxy-ran-the-program")'
+
+  # THE MODE. Same host, same $FIRM_PYTHON, different question.
+  rm -f "$PROXY_RAN"
+  ts_fp="$(env FIRM_PYTHON="$PROXY_DIR/python3" "$FP" --trusted-status 2>&1)"
+  assert_output "trusted-only resolution reports trusted=yes on this host" "trusted=yes" \
+    printf '%s\n' "$ts_fp"
+  case "$ts_fp" in
+    *"$PROXY_DIR"*) _t_no "trusted-only resolution ignores \$FIRM_PYTHON" "got: $(_t_ctx "$ts_fp")" ;;
+    *) _t_ok "trusted-only resolution ignores \$FIRM_PYTHON" ;;
+  esac
+  # NOT MERELY UNSELECTED -- NOT RUN. Probing a caller-supplied program would still let it burn the
+  # merge guard's hook budget, and a hook that overruns its registered timeout is measured to fail
+  # OPEN, so "we probed it and said no" would still have been a permit.
+  assert_no_file "  and never executes it, not even to probe and reject it" "$PROXY_RAN"
+
+  # The $PATH vector, with $FIRM_PYTHON unset entirely. It needs no variable that could have been
+  # special-cased by name, which is why the answer had to be a whitelist and not a blacklist.
+  rm -f "$PROXY_RAN"
+  ts_path="$(env PATH="$PROXY_DIR:/usr/bin:/bin" "$FP" --trusted-status 2>&1)"
+  assert_output "trusted-only resolution reports trusted=yes with the proxy first on \$PATH" \
+    "trusted=yes" printf '%s\n' "$ts_path"
+  case "$ts_path" in
+    *"$PROXY_DIR"*) _t_no "trusted-only resolution ignores \$PATH" "got: $(_t_ctx "$ts_path")" ;;
+    *) _t_ok "trusted-only resolution ignores \$PATH" ;;
+  esac
+  assert_no_file "  and does not execute the \$PATH candidate either" "$PROXY_RAN"
+  # The argv it DID choose is one of the fixed absolute paths, asserted against the list in the file
+  # rather than against a path spelled here (which would drift the moment the list changes).
+  assert_ok "the argv it chose is a literal from _firm_python_trusted_candidates" t_python - "$FP" \
+    "$(env "$FP" --trusted-status)" <<'PY'
+import re, sys
+src, status = open(sys.argv[1], encoding="utf-8").read(), sys.argv[2]
+body = re.search(r"_firm_python_trusted_candidates\(\) \{\n(.*?)\n\}", src, re.S).group(1)
+paths = re.findall(r"^\s+(/\S+)", body, re.M)
+argv = status.split(" argv=", 1)[1].split(" reason=", 1)[0].split()
+assert paths, "no candidates found in the trusted list"
+assert argv[-1] in paths, (argv, paths)
+PY
+  # The ordinary resolution never claims provenance, even when it happens to land on the same path.
+  assert_ok "the ORDINARY resolution never publishes trusted=1, even choosing a trusted path" \
+    bash -c '. "$1" >/dev/null 2>&1; [ "$FIRM_PYTHON_TRUSTED" = "0" ]' _ "$FP"
+  # Sourcing with the flag set really runs the trusted resolution, which is how the guard uses it.
+  assert_ok "sourcing with FIRM_PYTHON_TRUSTED_ONLY=1 resolves trusted, and does not run \$FIRM_PYTHON" \
+    bash -c 'rm -f "$3"; FIRM_PYTHON_TRUSTED_ONLY=1 FIRM_PYTHON="$2" . "$1" >/dev/null 2>&1
+             [ "$FIRM_PYTHON_TRUSTED" = "1" ] && [ ! -e "$3" ]' _ "$FP" "$PROXY_DIR/python3" "$PROXY_RAN"
+fi
+# An EXPORTED FIRM_PYTHON_TRUSTED cannot answer the provenance question from the environment -- the
+# SEC-03 lesson, applied to the new variable on the day it is introduced. On the unsatisfiable copy
+# the honest answer is no, and it must stay no however the caller decorates the environment.
+assert_output "an exported FIRM_PYTHON_TRUSTED=1 does not make an unsatisfiable host trusted" \
+  "trusted=no" env FIRM_PYTHON_TRUSTED=1 "$UNSAT" --trusted-status
+assert_output "  nor does exporting FIRM_PYTHON_P2=1 beside it" "trusted=no" \
+  env FIRM_PYTHON_TRUSTED=1 FIRM_PYTHON_P2=1 "$UNSAT" --trusted-status
+# FAIL CLOSED, and diagnosable: there is no degraded fallback in this mode (the ordinary one has one
+# on purpose, which is what keeps unsupported CI hosts usable), and the reason names the fixed paths,
+# because an operator cannot repair a list they cannot see.
+assert_output "an unsatisfiable host reports trusted=no rather than degrading to something" \
+  "trusted=no" "$UNSAT" --trusted-status
+assert_output "  and says the caller's own selectors were not consulted" \
+  'are deliberately NOT consulted in trusted-only mode' "$UNSAT" --trusted-status
+assert_output "  and names the absolute paths it probed" "/usr/bin/python3" "$UNSAT" --trusted-status
+# ...and where none of them EXISTS, they are still named. Silently skipping an absent candidate is
+# how a fixed list becomes undiagnosable: the reason would read "probed: none", which names nothing
+# and reads like a broken probe rather than a host that needs an interpreter installed. $ONLY is the
+# copy whose absolute candidates were all redirected into a directory that does not exist.
+assert_output "  even where none of them exists at all, each is named" "(absent)" \
+  env PATH=/usr/bin:/bin "$ONLY" --trusted-status
+assert_output "  and that copy really has no trusted candidate left" "trusted=no" \
+  env PATH=/usr/bin:/bin "$ONLY" --trusted-status
+
+t_case "WO-16 the trusted candidate list cannot be reached by anything a caller sets"
+# THE STRUCTURAL GUARANTEE, asserted on the SOURCE rather than on behaviour. Every behaviour row
+# above speaks only for the shapes it was handed; this speaks for all of them, and it is the row that
+# fails if a future edit re-introduces a variable, a `command -v`, a $PATH lookup or a file read into
+# the list. That is the exact edit that would silently restore the vector, and no host-dependent
+# assertion would catch it.
+assert_ok "the list is literal absolute paths only — no variable, no lookup, no file read" \
+  t_python - "$FP" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"_firm_python_trusted_candidates\(\) \{\n(.*?)\n\}", src, re.S)
+assert m, "the trusted candidate list is gone; every WO-16 guarantee rests on it"
+body = m.group(1)
+paths = re.findall(r"^\s+(\S+?)\s*\\?$", body, re.M)
+paths = [p for p in paths if p not in ("printf",)]
+assert paths, "the trusted list is empty: " + body
+for p in paths:
+    assert p.startswith("/"), "a non-absolute trusted candidate is a $PATH lookup in disguise: " + p
+# The whole body may contain no expansion of any kind. `$` is the only character a shell needs to
+# read something from outside, so its absence is the guarantee, and it is one character to check.
+assert "$" not in body, "the trusted list interpolates something: " + body
+for bad in ("command -v", "PATH", "eval", "source", "cat ", "read "):
+    assert bad not in body, "the trusted list consults %r: %s" % (bad, body)
+# And the ORDINARY resolution still reads the caller's selectors — this file did not become strict
+# everywhere, which would have withdrawn a documented operator convenience.
+ordinary = re.search(r"_firm_python_candidates\(\) \{\n(.*?)\n\}", src, re.S).group(1)
+assert "FIRM_PYTHON" in ordinary and "command -v python3" in ordinary, ordinary
+assert "_firm_python_trusted_candidates" in ordinary, "the two lists have been forked into two copies"
+PY
+
 t_case "an unusable \$FIRM_PYTHON degrades to a working interpreter, and is named"
 # SEC-04 / CR-09: the fallback used to take $FIRM_PYTHON without the `[ -x ]` test every other
 # candidate gets, so a typo made every firm-* tool exit 127 "command not found" -- not the documented

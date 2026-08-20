@@ -147,6 +147,10 @@ bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-ver
                               #     $FIRM_PYTHON overrides the candidate order (it is probed like any
                               #     other candidate, so it cannot make a non-compliant interpreter
                               #     report p2=yes)
+                              #     ONE EXCEPTION, deliberately: firm-merge-guard is a security
+                              #     control and resolves from fixed absolute paths only, consulting
+                              #     neither $FIRM_PYTHON nor $PATH. `firm-python --trusted-status`
+                              #     reports what it would run.
 .envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
 agent-firm/templates/visual/  # Playwright visual-regression config + specs (firm-visual-check gates on these)
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy,
