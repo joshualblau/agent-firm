@@ -2,13 +2,15 @@
 # The eval's own guard for the reviewer capability probe. Two checks:
 #
 #   1. the firm's offline discovery/invocation drift check (tests/test-reviewer-capability-contract.sh)
-#   2. a LIVE binding of each provider's declared help surfaces against the installed CLI's real
-#      help text (test/surfaces.py, shipped beside this file)
+#   2. a LIVE binding of each provider's declared surfaces against the installed CLI's real help
+#      text, plus a parse check of the real invocation argv (test/surfaces.py, beside this file)
 #
-# Neither could pass under the 2026-08-21 defect. (1) fails because a wrapper that probes
-# `codex --help` while invoking `codex exec ...` has an invoked surface that is not a probed surface.
-# (2) fails because `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--output-schema` and
-# `--output-last-message` are absent from the only surface it declared.
+# Neither passes under either defect this eval guards. Against the original (probe `codex --help`,
+# invoke `codex exec ...`): (1) fails because an invoked surface is not a probed surface, and (2)
+# fails because `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--output-schema` and
+# `--output-last-message` are absent from the only declared surface. Against the union rule that
+# briefly replaced it: (2) fails twice over — `-a` is not on the `codex exec --help` surface it would
+# be passed on, and the invocation itself does not parse (`codex exec -a never ... --help` exits 2).
 #
 # Fails closed on every ambiguity: no wrapper on PATH, no provider CLI installed, an unreadable help
 # surface. "Could not check" is never reported as "checked and fine" — that conflation is the exact

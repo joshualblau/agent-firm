@@ -278,7 +278,7 @@ for provider in sources:
         require_rejection(provider, "output-" + field,
                           lambda target, field=field: mutate_activation_output(target, field))
 PY
-assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" python3 - "$BIN/firm-reviewer-common" <<'PY'
+cat > "$W/reviewer-envelope-check.py" <<'PY'
 import ast, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 source = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
@@ -291,27 +291,90 @@ def literal_values(node):
 resolver = [literal_values(node) for node in lists if "firm-model-resolve" in ast.unparse(node)]
 assert len(resolver) == 1, resolver
 assert resolver[0][1:] == ["--provider", None, "--role", "reviewer", "--format", "json"], resolver[0]
-# Find the launch envelopes by NAMING the one function that constructs them, not by guessing at
-# module-level list shape. The old search was "the single module list mentioning --effort and
-# --permission-mode"; that stopped identifying the launch line uniquely the moment the wrapper also
-# DECLARED those controls as required capabilities (CAPABILITY_CONTRACT, added 2026-08-21 so that
-# discovery probes the surfaces the invocation actually uses). Two lists then matched a predicate
-# asserting there is exactly one, and this check failed for a reason with nothing to do with model
-# envelopes. Scoping to judge_invocation is strictly stronger: it pins the envelopes to the single
-# construction of the judge command line, so a second launch site breaks `len(...) == 1` here for a
-# real reason instead of a coincidence of vocabulary.
+# TWO separate claims, because they are separate and one of them was briefly lost.
+#
+# IDENTIFICATION — find the launch envelopes by NAMING the function that builds them. The original
+# search was "the single module-level ast.List mentioning --effort and --permission-mode"; that
+# stopped identifying the launch line uniquely once the wrapper also DECLARED those controls as
+# required capabilities (CAPABILITY_CONTRACT, 2026-08-21), and this assertion then failed for a
+# reason with nothing to do with model envelopes.
+#
+# UNIQUENESS — function-scoping is stronger on identification and, on its own, WEAKER on uniqueness.
+# It asserts only "there is exactly one function with this name", never "there is no other
+# construction". Review demonstrated the gap by adding a plausible fallback launch path outside the
+# function (`if os.environ.get("FIRM_JUDGE_FALLBACK"): command = [executable, "exec", ...]`) carrying
+# an undeclared control: it passed the function-scoped check and the drift check, and would have
+# failed the original module-wide one. Uniqueness is therefore restored at the bottom of this block,
+# on a marker the capability declaration cannot collide with — a list literal containing the
+# `executable` NAME. Only the readiness probes may build one outside the judge constructors.
 definitions = [node for node in ast.walk(tree)
-               if isinstance(node, ast.FunctionDef) and node.name == "judge_invocation"]
-assert len(definitions) == 1, "judge_invocation must be the single construction of the judge argv"
-returns = [node.value for node in ast.walk(definitions[0]) if isinstance(node, ast.Return)]
-assert returns and all(isinstance(node, ast.List) for node in returns), [ast.dump(n) for n in returns]
-codex = [node for node in returns if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
-claude = [node for node in returns if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
-          and any(isinstance(x, ast.Constant) and x.value == "--permission-mode" for x in node.elts)]
-assert len(codex) == 1 and len(claude) == 1
-cv, av = literal_values(codex[0]), literal_values(claude[0])
-assert cv[cv.index("-m") + 1] is None and cv[cv.index("-c") + 1] == 'model_reasoning_effort="xhigh"'
-assert av[av.index("--model") + 1] is None and av[av.index("--effort") + 1] == "xhigh"
+               if isinstance(node, ast.FunctionDef) and node.name in ("judge_plan", "judge_invocation")]
+assert sorted(node.name for node in definitions) == ["judge_invocation", "judge_plan"], \
+    [node.name for node in definitions]
+builder = [node for node in definitions if node.name == "judge_plan"][0]
+assembler = [node for node in definitions if node.name == "judge_invocation"][0]
+returns = [node.value for node in ast.walk(builder) if isinstance(node, ast.Return)]
+assert len(returns) == 2, [ast.dump(n) for n in returns]
+# The `options` lists specifically: every element is a (flag, value) tuple. Without this the outer
+# segment list matches too and every count below doubles.
+segment_lists = [node for node in ast.walk(builder)
+                 if isinstance(node, ast.List) and node.elts
+                 and all(isinstance(item, ast.Tuple) for item in node.elts)]
+codex = [node for node in segment_lists if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
+claude = [node for node in segment_lists
+          if "'--effort'" in ast.unparse(node) and "'--permission-mode'" in ast.unparse(node)]
+assert len(codex) == 1 and len(claude) == 1, (len(codex), len(claude))
+
+def option_pairs(node):
+    """{flag: literal-or-None} for each ("flag", value) tuple in a judge_plan options list."""
+    pairs = {}
+    for item in ast.walk(node):
+        if isinstance(item, ast.Tuple) and len(item.elts) == 2 and isinstance(item.elts[0], ast.Constant):
+            value = item.elts[1]
+            pairs[item.elts[0].value] = value.value if isinstance(value, ast.Constant) else None
+    return pairs
+
+cv, av = option_pairs(codex[0]), option_pairs(claude[0])
+assert cv["-m"] is None and cv["-c"] == 'model_reasoning_effort="xhigh"', cv
+assert av["--model"] is None and av["--effort"] == "xhigh", av
+
+# Uniqueness, module-wide. A second launch site anywhere — fallback, retry, env-gated branch —
+# builds its own [executable, ...] list, and is caught here rather than shipping unprobed controls.
+inside = {id(node) for scope in (builder, assembler) for node in ast.walk(scope)}
+executable_lists = [node for node in ast.walk(tree)
+                    if isinstance(node, ast.List) and id(node) not in inside
+                    and any(isinstance(x, ast.Name) and x.id == "executable" for x in ast.walk(node))]
+rendered = sorted(ast.unparse(node) for node in executable_lists)
+assert rendered == [
+    "[executable, 'auth', 'status', '--json']",     # claude auth probe
+    "[executable, 'login', 'status', '--json']",    # codex auth probe
+    "[executable, 'models', 'list', '--json']",     # model probe
+    "[executable]",                                 # discovery probe base
+], rendered   # ...and nothing else in the module builds a provider argv
 PY
+
+t_case "reviewer launch envelopes are resolver-bound, uniquely constructed, and literal"
+assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" \
+  python3 "$W/reviewer-envelope-check.py" "$BIN/firm-reviewer-common"
+# Prove the restored module-wide uniqueness assertion BITES. Review defeated the function-scoped
+# version with exactly this mutant: a second, env-gated launch site outside the judge constructors
+# carrying an undeclared control. It passed the function-scoped check AND the drift check. It must
+# not pass now — a launch line built anywhere else is a launch line no capability probe has seen.
+cp "$BIN/firm-reviewer-common" "$W/mutant-second-launch-site"
+python3 - "$W/mutant-second-launch-site" <<'MUT'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+anchor = '    attempt["launch"] = {'
+assert text.count(anchor) == 1, "mutation anchor is not unique; update this test"
+fallback = (
+    '    if os.environ.get("FIRM_JUDGE_FALLBACK"):\n'
+    '        command = [executable, "exec", "--ephemeral", "--search", "-m", model, prompt]\n'
+)
+open(path, "w", encoding="utf-8").write(text.replace(anchor, fallback + anchor))
+MUT
+chmod +x "$W/mutant-second-launch-site"
+assert_fail "a second launch site outside the judge constructors is caught" \
+  python3 "$W/reviewer-envelope-check.py" "$W/mutant-second-launch-site"
 
 t_summary

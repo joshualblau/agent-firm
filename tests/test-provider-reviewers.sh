@@ -85,21 +85,40 @@ cat > "$STUB/codex" <<'SH'
 #!/bin/sh
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
+# Real codex-cli REJECTS a top-level-only option placed after the subcommand:
+#   $ codex exec -a never --help   ->  rc=2  error: unexpected argument '-a' found
+#   $ codex -a never exec --help   ->  rc=0
+# Modelling that refusal is the point of this block. Without it the stub accepts an argv the real CLI
+# cannot parse — which is precisely how the wrapper shipped a judge command line that had never been
+# executable at any Codex version while this suite stayed green.
+case "$all_args" in
+  *"exec "*)
+    after=" ${all_args#*exec } "
+    case "$after" in
+      *" -a "*|*" --ask-for-approval "*)
+        echo "error: unexpected argument '-a' found" >&2; exit 2 ;;
+    esac ;;
+esac
 case "$*" in
   "--help")
-    # Real codex-cli SPLITS its controls across surfaces. Top-level help carries --ask-for-approval
-    # and not --ephemeral/--ignore-*/--output-*; `exec --help` carries the reverse. This stub used to
-    # print all eight required flags here, which encoded the very assumption that made the wrapper's
-    # single top-level probe look correct while it was silently failing against every real Codex.
+    # Real codex-cli SPLITS its controls across surfaces, and a control must be found on the surface
+    # it is PASSED on: -a/--ask-for-approval is top level only; --ephemeral, --ignore-*, --output-*
+    # and --skip-git-repo-check are exec only; -s/-m/-c are on both. This stub once printed all eight
+    # required flags here, encoding the assumption that made the old single top-level probe look
+    # correct while it silently failed against every real Codex.
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = discovery_error ] && { echo 'top-level help is unavailable' >&2; exit 7; }
-    echo '--sandbox --ask-for-approval --model --config'
+    # wrong_surface: -a is absent HERE and present under exec. The wrapper passes it at top level, so
+    # this must still be exit 3 — a control found on a surface it is not passed on is a miss.
+    [ "$STUB_MODE" = wrong_surface ] && { echo '  -s, --sandbox   -m, --model   -c, --config'; exit 0; }
+    echo '  -a, --ask-for-approval   -s, --sandbox   -m, --model   -c, --config'
     exit 0 ;;
   "exec --help")
     [ "$STUB_MODE" = exec_discovery_error ] && { echo 'exec help is unavailable' >&2; exit 7; }
-    # capability: --ephemeral appears on NEITHER surface, so it is genuinely absent everywhere.
-    [ "$STUB_MODE" = capability ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --sandbox --model --config --output-schema --output-last-message'; exit 0; }
-    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral --sandbox --model --config --output-schema --output-last-message'
+    # capability: --ephemeral is absent from the surface that requires it.
+    [ "$STUB_MODE" = capability ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'; exit 0; }
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -a, --ask-for-approval  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'; exit 0; }
+    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'
     exit 0 ;;
   "login status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
@@ -170,7 +189,7 @@ case "$*" in
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = discovery_error ] && { echo 'help is unavailable' >&2; exit 7; }
     [ "$STUB_MODE" = capability ] && { echo '--safe-mode --model'; exit 0; }
-    echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
+    echo '  -p, --print   --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
     exit 0 ;;
   "auth status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
@@ -279,13 +298,38 @@ assert_output "Claude probed the top-level help surface" "args=--help" cat "$CAL
 assert_ok "Claude probed no subcommand help surface it never invokes" \
   sh -c "! grep -qE 'args=[A-Za-z][A-Za-z0-9_-]* --help' '$CALLS'"
 
-t_case "a control absent from EVERY searched surface is still trusted-unavailable, and says where it looked"
-assert_rc "GPT control missing from both surfaces stays exit 3" 3 review_env capability "$GPT"
-assert_output "the exit-3 message names the missing control" "--ephemeral" review_env capability "$GPT"
+t_case "the stub refuses a top-level-only option after the subcommand, as real codex does"
+# The guard that makes the surface binding load-bearing here: if anyone moves `-a never` back after
+# `exec`, every GPT case in this file turns red instead of staying green against an argv the real
+# CLI cannot parse.
+assert_rc "codex stub accepts -a BEFORE exec" 0 \
+  env STUB_CALLS=/dev/null STUB_MODE=approve "$STUB/codex" -a never exec --help
+assert_rc "codex stub rejects -a AFTER exec with codex's own exit 2" 2 \
+  env STUB_CALLS=/dev/null STUB_MODE=approve "$STUB/codex" exec -a never --help
+assert_output "and says what real codex says" "unexpected argument '-a' found" \
+  env STUB_CALLS=/dev/null STUB_MODE=approve "$STUB/codex" exec -a never --help
+: > "$CALLS"
+assert_rc "the real GPT invocation is one the stub accepts" 0 review_env approve "$GPT"
+assert_output "and it passes -a ahead of the exec subcommand" "args=-a never exec " cat "$CALLS"
+
+t_case "a control absent from ITS OWN surface is trusted-unavailable, and says where it looked"
+assert_rc "GPT control missing from the surface that requires it stays exit 3" 3 review_env capability "$GPT"
+assert_output "the exit-3 message names the missing control and its surface" \
+  '--ephemeral (required on `codex exec --help`)' review_env capability "$GPT"
 assert_output "the exit-3 message names every surface it searched" \
   '`codex --help`, `codex exec --help`' review_env capability "$GPT"
 assert_output "Claude's exit-3 message names its one searched surface" \
   '`claude --help`' review_env capability "$CLAUDE"
+
+t_case "a control found only on a surface the wrapper does not pass it on does NOT satisfy discovery"
+# The false-positive blocker, as a regression. -a is absent from `codex --help` and present under
+# `codex exec --help`; the wrapper passes it at top level. A union rule reports this provider ready
+# and then the invocation cannot execute. Surface-scoped discovery must call it unavailable.
+assert_rc "wrong-surface satisfaction is still exit 3" 3 review_env wrong_surface "$GPT"
+assert_output "and the message names the control and the surface it is required on" \
+  '-a (required on `codex --help`)' review_env wrong_surface "$GPT"
+assert_output "and says being on another surface does not satisfy it" \
+  'being present on a different surface does not satisfy it' review_env wrong_surface "$GPT"
 
 t_case "a help surface that cannot be READ is a BLOCK, never a trusted unavailable"
 # The distinction that made the original defect survivable at all: "the probe broke" (exit 1, BLOCK)
@@ -320,7 +364,12 @@ t_case "actual provider commands receive controlled roots and complete native su
 : > "$CALLS"
 assert_rc "GPT controlled invocation succeeds" 0 review_env approve "$GPT"
 assert_output "GPT suppresses ambient config and rules" "--ignore-user-config --ignore-rules" cat "$CALLS"
-assert_output "GPT is ephemeral read-only and non-interactive" "--ephemeral -s read-only -a never" cat "$CALLS"
+# Was one contiguous "--ephemeral -s read-only -a never" assertion. The approval control moved ahead
+# of `exec` because `codex exec` rejects it outright (rc=2), so the same two claims are now asserted
+# on the two segments they are actually passed in — non-interactive at top level, ephemeral and
+# read-only under exec. Neither claim is dropped, and the ordering is now pinned rather than assumed.
+assert_output "GPT is non-interactive, at the surface codex accepts that control" "-a never exec " cat "$CALLS"
+assert_output "GPT is ephemeral and read-only under exec" "--ephemeral -s read-only" cat "$CALLS"
 assert_output "GPT carries explicit model reasoning" 'model_reasoning_effort="xhigh"' cat "$CALLS"
 assert_output "GPT uses wrapper-selected schema/output" "--output-schema" cat "$CALLS"
 : > "$CALLS"

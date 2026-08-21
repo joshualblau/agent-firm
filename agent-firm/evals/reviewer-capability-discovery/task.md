@@ -23,13 +23,21 @@ legitimately unmet.
 `test/capability-discovery.sh` is therefore part of the pass criteria. It asserts two things the
 defect could not have satisfied:
 
-1. **No discovery/invocation drift.** Every control the wrapper passes on its judge invocation line
-   is required by discovery, and every control discovery requires is one the wrapper actually
-   passes — in both directions, per provider — and the subcommand path the wrapper invokes is one of
-   the help surfaces discovery probes.
-2. **The declared surfaces match the installed CLI.** For every provider CLI present on this host,
-   each required control is found in at least one of that provider's *declared* help surfaces, read
-   live from the real executable.
+1. **No discovery/invocation drift, per surface and in both directions.** The surfaces discovery
+   probes are exactly the surfaces the wrapper passes controls on, in the same order; and on each
+   surface the controls discovery requires are exactly the options the wrapper passes there.
+2. **The declaration matches the installed CLI.** For every provider CLI present on this host, each
+   control is found in the help text of the surface that *owns* it — not merely somewhere — and the
+   real invocation argv, with `--help` appended, parses on the real executable.
+
+Point 1 is per-surface rather than a union for a reason found in review of the first fix. A union
+rule ("the control appears on *some* probed surface") certifies `--ask-for-approval` as ready
+because it is in `codex --help`, while the invocation passed it to `codex exec`, which rejects it —
+`codex exec -a never ...` exits 2 with `unexpected argument '-a' found`. That is the same wrong
+question with its answer inverted: a false positive on the very flag whose false negative started
+this. Presence on a surface the wrapper does not pass a control on is a miss, not a pass. That
+invocation had never been executable at any Codex version; the discovery defect was hiding a second,
+independent defect beneath it.
 
 Run it yourself before you call the work done, and treat a failure as a blocker, not as an
 environment problem.

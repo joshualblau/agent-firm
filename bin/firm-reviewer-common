@@ -42,95 +42,153 @@ label = "firm-gpt-qa" if provider == "gpt" else "firm-claude-qa"
 
 # ---------------------------------------------------------------------------
 # The provider capability contract: one declaration per provider of the help surfaces discovery
-# probes and the controls it requires. Discovery must interrogate the surfaces the wrapper is
-# actually INVOKED through. Asking a different surface is not a readiness check; it answers a
-# question nobody asked, and it did exactly that until 2026-08-21 — `codex --help` was probed while
-# `codex exec ...` was invoked, so five controls that exist only under `codex exec --help` were
-# reported missing and a fully capable provider was published as `unsupported_capability` (exit 3),
-# silently suppressing the cross-provider second voice on every run.
+# probes and the controls it requires ON EACH ONE. Discovery must interrogate the surface a control
+# is actually PASSED on. Two distinct ways of getting that wrong have now been found here:
 #
-# `help_surfaces` are argv suffixes appended to the resolved executable. codex-cli splits its flags
-# across both surfaces (`--ask-for-approval` is top-level only; `--ephemeral`, `--ignore-user-config`,
-# `--ignore-rules`, `--output-schema`, `--output-last-message`, `--skip-git-repo-check` are `exec`
-# only), so BOTH are probed and each required flag must appear in AT LEAST ONE. `claude` is invoked
-# at top level (`claude -p ...`) and every control it passes is in `claude --help`; probing a
-# subcommand there would loosen a check that is already correct, so it declares one surface. This is
-# per-provider on purpose — "probe everything" trades this false negative for a future false positive
-# on the gate that protects PII-touching runs.
+#   * 2026-08-21, false NEGATIVE: `codex --help` was probed while `codex exec ...` was invoked, so
+#     five controls that exist only under `codex exec --help` were reported missing and a fully
+#     capable provider was published as `unsupported_capability` (exit 3), silently suppressing the
+#     cross-provider second voice on every run.
+#   * 2026-08-21, false POSITIVE, found in review of the fix: probing the UNION of both surfaces and
+#     accepting a control found on *some* surface certifies `--ask-for-approval` as ready because it
+#     is in `codex --help` — while the invocation passed it to `codex exec`, which rejects it
+#     (`codex exec -a never ...` exits 2, "unexpected argument '-a' found"). Same wrong question,
+#     inverted answer. That invocation had never been executable at any Codex version; the discovery
+#     defect was masking a second, independent defect underneath it.
 #
-# `flag_aliases` maps a short option the invocation actually passes to the canonical long option
-# discovery searches for. `required_flags` must equal the alias-normalized set of options on the
-# invocation line in BOTH directions; tests/test-reviewer-capability-contract.sh asserts that, so a
-# future edit that adds a flag to the invocation without adding it to discovery fails a test rather
-# than a production run.
+# So a control is declared against exactly one surface and must be found THERE. Satisfaction on a
+# surface the wrapper does not pass it on is a miss, not a pass. `subcommand` is the argv prefix that
+# selects the surface (`[]` = top level); the probe is `executable + subcommand + ["--help"]`.
+#
+# `controls` are the EXACT tokens the invocation passes — `-a`, not `--ask-for-approval`. There is
+# deliberately no alias/synonym map. The previous revision had one, and review defeated the drift
+# check through it: adding real new controls `-x` and `--search` to the invocation plus
+# `{"-x": "--model", "--search": "--model"}` to the alias map normalised both onto `--model`, which
+# de-duplicated to a single entry and passed cleanly. Any normalisation step is a place where two
+# unchecked controls can be laundered into one checked one, and an alias claim is a claim about the
+# provider CLI that no offline check can refute. Every short form the wrapper passes is present
+# verbatim in the help text of its own surface (measured against codex-cli 0.149.0 and Claude Code
+# 2.1.238), so nothing is lost by searching for the token itself.
+#
+# This declaration is HAND-MAINTAINED and must agree, in both directions, with the equally
+# hand-maintained judge_plan() below: same surfaces in the same order, same control tokens on each.
+# tests/test-reviewer-capability-contract.sh asserts that, so an edit to one and not the other fails
+# a test rather than a production run.
 CAPABILITY_CONTRACT = {
     "gpt": {
-        "help_surfaces": [["--help"], ["exec", "--help"]],
-        "flag_aliases": {"-s": "--sandbox", "-a": "--ask-for-approval", "-m": "--model",
-                         "-o": "--output-last-message", "-c": "--config"},
-        "required_flags": ["--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-                           "--ephemeral", "--sandbox", "--ask-for-approval", "--model", "--config",
-                           "--output-schema", "--output-last-message"],
+        "surfaces": [
+            # `-a` is top-level ONLY on codex-cli; `codex exec` rejects it outright.
+            {"subcommand": [], "controls": ["-a"]},
+            {"subcommand": ["exec"],
+             "controls": ["--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+                          "--ephemeral", "-s", "-m", "-c", "--output-schema", "-o"]},
+        ],
     },
     "claude": {
-        "help_surfaces": [["--help"]],
-        "flag_aliases": {"-p": "--print"},
-        "required_flags": ["--print", "--safe-mode", "--system-prompt", "--strict-mcp-config",
-                           "--model", "--effort", "--output-format", "--json-schema",
-                           "--permission-mode", "--tools", "--disallowedTools",
-                           "--no-session-persistence"],
+        # claude is invoked at top level (`claude -p ...`) and carries every control it passes in
+        # `claude --help`. It declares one surface: probing a subcommand here would loosen a check
+        # that is already correct, trading this defect class for its mirror image.
+        "surfaces": [
+            {"subcommand": [],
+             "controls": ["-p", "--safe-mode", "--system-prompt", "--strict-mcp-config", "--model",
+                          "--effort", "--output-format", "--json-schema", "--permission-mode",
+                          "--tools", "--disallowedTools", "--no-session-persistence"]},
+        ],
     },
 }
 
+def judge_plan(provider_name, model, prompt, contract_text, empty_mcp, schema_path, schema_text,
+               candidate_verdict):
+    """The single structured description of the judge invocation: an ordered list of segments, each
+    a subcommand step plus the options passed AT THAT POINT, and the trailing operands. argv and the
+    surface/control split are both derived from this, so the invocation cannot disagree with itself
+    about which surface a control is passed on — the exact thing that made `-a never` sit after
+    `exec`, where Codex refuses it, for as long as the wrapper has existed."""
+    if provider_name == "gpt":
+        return ([
+            {"subcommand": [], "options": [("-a", "never")]},
+            {"subcommand": ["exec"], "options": [
+                ("--skip-git-repo-check", None), ("--ignore-user-config", None),
+                ("--ignore-rules", None), ("--ephemeral", None), ("-s", "read-only"),
+                ("-m", model), ("-c", 'model_reasoning_effort="xhigh"'),
+                ("--output-schema", str(schema_path)), ("-o", str(candidate_verdict)),
+            ]},
+        ], [prompt])
+    return ([
+        {"subcommand": [], "options": [
+            ("-p", prompt), ("--safe-mode", None), ("--system-prompt", contract_text),
+            ("--strict-mcp-config", str(empty_mcp)), ("--model", model), ("--effort", "xhigh"),
+            ("--output-format", "json"), ("--json-schema", schema_text),
+            ("--permission-mode", "dontAsk"), ("--tools", "Read,Grep,Glob"),
+            ("--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch"),
+            ("--no-session-persistence", None),
+        ]},
+    ], [])
+
 def judge_invocation(provider_name, executable, model, prompt, contract_text, empty_mcp,
                      schema_path, schema_text, candidate_verdict):
-    """The single construction of the judge command line. Capability discovery is checked against
-    this exact function, so the probed controls and the invoked controls cannot be edited apart."""
-    if provider_name == "gpt":
-        return [
-            executable, "exec", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-            "--ephemeral", "-s", "read-only", "-a", "never", "-m", model,
-            "-c", 'model_reasoning_effort="xhigh"', "--output-schema", str(schema_path),
-            "-o", str(candidate_verdict), prompt
-        ]
-    return [
-        executable, "-p", prompt, "--safe-mode", "--system-prompt", contract_text,
-        "--strict-mcp-config", str(empty_mcp), "--model", model, "--effort", "xhigh",
-        "--output-format", "json", "--json-schema", schema_text, "--permission-mode", "dontAsk",
-        "--tools", "Read,Grep,Glob", "--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch",
-        "--no-session-persistence"
-    ]
+    """Flatten judge_plan into argv. The single construction of the judge command line."""
+    segments, operands = judge_plan(provider_name, model, prompt, contract_text, empty_mcp,
+                                    schema_path, schema_text, candidate_verdict)
+    argv = [executable]
+    for segment in segments:
+        argv.extend(segment["subcommand"])
+        for flag, value in segment["options"]:
+            argv.append(flag)
+            if value is not None:
+                argv.append(value)
+    argv.extend(operands)
+    return argv
 
 def invocation_argv(provider_name):
-    """The judge command line with every operand replaced by a dash-free placeholder, so the option
-    tokens can be read off it exactly. Carries no path, prompt, schema or credential."""
+    """The judge command line with every operand replaced by a dash-free placeholder. Carries no
+    path, prompt, schema or credential."""
     return judge_invocation(provider_name, "EXECUTABLE", "MODEL", "PROMPT", "CONTRACT",
                             "EMPTY_MCP", "SCHEMA_PATH", "SCHEMA_TEXT", "CANDIDATE_VERDICT")
 
-def invocation_flags(provider_name):
-    """Alias-normalized options the wrapper actually passes, derived from judge_invocation itself.
-    Every operand is a placeholder with no leading dash, so each remaining leading-dash token is a
-    real option and the result is a fact about the invocation, not a second hand-kept list."""
-    aliases = CAPABILITY_CONTRACT[provider_name]["flag_aliases"]
-    argv_probe = invocation_argv(provider_name)
-    found = []
-    for token in argv_probe[1:]:
-        if not token.startswith("-"):
-            continue
-        canonical = aliases.get(token, token)
-        if canonical not in found:
-            found.append(canonical)
-    return found
+def invocation_surfaces(provider_name):
+    """The surfaces the wrapper actually passes controls on, and which controls, derived from
+    judge_plan itself rather than from a second hand-kept list. Cumulative subcommand path, so a
+    nested subcommand would be described exactly."""
+    segments, _ = judge_plan(provider_name, "MODEL", "PROMPT", "CONTRACT", "EMPTY_MCP",
+                             "SCHEMA_PATH", "SCHEMA_TEXT", "CANDIDATE_VERDICT")
+    surfaces = []
+    path = []
+    for segment in segments:
+        path = path + list(segment["subcommand"])
+        surfaces.append({"subcommand": list(path),
+                         "controls": [flag for flag, _ in segment["options"]]})
+    return surfaces
+
+def surface_label(executable_name, subcommand):
+    return " ".join([executable_name] + list(subcommand) + ["--help"])
+
+def flag_present(flag, help_text):
+    """Word-boundary match, not substring containment. `-s` occurs inside `--sandbox`, `--strict-...`
+    and a hundred prose words; plain containment would report a short option as supported by any help
+    text at all. It also stops a required `--model` being satisfied by an unrelated `--models`."""
+    return re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_text) is not None
 
 if args.print_capability_contract:
+    # Introspection only, and ONLY introspection: any other argument makes this ambiguous with a real
+    # engagement call, whose stdout is consumed by the caller. Refuse rather than short-circuit a run
+    # someone meant to happen.
+    conflicting = [name for name, value in (
+        ("run directory", args.run_dir), ("--run", args.run_option),
+        ("--discovery-timeout", args.discovery_timeout), ("--readiness-timeout", args.readiness_timeout),
+        ("--judge-timeout", args.judge_timeout), ("--grace", args.grace),
+        ("--max-output", args.max_output), ("--retain-raw-seconds", args.retain_raw_seconds),
+    ) if value is not None]
+    if conflicting:
+        print(f"{label}: --print-capability-contract takes no other argument; got "
+              + ", ".join(conflicting), file=sys.stderr)
+        raise SystemExit(2)
     print(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "providers": {
             name: {
-                "help_surfaces": entry["help_surfaces"],
-                "flag_aliases": entry["flag_aliases"],
-                "required_flags": entry["required_flags"],
-                "invocation_flags": invocation_flags(name),
+                "declared_surfaces": entry["surfaces"],
+                "invocation_surfaces": invocation_surfaces(name),
                 "invocation_argv": invocation_argv(name)[1:],
             }
             for name, entry in CAPABILITY_CONTRACT.items()
@@ -962,34 +1020,38 @@ except Exception as exc:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"cli_missing"}, trusted_reason="cli_missing", diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"{provider} CLI unavailable from the controlled readiness PATH (exit 3)", 3)
 
-    # Probe exactly the help surfaces this provider is invoked through, in order, each bounded by the
-    # same discovery_timeout as before. A required flag must be found in AT LEAST ONE surface; a flag
-    # found in none is still unsupported_capability, exit 3. A probe that cannot RUN stays a BLOCK
-    # (exit 1) and never becomes exit 3 — "the probe broke" and "the provider lacks a control" are
-    # different facts, and collapsing them is what made the original defect survivable.
+    # Probe each declared help surface, in order, each bounded by the same discovery_timeout as
+    # before, and require every control to be present on ITS OWN surface. Not the union: a control
+    # found only on a surface the wrapper does not pass it on would certify an invocation that cannot
+    # execute (see the CAPABILITY_CONTRACT comment). A control missing from its surface is
+    # unsupported_capability, exit 3. A probe that cannot RUN stays a BLOCK (exit 1) and never
+    # becomes exit 3 — "the probe broke" and "the provider lacks a control" are different facts, and
+    # collapsing them is what made the original defect survivable.
     capability = CAPABILITY_CONTRACT[provider]
-    required_flags = capability["required_flags"]
+    executable_name = Path(executable).name
     surfaces_searched = []
-    surface_help_texts = []
-    for surface_index, surface_args in enumerate(capability["help_surfaces"]):
+    missing = []
+    for surface_index, declared in enumerate(capability["surfaces"]):
         phase_name = "discovery" if surface_index == 0 else f"discovery-{surface_index + 1}"
-        surface_label = " ".join([Path(executable).name] + list(surface_args))
-        surfaces_searched.append(surface_label)
-        rc, result, raw = run_phase(phase_name, discovery_timeout, [executable] + list(surface_args))
+        label_text = surface_label(executable_name, declared["subcommand"])
+        surfaces_searched.append(label_text)
+        probe_command = [executable] + list(declared["subcommand"]) + ["--help"]
+        rc, result, raw = run_phase(phase_name, discovery_timeout, probe_command)
         if result.get("status") in ("timeout", "turn_limit"):
             finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":phase_name},
                              capability_surfaces_searched=surfaces_searched,
                              diagnostic=str(diagnostic_path.relative_to(run)))
-            stop(f"bounded capability discovery timed out on help surface `{surface_label}`; BLOCK", 1)
+            stop(f"bounded capability discovery timed out on help surface `{label_text}`; BLOCK", 1)
         if rc != 0:
             finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":phase_name},
                              capability_surfaces_searched=surfaces_searched,
                              diagnostic=str(diagnostic_path.relative_to(run)))
-            stop(f"capability discovery failed on help surface `{surface_label}`; BLOCK "
+            stop(f"capability discovery failed on help surface `{label_text}`; BLOCK "
                  "(a probe that cannot run is not a provider that lacks a capability)", 1)
-        surface_help_texts.append(raw.decode("utf-8", "replace"))
-    missing = [flag for flag in required_flags
-               if not any(flag in help_text for help_text in surface_help_texts)]
+        help_text = raw.decode("utf-8", "replace")
+        for flag in declared["controls"]:
+            if not flag_present(flag, help_text):
+                missing.append(f"{flag} (required on `{label_text}`)")
     if missing:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"},
                          trusted_reason="unsupported_capability", missing_capabilities=missing,
@@ -997,7 +1059,9 @@ except Exception as exc:
                          diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"required provider controls unsupported: {', '.join(missing)}; searched "
              f"{len(surfaces_searched)} help surface(s): "
-             + ", ".join(f"`{item}`" for item in surfaces_searched) + " (exit 3)", 3)
+             + ", ".join(f"`{item}`" for item in surfaces_searched)
+             + ". A control is required on the surface the wrapper passes it on; being present on a "
+               "different surface does not satisfy it (exit 3)", 3)
 
     auth_command = [executable, "login", "status", "--json"] if provider == "gpt" else [executable, "auth", "status", "--json"]
     rc, result, raw = run_phase("authentication", readiness_timeout, auth_command)
