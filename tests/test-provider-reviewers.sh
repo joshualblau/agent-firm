@@ -24,6 +24,38 @@ STUB="$WORK/stub"; mkdir "$STUB"
 CALLS="$WORK/calls.log"; : > "$CALLS"
 printf 'redirect target must stay unchanged\n' > "$WORK/redirect-target"
 REDIRECT_SHA="$(shasum -a 256 "$WORK/redirect-target" | awk '{print $1}')"
+
+# ==========================================================================================
+# THE CODEX CREDENTIAL STORE THIS FILE REVIEWS AGAINST — AND WHY IT HAS TO SAY SO
+#
+# bin/firm-reviewer-common resolves the codex credential as
+# `os.environ.get("CODEX_HOME") or str(Path.home()/".codex")` and copies that store's auth.json
+# into the attempt tree on EVERY gpt attempt (:1025-1026). That is production behaviour, it is
+# correct, and it is how the gpt judge authenticates — it is not what changed here. What was wrong
+# is that this file never said WHICH store, so every gpt case below ran against the OPERATOR's real
+# ~/.codex: a test suite consumed a live credential as a side effect of running, and the file's
+# result depended on whether the operator happened to be logged in.
+#
+# CODEX_HOME IS SET UNCONDITIONALLY, AND IS NEVER THE EMPTY STRING. The `or` above is not a
+# defaulting convenience, it is a trapdoor: "" is falsy, so an empty CODEX_HOME RE-SELECTS ~/.codex
+# while the harness looks isolated and every structural check of the fix passes. The Claude-side
+# neutralisation in review_env below is deliberately an empty string — for CLAUDE_CODE_OAUTH_TOKEN
+# and friends, empty IS absence — and copying that shape here would reproduce the exact defect this
+# fixture exists to close. `${STUB_CODEX_HOME:-$CODEX_FIXTURE}` is the form: `:-` (not `-`) so that
+# a case which clears the override falls back to a path, never to nothing.
+#
+# The store is built HERE, at run time, under this file's temp tree. Nothing credential-shaped is
+# committed, and the marker below is the only thing that distinguishes this store from any other.
+CODEX_FIXTURE="$WORK/codex-home"; mkdir -p "$CODEX_FIXTURE"
+CODEX_FIXTURE_MARKER='CODEX-FIXTURE-CREDENTIAL-2e6b'
+printf '{"OPENAI_API_KEY":null,"tokens":{"access_token":"%s"},"last_refresh":"1970-01-01T00:00:00Z"}\n' \
+  "$CODEX_FIXTURE_MARKER" > "$CODEX_FIXTURE/auth.json"
+chmod 600 "$CODEX_FIXTURE/auth.json"
+# A second store that exists and is EMPTY. Used by the absence case, which is the one case in this
+# file whose outcome differs between a host that has a credential and one that does not — see the
+# codex credential boundary at the end of the file, and tests/test-reviewer-hermeticity.sh.
+CODEX_EMPTY="$WORK/codex-home-empty"; mkdir -p "$CODEX_EMPTY"
+
 SHA="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$RUN/09-test-evidence/qa-candidate.json")"
 GEN="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$RUN/09-test-evidence/qa-candidate.json")"
 
@@ -95,10 +127,28 @@ cat > "$STUB/codex" <<'SH'
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
 if [ -n "${STUB_ENV_CAPTURE:-}" ]; then
-  printf 'codex phase=%s oauth=%s apikey=%s authtok=%s fd=%s\n' "${1:-none}" \
+  # WHICH STORE THE HARNESS POINTED THE WRAPPER AT IS ONLY OBSERVABLE FROM IN HERE. The wrapper
+  # copies the resolved store's auth.json to $CODEX_HOME/auth.json inside the attempt's controlled
+  # root (bin/firm-reviewer-common:931,1026), and the cleanup guardian destroys that whole root
+  # before the wrapper returns (:1483) — which the "hard-killed attempt control is gone" case below
+  # already asserts. The parent therefore CANNOT read what landed. The child can, and this is the
+  # child.
+  #
+  # A DERIVED VALUE, NEVER THE BYTES. Under the mutation this field exists to catch, the file being
+  # looked at is the operator's REAL credential. Copying it into $STUB_ENV_CAPTURE — or printing it
+  # — would write a live credential into $TMPDIR as a side effect of testing that it must never be
+  # read. `grep -q` answers the only question asked, "is this the store the test created", and emits
+  # nothing. The fallback pattern cannot match anything, so an unset marker reports `other`/`absent`
+  # rather than turning this into a check that cannot fail.
+  cred=absent
+  if [ -f "${CODEX_HOME:-}/auth.json" ]; then
+    if grep -q "${STUB_CODEX_MARKER:-NO-STUB-CODEX-MARKER-CONFIGURED}" "$CODEX_HOME/auth.json" 2>/dev/null
+    then cred=marker; else cred=other; fi
+  fi
+  printf 'codex phase=%s oauth=%s apikey=%s authtok=%s fd=%s cred=%s\n' "${1:-none}" \
     "${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}" "${ANTHROPIC_API_KEY:-<unset>}" \
     "${ANTHROPIC_AUTH_TOKEN:-<unset>}" "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-<unset>}" \
-    >> "$STUB_ENV_CAPTURE"
+    "$cred" >> "$STUB_ENV_CAPTURE"
 fi
 case "$*" in
   # THE FLAG SET LIVES AT `exec`, NOT AT THE TOP LEVEL — this stub models codex-cli 0.147.0, where
@@ -327,7 +377,8 @@ review_env() { # mode wrapper [extra args]
     STUB_CLAUDE_APPROVE="$WORK/claude-approve.json" STUB_CLAUDE_BLOCK="$WORK/claude-block.json" \
     STUB_CANDIDATE="$RUN/09-test-evidence/qa-candidate.json" \
     STUB_MANIFEST_CAPTURE="${STUB_MANIFEST_CAPTURE:-}" STUB_RUN="$RUN" STUB_REDIRECT="$WORK/redirect-target" \
-    STUB_ENV_CAPTURE="${STUB_ENV_CAPTURE:-}" \
+    STUB_ENV_CAPTURE="${STUB_ENV_CAPTURE:-}" STUB_CODEX_MARKER="$CODEX_FIXTURE_MARKER" \
+    CODEX_HOME="${STUB_CODEX_HOME:-$CODEX_FIXTURE}" \
     CLAUDE_CODE_OAUTH_TOKEN="${STUB_OAUTH_TOKEN:-}" \
     CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="${STUB_OAUTH_TOKEN_FD:-}" \
     ANTHROPIC_API_KEY="${STUB_ANTHROPIC_API_KEY:-}" ANTHROPIC_AUTH_TOKEN="${STUB_ANTHROPIC_AUTH_TOKEN:-}" \
@@ -366,7 +417,14 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_rc "$provider ambiguous readiness text BLOCKs" 1 review_env ambiguous_auth "$wrapper"
   assert_rc "$provider post-start auth/model phrases remain BLOCK" 1 review_env authphrase_main "$wrapper"
 done
-assert_rc "missing GPT CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$GPT" "$RUN"
+# THE TWO INVOCATIONS THAT DO NOT GO THROUGH review_env STILL NEED ITS ISOLATION. The credential
+# import at bin/firm-reviewer-common:1025 runs BEFORE the `shutil.which` that decides the CLI is
+# missing (:1141), so this gpt case reaches the import and would otherwise read whatever store the
+# ambient environment names — which on an operator's machine is the real one. Naming the fixture
+# here costs nothing (the case still exits 3 on the empty PATH) and keeps "no gpt case reads the
+# operator's store" true of the FILE rather than only of review_env.
+assert_rc "missing GPT CLI is trusted unavailable" 3 \
+  env PATH="/usr/bin:/bin" CODEX_HOME="$CODEX_FIXTURE" "$GPT" "$RUN"
 assert_rc "missing Claude CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$CLAUDE" "$RUN"
 
 t_case "zero, negative, malformed, and excessive wrapper bounds reject before provider execution"
@@ -1231,5 +1289,68 @@ assert_output "the judge is handed no API key, auth token, or token descriptor" 
   "apikey=<unset> authtok=<unset> fd=<unset>" grep 'phase=-p' "$ENVCAP"
 STUB_ANTHROPIC_API_KEY=""; STUB_ANTHROPIC_AUTH_TOKEN=""; STUB_OAUTH_TOKEN_FD=""
 STUB_OAUTH_TOKEN=""; STUB_ENV_CAPTURE=""
+
+# ==========================================================================================
+# THE CODEX CREDENTIAL BOUNDARY
+#
+# codex's credential IS a file, so unlike claude's it can be pointed somewhere — and until this
+# block existed, nothing in this file pointed it anywhere. The wrapper's import is correct and
+# unchanged; what these two cases pin is the HARNESS's half of the boundary: that the store the
+# wrapper resolves is one this test created, that what actually reached the judge came out of that
+# store, and that an EMPTY store is recorded as absent rather than quietly satisfied from somewhere
+# else. See the fixture built at the top of this file for why CODEX_HOME is never the empty string.
+#
+# THE TWO CASES ARE ONE DESIGN AND THE SECOND MAY NOT BE DROPPED. The provenance case fails in every
+# environment once the isolation is removed, which is what makes it the right AC-006 detector and
+# also what makes it useless to tests/test-reviewer-hermeticity.sh: a case that fails everywhere
+# diverges nowhere. The absence case is the only case in this file whose OUTCOME depends on whether
+# the ambient store holds a credential, so it is the entire reason the hermeticity invariance can
+# fail at all. Merging it into the case above, or making it conditional, silently turns that file
+# into a check that cannot fail.
+# ==========================================================================================
+t_case "the codex credential the gpt judge is handed comes from the harness's own store"
+
+STUB_ENV_CAPTURE="$ENVCAP"
+codex_credential_field() { # attempt-dir field
+  t_python -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/attempt.json"))["provider_credential"]
+m=[a for a in d["artifacts"] if a["artifact"]=="auth.json"]
+print(m[0][sys.argv[2]] if m else "NO-RECORD")' "$1" "$2"
+}
+
+# 1. PROVENANCE, OBSERVED WHERE IT IS OBSERVABLE. `cred=` is derived by the stub from the auth.json
+#    at its OWN $CODEX_HOME — the attempt-local copy the wrapper made — because the control tree is
+#    destroyed before the wrapper returns. `marker` means the bytes came from this file's fixture;
+#    `other` means some other store answered; `absent` means nothing was imported. Every codex phase
+#    is checked, not just the judge's, because the import happens once for the whole attempt and
+#    "which store" must not be able to differ between phases.
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "gpt reviews normally against the harness's own credential store" 0 review_env approve "$GPT"
+assert_output "the judge was handed the credential this test created" "cred=marker" \
+  grep 'codex phase' "$ENVCAP"
+assert_ok "no codex phase was handed a credential the test did not create" sh -c \
+  "! grep 'codex phase' '$ENVCAP' | grep -qv 'cred=marker'"
+
+# 2. SAYING A CREDENTIAL WAS IMPORTED MUST NOT MEAN SAYING WHAT IT WAS. Same rule the Claude token
+#    gets above, for the one credential that really is written to disk.
+assert_ok "the fixture credential's marker is absent from every artifact the run keeps" sh -c \
+  "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$RUN' 2>/dev/null"
+assert_ok "the fixture credential's marker is absent from the private reviewer control tree" sh -c \
+  "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
+
+# 3. AN EMPTY STORE IS RECORDED AS ABSENT, NOT SATISFIED FROM SOMEWHERE ELSE. This is the
+#    FileNotFoundError arm at bin/firm-reviewer-common:1045, read back out of the attempt's own
+#    durable record — attempt.json's provider_credential, the same artifact the Claude cases read.
+#    It is also the load-bearing half of tests/test-reviewer-hermeticity.sh: see the block header.
+STUB_CODEX_HOME="$CODEX_EMPTY"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an empty credential store still carries the gpt judge to a verdict" 0 review_env approve "$GPT"
+empty_attempt="$(latest_attempt gpt)"
+assert_eq "an absent codex credential is recorded as absent" "absent" \
+  "$(codex_credential_field "$empty_attempt" reason)"
+assert_eq "an absent codex credential is not recorded as imported" "False" \
+  "$(codex_credential_field "$empty_attempt" imported)"
+assert_output "an empty store hands the judge no credential at all" "cred=absent" \
+  grep 'codex phase' "$ENVCAP"
+STUB_CODEX_HOME=""; STUB_ENV_CAPTURE=""
 
 t_summary
