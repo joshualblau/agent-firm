@@ -235,6 +235,47 @@ assert_rc "Codex selection succeeds" 0 behavior_run ok 3 2 2 codex
 assert_eq "Codex selected exactly once" "1" "$(grep -c '^codex ' "$PROVIDER_CALLS" | tr -d ' ')"
 assert_eq "Claude not selected" "0" "$(grep -c '^claude ' "$PROVIDER_CALLS" | tr -d ' ')"
 
+t_case "the eval fixture's default branch is stated by run_one, not inherited from the host"
+# THE FIRST-PARTY REGRESSION NOTHING COVERED. run_one() built its fixture with a bare `git init`,
+# which takes its branch name from the HOST's init.defaultBranch. Once bin/firm-new-run started
+# refusing to derive an already-reviewed base from a HEAD it cannot place on a default branch, a host
+# set to anything but main or master made every behavioural eval fail at its own first instruction --
+# `firm-new-run`, which every eval's task.md opens with -- before the eval had done anything at all.
+#
+# THE HOSTILE SETTING IS ASSERTED, NOT ASSUMED. On a host that already defaults to main this case
+# would be a green that proves nothing (and .github/workflows/ci.yml pins init.defaultBranch=main on
+# every runner), so the probe below fails loudly if the override did not take on this git. The
+# override is passed as GIT_CONFIG_COUNT/KEY/VALUE, which outranks every config FILE, so it is
+# hostile even where a global init.defaultBranch is already set.
+#
+# The rc of firm-run-evals is deliberately NOT the detector here: this eval's assertion is
+# `file_exists: seed.txt`, which the fixture satisfies whether or not the firm inside it could ever
+# have opened a run, so the pre-fix regression came back rc 0. What is asserted is the branch the
+# fixture actually landed on, and then the call that was actually refused.
+HOSTILE_PROBE="$W/hostile-default-branch-probe"; mkdir -p "$HOSTILE_PROBE"
+( cd "$HOSTILE_PROBE" && env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch \
+    GIT_CONFIG_VALUE_0=trunk git init -q ) >/dev/null 2>&1
+assert_eq "fixture precondition: this git really honours the hostile init.defaultBranch override" \
+  "refs/heads/trunk" "$(git -C "$HOSTILE_PROBE" symbolic-ref HEAD 2>/dev/null)"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+  FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_PROVIDER_STUB_MODE=ok FIRM_CHECKER_STUB_MODE=real \
+  FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=2 FIRM_EVAL_KILL_GRACE=1 \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=trunk \
+  "$BEHAVIOR_RUN" --provider claude bounded-one > "$W/hostile-branch.out" 2>&1
+hostile_rc=$?
+assert_eq "the behavioral run completes under a hostile host default branch" 0 "$hostile_rc"
+HOSTILE_SCRATCH="$(sed -n 's/.*bounded posture) in //p' "$W/hostile-branch.out" | head -1)"
+t_track "$HOSTILE_SCRATCH"
+assert_ok "the run reported the fixture repository it built" \
+  sh -c "[ -n '$HOSTILE_SCRATCH' ] && [ -d '$HOSTILE_SCRATCH/.git' ]"
+assert_eq "the fixture is on the branch run_one names, not the one the host would have given it" \
+  "refs/heads/main" "$(git -C "$HOSTILE_SCRATCH" symbolic-ref HEAD 2>/dev/null)"
+# The consequence, not just the shape. This is the exact call every eval's task.md opens with, and
+# the exact call that returned rc 2 for the whole class of hosts before this was stated.
+assert_rc "and firm-new-run opens a run in that fixture, which is every eval's first instruction" \
+  0 sh -c "cd '$HOSTILE_SCRATCH' && '$BIN/firm-new-run' hostile-default-branch fast_path"
+
 t_case "provider failure and wall timeout permit exactly one attempt and no retry"
 : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
 assert_rc "provider nonzero blocks" 1 behavior_run fail 3 2 2 claude

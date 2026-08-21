@@ -183,6 +183,40 @@ case "$slug_raw" in
     exit 2
     ;;
 esac
+# Refuse an UNCONSUMED OPTION-SHAPED ARGUMENT after the positionals. The leading-option loop above
+# stops at the first non-option, so `firm-new-run demo full_track --base <sha>` parsed as slug=demo,
+# track=full_track and two arguments nothing ever looked at: the run OPENED, exited 0, and recorded
+# the DEFAULT BRANCH'S TIP as accepted_base_sha instead of the commit the operator named. Silently
+# substituting a different already-reviewed base for the one that was stated is precisely what the
+# base guard below exists to prevent, so an option-shaped argument that nothing consumed is an error
+# here, not noise. `--primary codex` in the same position is discarded identically (the run records
+# claude however loudly codex was asked for), which is why this refuses the argument SHAPE rather
+# than the two option names -- a `--base`-only check would leave the same defect one option over.
+#
+# It sits AHEAD OF THE FIRST mkdir like every other refusal in this file, and reads argv only: no git
+# state, nothing created, nothing to clean up.
+#
+# SCOPED TO OPTION-SHAPED ARGUMENTS DELIBERATELY. A bare trailing word (`firm-new-run demo full_track
+# extra`) has been ignored since this script was written and still is; refusing that too is a wider
+# argv contract than this defect calls for. EVERY EXISTING CALLER WAS ENUMERATED FIRST:
+# bin/firm-qa-checkout, bin/firm-reviewer-common, bin/firm-final-qa-check and
+# bin/firm-traceability-check all invoke `--metadata-view <dir>`, which exec's at the top of this
+# file long before here; every tests/ call site and every documented form (agent-firm/contracts/
+# lifecycle.md, commands/start.md, codex-skills/start/SKILL.md, docs/PHASE0.md) puts its options
+# BEFORE the slug. Nothing that works today is refused by this.
+if [[ $# -gt 2 ]]; then
+  for unconsumed in "${@:3}"; do
+    case "$unconsumed" in
+      -*)
+        printf 'firm-new-run: refusing argument %s -- options are read only BEFORE the slug, so nothing\n' "$unconsumed" >&2
+        printf 'firm-new-run: consumed this one and it would have been silently discarded\n' >&2
+        printf 'firm-new-run:   firm-new-run [--primary claude|codex] [--base <rev>] <slug> [fast_path|full_track]\n' >&2
+        printf 'firm-new-run: run `firm-new-run --help` for the accepted options\n' >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
 case "$primary" in claude|codex) ;; *) echo "firm-new-run: --primary must be claude or codex" >&2; exit 2 ;; esac
 case "$track" in fast_path|full_track) ;; *) echo "firm-new-run: track must be fast_path or full_track" >&2; exit 2 ;; esac
 slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"

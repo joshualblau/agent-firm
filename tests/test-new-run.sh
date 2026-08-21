@@ -344,6 +344,49 @@ assert_eq "the stated base is recorded" "$trunk_sha" "$(json_field "$repo7/$out7
 assert_no_file "and no run-baseline.json is written, because the default branch is still unknown" \
   "$repo7/$out7/run-baseline.json"
 
+t_case "an option placed AFTER the positionals is refused, and creates nothing (AC-003)"
+# THE COUNTEREXAMPLE. Options are read only by the leading loop, so `firm-new-run demo full_track
+# --base <older-sha>` used to exit 0 at the default branch's tip and record the TIP: the operator
+# names a base and silently gets a different one, which is the single substitution AC-003 exists to
+# prevent. Every --base case above puts the option first, so all of them passed while this did not.
+#
+# The fixture needs an OLDER commit that is not the tip, for the same reason the stated-base case
+# above needs one: if the discarded value happened to equal what the script records anyway, the
+# assertion could not tell "honoured" from "ignored" apart.
+repoP="$(mk_repo)"
+( cd "$repoP" && printf 'more\n' >> seed.txt && git add -A && git commit -qm second ) >/dev/null 2>&1
+p_tip_sha="$(sha_of "$repoP" main)"
+p_older_sha="$(sha_of "$repoP" 'main~1')"
+assert_ne "fixture precondition: the older commit is genuinely not the default branch's tip" \
+  "$p_tip_sha" "$p_older_sha"
+inv_p_before="$(inventory_of "$repoP")"
+err_p="$( (cd "$repoP" && "$NEW_RUN" trailing-base full_track --base "$p_older_sha") 2>&1 1>/dev/null )"; rc_p=$?
+inv_p_after="$(inventory_of "$repoP")"
+assert_eq "a --base after the positionals exits 2 instead of being discarded" 2 "$rc_p"
+assert_output "the stderr diagnostic names the argument nothing consumed" "--base" printf '%s' "$err_p"
+assert_output "and says where options are read instead" "BEFORE the slug" printf '%s' "$err_p"
+assert_eq "no run dir, and no partial scaffold, is left behind" "$inv_p_before" "$inv_p_after"
+
+# The refusal is of an unconsumed option SHAPE, not of the string "--base": `--primary` in the same
+# position was discarded the same way, recording claude for a run that asked for codex.
+err_p2="$( (cd "$repoP" && "$NEW_RUN" trailing-primary full_track --primary codex) 2>&1 1>/dev/null )"; rc_p2=$?
+assert_eq "a --primary after the positionals is refused too" 2 "$rc_p2"
+assert_output "and that diagnostic names --primary" "--primary" printf '%s' "$err_p2"
+assert_eq "neither refusal leaves anything behind" "$inv_p_before" "$(inventory_of "$repoP")"
+
+t_case "the same base in the supported LEADING position still opens the run (AC-003)"
+# The other half, and it is not optional: without it every assertion above would also pass against an
+# implementation that had simply stopped honouring --base anywhere. What is refused is the position.
+outP="$( (cd "$repoP" && "$NEW_RUN" --base "$p_older_sha" leading-base full_track) )"; rc_p3=$?
+rdP="$repoP/$outP"
+assert_eq "the documented leading form is accepted, exit 0" 0 "$rc_p3"
+assert_eq "and the stated older commit is what gets recorded" \
+  "$p_older_sha" "$(json_field "$rdP/run.jsonl" base_sha)"
+assert_ne "which is NOT the default-branch tip the trailing form used to record in its place" \
+  "$p_tip_sha" "$(json_field "$rdP/run.jsonl" base_sha)"
+assert_eq "and the ledger records that the base was stated, not derived" \
+  "explicit" "$(json_field "$rdP/run.jsonl" base_source)"
+
 # ---------------------------------------------------------------------------
 # AC-005. --metadata-view compares run-metadata.json's parsed field set for EXACT equality against
 # nine names and fails closed on any difference, so the record of HOW the base was chosen cannot live

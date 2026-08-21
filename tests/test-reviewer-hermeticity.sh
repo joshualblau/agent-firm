@@ -52,6 +52,46 @@ assert_file "the file whose invariance is measured is present" "$TARGET"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/firm-hermeticity.XXXXXX")"; t_track "$WORK"
 
+# ---------------------------------------------------------------------------
+# THE ANCHOR, ASSERTED INSTEAD OF DESCRIBED.
+#
+# Everything below can only fail while at least one case in $TARGET answers differently depending on
+# whether the ambient credential store holds a credential. Exactly one block does -- the absence case
+# in that file's codex credential boundary block -- and until this list existed its survival was
+# guaranteed by nothing but the paragraph above and a comment in the other file. Delete that case for
+# any unrelated reason and both invariance assertions at the bottom of this file go GREEN against a
+# harness with no isolation at all. That is not a worry, it is measured: 09-test-evidence/wo-b/
+# 08-M12-delete-assignment-and-absence-case.txt, and again as this file's own repair evidence, where
+# deleting the case alone took the whole file to "11 passed, 0 failed".
+#
+# So the coupling is mechanical from here on. These are the three assertion names the M11/M12 pair
+# showed diverging by credential environment; if any of them stops existing, THIS file goes red and
+# says which one and why, instead of quietly becoming a check that cannot fail. Renaming one is the
+# same event as deleting one and is meant to land here too: the name IS the coupling. Moving the case
+# is fine -- only its presence in this file's subject is asserted, not where in it.
+ANCHOR_LIST="$WORK/anchor-cases"
+cat > "$ANCHOR_LIST" <<'ANCHORS'
+an absent codex credential is recorded as absent
+an absent codex credential is not recorded as imported
+an empty store hands the judge no credential at all
+ANCHORS
+ANCHOR_COUNT="$(wc -l < "$ANCHOR_LIST" | tr -d ' ')"
+
+# An empty list would make the loop assert nothing and the two transcript counts below compare 0 to
+# 0 -- the same shape of vacuum this whole file exists to refuse. Stated first, so it cannot happen
+# silently.
+assert_ne "the invariance anchor list names at least one case" 0 "$ANCHOR_COUNT"
+while IFS= read -r anchor_case; do
+  assert_ok "the invariance anchor is still present in the measured file: $anchor_case" \
+    grep -q -F -- "$anchor_case" "$TARGET"
+done < "$ANCHOR_LIST"
+
+# Presence in the source is necessary, not sufficient: a case that exists but never runs -- guarded,
+# early-returned past, or renamed in one of its two halves -- satisfies the grep above and still
+# leaves the comparison at the bottom of this file unable to fail. So the child transcripts are asked
+# the same question after they are captured; see the assertions just before the divergence check.
+anchor_hits() { grep -c -x -F -f "$ANCHOR_LIST" "$1" 2>/dev/null | tr -d ' '; }
+
 # Environment 1: a store that holds a credential. Its content is deliberately NOT the marker
 # tests/test-provider-reviewers.sh builds for itself — this stands in for the operator's store, and
 # a stand-in that carried the fixture's own marker would let an unisolated harness pass by accident.
@@ -109,6 +149,16 @@ passing_set present > "$WORK/passing.present"
 passing_set missing > "$WORK/passing.missing"
 assert_eq "both runs recorded the same number of passing cases" \
   "$(count_ok present)" "$(count_ok missing)"
+
+# The other half of the anchor check: the named cases did not merely exist in the source, they ran
+# and passed in BOTH children. Under intact isolation that is what "invariant" means for them; under
+# broken isolation they pass in only one child, so this fails alongside the divergence assertion
+# rather than instead of it. Under a DELETED anchor they appear in neither, and this is what turns
+# the deletion into a red file instead of a silently blind one.
+assert_eq "every anchor case ran and passed in the credential-bearing child" \
+  "$ANCHOR_COUNT" "$(anchor_hits "$WORK/passing.present")"
+assert_eq "every anchor case ran and passed in the nonexistent-store child" \
+  "$ANCHOR_COUNT" "$(anchor_hits "$WORK/passing.missing")"
 
 diff "$WORK/passing.present" "$WORK/passing.missing" > "$WORK/divergence" 2>&1
 divergence="$(grep '^[<>]' "$WORK/divergence" | head -8 | tr '\n' '|')"
