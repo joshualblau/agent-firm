@@ -120,15 +120,24 @@ case "$*" in
     [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -a, --ask-for-approval  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'; exit 0; }
     echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'
     exit 0 ;;
-  "login status --json")
+  "login status")
+    # Real codex-cli 0.149.0 has NO --json form here (`codex login status --json` exits 2) and writes
+    # its one-line human answer to STDERR, both mirrored below. The stub used to answer
+    # `login status --json` with {"status":"authenticated"}, which is the assumption the defect was
+    # made of: a JSON contract no Codex has ever implemented, invented by the firm and then believed.
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth ] && { echo '{"status":"unavailable","reason":"authentication"}'; exit 1; }
-    [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret'; exit 1; }
-    echo '{"status":"authenticated"}'; exit 0 ;;
-  "models list --json")
-    [ "$STUB_MODE" = model_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = incompatible ] && { echo '{"models":["other"]}'; exit 0; }
-    echo '{"models":["gpt-5.6-sol"]}'; exit 0 ;;
+    [ "$STUB_MODE" = auth ] && { echo 'Not logged in' >&2; exit 1; }
+    [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret' >&2; exit 1; }
+    # A declared READY body carrying an undeclared exit status. Body and status must agree.
+    [ "$STUB_MODE" = status_body_mismatch ] && { echo 'Logged in using ChatGPT' >&2; exit 1; }
+    # The shape the OLD wrapper accepted. It must no longer be an answer at all.
+    [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
+    echo 'Logged in using ChatGPT' >&2; exit 0 ;;
+  "login status --json"|"models"|"models list"|"models list --json")
+    # No CLI answers these. `codex login status --json` exits 2; codex has no `models` subcommand at
+    # all, so `codex models ...` parses as a PROMPT. If the wrapper ever asks again, fail loudly here
+    # rather than let it fall through to the judge branch and look like a pass.
+    echo "stub: the wrapper asked codex for \`$*\`, which no real codex answers" >&2; exit 99 ;;
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
@@ -192,14 +201,19 @@ case "$*" in
     echo '  -p, --print   --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
     exit 0 ;;
   "auth status --json")
+    # The real Claude Code 2.1.238 payload. Authentication is reported as `loggedIn`, matching
+    # neither key the old wrapper read (`status`, `authentication`) — which is why an authenticated
+    # host BLOCKed. Logged out is the same key with `false`, and exit 1.
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth ] && { echo '{"status":"unavailable","reason":"authentication"}'; exit 1; }
+    [ "$STUB_MODE" = auth ] && { echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; exit 1; }
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not authenticated token=secret'; exit 1; }
-    echo '{"status":"authenticated"}'; exit 0 ;;
-  "models list --json")
-    [ "$STUB_MODE" = model_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = incompatible ] && { echo '{"models":["other"]}'; exit 0; }
-    echo '{"models":["opus"]}'; exit 0 ;;
+    [ "$STUB_MODE" = status_body_mismatch ] && { echo '{"loggedIn":true,"authMethod":"claude.ai"}'; exit 1; }
+    [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
+    echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"qa@example.com","subscriptionType":"max"}'; exit 0 ;;
+  "models"|"models list"|"models list --json")
+    # `claude models list` is not a subcommand: Claude Code takes it as a PROMPT and bills a model
+    # turn to answer it in prose. A readiness gate must never be able to do that.
+    echo "stub: the wrapper asked claude for \`$*\`, which is a PROMPT, not a query" >&2; exit 99 ;;
 esac
 echo 'Cookie: session=super-secret request_id=req-123 device_code=987 user@example.com https://oauth.example/login'
 case "$STUB_MODE" in
@@ -273,10 +287,13 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_rc "$provider schema-valid BLOCK" 1 review_env block "$wrapper"
   assert_rc "$provider malformed judge output BLOCKs" 1 review_env malformed "$wrapper"
   assert_rc "$provider main timeout BLOCKs" 1 review_env timeout "$wrapper"
+  # The three readiness outcomes, kept sharp. Only a DECLARED unavailable answer is exit 3; every
+  # other non-ready response is BLOCK exit 1 and none of them can become "available".
   assert_rc "$provider trusted authentication unavailable" 3 review_env auth "$wrapper"
-  assert_rc "$provider trusted model unavailable" 3 review_env incompatible "$wrapper"
   assert_rc "$provider unsupported mandatory capability unavailable" 3 review_env capability "$wrapper"
   assert_rc "$provider ambiguous readiness text BLOCKs" 1 review_env ambiguous_auth "$wrapper"
+  assert_rc "$provider ready body with an undeclared exit status BLOCKs" 1 review_env status_body_mismatch "$wrapper"
+  assert_rc "$provider the old invented {\"status\":\"authenticated\"} shape BLOCKs" 1 review_env legacy_json_auth "$wrapper"
   assert_rc "$provider post-start auth/model phrases remain BLOCK" 1 review_env authphrase_main "$wrapper"
 done
 assert_rc "missing GPT CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$GPT" "$RUN"
@@ -352,12 +369,26 @@ for value in 1 300 -1 nope 3601; do
   assert_eq "provider did not execute for raw retention $value" "" "$(cat "$CALLS")"
 done
 
-t_case "discovery, authentication, model, and judge hangs are bounded and descendants are reaped"
-for phase in discovery_hang authentication_hang model_hang timeout; do
+# `model_hang` is gone from this loop because the model-readiness PHASE is gone: no CLI implements
+# `models list` in any form, and on claude it is a prompt that bills a model turn. The coverage it
+# gave is replaced, stronger, by the stub arms that exit 99 if the wrapper ever asks for a models
+# list again, plus the call-log assertion below that the readiness phase runs one declared probe.
+t_case "discovery, authentication, and judge hangs are bounded and descendants are reaped"
+for phase in discovery_hang authentication_hang timeout; do
   rm -f "$WORK/child.pid"
   assert_rc "$phase is BLOCKING" 1 review_env "$phase" "$GPT"
   child="$(cat "$WORK/child.pid")"
   assert_ok "$phase descendant is gone" sh -c "! kill -0 '$child' 2>/dev/null"
+done
+
+t_case "the readiness phase runs exactly the declared probe, and no models gate"
+for pair in "gpt:$GPT:login status" "claude:$CLAUDE:auth status --json"; do
+  provider="${pair%%:*}"; rest="${pair#*:}"; wrapper="${rest%%:*}"; probe="${rest#*:}"
+  : > "$CALLS"
+  assert_rc "$provider reaches the judge from a real-shape ready answer" 0 review_env approve "$wrapper"
+  assert_output "$provider ran the declared readiness probe" "args=$probe" cat "$CALLS"
+  assert_ok "$provider asked for no models list" \
+    sh -c "! grep -q 'args=models' '$CALLS'"
 done
 
 t_case "actual provider commands receive controlled roots and complete native suppression flags"

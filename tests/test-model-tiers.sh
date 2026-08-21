@@ -341,15 +341,40 @@ assert av["--model"] is None and av["--effort"] == "xhigh", av
 # Uniqueness, module-wide. A second launch site anywhere — fallback, retry, env-gated branch —
 # builds its own [executable, ...] list, and is caught here rather than shipping unprobed controls.
 inside = {id(node) for scope in (builder, assembler) for node in ast.walk(scope)}
+parents = {}
+for node in ast.walk(tree):
+    for child in ast.iter_child_nodes(node):
+        parents[id(child)] = node
+
+def enclosing(node):
+    """The function a construction lives in — 'where', not just 'what'."""
+    current = parents.get(id(node))
+    while current is not None:
+        if isinstance(current, ast.FunctionDef):
+            return current.name
+        current = parents.get(id(current))
+    return "<module>"
+
+# A provider argv BEGINS with the executable. Requiring that (rather than "mentions it anywhere")
+# stops a message string that merely names the binary from registering as a launch site.
 executable_lists = [node for node in ast.walk(tree)
-                    if isinstance(node, ast.List) and id(node) not in inside
-                    and any(isinstance(x, ast.Name) and x.id == "executable" for x in ast.walk(node))]
-rendered = sorted(ast.unparse(node) for node in executable_lists)
+                    if isinstance(node, ast.List) and id(node) not in inside and node.elts
+                    and isinstance(node.elts[0], ast.Name) and node.elts[0].id == "executable"]
+rendered = sorted((enclosing(node), ast.unparse(node)) for node in executable_lists)
+# CHANGED 2026-08-21, and STRENGTHENED while changing. This list used to name three probe argvs
+# built inline: `login status --json`, `auth status --json` and `models list --json`. Two of those
+# commands do not exist on any real CLI (`codex login status --json` exits 2; `codex models list`
+# and `claude models list` are not subcommands at all — on claude it is a PROMPT that bills a model
+# turn), so the model gate was removed outright and the authentication probe now has exactly ONE
+# construction, readiness_invocation(), built from READINESS_CONTRACT. Pinning the literal argvs
+# here is what let the wrapper keep three impossible commands written down and passing tests.
+#
+# Each entry is now (enclosing function, source), so this pins WHERE each provider argv is built as
+# well as what it looks like — strictly more than the previous string-only comparison. A second
+# launch site anywhere, including one that copies an existing argv verbatim, adds an entry.
 assert rendered == [
-    "[executable, 'auth', 'status', '--json']",     # claude auth probe
-    "[executable, 'login', 'status', '--json']",    # codex auth probe
-    "[executable, 'models', 'list', '--json']",     # model probe
-    "[executable]",                                 # discovery probe base
+    ("<module>", "[executable]"),            # capability discovery probe base: + subcommand + --help
+    ("readiness_invocation", "[executable]"),  # the single readiness argv, + READINESS_CONTRACT command
 ], rendered   # ...and nothing else in the module builds a provider argv
 PY
 

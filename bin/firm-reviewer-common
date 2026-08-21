@@ -97,6 +97,102 @@ CAPABILITY_CONTRACT = {
     },
 }
 
+# READINESS_CONTRACT — the authentication probe, per provider: the command actually run and the
+# EXACT responses that command is known to give. Same declarative discipline as CAPABILITY_CONTRACT
+# above, for the same reason: the previous revision asked both CLIs a question neither answers.
+#
+# Measured on 2026-08-21 against codex-cli 0.149.0 and Claude Code 2.1.238 (macOS 26.5.1, arm64):
+#
+#   codex login status --json   rc=2  "error: unexpected argument '--json' found"   NO SUCH FORM
+#   codex login status          rc=0  "Logged in using ChatGPT"      (human text, written to stderr)
+#   codex login status          rc=1  "Not logged in"                (empty CODEX_HOME)
+#   claude auth status --json   rc=0  {"loggedIn":true,"authMethod":"claude.ai",...}
+#   claude auth status --json   rc=1  {"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}
+#
+# So: codex answers only in human text and there is no JSON contract to invent (proposal item 3); it
+# is parsed narrowly and literally, line-anchored, case-sensitive, one exact phrase per answer.
+# claude answers in JSON but under `loggedIn`, matching neither key the old code read — which is why
+# a fully authenticated CLI was published as "not a trusted structured available result" and BLOCKed.
+#
+# `exit_codes` is part of each answer, not decoration. The body and the exit status must AGREE: a
+# "Logged in using ..." line delivered with a nonzero status, or a `loggedIn: true` payload from a
+# command that failed, is not a fourth outcome to interpret — it is an unrecognised response, and
+# unrecognised is BLOCK. Exactly one declared answer may match; zero matches, two matches, or a match
+# whose exit status is undeclared all return None, and None is BLOCK. Nothing here can ever produce
+# "available" from a response the CLI did not clearly give.
+#
+# There is deliberately NO model-readiness probe. See the readiness phase below for the argument.
+READINESS_CONTRACT = {
+    "gpt": {
+        "command": ["login", "status"],
+        "shape": "text",
+        "keys": [],
+        "answers": [
+            {"answer": "ready", "exit_codes": [0], "line": r"Logged in using .+"},
+            {"answer": "unavailable", "reason": "authentication", "exit_codes": [1],
+             "line": r"Not logged in"},
+        ],
+    },
+    "claude": {
+        "command": ["auth", "status", "--json"],
+        "shape": "json",
+        "keys": ["loggedIn"],
+        "answers": [
+            {"answer": "ready", "exit_codes": [0], "key": "loggedIn", "value": True},
+            {"answer": "unavailable", "reason": "authentication", "exit_codes": [1],
+             "key": "loggedIn", "value": False},
+        ],
+    },
+}
+
+def readiness_invocation(provider_name, executable):
+    """The single construction of the readiness argv, derived from READINESS_CONTRACT. The wrapper
+    runs this and nothing else in the readiness phase, so a command the declaration does not name
+    cannot be sent to a provider."""
+    return [executable] + list(READINESS_CONTRACT[provider_name]["command"])
+
+def readiness_answer(provider_name, exit_code, raw):
+    """Classify one readiness response into exactly one of three outcomes:
+
+        ("ready", None)                -> the CLI said it is authenticated
+        ("unavailable", <reason>)      -> the CLI said, in a declared form, that it is not
+        (None, None)                   -> anything else: unparsable, unknown shape, ambiguous, or a
+                                          declared body carrying an undeclared exit status
+
+    The caller must treat None as BLOCK. It is never "probably fine" and never trusted-unavailable:
+    "the probe did not give a recognised answer" and "the provider answered that it is unavailable"
+    are different facts, and collapsing them is the defect class this wrapper keeps being bitten by.
+    """
+    declared = READINESS_CONTRACT[provider_name]
+    text = raw.decode("utf-8", "replace")
+    matched = []
+    if declared["shape"] == "json":
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+        for answer in declared["answers"]:
+            # Identity-strict: `1` must not satisfy `True`, and "true" must not either.
+            value = data.get(answer["key"], None)
+            if isinstance(value, bool) and value is answer["value"]:
+                matched.append(answer)
+    else:
+        # Narrow, literal line matching. Whole stripped line, anchored at both ends, case-sensitive.
+        # Other lines may exist (update notices and the like) but cannot themselves be the answer,
+        # and a line that merely CONTAINS the phrase ("not logged in token=secret") is not a match.
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for answer in declared["answers"]:
+            if any(re.fullmatch(answer["line"], line) for line in lines):
+                matched.append(answer)
+    if len(matched) != 1:
+        return None, None
+    answer = matched[0]
+    if exit_code not in answer["exit_codes"]:
+        return None, None
+    return answer["answer"], answer.get("reason")
+
 def judge_plan(provider_name, model, prompt, contract_text, empty_mcp, schema_path, schema_text,
                candidate_verdict):
     """The single structured description of the judge invocation: an ordered list of segments, each
@@ -192,6 +288,20 @@ if args.print_capability_contract:
                 "invocation_argv": invocation_argv(name)[1:],
             }
             for name, entry in CAPABILITY_CONTRACT.items()
+        },
+        # The readiness declaration travels with the capability one, through the same guarded
+        # introspection path, so a drift check can read both without a second entry point to secure.
+        # `probe_argv` is built by readiness_invocation(), the same function the runtime calls, so a
+        # command the declaration does not name cannot be run against a provider unnoticed.
+        "readiness": {
+            name: {
+                "command": list(entry["command"]),
+                "shape": entry["shape"],
+                "keys": list(entry["keys"]),
+                "answers": entry["answers"],
+                "probe_argv": readiness_invocation(name, "EXECUTABLE")[1:],
+            }
+            for name, entry in READINESS_CONTRACT.items()
         }
     }, indent=2, sort_keys=True))
     raise SystemExit(0)
@@ -1063,56 +1173,53 @@ except Exception as exc:
              + ". A control is required on the surface the wrapper passes it on; being present on a "
                "different surface does not satisfy it (exit 3)", 3)
 
-    auth_command = [executable, "login", "status", "--json"] if provider == "gpt" else [executable, "auth", "status", "--json"]
-    rc, result, raw = run_phase("authentication", readiness_timeout, auth_command)
-    def structured_readiness(payload):
-        try:
-            data = json.loads(payload.decode("utf-8"))
-        except Exception:
-            return None, None
-        if not isinstance(data, dict):
-            return None, None
-        status_value = str(data.get("status") or data.get("authentication") or "").lower()
-        reason_value = str(data.get("reason") or "").lower()
-        if status_value in ("ok", "available", "authenticated", "logged_in", "logged-in"):
-            return True, None
-        if status_value == "unavailable" and reason_value in ("authentication", "model"):
-            return False, reason_value
-        return None, None
-    ready, unavailable_reason = structured_readiness(raw)
-    if ready is False:
-        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":unavailable_reason}, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop(f"trusted structured authentication readiness is unavailable: {unavailable_reason} (exit 3)", 3)
-    if result.get("status") == "timeout":
+    # AUTHENTICATION READINESS. One probe, declared in READINESS_CONTRACT, classified by
+    # readiness_answer() into exactly three outcomes and no fourth. The order below is the load-
+    # bearing part: a phase that timed out or was truncated is decided BEFORE its bytes are read at
+    # all, because a partial stream that happens to contain a declared phrase is not an answer the
+    # provider finished giving. The previous revision read the payload first and could take exit 3
+    # off a truncated timeout.
+    rc, result, raw = run_phase("authentication", readiness_timeout,
+                                readiness_invocation(provider, executable))
+    if result.get("status") in ("timeout", "turn_limit"):
         finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("authentication readiness timed out; BLOCK", 1)
-    if rc != 0 or ready is not True:
+    if result.get("truncated"):
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("authentication readiness was not a trusted structured available result; BLOCK", 1)
+        stop("authentication readiness output was truncated, so no answer was completed; BLOCK", 1)
+    answer, unavailable_reason = readiness_answer(provider, rc, raw)
+    if answer == "unavailable":
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":unavailable_reason}, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
+        stop(f"trusted structured authentication readiness is unavailable: {unavailable_reason} (exit 3)", 3)
+    if answer != "ready":
+        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
+        probe_label = Path(executable).name + " " + " ".join(READINESS_CONTRACT[provider]["command"])
+        stop(f"authentication readiness gave no recognised answer from `{probe_label}` (exit {rc}); "
+             "BLOCK (an unrecognised response is not an authenticated provider, and it is not a "
+             "trusted unavailable one either)", 1)
 
-    model_command = [executable, "models", "list", "--json"]
-    rc, result, raw = run_phase("model", readiness_timeout, model_command)
-    try:
-        model_data = json.loads(raw.decode("utf-8"))
-        if isinstance(model_data, dict) and model_data.get("status") == "unavailable" and model_data.get("reason") == "model":
-            models = []
-            model_unavailable = True
-        else:
-            values = model_data.get("models") if isinstance(model_data, dict) else model_data
-            models = [str(item.get("id") or item.get("name")) if isinstance(item,dict) else str(item) for item in values]
-            model_unavailable = model not in models
-    except Exception:
-        models = []
-        model_unavailable = None
-    if result.get("status") == "timeout":
-        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("model readiness timed out; BLOCK", 1)
-    if rc == 0 and model_unavailable is True:
-        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"model"}, trusted_reason="model", diagnostic=str(diagnostic_path.relative_to(run)))
-        stop(f"trusted structured model readiness does not list {model} (exit 3)", 3)
-    if rc != 0 or model_unavailable is None:
-        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("model readiness was not trusted structured data; BLOCK", 1)
+    # NO MODEL-READINESS PROBE, deliberately. The wrapper used to run `<cli> models list --json` and
+    # require the resolved model to appear in the answer. Neither CLI has that surface, and neither
+    # has one to move it to (measured 2026-08-21, codex-cli 0.149.0 / Claude Code 2.1.238):
+    #
+    #   * `codex --help` lists 31 subcommands and none of them is `models`, so `codex models list`
+    #     parses `models` as the PROMPT operand and exits 2 on `list`. Drop the operand and
+    #     `codex models` is a prompt, i.e. a model call.
+    #   * `claude models list --json` exits 1 on the unknown option, and `claude models list` is not
+    #     a subcommand either — Claude Code takes it as a PROMPT and runs a real, billable turn. It
+    #     answered ours with a prose table of model names.
+    #
+    # A readiness gate that on one provider is an inference request is not a gate; it is a way to buy
+    # a paragraph of prose and call it a fact. There is no symmetric implementation available, and a
+    # probe kept alive only by the test stub that answers it measures the stub and nothing else —
+    # which is precisely the defect being fixed here, so keeping it was never the safe option.
+    #
+    # The claim the probe existed to make is still enforced, at the point of use and with a louder
+    # failure: judge_invocation() passes the resolved model (`-m` / `--model`) and an unknown model
+    # makes the judge phase exit nonzero, which is BLOCK (exit 1). That is STRICTER than what was
+    # removed: the old path could answer "model" as a TRUSTED unavailable reason and hand the run a
+    # routine second-voice waiver. Removing the probe closes that laundering route and leaves the
+    # model question answered by the only thing that can answer it — actually asking for the model.
 
     schema_path = controlled_schema
     schema_text = json.dumps(json.loads(schema_path.read_text(encoding="utf-8")), separators=(",", ":"))

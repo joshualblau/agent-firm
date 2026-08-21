@@ -1,0 +1,9 @@
+{
+  "name": "reviewer-readiness-probes-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty starting point; the firm adds ready()+test and must leave the reviewer readiness gate bound to the commands and response shapes the provider CLIs actually implement (see test/readiness-probes.sh).",
+  "scripts": {
+    "test": "node --test"
+  }
+}
