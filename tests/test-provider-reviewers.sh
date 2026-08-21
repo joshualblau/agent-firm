@@ -87,9 +87,19 @@ printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
 case "$*" in
   "--help")
+    # Real codex-cli SPLITS its controls across surfaces. Top-level help carries --ask-for-approval
+    # and not --ephemeral/--ignore-*/--output-*; `exec --help` carries the reverse. This stub used to
+    # print all eight required flags here, which encoded the very assumption that made the wrapper's
+    # single top-level probe look correct while it was silently failing against every real Codex.
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = capability ] && { echo '--ephemeral --sandbox --model'; exit 0; }
-    echo '--ignore-user-config --ignore-rules --ephemeral --sandbox --ask-for-approval --model --output-schema --output-last-message'
+    [ "$STUB_MODE" = discovery_error ] && { echo 'top-level help is unavailable' >&2; exit 7; }
+    echo '--sandbox --ask-for-approval --model --config'
+    exit 0 ;;
+  "exec --help")
+    [ "$STUB_MODE" = exec_discovery_error ] && { echo 'exec help is unavailable' >&2; exit 7; }
+    # capability: --ephemeral appears on NEITHER surface, so it is genuinely absent everywhere.
+    [ "$STUB_MODE" = capability ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --sandbox --model --config --output-schema --output-last-message'; exit 0; }
+    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral --sandbox --model --config --output-schema --output-last-message'
     exit 0 ;;
   "login status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
@@ -154,9 +164,13 @@ printf 'claude cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
 case "$*" in
   "--help")
+    # claude is invoked at TOP LEVEL (`claude -p ...`) and really does carry every control it passes
+    # in `claude --help`, so this provider declares exactly one probed surface. Verified against
+    # Claude Code 2.1.238.
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    [ "$STUB_MODE" = discovery_error ] && { echo 'help is unavailable' >&2; exit 7; }
     [ "$STUB_MODE" = capability ] && { echo '--safe-mode --model'; exit 0; }
-    echo '--safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --tools --disallowedTools'
+    echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
     exit 0 ;;
   "auth status --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
@@ -248,6 +262,39 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
 done
 assert_rc "missing GPT CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$GPT" "$RUN"
 assert_rc "missing Claude CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$CLAUDE" "$RUN"
+
+t_case "capability discovery searches exactly the help surfaces the wrapper is invoked through"
+# The regression that would have caught the 2026-08-21 defect: with the required controls SPLIT
+# across `codex --help` and `codex exec --help` the way real codex-cli splits them, discovery must
+# still pass. A single top-level probe fails this; so does a single exec probe.
+: > "$CALLS"
+assert_rc "GPT passes discovery with controls split across top-level and exec help" 0 review_env approve "$GPT"
+assert_output "GPT probed the top-level help surface" "args=--help" cat "$CALLS"
+assert_output "GPT probed the exec subcommand help surface, which it is invoked through" "args=exec --help" cat "$CALLS"
+: > "$CALLS"
+assert_rc "Claude passes discovery from its single correct surface" 0 review_env approve "$CLAUDE"
+assert_output "Claude probed the top-level help surface" "args=--help" cat "$CALLS"
+# Not a blanket "probe every subcommand": widening claude, whose top-level probe already matches its
+# top-level invocation, would trade this false negative for a future false positive.
+assert_ok "Claude probed no subcommand help surface it never invokes" \
+  sh -c "! grep -qE 'args=[A-Za-z][A-Za-z0-9_-]* --help' '$CALLS'"
+
+t_case "a control absent from EVERY searched surface is still trusted-unavailable, and says where it looked"
+assert_rc "GPT control missing from both surfaces stays exit 3" 3 review_env capability "$GPT"
+assert_output "the exit-3 message names the missing control" "--ephemeral" review_env capability "$GPT"
+assert_output "the exit-3 message names every surface it searched" \
+  '`codex --help`, `codex exec --help`' review_env capability "$GPT"
+assert_output "Claude's exit-3 message names its one searched surface" \
+  '`claude --help`' review_env capability "$CLAUDE"
+
+t_case "a help surface that cannot be READ is a BLOCK, never a trusted unavailable"
+# The distinction that made the original defect survivable at all: "the probe broke" (exit 1, BLOCK)
+# and "the provider lacks a control" (exit 3, trusted waiver path) are different facts. Collapsing
+# them would turn every transient CLI hiccup into a silently waived second voice.
+assert_rc "GPT top-level help error BLOCKs" 1 review_env discovery_error "$GPT"
+assert_rc "GPT exec help error BLOCKs even though the first surface succeeded" 1 review_env exec_discovery_error "$GPT"
+assert_rc "Claude help error BLOCKs" 1 review_env discovery_error "$CLAUDE"
+assert_output "the BLOCK names the surface that failed" "codex exec --help" review_env exec_discovery_error "$GPT"
 
 t_case "zero, negative, malformed, and excessive wrapper bounds reject before provider execution"
 for value in 0 -1 nope 901; do

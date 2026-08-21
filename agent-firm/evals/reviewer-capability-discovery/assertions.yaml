@@ -1,0 +1,21 @@
+name: reviewer-capability-discovery
+description: >-
+  Guards the reviewer capability probe against the 2026-08-21 defect, where discovery interrogated
+  `codex --help` while the wrapper invoked `codex exec ...`, so five controls that exist only under
+  `codex exec --help` were reported missing and a fully capable provider was published as
+  unsupported_capability (exit 3) — silently suppressing the required cross-provider second voice.
+  The eval drives a normal lifecycle and then runs two checks that could not both pass under that
+  defect: the offline discovery/invocation drift check, and a live binding of each provider's
+  DECLARED help surfaces against the installed CLI's REAL help text.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/probe.js
+  - file_exists: test/probe.test.js
+  - test_passes: node --test
+  - test_passes: sh test/capability-discovery.sh
+  - traceability_passes: true
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

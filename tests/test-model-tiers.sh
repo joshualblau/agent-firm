@@ -291,8 +291,22 @@ def literal_values(node):
 resolver = [literal_values(node) for node in lists if "firm-model-resolve" in ast.unparse(node)]
 assert len(resolver) == 1, resolver
 assert resolver[0][1:] == ["--provider", None, "--role", "reviewer", "--format", "json"], resolver[0]
-codex = [node for node in lists if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
-claude = [node for node in lists if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
+# Find the launch envelopes by NAMING the one function that constructs them, not by guessing at
+# module-level list shape. The old search was "the single module list mentioning --effort and
+# --permission-mode"; that stopped identifying the launch line uniquely the moment the wrapper also
+# DECLARED those controls as required capabilities (CAPABILITY_CONTRACT, added 2026-08-21 so that
+# discovery probes the surfaces the invocation actually uses). Two lists then matched a predicate
+# asserting there is exactly one, and this check failed for a reason with nothing to do with model
+# envelopes. Scoping to judge_invocation is strictly stronger: it pins the envelopes to the single
+# construction of the judge command line, so a second launch site breaks `len(...) == 1` here for a
+# real reason instead of a coincidence of vocabulary.
+definitions = [node for node in ast.walk(tree)
+               if isinstance(node, ast.FunctionDef) and node.name == "judge_invocation"]
+assert len(definitions) == 1, "judge_invocation must be the single construction of the judge argv"
+returns = [node.value for node in ast.walk(definitions[0]) if isinstance(node, ast.Return)]
+assert returns and all(isinstance(node, ast.List) for node in returns), [ast.dump(n) for n in returns]
+codex = [node for node in returns if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
+claude = [node for node in returns if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
           and any(isinstance(x, ast.Constant) and x.value == "--permission-mode" for x in node.elts)]
 assert len(codex) == 1 and len(claude) == 1
 cv, av = literal_values(codex[0]), literal_values(claude[0])

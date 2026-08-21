@@ -33,9 +33,110 @@ parser.add_argument("--judge-timeout")
 parser.add_argument("--grace")
 parser.add_argument("--max-output")
 parser.add_argument("--retain-raw-seconds")
+parser.add_argument("--print-capability-contract", action="store_true",
+                    help="print the provider capability contract as JSON and exit; reads nothing, "
+                         "writes nothing, runs no provider")
 args = parser.parse_intermixed_args(argv)
 provider = args.provider
 label = "firm-gpt-qa" if provider == "gpt" else "firm-claude-qa"
+
+# ---------------------------------------------------------------------------
+# The provider capability contract: one declaration per provider of the help surfaces discovery
+# probes and the controls it requires. Discovery must interrogate the surfaces the wrapper is
+# actually INVOKED through. Asking a different surface is not a readiness check; it answers a
+# question nobody asked, and it did exactly that until 2026-08-21 — `codex --help` was probed while
+# `codex exec ...` was invoked, so five controls that exist only under `codex exec --help` were
+# reported missing and a fully capable provider was published as `unsupported_capability` (exit 3),
+# silently suppressing the cross-provider second voice on every run.
+#
+# `help_surfaces` are argv suffixes appended to the resolved executable. codex-cli splits its flags
+# across both surfaces (`--ask-for-approval` is top-level only; `--ephemeral`, `--ignore-user-config`,
+# `--ignore-rules`, `--output-schema`, `--output-last-message`, `--skip-git-repo-check` are `exec`
+# only), so BOTH are probed and each required flag must appear in AT LEAST ONE. `claude` is invoked
+# at top level (`claude -p ...`) and every control it passes is in `claude --help`; probing a
+# subcommand there would loosen a check that is already correct, so it declares one surface. This is
+# per-provider on purpose — "probe everything" trades this false negative for a future false positive
+# on the gate that protects PII-touching runs.
+#
+# `flag_aliases` maps a short option the invocation actually passes to the canonical long option
+# discovery searches for. `required_flags` must equal the alias-normalized set of options on the
+# invocation line in BOTH directions; tests/test-reviewer-capability-contract.sh asserts that, so a
+# future edit that adds a flag to the invocation without adding it to discovery fails a test rather
+# than a production run.
+CAPABILITY_CONTRACT = {
+    "gpt": {
+        "help_surfaces": [["--help"], ["exec", "--help"]],
+        "flag_aliases": {"-s": "--sandbox", "-a": "--ask-for-approval", "-m": "--model",
+                         "-o": "--output-last-message", "-c": "--config"},
+        "required_flags": ["--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+                           "--ephemeral", "--sandbox", "--ask-for-approval", "--model", "--config",
+                           "--output-schema", "--output-last-message"],
+    },
+    "claude": {
+        "help_surfaces": [["--help"]],
+        "flag_aliases": {"-p": "--print"},
+        "required_flags": ["--print", "--safe-mode", "--system-prompt", "--strict-mcp-config",
+                           "--model", "--effort", "--output-format", "--json-schema",
+                           "--permission-mode", "--tools", "--disallowedTools",
+                           "--no-session-persistence"],
+    },
+}
+
+def judge_invocation(provider_name, executable, model, prompt, contract_text, empty_mcp,
+                     schema_path, schema_text, candidate_verdict):
+    """The single construction of the judge command line. Capability discovery is checked against
+    this exact function, so the probed controls and the invoked controls cannot be edited apart."""
+    if provider_name == "gpt":
+        return [
+            executable, "exec", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+            "--ephemeral", "-s", "read-only", "-a", "never", "-m", model,
+            "-c", 'model_reasoning_effort="xhigh"', "--output-schema", str(schema_path),
+            "-o", str(candidate_verdict), prompt
+        ]
+    return [
+        executable, "-p", prompt, "--safe-mode", "--system-prompt", contract_text,
+        "--strict-mcp-config", str(empty_mcp), "--model", model, "--effort", "xhigh",
+        "--output-format", "json", "--json-schema", schema_text, "--permission-mode", "dontAsk",
+        "--tools", "Read,Grep,Glob", "--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch",
+        "--no-session-persistence"
+    ]
+
+def invocation_argv(provider_name):
+    """The judge command line with every operand replaced by a dash-free placeholder, so the option
+    tokens can be read off it exactly. Carries no path, prompt, schema or credential."""
+    return judge_invocation(provider_name, "EXECUTABLE", "MODEL", "PROMPT", "CONTRACT",
+                            "EMPTY_MCP", "SCHEMA_PATH", "SCHEMA_TEXT", "CANDIDATE_VERDICT")
+
+def invocation_flags(provider_name):
+    """Alias-normalized options the wrapper actually passes, derived from judge_invocation itself.
+    Every operand is a placeholder with no leading dash, so each remaining leading-dash token is a
+    real option and the result is a fact about the invocation, not a second hand-kept list."""
+    aliases = CAPABILITY_CONTRACT[provider_name]["flag_aliases"]
+    argv_probe = invocation_argv(provider_name)
+    found = []
+    for token in argv_probe[1:]:
+        if not token.startswith("-"):
+            continue
+        canonical = aliases.get(token, token)
+        if canonical not in found:
+            found.append(canonical)
+    return found
+
+if args.print_capability_contract:
+    print(json.dumps({
+        "schema_version": 1,
+        "providers": {
+            name: {
+                "help_surfaces": entry["help_surfaces"],
+                "flag_aliases": entry["flag_aliases"],
+                "required_flags": entry["required_flags"],
+                "invocation_flags": invocation_flags(name),
+                "invocation_argv": invocation_argv(name)[1:],
+            }
+            for name, entry in CAPABILITY_CONTRACT.items()
+        }
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0)
 
 def stop(message, code=1):
     print(f"{label}: {message}", file=sys.stderr)
@@ -861,24 +962,42 @@ except Exception as exc:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"cli_missing"}, trusted_reason="cli_missing", diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"{provider} CLI unavailable from the controlled readiness PATH (exit 3)", 3)
 
-    discovery_command = [executable, "--help"]
-    rc, result, raw = run_phase("discovery", discovery_timeout, discovery_command)
-    if result.get("status") in ("timeout", "turn_limit"):
-        finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("bounded capability discovery timed out; BLOCK", 1)
-    if rc != 0:
-        finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"discovery"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("capability discovery failed; BLOCK", 1)
-    help_text = raw.decode("utf-8", "replace")
-    required_flags = (
-        ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "--ask-for-approval", "--model", "--output-schema", "--output-last-message"]
-        if provider == "gpt" else
-        ["--safe-mode", "--system-prompt", "--strict-mcp-config", "--no-session-persistence", "--model", "--effort", "--output-format", "--json-schema", "--tools", "--disallowedTools"]
-    )
-    missing = [flag for flag in required_flags if flag not in help_text]
+    # Probe exactly the help surfaces this provider is invoked through, in order, each bounded by the
+    # same discovery_timeout as before. A required flag must be found in AT LEAST ONE surface; a flag
+    # found in none is still unsupported_capability, exit 3. A probe that cannot RUN stays a BLOCK
+    # (exit 1) and never becomes exit 3 — "the probe broke" and "the provider lacks a control" are
+    # different facts, and collapsing them is what made the original defect survivable.
+    capability = CAPABILITY_CONTRACT[provider]
+    required_flags = capability["required_flags"]
+    surfaces_searched = []
+    surface_help_texts = []
+    for surface_index, surface_args in enumerate(capability["help_surfaces"]):
+        phase_name = "discovery" if surface_index == 0 else f"discovery-{surface_index + 1}"
+        surface_label = " ".join([Path(executable).name] + list(surface_args))
+        surfaces_searched.append(surface_label)
+        rc, result, raw = run_phase(phase_name, discovery_timeout, [executable] + list(surface_args))
+        if result.get("status") in ("timeout", "turn_limit"):
+            finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":phase_name},
+                             capability_surfaces_searched=surfaces_searched,
+                             diagnostic=str(diagnostic_path.relative_to(run)))
+            stop(f"bounded capability discovery timed out on help surface `{surface_label}`; BLOCK", 1)
+        if rc != 0:
+            finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":phase_name},
+                             capability_surfaces_searched=surfaces_searched,
+                             diagnostic=str(diagnostic_path.relative_to(run)))
+            stop(f"capability discovery failed on help surface `{surface_label}`; BLOCK "
+                 "(a probe that cannot run is not a provider that lacks a capability)", 1)
+        surface_help_texts.append(raw.decode("utf-8", "replace"))
+    missing = [flag for flag in required_flags
+               if not any(flag in help_text for help_text in surface_help_texts)]
     if missing:
-        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"}, trusted_reason="unsupported_capability", missing_capabilities=missing, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop(f"required provider controls unsupported: {', '.join(missing)} (exit 3)", 3)
+        finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":"unsupported_capability"},
+                         trusted_reason="unsupported_capability", missing_capabilities=missing,
+                         capability_surfaces_searched=surfaces_searched,
+                         diagnostic=str(diagnostic_path.relative_to(run)))
+        stop(f"required provider controls unsupported: {', '.join(missing)}; searched "
+             f"{len(surfaces_searched)} help surface(s): "
+             + ", ".join(f"`{item}`" for item in surfaces_searched) + " (exit 3)", 3)
 
     auth_command = [executable, "login", "status", "--json"] if provider == "gpt" else [executable, "auth", "status", "--json"]
     rc, result, raw = run_phase("authentication", readiness_timeout, auth_command)
@@ -940,21 +1059,9 @@ except Exception as exc:
         f"attempt_id={attempt_id}. BLOCK on any uncertainty and list every untested criterion."
     )
     candidate_verdict = attempt_dir / "candidate-verdict.json"
-    if provider == "gpt":
-        command = [
-            executable, "exec", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-            "--ephemeral", "-s", "read-only", "-a", "never", "-m", model,
-            "-c", 'model_reasoning_effort="xhigh"', "--output-schema", str(schema_path),
-            "-o", str(candidate_verdict), prompt
-        ]
-    else:
-        command = [
-            executable, "-p", prompt, "--safe-mode", "--system-prompt", contract.decode("utf-8"),
-            "--strict-mcp-config", str(empty_mcp), "--model", model, "--effort", "xhigh",
-            "--output-format", "json", "--json-schema", schema_text, "--permission-mode", "dontAsk",
-            "--tools", "Read,Grep,Glob", "--disallowedTools", "Edit,Write,Bash,WebFetch,WebSearch",
-            "--no-session-persistence"
-        ]
+    # One construction, shared with capability discovery via judge_invocation/invocation_flags.
+    command = judge_invocation(provider, executable, model, prompt, contract.decode("utf-8"),
+                               empty_mcp, schema_path, schema_text, candidate_verdict)
     attempt["launch"] = {"provider":provider, "model":model, "display":model_display, "effort":model_effort,
                          "argv":command[1:]}
     atomic_write(attempt_path, json_bytes(attempt), 0o600)
