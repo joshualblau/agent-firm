@@ -130,6 +130,22 @@ case "$*" in
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret' >&2; exit 1; }
     # A declared READY body carrying an undeclared exit status. Body and status must agree.
     [ "$STUB_MODE" = status_body_mismatch ] && { echo 'Logged in using ChatGPT' >&2; exit 1; }
+    # ORDERING ARMS. Both emit a DECLARED answer and then break the phase, which is the case no stub
+    # covered before: every previous hang arm emitted nothing first, so the payload was empty and the
+    # classifier returned None whatever order the checks ran in.
+    [ "$STUB_MODE" = auth_phrase_then_hang ] && { echo 'Not logged in' >&2; (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    [ "$STUB_MODE" = auth_phrase_then_flood ] && {
+      echo 'Logged in using ChatGPT' >&2
+      # Past the 64 KiB default cap, so result.truncated is true. Retention keeps the PREFIX, so the
+      # declared ready line survives in the payload: if the payload were read before truncation was
+      # checked, this would classify as ready and the run would proceed to the judge.
+      awk 'BEGIN{for(i=0;i<4000;i++) print "x0123456789012345678901234567890"}'
+      exit 0; }
+    # A ready answer with a secret-shaped line beside it: ready, and nothing of it may be published.
+    [ "$STUB_MODE" = auth_ready_with_secret ] && {
+      echo 'Logged in using ChatGPT' >&2
+      echo 'account_id=admin@corp.example token=READINESS-BODY-SENTINEL-4c19' >&2
+      exit 0; }
     # The shape the OLD wrapper accepted. It must no longer be an answer at all.
     [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
     echo 'Logged in using ChatGPT' >&2; exit 0 ;;
@@ -208,6 +224,17 @@ case "$*" in
     [ "$STUB_MODE" = auth ] && { echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; exit 1; }
     [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not authenticated token=secret'; exit 1; }
     [ "$STUB_MODE" = status_body_mismatch ] && { echo '{"loggedIn":true,"authMethod":"claude.ai"}'; exit 1; }
+    [ "$STUB_MODE" = auth_phrase_then_hang ] && { echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    # For claude the flood arm pins the OUTCOME but cannot discriminate the ordering: truncating a
+    # JSON document makes it unparsable, so this is BLOCK either way. gpt's line-oriented text is
+    # where truncation-before-payload is actually pinned.
+    [ "$STUB_MODE" = auth_phrase_then_flood ] && {
+      echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
+      awk 'BEGIN{for(i=0;i<4000;i++) print "x0123456789012345678901234567890"}'
+      exit 0; }
+    [ "$STUB_MODE" = auth_ready_with_secret ] && {
+      echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"admin@corp.example","token":"READINESS-BODY-SENTINEL-4c19"}'
+      exit 0; }
     [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
     echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"qa@example.com","subscriptionType":"max"}'; exit 0 ;;
   "models"|"models list"|"models list --json")
@@ -379,6 +406,55 @@ for phase in discovery_hang authentication_hang timeout; do
   assert_rc "$phase is BLOCKING" 1 review_env "$phase" "$GPT"
   child="$(cat "$WORK/child.pid")"
   assert_ok "$phase descendant is gone" sh -c "! kill -0 '$child' 2>/dev/null"
+done
+
+# The most recent reviewer_* ledger event, which is where "why did readiness fail" is recorded. Exit
+# status alone cannot tell a timed-out phase from an unrecognised one; both are BLOCK exit 1.
+last_reviewer_event() {
+  python3 - "$RUN/run.jsonl" <<'LEDGER'
+import json, sys
+last = None
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        event = json.loads(line)
+    except Exception:
+        continue
+    if str(event.get("event", "")).startswith("reviewer_"):
+        last = event
+print(json.dumps(last or {}, sort_keys=True))
+LEDGER
+}
+
+t_case "a declared answer cut short by a timeout or the output cap is never trusted"
+# THE ORDERING TEST. timeout/turn_limit and truncation are decided BEFORE the payload is read,
+# because a partial stream that happens to contain a declared phrase is not an answer the provider
+# finished giving. The old code read the payload first and could take a trusted exit 3 off a
+# truncated timeout. Nothing pinned the new order until these arms existed.
+for pair in "gpt:$GPT" "claude:$CLAUDE"; do
+  provider="${pair%%:*}"; wrapper="${pair#*:}"
+  assert_rc "$provider declared UNAVAILABLE answer then a hang is BLOCK, never exit 3" 1 \
+    review_env auth_phrase_then_hang "$wrapper"
+  # Discriminates the ordering: with the payload read first the classifier reports "no recognised
+  # answer" and the attempt is recorded as reviewer_invalid, losing the fact that the provider hung.
+  assert_output "$provider records it as a TIMEOUT, not as an unrecognised answer" \
+    "reviewer_timeout" last_reviewer_event
+  assert_rc "$provider declared READY answer then output past the cap is BLOCK, never available" 1 \
+    review_env auth_phrase_then_flood "$wrapper"
+done
+
+t_case "a readiness body is never published, even from a ready answer"
+# The invariant is currently true by construction - the body reaches only the control root, which is
+# rmtree'd, and the BLOCK message carries the argv label and exit code, never the response. Pinned
+# here while it is true, so that "just include the first line of the response" has to go through
+# redact() rather than around it.
+for pair in "gpt:$GPT" "claude:$CLAUDE"; do
+  provider="${pair%%:*}"; wrapper="${pair#*:}"
+  assert_rc "$provider ready answer beside a secret-shaped line still reaches the judge" 0 \
+    review_env auth_ready_with_secret "$wrapper"
+  assert_ok "$provider published no byte of the readiness body" \
+    sh -c "! grep -rqI 'READINESS-BODY-SENTINEL-4c19' '$RUN'"
+  assert_ok "$provider published no account identifier from the readiness body" \
+    sh -c "! grep -rqI 'admin@corp.example' '$RUN'"
 done
 
 t_case "the readiness phase runs exactly the declared probe, and no models gate"

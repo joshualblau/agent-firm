@@ -355,11 +355,17 @@ def enclosing(node):
         current = parents.get(id(current))
     return "<module>"
 
-# A provider argv BEGINS with the executable. Requiring that (rather than "mentions it anywhere")
-# stops a message string that merely names the binary from registering as a launch site.
+# MEMBERSHIP, not position. An earlier revision of this test required elts[0] to be `executable`,
+# reasoning that a provider argv begins with the executable. Review demonstrated the escape in one
+# line: a second launch site written as ["/usr/bin/env", executable, "models", "list"] — or through
+# any interpreter, sandbox or nice/timeout prefix — has a Constant first, is invisible to the
+# positional rule, and would ship an unprobed argv. The membership rule catches it, and the mutant
+# below keeps it caught. (The stated reason for narrowing was also wrong: the list it was aimed at,
+# [Path(executable).name], is an ast.List and did register — it stopped existing because the BLOCK
+# message was rewritten not to build a list, so the narrowing bought nothing on any source.)
 executable_lists = [node for node in ast.walk(tree)
-                    if isinstance(node, ast.List) and id(node) not in inside and node.elts
-                    and isinstance(node.elts[0], ast.Name) and node.elts[0].id == "executable"]
+                    if isinstance(node, ast.List) and id(node) not in inside
+                    and any(isinstance(x, ast.Name) and x.id == "executable" for x in ast.walk(node))]
 rendered = sorted((enclosing(node), ast.unparse(node)) for node in executable_lists)
 # CHANGED 2026-08-21, and STRENGTHENED while changing. This list used to name three probe argvs
 # built inline: `login status --json`, `auth status --json` and `models list --json`. Two of those
@@ -401,5 +407,25 @@ MUT
 chmod +x "$W/mutant-second-launch-site"
 assert_fail "a second launch site outside the judge constructors is caught" \
   python3 "$W/reviewer-envelope-check.py" "$W/mutant-second-launch-site"
+
+t_case "it bites: a second launch site hidden behind a prefix argument"
+# Review's defeat of the positional predicate. `env` (or any wrapper binary) in front of the
+# executable makes the argv invisible to a first-element rule while still launching a provider with
+# controls no capability probe has seen.
+cp "$BIN/firm-reviewer-common" "$W/mutant-prefixed-launch-site"
+python3 - "$W/mutant-prefixed-launch-site" <<'MUT'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+anchor = '    attempt["launch"] = {'
+assert text.count(anchor) == 1, "mutation anchor is not unique; update this test"
+prefixed = (
+    '    if os.environ.get("FIRM_JUDGE_PREFIX"):\n'
+    '        command = ["/usr/bin/env", executable, "models", "list"]\n'
+)
+open(path, "w", encoding="utf-8").write(text.replace(anchor, prefixed + anchor))
+MUT
+assert_fail "a launch site behind a prefix argument is caught" \
+  python3 "$W/reviewer-envelope-check.py" "$W/mutant-prefixed-launch-site"
 
 t_summary

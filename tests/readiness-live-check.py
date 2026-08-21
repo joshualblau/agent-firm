@@ -26,8 +26,25 @@ Then it applies the declaration — the same matching rule the wrapper applies �
     emits is the original defect written down (the old code read `status`/`authentication`; the CLI
     emits `loggedIn`), and it must not survive being declared.
 
-Fails closed: no CLI installed at all is a FAILURE, not a silent pass. Nothing here costs
-subscription spend — both declared commands are local status queries; neither starts a model turn.
+Fails closed PER PROVIDER: a declared provider whose CLI is not installed is an unverified
+declaration and therefore a failure, not a "NOT CHECKED" line in a green log. An earlier revision
+only failed when NO CLI was present, so a host with one of the two passed on the other's strength
+while an entire declaration went unchecked — "could not check" reported as "checked and fine", in
+the guard written to refuse exactly that. A host that genuinely has one provider can say so out
+loud with FIRM_READINESS_LIVE_ALLOW_MISSING=gpt (comma-separated), which still prints the provider
+as unverified; there is no silent path.
+
+The two arms rot differently, and both rot safely:
+
+  * The UNAVAILABLE half is pinned on every host, authenticated or not, because the logged-out arm
+    is forced. It fires the day either vendor changes "Not logged in", `loggedIn:false`, or their
+    exit statuses.
+  * The READY half is only pinned on an authenticated host. On a logged-out one it is reported as
+    NOT EXERCISED with a WARNING line, so a green log still says which half was checked. A ready
+    declaration that goes stale unnoticed produces a false BLOCK, never a false available.
+
+Nothing here costs subscription spend — both declared commands are local status queries; neither
+starts a model turn.
 """
 import json
 import os
@@ -112,7 +129,17 @@ def main():
                             f"wrapper runs {declaration['probe_argv']}")
         executable = shutil.which(EXECUTABLE[name])
         if not executable:
-            print(f"NOT CHECKED {name}: {EXECUTABLE[name]} is not installed on this host")
+            waived = [item.strip() for item
+                      in os.environ.get("FIRM_READINESS_LIVE_ALLOW_MISSING", "").split(",")
+                      if item.strip()]
+            if name in waived:
+                print(f"UNVERIFIED {name}: {EXECUTABLE[name]} is not installed and was explicitly "
+                      f"waived by FIRM_READINESS_LIVE_ALLOW_MISSING; its declaration was NOT checked")
+            else:
+                problems.append(
+                    f"{name} is declared but {EXECUTABLE[name]} is not installed, so its readiness "
+                    f"declaration — command, response keys and exit statuses — was not verified. "
+                    f"Set FIRM_READINESS_LIVE_ALLOW_MISSING={name} to state that on purpose")
             continue
         checked.append(name)
         argv = [executable] + list(declaration["probe_argv"])
@@ -151,8 +178,9 @@ def main():
                     f"declared answer. The wrapper turns that into a BLOCK, so this host has no "
                     f"working {name} second voice — the declaration has drifted from the CLI")
             elif answer == "unavailable":
-                print(f"    NOT EXERCISED {name}: this host is logged out of {EXECUTABLE[name]}, so "
-                      f"the 'ready' answer could not be confirmed against a real authenticated CLI")
+                print(f"    WARNING: NOT EXERCISED {name}: this host is logged out of "
+                      f"{EXECUTABLE[name]}, so the 'ready' half of its declaration was NOT confirmed "
+                      f"against a real authenticated CLI. Only the unavailable half is pinned here")
 
         # Every declared response key must be emitted by a real CLI.
         for key in declaration["keys"]:
@@ -175,6 +203,7 @@ def main():
         print("FAIL: no provider CLI is installed, so no declaration was verified. 'Could not check' "
               "is reported as a failure on purpose.")
         return 1
+    print(f"CHECKED against a real CLI: {', '.join(checked)}")
     for line in problems:
         print("FAIL: " + line)
     if problems:

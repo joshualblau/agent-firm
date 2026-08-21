@@ -1192,6 +1192,15 @@ except Exception as exc:
         finalize_attempt("unavailable", 3, "reviewer_unavailable", {"reason":unavailable_reason}, trusted_reason=unavailable_reason, diagnostic=str(diagnostic_path.relative_to(run)))
         stop(f"trusted structured authentication readiness is unavailable: {unavailable_reason} (exit 3)", 3)
     if answer != "ready":
+        # INVARIANT: no byte of a readiness response is published. The body exists only in the
+        # control root (deleted on exit; persistent raw retention is refused outright at parse time),
+        # and this message deliberately carries the argv label and the numeric exit status and
+        # nothing from the response. That makes an unrecognised answer harder to debug, which makes
+        # "just include the first line" a very natural next edit — and that edit would put an
+        # unredacted provider auth response into a published artifact. If the body is ever wanted
+        # here it must go through redact() and past the sentinel cases in
+        # tests/test-provider-reviewers.sh ("a readiness body is never published"), which fail if a
+        # token- or account-shaped string from the response reaches anything under the run directory.
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"authentication"}, diagnostic=str(diagnostic_path.relative_to(run)))
         probe_label = Path(executable).name + " " + " ".join(READINESS_CONTRACT[provider]["command"])
         stop(f"authentication readiness gave no recognised answer from `{probe_label}` (exit {rc}); "
@@ -1216,10 +1225,15 @@ except Exception as exc:
     #
     # The claim the probe existed to make is still enforced, at the point of use and with a louder
     # failure: judge_invocation() passes the resolved model (`-m` / `--model`) and an unknown model
-    # makes the judge phase exit nonzero, which is BLOCK (exit 1). That is STRICTER than what was
-    # removed: the old path could answer "model" as a TRUSTED unavailable reason and hand the run a
-    # routine second-voice waiver. Removing the probe closes that laundering route and leaves the
-    # model question answered by the only thing that can answer it — actually asking for the model.
+    # makes the judge phase exit nonzero, which is BLOCK (exit 1).
+    #
+    # Precisely on what was removed: the old model phase COULD answer "model" as a TRUSTED
+    # unavailable reason and hand the run a routine second-voice waiver, but only in response to a
+    # `{"status":"unavailable","reason":"model"}` payload — which is a shape the firm invented. On
+    # the real CLIs that route was unreachable: codex exits 2 and claude answers in prose, and both
+    # fail json.loads and land on BLOCK. The exit-3 laundering route existed in the code and only
+    # the test stub could walk it. That is an argument for removal, not against it — a gate whose
+    # trusted branch is reachable exclusively by the firm's own stub is measuring the stub.
 
     schema_path = controlled_schema
     schema_text = json.dumps(json.loads(schema_path.read_text(encoding="utf-8")), separators=(",", ":"))
