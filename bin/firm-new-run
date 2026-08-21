@@ -109,37 +109,99 @@ print(json.dumps(view, sort_keys=True, separators=(",", ":")))
 PY
 fi
 
+# ---------------------------------------------------------------------------
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation). Factored precisely so the two cannot drift apart. It is also the
+# documentation surface for --base: an operator refused by the base guard below lands here, at the
+# moment they need it, and no provider-parity-compared file (commands/start.md,
+# codex-skills/start/SKILL.md) has to be edited to say it twice.
+usage() {
+  cat <<'EOF'
+usage: firm-new-run [--primary claude|codex] [--base <rev>] <slug> [fast_path|full_track]
+       firm-new-run --metadata-view <run-dir>
+       firm-new-run --help
+
+Scaffolds .agent-firm/runs/<ts>-<slug>/, seeds it from the firm templates, opens run.jsonl with a
+run_started event, and points .agent-firm/CURRENT_RUN at it. Run from the ROOT of the work project
+(the git repo you are operating on).
+
+  --primary claude|codex   Provider that is primary for this run. Default: claude.
+  --base <rev>             The commit this run records as its ALREADY-REVIEWED base. Any revision
+                           this repository resolves to a commit is accepted (a full or short sha, a
+                           tag, origin/main, HEAD~1); the 40-character sha git resolves it to is what
+                           gets recorded, never the string you typed.
+  --metadata-view <dir>    Print normalized metadata for an existing run directory, and exit.
+  -h, --help               Print this synopsis and exit. Creates nothing.
+
+--base IS REQUIRED WHEN HEAD IS NOT AT THE TIP OF THIS REPOSITORY'S DEFAULT BRANCH. accepted_base_sha
+is what every mechanical gate downstream treats as already reviewed, so this script will not derive it
+silently from wherever HEAD happens to be; it has to be stated. The same requirement applies when the
+default branch cannot be resolved at all (no origin/HEAD, and no local main or master) -- unknown is
+not the same as HEAD. `git remote set-head origin -a` fixes that underlying cause; --base <rev> states
+the answer directly.
+EOF
+}
+
+# The help dispatch reads the FIRST positional argument, before any option is consumed, so that
+# `firm-new-run --primary claude --help` is NOT help: it falls through to the slug rules below and is
+# refused. A refusal is the safer of the two answers for an invocation nobody meant to write, and
+# scoping help to argv[1] keeps this from becoming a general option parser.
+first_arg="${1:-}"
+case "$first_arg" in --help|-h) usage; exit 0 ;; esac
+
 primary="claude"
-if [[ "${1:-}" == "--primary" ]]; then
-  primary="${2:-}"
-  shift 2 || true
-fi
+base_arg=""
+base_given=false
+# Leading options, in any order. `shift 2 || break` (not `shift 2 || true`) is deliberate: when the
+# option is the last argument, `shift 2` fails and shifts NOTHING, so looping again would spin on the
+# same argv forever. Breaking leaves argv untouched, which reproduces the pre-existing behaviour of
+# `firm-new-run --primary` exactly -- slug becomes "--primary", primary becomes "", and the
+# provider check below still exits 2.
+while :; do
+  case "${1:-}" in
+    --primary) primary="${2:-}"; shift 2 || break ;;
+    --base)    base_arg="${2:-}"; base_given=true; shift 2 || break ;;
+    *) break ;;
+  esac
+done
 slug="${1:-}"
+slug_raw="$slug"
 track="${2:-full_track}"
 if [[ -z "$slug" ]]; then
-  echo "usage: firm-new-run [--primary claude|codex] <slug> [fast_path|full_track]" >&2; exit 2
+  usage >&2; exit 2
 fi
+# Refuse a flag-shaped slug. Every recognized option has already been consumed above, so a remaining
+# leading hyphen is by definition not one. This is the D-03 defect: `--help` survives BOTH `tr` stages
+# intact (hyphens are inside the [a-z0-9-] keep-set), so the sanitizer happily produced the run id
+# `20260821T011819Z---help`, seeded every template into it, wrote a run_started event and repointed
+# CURRENT_RUN. `printf '%s'`, never `echo`: a slug holding backslashes must not be re-interpreted by a
+# shell whose `echo` expands them.
+case "$slug_raw" in
+  -*)
+    printf 'firm-new-run: refusing slug %s -- it is not a recognized option, and a leading hyphen makes an unusable run id\n' "$slug_raw" >&2
+    printf 'firm-new-run: run `firm-new-run --help` for the accepted options\n' >&2
+    exit 2
+    ;;
+esac
 case "$primary" in claude|codex) ;; *) echo "firm-new-run: --primary must be claude or codex" >&2; exit 2 ;; esac
 case "$track" in fast_path|full_track) ;; *) echo "firm-new-run: track must be fast_path or full_track" >&2; exit 2 ;; esac
 slug="$(printf '%s' "$slug" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
-
-ts="$(date -u +%Y%m%dT%H%M%SZ)"
-run_id="${ts}-${slug}"
-run_dir=".agent-firm/runs/${run_id}"
-mkdir -p "$run_dir/05-work-orders" "$run_dir/09-test-evidence"
-
-# Seed from templates (copy whatever exists; don't fail if a template is missing).
-if [[ -d "$TEMPLATES" ]]; then
-  for t in "$TEMPLATES"/*; do
-    # Ledger artifacts are files. Skip directories (e.g. templates/visual/, which is a
-    # project scaffold for firm-visual-check, not a run artifact) — `cp -n` on a directory
-    # fails and, under `set -e`, aborted the whole run scaffold.
-    [[ -f "$t" ]] || continue
-    cp -n "$t" "$run_dir/$(basename "$t")"
-  done
+# A slug made only of characters the sanitizer strips leaves nothing behind, and the run id becomes a
+# bare timestamp with a trailing hyphen -- a directory nobody can identify later. Refuse it here, with
+# the ORIGINAL slug in the diagnostic, since the sanitized one is empty and names nothing.
+if [[ -z "$slug" ]]; then
+  printf 'firm-new-run: refusing slug %s -- nothing survives slug sanitization, so the run id would be a bare timestamp\n' "$slug_raw" >&2
+  printf 'firm-new-run: run `firm-new-run --help` for the accepted options\n' >&2
+  exit 2
 fi
 
-# Open the append-only event log.
+# ---------------------------------------------------------------------------
+# GIT STATE IS RESOLVED HERE, AHEAD OF THE SCAFFOLD BELOW. The values computed in this section are
+# functions of $PWD and git state alone -- nothing here reads anything the scaffold creates -- so
+# hoisting it above the first `mkdir` is value-preserving, and it is what lets every refusal in this
+# script precede the first directory it would otherwise have created. A guard that runs after the
+# scaffold still returns the right exit status while leaving a partial run behind, which is the shape
+# of "check that cannot fail" this ordering exists to prevent.
 repo="$(basename "$(pwd)")"
 repo_root=""
 git_common_dir=""
@@ -159,9 +221,13 @@ fi
 # because eval fixtures happen to start with exactly one commit, and proves nothing in a real repo).
 # Every `if`/`||` below is deliberately structured so a resolution failure does NOT abort run creation
 # under `set -e` — `cmd && { ...; }` as a bare statement WOULD trigger -e on failure; `if cmd; then`
-# and a trailing `|| true` do not. Absence of a resolvable default branch (no git, or a brand-new repo
-# with zero commits) means no baseline is written below — callers must fail closed on that absence,
-# never assume "unchanged", the same way firm-doctor now fails closed on a settings.json it can't read.
+# and a trailing `|| true` do not. Absence of a resolvable default branch means no baseline is written
+# below — callers must fail closed on that absence, never assume "unchanged", the same way firm-doctor
+# now fails closed on a settings.json it can't read. It ALSO now means the base guard below refuses the
+# run outright whenever HEAD resolves to a commit, because an unknown default branch is not evidence
+# that HEAD is that branch's tip. The two remaining no-baseline paths (not a git repo; a repo with
+# zero commits) are unaffected: there HEAD resolves to nothing, no base is recorded at all,
+# approval_eligible is false, and the downstream readers already fail closed on the missing baseline.
 default_branch=""
 default_branch_start_sha=""
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -186,8 +252,94 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fi
 fi
 
-printf '{"ts":"%s","event":"run_started","event_id":"evt-run-started-%s","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" >> "$run_dir/run.jsonl"
+# THE BASE GUARD. base_sha lands in run-metadata.json as accepted_base_sha, which firm-qa-checkout,
+# firm-traceability-check, firm-qa-clean-check and firm-reviewer-common all treat as the commit that
+# was ALREADY REVIEWED. Deriving it from HEAD marks whatever HEAD happens to be sitting on as
+# pre-approved, silently. The comparison is BY SHA, never by branch name, so a detached HEAD parked on
+# the default branch's tip is a legitimate silent success rather than a refusal.
+#
+# Fires when a base WOULD be recorded (HEAD resolves) AND none was stated AND it is not the default
+# branch's tip -- INCLUDING when the default branch's tip cannot be established at all, because
+# unknown is not HEAD. When HEAD resolves to nothing there is no base to mis-record: base_sha stays
+# "", approval_eligible stays false, no run-baseline.json is written, and the downstream readers
+# already refuse such a run. Demanding --base there would fail closed against a risk that does not
+# exist.
+base_source=none
+if [[ "$base_given" == true ]]; then
+  # Refuse a leading hyphen BEFORE the value reaches git, so no --base value can be read as a git
+  # option. Then resolve with `--verify --quiet` and record what GIT PRINTS, never the operator's
+  # string: the recorded value is interpolated into run.jsonl and run-metadata.json by printf, and 40
+  # characters of [0-9a-f] cannot corrupt either file, while a quote, a backslash or a newline in the
+  # raw argument could. `--verify --quiet` specifically, for the reason spelled out above: plain
+  # `git rev-parse` echoes the literal ref to stdout before failing.
+  case "$base_arg" in
+    -*)
+      printf 'firm-new-run: refusing --base %s -- a revision may not begin with a hyphen\n' "$base_arg" >&2
+      exit 2
+      ;;
+  esac
+  explicit_base="$(git rev-parse --verify --quiet "${base_arg}^{commit}" 2>/dev/null || true)"
+  if [[ -z "$explicit_base" ]]; then
+    printf 'firm-new-run: refusing --base %s -- this repository cannot resolve it to a commit\n' "$base_arg" >&2
+    exit 2
+  fi
+  base_sha="$explicit_base"
+  base_source=explicit
+elif [[ -n "$base_sha" ]]; then
+  if [[ "$base_sha" == "$default_branch_start_sha" ]]; then
+    base_source=default_branch_tip
+  else
+    head_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    # Double quotes on this one format string, single quotes on the rest: it is the only line here
+    # that needs an apostrophe, and `\n` is not expanded inside double quotes either, so printf still
+    # receives the escape and emits the newline.
+    printf "firm-new-run: refusing to open a run: HEAD is not at the tip of this repository's default branch.\n" >&2
+    if [[ -n "$head_branch" ]]; then
+      printf 'firm-new-run:   HEAD is on branch %s, at %s\n' "$head_branch" "$base_sha" >&2
+    else
+      printf 'firm-new-run:   HEAD is detached, at %s\n' "$base_sha" >&2
+    fi
+    printf 'firm-new-run:   %s is the base this run would otherwise have recorded as accepted_base_sha\n' "$base_sha" >&2
+    if [[ -n "$default_branch" ]]; then
+      printf 'firm-new-run:   default branch %s is at %s\n' "$default_branch" "$default_branch_start_sha" >&2
+    else
+      printf 'firm-new-run:   this repository has no resolvable default branch (no origin/HEAD, no local main or master)\n' >&2
+      printf 'firm-new-run:   an unknown default branch is not evidence that HEAD is its tip\n' >&2
+    fi
+    printf 'firm-new-run: accepted_base_sha is what every mechanical gate treats as ALREADY REVIEWED, so it is\n' >&2
+    printf 'firm-new-run: never derived silently from HEAD. State the reviewed base on the record instead:\n' >&2
+    printf 'firm-new-run:   firm-new-run --base <rev> <slug> [fast_path|full_track]\n' >&2
+    printf 'firm-new-run: if the default branch simply could not be resolved, `git remote set-head origin -a`\n' >&2
+    printf 'firm-new-run: fixes that cause; `firm-new-run --help` has the full synopsis.\n' >&2
+    exit 2
+  fi
+fi
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="${ts}-${slug}"
+run_dir=".agent-firm/runs/${run_id}"
+mkdir -p "$run_dir/05-work-orders" "$run_dir/09-test-evidence"
+
+# Seed from templates (copy whatever exists; don't fail if a template is missing).
+if [[ -d "$TEMPLATES" ]]; then
+  for t in "$TEMPLATES"/*; do
+    # Ledger artifacts are files. Skip directories (e.g. templates/visual/, which is a
+    # project scaffold for firm-visual-check, not a run artifact) — `cp -n` on a directory
+    # fails and, under `set -e`, aborted the whole run scaffold.
+    [[ -f "$t" ]] || continue
+    cp -n "$t" "$run_dir/$(basename "$t")"
+  done
+fi
+
+# Open the append-only event log. base_source records HOW the base above was chosen -- explicit (the
+# operator stated it with --base), default_branch_tip (HEAD was the default branch's tip), or none (no
+# base was recorded at all). It is APPENDED AT THE END of the object on purpose: run-metadata.json's
+# reader compares its parsed field set for EXACT equality and fails closed on any difference, so this
+# decision cannot live there; and tests/test-new-run.sh asserts the exact adjacent substring
+# "default_branch":"","default_branch_start_sha":"", so a field inserted between those two keys would
+# break a pre-existing assertion. The ledger is append-only and its consumers read by key.
+printf '{"ts":"%s","event":"run_started","event_id":"evt-run-started-%s","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s","base_source":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" "$base_source" >> "$run_dir/run.jsonl"
 chmod 600 "$run_dir/run.jsonl"
 
 # Machine-readable current metadata. Historical runs are interpreted only through --metadata-view.
