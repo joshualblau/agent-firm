@@ -147,7 +147,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Blocking objections as plain text, in the same order as blocker_objects. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
+      "description": "Blocking objections as plain text, in the same order as blocker_objects. The PAIRING RULE, which is REQUIRED and is enforced after you answer: blockers and blocker_objects are parallel arrays of the same length, and blocker_objects[i].text must be the EXACT SAME STRING as blockers[i] — character for character, not a summary, not a paraphrase, not a shortened restatement. Every blocker_objects[i].id must be unique. A verdict whose object text differs from its blocker text in any way is discarded, so put the full objection in both fields and use `id`, `affected_criteria` and `affected_paths` for the parts that are not prose. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
     },
     "blocker_objects": {
       "type": "array",
@@ -155,7 +155,7 @@
       "items": {
         "$ref": "#/$defs/blockerObject"
       },
-      "description": "Immutable producer-authored identity and risk mapping for every BLOCK objection. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
+      "description": "Immutable producer-authored identity and risk mapping for every BLOCK objection. The PAIRING RULE, which is REQUIRED and is enforced after you answer: blockers and blocker_objects are parallel arrays of the same length, and blocker_objects[i].text must be the EXACT SAME STRING as blockers[i] — character for character, not a summary, not a paraphrase, not a shortened restatement. Every blocker_objects[i].id must be unique. A verdict whose object text differs from its blocker text in any way is discarded, so put the full objection in both fields and use `id`, `affected_criteria` and `affected_paths` for the parts that are not prose. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
     },
     "warnings": {
       "type": "array",
@@ -229,7 +229,8 @@
         },
         "text": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "The blocker text. Must be the EXACT SAME STRING as blockers[i] for the same index i — character for character, not a summary, not a paraphrase, not a shortened restatement."
         },
         "affected_criteria": {
           "type": "array",

@@ -116,6 +116,11 @@ projected=namespace["transport_schema"](canonical)
 probe=namespace["transport_schema"](
     {"type":"object","properties":{"pattern":{"type":"string","format":"uri"},
                                    "default":{"type":"string"}}})
+def carries_pairing_rule(node):
+    """Does the projected schema tell the judge that blocker_objects[i].text must be the EXACT
+    string blockers[i]? A live claude BLOCK was discarded for breaking a rule stated nowhere."""
+    text = json.dumps(node).lower()
+    return "exact same string" in text and "paraphrase" in text
 def carries_rule(node):
     """Does the projected schema still TELL the judge the BLOCK/APPROVE blocker rule? The canonical
     allOf that encodes it cannot go on the wire, so it is carried in descriptions, which the
@@ -140,6 +145,10 @@ print(json.dumps({
     "rule_reaches_verdict_property": carries_rule(projected["properties"]["verdict"]),
     "rule_reaches_blockers_property": carries_rule(projected["properties"]["blockers"]),
     "rule_reaches_blocker_objects_property": carries_rule(projected["properties"]["blocker_objects"]),
+    "pairing_reaches_blockers": carries_pairing_rule(projected["properties"]["blockers"]),
+    "pairing_reaches_blocker_objects": carries_pairing_rule(projected["properties"]["blocker_objects"]),
+    "pairing_reaches_object_text": carries_pairing_rule(
+        projected["$defs"]["blockerObject"]["properties"]["text"]),
 }, sort_keys=True))
 PY
 )"
@@ -178,6 +187,17 @@ assert_eq "the rule still reaches the judge on the verdict property" "true" "$(p
 assert_eq "the rule still reaches the judge on the blockers property" "true" "$(proj rule_reaches_blockers_property)"
 assert_eq "the rule still reaches the judge on the blocker_objects property" "true" \
   "$(proj rule_reaches_blocker_objects_property)"
+# Defect #7: `blocker_objects[i].text` must be byte-identical to `blockers[i]`, and the schema said
+# only "in the same order as blocker_objects". A live claude judge read that reasonably, summarised
+# its object texts, and had a 420s paid verdict discarded. Same fix, same route as the APPROVE rule.
+assert_eq "the exact-text pairing rule reaches the judge on the blockers property" "true" \
+  "$(proj pairing_reaches_blockers)"
+assert_eq "the exact-text pairing rule reaches the judge on the blocker_objects property" "true" \
+  "$(proj pairing_reaches_blocker_objects)"
+assert_eq "the exact-text pairing rule reaches the judge on blockerObject.text itself" "true" \
+  "$(proj pairing_reaches_object_text)"
+assert_ok "the judge prompt states the pairing rule as well" \
+  sh -c "grep -q 'must be the EXACT SAME STRING as .blockers\[i\]' \"\$1\"" sh "$COMMON"
 assert_ok "the judge prompt states the rule too, since the wire schema cannot enforce it" \
   sh -c "grep -q 'APPROVE/BLOCK blocker rule is enforced after you answer' \"\$1\"" sh "$COMMON"
 

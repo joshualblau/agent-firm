@@ -79,6 +79,18 @@ for provider in ("gpt","claude"):
   d=dict(base); d["provider"]=provider; d["verdict"]=word; d["blockers"]=[] if word=="APPROVE" else ["fixture blocker"]
   if word=="BLOCK": d["blocker_objects"]=[{"id":"obj-fixture","text":"fixture blocker","affected_criteria":[],"affected_paths":[]}]
   json.dump(d,open(os.path.join(w,f"{provider}-{word.lower()}.json"),"w"))
+ # A BLOCK whose object text SUMMARISES its blocker text. This is the shape a live claude judge
+ # actually returned on 2026-08-23: legal under "in the same order as blocker_objects", which was
+ # all the schema said, and discarded by a byte-identity rule that had never been stated anywhere.
+ summarised=dict(base); summarised["provider"]=provider; summarised["verdict"]="BLOCK"
+ summarised["blockers"]=["the candidate leaves acceptance criterion AC-1 unproved because the cited evidence is a prose claim"]
+ summarised["blocker_objects"]=[{"id":"obj-fixture","text":"AC-1 unproved","affected_criteria":[],"affected_paths":[]}]
+ json.dump(summarised,open(os.path.join(w,f"{provider}-block-summarised.json"),"w"))
+ duplicated=dict(base); duplicated["provider"]=provider; duplicated["verdict"]="BLOCK"
+ duplicated["blockers"]=["first objection","second objection"]
+ duplicated["blocker_objects"]=[{"id":"obj-same","text":"first objection","affected_criteria":[],"affected_paths":[]},
+                                {"id":"obj-same","text":"second objection","affected_criteria":[],"affected_paths":[]}]
+ json.dump(duplicated,open(os.path.join(w,f"{provider}-block-duplicated.json"),"w"))
 PY
 
 cat > "$STUB/codex" <<'SH'
@@ -169,6 +181,8 @@ case "$STUB_MODE" in
   promotion_symlink) rm -f "$STUB_RUN/08-qa-verdict.gpt.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/08-qa-verdict.gpt.json"; src="$STUB_GPT_APPROVE" ;;
   review_blocker) grep -q 'status: open' "$PWD/input/run-evidence/files/07-review-findings.yaml" && src="$STUB_GPT_BLOCK" || src="$STUB_GPT_APPROVE" ;;
   block) src="$STUB_GPT_BLOCK" ;;
+  block_summarised) src="$STUB_GPT_SUMMARISED" ;;
+  block_duplicated) src="$STUB_GPT_DUPLICATED" ;;
   *) src="$STUB_GPT_APPROVE" ;;
 esac
 python3 - "$FIRM_QA_BEHAVIOR_SENTINEL" "$PWD" "$HOME" "$all_args" "$STUB_MODE" "$FIRM_QA_INPUT_MANIFEST" "${STUB_MANIFEST_CAPTURE:-}" <<'PY'
@@ -253,6 +267,8 @@ case "$STUB_MODE" in
   promotion_symlink) rm -f "$STUB_RUN/08-qa-verdict.claude.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/08-qa-verdict.claude.json"; src="$STUB_CLAUDE_APPROVE" ;;
   review_blocker) grep -q 'status: open' "$PWD/input/run-evidence/files/07-review-findings.yaml" && src="$STUB_CLAUDE_BLOCK" || src="$STUB_CLAUDE_APPROVE" ;;
   block) src="$STUB_CLAUDE_BLOCK" ;;
+  block_summarised) src="$STUB_CLAUDE_SUMMARISED" ;;
+  block_duplicated) src="$STUB_CLAUDE_DUPLICATED" ;;
   *) src="$STUB_CLAUDE_APPROVE" ;;
 esac
 python3 - "$FIRM_QA_BEHAVIOR_SENTINEL" "$PWD" "$HOME" "$all_args" "$STUB_MODE" "$FIRM_QA_INPUT_MANIFEST" "${STUB_MANIFEST_CAPTURE:-}" <<'PY'
@@ -293,6 +309,8 @@ review_env() { # mode wrapper [extra args]
   env PATH="$STUB:/usr/bin:/bin" STUB_MODE="$mode" STUB_CALLS="$CALLS" STUB_CHILD="$WORK/child.pid" \
     STUB_GPT_APPROVE="$WORK/gpt-approve.json" STUB_GPT_BLOCK="$WORK/gpt-block.json" \
     STUB_CLAUDE_APPROVE="$WORK/claude-approve.json" STUB_CLAUDE_BLOCK="$WORK/claude-block.json" \
+    STUB_GPT_SUMMARISED="$WORK/gpt-block-summarised.json" STUB_GPT_DUPLICATED="$WORK/gpt-block-duplicated.json" \
+    STUB_CLAUDE_SUMMARISED="$WORK/claude-block-summarised.json" STUB_CLAUDE_DUPLICATED="$WORK/claude-block-duplicated.json" \
     STUB_CANDIDATE="$RUN/09-test-evidence/qa-candidate.json" \
     STUB_MANIFEST_CAPTURE="${STUB_MANIFEST_CAPTURE:-}" STUB_RUN="$RUN" STUB_REDIRECT="$WORK/redirect-target" \
     FIRM_GPT_QA_DISCOVERY_TIMEOUT=2 FIRM_GPT_QA_READINESS_TIMEOUT=2 FIRM_GPT_QA_TIMEOUT=2 \
@@ -597,6 +615,29 @@ python3 - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="open"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
+t_case "a BLOCK whose object text is not its blocker text is rejected, and the message says which"
+# Defect #7, 2026-08-23: a live claude judge returned a well-formed BLOCK whose blocker_objects[i].text
+# SUMMARISED blockers[i]. The wrapper discarded a 420-second paid run and reported only "missing,
+# duplicated, reordered, or contradict blocker text" -- four distinct failures behind one string, so
+# the reader could not tell which had happened without opening the source. GPT had passed the same
+# check only because its texts happened to match byte for byte. Enforcement is unchanged here; what
+# these cases pin is that the diagnosis names the actual failure and its index.
+for wrapper_name in GPT CLAUDE; do
+  eval "wrapper=\$$wrapper_name"
+  out="$(review_env block_summarised "$wrapper" 2>&1)"; rc=$?
+  assert_eq "$wrapper_name summarised object text is still rejected" "1" "$rc"
+  assert_ok "$wrapper_name says the TEXT differs, not that the order is wrong" \
+    sh -c "printf '%s' \"\$1\" | grep -q 'is not the exact string blockers\[0\]'" sh "$out"
+  assert_ok "$wrapper_name names the differing index" \
+    sh -c "printf '%s' \"\$1\" | grep -q 'Indices differing: 0'" sh "$out"
+  assert_ok "$wrapper_name says a paraphrase is not accepted" \
+    sh -c "printf '%s' \"\$1\" | grep -q 'summary or paraphrase is not'" sh "$out"
+  out="$(review_env block_duplicated "$wrapper" 2>&1)"; rc=$?
+  assert_eq "$wrapper_name duplicate blocker ids are still rejected" "1" "$rc"
+  assert_ok "$wrapper_name names the duplicated id rather than the text mismatch" \
+    sh -c "printf '%s' \"\$1\" | grep -q 'ids are not unique: obj-same'" sh "$out"
+done
+
 assert_rc "GPT sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$GPT"
 assert_rc "Claude sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$CLAUDE"
 python3 - "$RUN/07-review-findings.yaml" <<'PY'
