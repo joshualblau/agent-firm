@@ -204,7 +204,12 @@ CREDENTIAL_CONTRACT = {
         "materialize": [
             {"id": "codex_auth", "kind": "copy", "source": "~/.codex/auth.json",
              "destination": "codex/auth.json", "mode": 0o400,
-             "exposes": "codex_oauth_credential"},
+             "exposes": "codex_oauth_credential",
+             "caveats": [
+                 "A copy at mode 0400, so the operator's ~/.codex/auth.json cannot be written "
+                 "through this passthrough. A token the CLI refreshes during the judge run is "
+                 "written to the copy and discarded with the control root.",
+             ]},
         ],
     },
     "claude": {
@@ -217,7 +222,22 @@ CREDENTIAL_CONTRACT = {
             {"id": "login_keychain", "kind": "symlink",
              "source": "~/Library/Keychains/login.keychain-db",
              "destination": "Library/Keychains/login.keychain-db", "mode": None,
-             "exposes": "macos_login_keychain"},
+             "exposes": "macos_login_keychain",
+             # Both of these were true from the first commit and were stated only in conversation.
+             # A caveat that lives in a handback is a caveat the next reader does not get, so they
+             # are published here, reach --print-capability-contract, and are written into every
+             # attempt record beside the exposure they qualify.
+             "caveats": [
+                 "This is a live symlink to the operator's real login keychain, so Claude Code's "
+                 "OAuth refresh can WRITE BACK through it. It is the one surface in this "
+                 "passthrough that is not read-only. A copy is not an alternative: the credential "
+                 "is obtainable only by extracting plaintext tokens from the keychain.",
+                 "The canary is silent on keychain CONTENTS by construction. It checks whether a "
+                 "path inside the sealed home resolves onto an operator surface; it does not and "
+                 "cannot enumerate what this keychain holds, so any other secret in the operator's "
+                 "login keychain that the claude binary's ACLs permit is within reach of that "
+                 "process and is not covered by any check here.",
+             ]},
         ],
     },
 }
@@ -299,7 +319,10 @@ def credential_declaration(provider_name):
         "unset_environment": unset,
         "materialize": [
             {"id": item["id"], "kind": item["kind"], "source": item["source"],
-             "destination": item["destination"], "exposes": item["exposes"]}
+             "destination": item["destination"], "exposes": item["exposes"],
+             # Published WITH the exposure, never separately: the qualification and the thing it
+             # qualifies have to arrive together or the reader gets the reassuring half.
+             "caveats": list(item.get("caveats", []))}
             for item in declared["materialize"]
         ],
         # The read boundary travels with the credential declaration because they are read together
@@ -585,6 +608,20 @@ def bounded_nonnegative(name, value, default, maximum):
 prefix = "FIRM_GPT_QA" if provider == "gpt" else "FIRM_CLAUDE_QA"
 discovery_timeout = positive("discovery timeout", args.discovery_timeout or os.environ.get(prefix+"_DISCOVERY_TIMEOUT"), 15, 120)
 readiness_timeout = positive("readiness timeout", args.readiness_timeout or os.environ.get(prefix+"_READINESS_TIMEOUT") or os.environ.get(prefix+"_PREFLIGHT_TIMEOUT"), 30, 180)
+# DEFAULT 300 s, AND THE FIRST REAL CANDIDATE THE FIRM EVER JUDGED EXCEEDED IT.
+#
+# Measured 2026-08-23, run 20260823T030032Z-judge-credential-boundary, candidate 5a23596, gpt:
+#   attempt gpt-c1-a0001   timed out at 300 s (default)   -> reviewer_timeout, BLOCK
+#   attempt gpt-c1-a0002   timed out at 300 s (default)   -> reviewer_timeout, BLOCK
+#   attempt gpt-c1-a0003   completed in 352 s, with --judge-timeout raised to 900
+#
+# So the default is not a margin around normal cost; it sits BELOW it for a real change of this
+# firm, and two attempts were spent discovering that. A judge that cannot finish reads as a judge
+# that failed: `reviewer_timeout` is a correctly classified BLOCK, and nothing in that outcome says
+# "it needed more seconds". The number is left at 300 deliberately — raising a spend bound is a
+# separate decision with its own approval, exactly as the eval ceiling was — but it is recorded here
+# so the next person meets the measurement rather than the mystery. The ceiling of 900 is unchanged
+# and is what the successful attempt ran under.
 judge_timeout = positive("judge timeout", args.judge_timeout or os.environ.get(prefix+"_TIMEOUT"), 300, 900)
 grace = positive("kill grace", args.grace or os.environ.get("FIRM_QA_KILL_GRACE"), 2, 30)
 max_output = positive("output cap", args.max_output or os.environ.get("FIRM_QA_MAX_OUTPUT"), 65536, 1048576)
@@ -1297,12 +1334,76 @@ except Exception as exc:
             yield value
     for origin in artifact_strings(primary_doc):
         add_source(origin)
+
+    # PRIOR TERMINAL REVIEWER ATTEMPTS, discovered from the target ledger.
+    #
+    # The judge contract promises the manifest inventories "every referenced nested evidence file
+    # with source/copy digest, size, mode, origin, and redaction transform. Treat an omission or
+    # mismatch as uncertainty and BLOCK." run.jsonl IS in the manifest, and its terminal reviewer
+    # events name an attempt record with `sha256` and `bytes`. Those records were reachable only if
+    # traceability.yaml happened to declare them — walk_refs() above already validates an origin
+    # against `event.get("attempt")`, so the SHAPE was anticipated — but nothing ever writes a
+    # reviewer attempt into traceability, so in practice they were never inventoried. The first live
+    # GPT judge held digests it could not check and did exactly what its contract says: BLOCK.
+    #
+    # Scope is deliberate and narrow:
+    #   * TERMINAL events only. A `reviewer_attempt_started` record is still being written.
+    #   * NEVER the current attempt. attempt.json is mutated throughout this run, so any digest
+    #     taken of it here would be stale before the judge read it.
+    #   * Digest and size must match the event that referenced them, exactly as traceability refs
+    #     are checked. A MISMATCH is tampering and stops the run.
+    #   * A referenced record that is ABSENT is recorded as an unresolved reference rather than
+    #     stopping the run or vanishing. Pruning an old attempt directory is plausible housekeeping
+    #     and must not brick review of the run; silently dropping it is what caused this finding.
+    #     Declaring it lets the judge weigh a gap it can see instead of one it cannot.
+    terminal_reviewer_events = (
+        "reviewer_approve", "reviewer_block", "reviewer_invalid",
+        "reviewer_timeout", "reviewer_unavailable",
+    )
+    unresolved_references = []
+    for item in ledger_records:
+        if item.get("event") not in terminal_reviewer_events:
+            continue
+        origin = item.get("attempt")
+        if not isinstance(origin, str) or not origin or origin == attempt_rel:
+            continue
+        if origin in seen_origins:
+            continue
+        if any(part in ("", ".", "..") for part in Path(origin).parts) or os.path.isabs(origin):
+            stop(f"target ledger references an unsafe attempt path: {origin!r}", 1)
+        target = run / origin
+        try:
+            info = os.lstat(target)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ValueError("not a regular no-follow file")
+            raw = target.read_bytes()
+        except Exception as exc:                                   # noqa: BLE001
+            unresolved_references.append({
+                "origin_path": origin, "referenced_by": item.get("event"),
+                "event_id": item.get("event_id"),
+                "declared_sha256": item.get("sha256"), "declared_bytes": item.get("bytes"),
+                "reason": f"unreadable:{type(exc).__name__}",
+            })
+            continue
+        if (str(item.get("sha256")) != hashlib.sha256(raw).hexdigest()
+                or str(item.get("bytes")) != str(len(raw))):
+            stop(f"prior reviewer attempt digest/size does not match the ledger event that "
+                 f"references it: {origin}", 1)
+        add_payload(origin, raw, os.lstat(target).st_mode)
     diff = subprocess.check_output(["git", "-C", str(repo), "diff", "--no-ext-diff", "--no-color", candidate["base_sha"], sha, "--"], stderr=subprocess.DEVNULL)
     if len(diff) > 2 * 1024 * 1024:
         stop("trusted candidate diff exceeds 2 MiB controlled-root bound", 1)
     add_payload("candidate.diff", diff, 0o400)
-    manifest = {"schema_version":1, "run_id":run.name, "candidate_sha":sha, "generation":generation,
-                "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"])}
+    manifest = {"schema_version":2, "run_id":run.name, "candidate_sha":sha, "generation":generation,
+                "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"]),
+                # Digest-referenced artifacts the manifest could NOT inventory. Empty is the normal
+                # case. A non-empty list is a declared gap the judge can weigh; the alternative —
+                # dropping the reference silently — is what its contract calls an omission.
+                "unresolved_references":sorted(unresolved_references,
+                                               key=lambda item:item["origin_path"]),
+                # The current attempt's own record is excluded by construction, not by accident:
+                # it is still being written while the judge reads this manifest.
+                "excludes_current_attempt":attempt_rel}
     atomic_write(run_snapshot / "input-manifest.json", json_bytes(manifest), 0o400)
 
     for current, dirs, files in os.walk(instruction_root, topdown=False):
@@ -1370,6 +1471,7 @@ except Exception as exc:
         for item in declared["materialize"]:
             entry = {"id": item["id"], "kind": item["kind"], "source": item["source"],
                      "destination": item["destination"], "exposes": item["exposes"],
+                     "caveats": list(item.get("caveats", [])),
                      "status": "refused", "reason": None}
             source = Path(os.path.expanduser(item["source"]))
             destination = config_root.joinpath(*Path(item["destination"]).parts)
