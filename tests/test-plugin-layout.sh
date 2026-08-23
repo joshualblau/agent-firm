@@ -165,7 +165,14 @@ assert calls == [
     ["claude", "-p", "Reply with exactly: ok", "--model", "opus", "--effort", "xhigh",
      "--output-format", "text", "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"],
     ["codex", "login", "status"],
-    ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-a", "never",
+    # `-a never` is TOP LEVEL, before `exec`. This expectation used to read
+    #   ["codex","exec","--skip-git-repo-check","--ephemeral","-s","read-only","-a","never",...]
+    # which is the 2026-08-23 defect written down as a passing test: `codex exec` rejects `-a`
+    # outright ("unexpected argument '-a' found", exit 2), so firm-doctor --probe could never have
+    # completed a Codex reviewer probe on any real host. The stub accepted it, so the test agreed
+    # with the stub and nothing else. tests/test-provider-launch-sites.sh now checks this argv
+    # against `codex exec --help` itself, which is the check that does not depend on a stub.
+    ["codex", "-a", "never", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
      "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"', "Reply with exactly: ok"],
 ], calls
 PY

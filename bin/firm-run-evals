@@ -195,9 +195,9 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
-      env FIRM_PRIMARY_PROVIDER=codex codex exec --ephemeral \
+      env FIRM_PRIMARY_PROVIDER=codex codex -a never exec --ephemeral \
         -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
-        -s workspace-write -a never --json "$prompt"
+        -s workspace-write --json "$prompt"
     provider_rc=$?
   fi
 

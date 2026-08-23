@@ -478,7 +478,7 @@ if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v codex >/dev/null 2>&1; then
   if run_capped 10 codex login status >/dev/null 2>&1; then
     pass "Codex ChatGPT subscription authentication is ready"
     if [ "$PROBE" = 1 ]; then
-      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
+      if run_capped 45 codex -a never exec --skip-git-repo-check --ephemeral -s read-only \
         -m "$CODEX_REVIEW_MODEL" -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" \
         "Reply with exactly: ok" >/dev/null 2>&1; then
         pass "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) completed a bounded read-only probe"
