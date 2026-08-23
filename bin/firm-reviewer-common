@@ -1390,6 +1390,62 @@ except Exception as exc:
             stop(f"prior reviewer attempt digest/size does not match the ledger event that "
                  f"references it: {origin}", 1)
         add_payload(origin, raw, os.lstat(target).st_mode)
+
+        # ONE LEVEL DEEPER: the artifacts that attempt record itself names. Inventorying the record
+        # and not its verdict recreates exactly the gap that record was added to close — a judge
+        # holding a reference it cannot resolve — one level down. Reported by the generation-2 GPT
+        # judge against gpt-c1-a0003/verdict.json and gpt-c1-a0004/verdict.json.
+        #
+        # `canonical` is deliberately NOT followed. It points at 08-qa-verdict.<provider>.json, a
+        # MUTABLE pointer that this very run unlinks before it starts; the immutable artifact is the
+        # attempt-local verdict.json, which is what the wrapper itself demands a canonical verdict
+        # be backed by. Following a moving target would manufacture an unresolved reference on every
+        # single run and teach the reader to ignore the list.
+        try:
+            attempt_doc = json.loads(raw.decode("utf-8", "strict"))
+        except Exception:                                          # noqa: BLE001
+            attempt_doc = None
+        if not isinstance(attempt_doc, dict):
+            unresolved_references.append({
+                "origin_path": origin, "referenced_by": item.get("event"),
+                "event_id": item.get("event_id"), "declared_sha256": None, "declared_bytes": None,
+                "reason": "attempt_record_is_not_a_json_object_so_its_artifacts_cannot_be_followed",
+            })
+            continue
+        # Digest attestation exists only for the verdict; the ledger event carries verdict_sha256 /
+        # verdict_bytes. The others are inventoried with the digest the manifest itself computes,
+        # which is a weaker claim and is not dressed up as a stronger one.
+        for field, declared_digest, declared_size in (
+            ("verdict", item.get("verdict_sha256"), item.get("verdict_bytes")),
+            ("prior_verdict", None, None),
+            ("diagnostic", None, None),
+            ("behavior_sentinel", None, None),
+        ):
+            nested = attempt_doc.get(field)
+            if not isinstance(nested, str) or not nested or nested in seen_origins:
+                continue
+            if any(part in ("", ".", "..") for part in Path(nested).parts) or os.path.isabs(nested):
+                stop(f"prior reviewer attempt references an unsafe artifact path: {nested!r}", 1)
+            nested_target = run / nested
+            try:
+                nested_info = os.lstat(nested_target)
+                if stat.S_ISLNK(nested_info.st_mode) or not stat.S_ISREG(nested_info.st_mode):
+                    raise ValueError("not a regular no-follow file")
+                nested_raw = nested_target.read_bytes()
+            except Exception as exc:                               # noqa: BLE001
+                unresolved_references.append({
+                    "origin_path": nested, "referenced_by": f"{origin}:{field}",
+                    "event_id": item.get("event_id"),
+                    "declared_sha256": declared_digest, "declared_bytes": declared_size,
+                    "reason": f"unreadable:{type(exc).__name__}",
+                })
+                continue
+            if declared_digest is not None and (
+                    str(declared_digest) != hashlib.sha256(nested_raw).hexdigest()
+                    or str(declared_size) != str(len(nested_raw))):
+                stop(f"prior reviewer verdict digest/size does not match the ledger event that "
+                     f"references it: {nested}", 1)
+            add_payload(nested, nested_raw, os.lstat(nested_target).st_mode)
     diff = subprocess.check_output(["git", "-C", str(repo), "diff", "--no-ext-diff", "--no-color", candidate["base_sha"], sha, "--"], stderr=subprocess.DEVNULL)
     if len(diff) > 2 * 1024 * 1024:
         stop("trusted candidate diff exceeds 2 MiB controlled-root bound", 1)
@@ -1716,7 +1772,17 @@ except Exception as exc:
         "The APPROVE/BLOCK blocker rule is enforced after you answer and is not negotiable: a BLOCK "
         "must carry at least one entry in BOTH `blockers` and `blocker_objects`; an APPROVE must "
         "carry EMPTY arrays for both. Put non-blocking observations in `warnings`. A verdict that "
-        "breaks this is discarded, so it is not a way to register a reservation."
+        "breaks this is discarded, so it is not a way to register a reservation. "
+        # Second rule, same route, same reason. A live claude judge returned a well-formed BLOCK
+        # whose object texts SUMMARISED its blocker texts — a fair reading of "in the same order as
+        # blocker_objects", which was all the schema said — and the wrapper discarded a paid run for
+        # breaking a byte-identity rule nobody had ever stated. GPT passed only because its texts
+        # happened to match.
+        "On a BLOCK, `blockers` and `blocker_objects` are PARALLEL ARRAYS: same length, same order, "
+        "and `blocker_objects[i].text` must be the EXACT SAME STRING as `blockers[i]`, character "
+        "for character. Not a summary, not a paraphrase, not a shortened restatement. Every "
+        "`blocker_objects[i].id` must be unique. Put the full objection text in both fields, and "
+        "use `id`, `affected_criteria` and `affected_paths` for everything that is not prose."
     )
     candidate_verdict = attempt_dir / "candidate-verdict.json"
     # One construction, shared with capability discovery via judge_invocation/invocation_flags.
@@ -1804,10 +1870,34 @@ except Exception as exc:
     if verdict.get("verdict") == "BLOCK":
         ids = [item.get("id") for item in blocker_objects if isinstance(item, dict)]
         texts = [item.get("text") for item in blocker_objects if isinstance(item, dict)]
-        if (len(ids) != len(blocker_objects) or len(ids) != len(set(ids))
-                or texts != verdict.get("blockers")):
+        blockers = verdict.get("blockers")
+        # ENFORCEMENT IS UNCHANGED. Only the DIAGNOSIS is. The previous message covered four
+        # distinct failures with one sentence — "missing, duplicated, reordered, or contradict
+        # blocker text" — so a judge run that cost real money and several minutes told its reader
+        # only that something in this area was wrong, and sent them to the source to find out which.
+        # A live claude verdict was discarded by the fourth clause while the message let the reader
+        # believe it might be any of the first three.
+        failure = None
+        if len(ids) != len(blocker_objects):
+            failure = (f"{len(blocker_objects) - len(ids)} of {len(blocker_objects)} blocker_objects "
+                       f"entries are not objects")
+        elif len(ids) != len(set(ids)):
+            duplicated = sorted({item for item in ids if ids.count(item) > 1})
+            failure = f"blocker_objects ids are not unique: {', '.join(map(str, duplicated))}"
+        elif not isinstance(blockers, list) or len(texts) != len(blockers):
+            failure = (f"blockers and blocker_objects are parallel arrays and must be the same "
+                       f"length; got {len(blockers) if isinstance(blockers, list) else 'non-list'} "
+                       f"blockers and {len(texts)} blocker_objects")
+        elif texts != blockers:
+            differing = [index for index, (text, blocker) in enumerate(zip(texts, blockers))
+                         if text != blocker]
+            first = differing[0]
+            failure = (f"blocker_objects[{first}].text is not the exact string blockers[{first}]. "
+                       f"They must match character for character — a summary or paraphrase is not "
+                       f"accepted. Indices differing: {', '.join(str(item) for item in differing)}")
+        if failure is not None:
             finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
-            stop("BLOCK verdict blocker objects are missing, duplicated, reordered, or contradict blocker text", 1)
+            stop(f"BLOCK verdict blocker objects are invalid: {failure}", 1)
     elif blocker_objects:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"validation"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("APPROVE verdict cannot contain blocker objects", 1)
