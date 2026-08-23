@@ -22,11 +22,22 @@ assert_ok "introspection still succeeds with the credential declaration attached
 
 decl() { printf '%s' "$CONTRACT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["credentials"][sys.argv[1]][sys.argv[2]],sort_keys=True))' "$1" "$2"; }
 
+# The exact-match drift guard is on WHICH credential surfaces are passed — id, kind, source,
+# destination, exposes. It deliberately projects `caveats` out, because prose belongs in the
+# dedicated caveat cases below rather than in a byte-exact comparison that would have to be
+# rewritten every time a qualification is clarified. Nothing about which surfaces are passed is
+# loosened by that: the identity below is still pinned exactly, and "and nothing else" still holds.
+mat() { printf '%s' "$CONTRACT" | python3 -c '
+import json,sys
+items=json.load(sys.stdin)["credentials"][sys.argv[1]]["materialize"]
+print(json.dumps([{k:v for k,v in m.items() if k!="caveats"} for m in items], sort_keys=True))
+' "$1"; }
+
 assert_eq "gpt inherits NO ambient environment variable" "[]" "$(decl gpt inherit_environment)"
 assert_eq "gpt unsets nothing" "[]" "$(decl gpt unset_environment)"
 assert_eq "gpt materialises exactly a COPY of ~/.codex/auth.json and nothing else" \
   '[{"destination": "codex/auth.json", "exposes": "codex_oauth_credential", "id": "codex_auth", "kind": "copy", "source": "~/.codex/auth.json"}]' \
-  "$(decl gpt materialize)"
+  "$(mat gpt)"
 assert_eq "claude inherits USER and only USER" '["USER"]' "$(decl claude inherit_environment)"
 # The measured mechanism: the keychain SERVICE name is suffixed with sha256(CLAUDE_CONFIG_DIR)[:8]
 # whenever that variable is set to ANY value, so a set CLAUDE_CONFIG_DIR asks for an item that does
@@ -35,9 +46,31 @@ assert_eq "claude UNSETS CLAUDE_CONFIG_DIR rather than sealing it" \
   '["CLAUDE_CONFIG_DIR"]' "$(decl claude unset_environment)"
 assert_eq "claude materialises exactly the login keychain and nothing else" \
   '[{"destination": "Library/Keychains/login.keychain-db", "exposes": "macos_login_keychain", "id": "login_keychain", "kind": "symlink", "source": "~/Library/Keychains/login.keychain-db"}]' \
-  "$(decl claude materialize)"
+  "$(mat claude)"
 assert_ok "the published declaration carries no environment VALUE" \
   sh -c "! printf '%s' \"\$1\" | grep -q '\"USER\": *\"[^\"]'" sh "$CONTRACT"
+
+t_case "every exposure carries its caveats, in the same artifact as the exposure"
+# The first live GPT judge blocked on this: `macos_login_keychain` was named as an exposure while
+# both of its qualifications existed only in a handback conversation. A caveat that is not in an
+# artifact is a caveat the next reader does not get.
+KEYCHAIN="$(decl claude materialize)"
+assert_ok "the keychain exposure records that the CLI can write back through it" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'WRITE BACK through it'" sh "$KEYCHAIN"
+assert_ok "the keychain exposure records that it is the one non-read-only surface" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'not read-only'" sh "$KEYCHAIN"
+assert_ok "the keychain exposure records that the canary is silent on its contents" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'silent on keychain CONTENTS by construction'" sh "$KEYCHAIN"
+assert_ok "the codex exposure records that its copy cannot be written back" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'cannot be written through this passthrough'" sh "$(decl gpt materialize)"
+# Guard the pairing itself: an exposure must never become publishable without its caveats.
+assert_ok "no declared exposure is published with an empty caveat list" \
+  sh -c "printf '%s' \"\$1\" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)[\"credentials\"]
+bad=[m[\"exposes\"] for p in d for m in d[p][\"materialize\"] if not m.get(\"caveats\")]
+sys.stderr.write(\",\".join(bad))
+sys.exit(1 if bad else 0)'" sh "$CONTRACT"
 
 t_case "the declaration states the READ boundary, and states it truthfully per provider"
 # This replaces an `isolated_surfaces` list that named nine operator surfaces as unreachable. In the

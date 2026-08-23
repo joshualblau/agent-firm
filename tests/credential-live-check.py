@@ -179,6 +179,13 @@ for provider in wanted:
         boundary = published["credentials"][provider]["read_boundary"]
         notes.append(f"{provider}: this proves nothing about absolute-path reads — the declared "
                      f"read boundary is `{boundary['bounded_by']}`")
+        # Print the caveats on whatever this passthrough exposes, beside the clean result they
+        # qualify. A canary that reports "clean" and stops reads as a broader assurance than it is,
+        # and for the claude keychain the two qualifications ARE the story: the surface is writable
+        # by the CLI, and this check cannot see inside it.
+        for item in published["credentials"][provider]["materialize"]:
+            for caveat in item.get("caveats", []):
+                notes.append(f"{provider}: CAVEAT on {item['exposes']} — {caveat}")
 
     with tempfile.TemporaryDirectory() as work:
         home = Path(work) / "sealed"
