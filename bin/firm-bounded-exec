@@ -15,7 +15,19 @@ import sys
 import tempfile
 import time
 
-MAX_TIMEOUT = 900
+# The OUTER envelope every supervised provider phase must fit inside. It is not the operating limit
+# for any particular phase: each caller declares and enforces its own, tighter ceiling, and this one
+# only says what the supervisor itself will ever agree to sit and wait for.
+#
+#   firm-reviewer-common  discovery 15/120, readiness 30/180, judge 300/900   (unchanged by this)
+#   firm-run-evals        900 claude-primary, 1800 codex-primary              (measured 2026-08-23)
+#
+# Raised from 900 to 1800 on 2026-08-23. 900 was the eval harness's ceiling AND the supervisor's, so
+# raising only the harness produced `{"status":"invalid","error":"timeout must be between 1 and
+# 900"}` and no provider run at all — two caps with the same value read as one cap until the moment
+# they disagree. The reviewer phases are untouched: their ceilings are enforced by
+# firm-reviewer-common before the argv is built, so a judge still cannot be given more than 900 s.
+MAX_TIMEOUT = 1800
 MAX_GRACE = 30
 MAX_OUTPUT = 1024 * 1024
 MAX_TURNS = 1000

@@ -272,6 +272,37 @@ for spec in \
   fi
 done
 
+t_case "the wall-clock ceiling is PER ORIENTATION, and each side of each ceiling is pinned"
+# One number served both orientations and was 900 s. Measured 2026-08-23, that fitted Claude-primary
+# and guillotined Codex-primary a few steps from the finish line: the eval had already logged
+# final_qa_passed and satisfied 7 of 8 assertions when the bound killed it mid-packaging. The
+# ceilings are now 900 claude-primary (unmeasured, inherited) and 1800 codex-primary (measured).
+# Both sides of both ceilings are asserted: a ceiling pinned only by what it REJECTS can be raised
+# without failing anything, and a ceiling pinned only by what it ACCEPTS can be lowered the same way.
+for spec in 'claude|900|0' 'claude|901|2' 'codex|901|0' 'codex|1800|0' 'codex|1801|2'; do
+  orientation="${spec%%|*}"; rest="${spec#*|}"
+  value="${rest%%|*}"; expect="${rest##*|}"
+  : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+  env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+    FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=1 \
+    FIRM_EVAL_KILL_GRACE=1 FIRM_EVAL_TIMEOUT_SECONDS="$value" \
+    "$BEHAVIOR_RUN" --provider "$orientation" bounded-one >/dev/null 2>&1
+  ceiling_rc=$?
+  if [ "$expect" -eq 2 ]; then
+    if [ "$ceiling_rc" -eq 2 ] && [ ! -s "$PROVIDER_CALLS" ]; then
+      _t_ok "$orientation-primary refuses a ${value}s wall bound before any provider work"
+    else
+      _t_no "$orientation-primary refuses a ${value}s wall bound before any provider work" "rc=$ceiling_rc"
+    fi
+  else
+    if [ "$ceiling_rc" -ne 2 ] && [ -s "$PROVIDER_CALLS" ]; then
+      _t_ok "$orientation-primary accepts a ${value}s wall bound and starts the provider"
+    else
+      _t_no "$orientation-primary accepts a ${value}s wall bound and starts the provider" "rc=$ceiling_rc provider_calls=$(wc -l < "$PROVIDER_CALLS")"
+    fi
+  fi
+done
+
 t_case "malformed, empty, and prose provider results fail before assertion dispatch"
 for provider in claude codex; do
   for result_kind in malformed empty prose; do
