@@ -211,7 +211,7 @@ fast_note() { FAST_REASONS="${FAST_REASONS}$1
 "; }
 
 fast_compute() {
-  local base changed p b tools t f hits rest
+  local base changed p b tools t f hits rest self
   if ! git -C "$FIRM_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     fast_note "not a git checkout — selecting every file"; fast_select_all=1; return 0
   fi
@@ -230,12 +230,22 @@ fast_compute() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     b="$(basename "$p")"
+    self=""
     case "$p" in
       tests/lib.sh|tests/run-tests.sh)
         fast_note "$p — the harness itself, so every file"; fast_select_all=1; continue ;;
       tests/test-*.sh)
+        # ADDITIVE, NOT TERMINAL. A changed test file selects itself -- and it does not only select
+        # itself. tests/test-reviewer-hermeticity.sh reads tests/test-provider-reviewers.sh and
+        # hard-codes three of its case titles, so renaming one of those cases GUARANTEES a red in a
+        # file this arm used to `continue` straight past, in the one scope a developer actually runs
+        # between edits. The relationship is found by the same derived mention-scan below that finds
+        # every other one, so it cannot rot as files are added. `self` records that the file already
+        # selected itself, which is what lets the scan finding nothing stop being a reason to fail
+        # open to the entire suite.
         t="${b%.sh}"; t="${t#test-}"
-        FAST_SELECTED="$FAST_SELECTED $t"; fast_note "$p -> $t"; continue ;;
+        self="$t"
+        FAST_SELECTED="$FAST_SELECTED $t"; fast_note "$p -> $t" ;;
     esac
     tools="$b"
     for t in "$FIRM_ROOT"/bin/firm-*; do
@@ -254,7 +264,13 @@ fast_compute() {
       done
     done
     if [ -z "$hits" ]; then
-      fast_note "$p — named by no test file, so every file"; fast_select_all=1
+      if [ -n "$self" ]; then
+        # A test file no other test file mentions. It is already selected, and "I could not reason
+        # about this path" -- the only thing fail-open is for -- is not true here.
+        fast_note "$p — named by no OTHER test file"
+      else
+        fast_note "$p — named by no test file, so every file"; fast_select_all=1
+      fi
     else
       FAST_SELECTED="$FAST_SELECTED$hits"; fast_note "$p ->$hits"
     fi

@@ -257,11 +257,29 @@ HOSTILE_PROBE="$W/hostile-default-branch-probe"; mkdir -p "$HOSTILE_PROBE"
     GIT_CONFIG_VALUE_0=trunk git init -q ) >/dev/null 2>&1
 assert_eq "fixture precondition: this git really honours the hostile init.defaultBranch override" \
   "refs/heads/trunk" "$(git -C "$HOSTILE_PROBE" symbolic-ref HEAD 2>/dev/null)"
+# ...AND THE OVERRIDE REACHES run_one's OWN `git init`, WHICH THE PROBE ABOVE DOES NOT SHOW. The
+# probe is a sibling directory: it proves this git honours GIT_CONFIG_* somewhere, not that the
+# setting was in force where the fixture was built. On its own, "the fixture is on main" below would
+# be just as green on a host that defaults to main with the override never arriving at all -- which
+# is the residual N-4 recorded against this case.
+#
+# So a SECOND key travels in the same GIT_CONFIG_COUNT block: init.templateDir, naming a directory
+# holding one marker file. `git init` copies a template directory's contents into the .git it
+# creates, so finding that marker inside the FIXTURE'S OWN .git is a direct observation that
+# run_one's `git init` read this environment's injected config -- and init.defaultBranch=trunk
+# travelled in the same block, by the same mechanism, to the same command.
+#
+# If a later change pins `--template=` on that `git init` (a reviewer has suggested it, so a global
+# init.templateDir cannot seed hooks), the marker stops appearing and this assertion goes red. That
+# is the right failure: move the probe to another key `git init` observably reads. Do not delete it.
+HOSTILE_TEMPLATE="$W/hostile-git-template"; mkdir -p "$HOSTILE_TEMPLATE"
+printf 'the injected git environment reached run_one\n' > "$HOSTILE_TEMPLATE/hostile-config-was-live"
 : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
 env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
   FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_PROVIDER_STUB_MODE=ok FIRM_CHECKER_STUB_MODE=real \
   FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=2 FIRM_EVAL_KILL_GRACE=1 \
-  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=trunk \
+  GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=trunk \
+  GIT_CONFIG_KEY_1=init.templateDir "GIT_CONFIG_VALUE_1=$HOSTILE_TEMPLATE" \
   "$BEHAVIOR_RUN" --provider claude bounded-one > "$W/hostile-branch.out" 2>&1
 hostile_rc=$?
 assert_eq "the behavioral run completes under a hostile host default branch" 0 "$hostile_rc"
@@ -269,12 +287,62 @@ HOSTILE_SCRATCH="$(sed -n 's/.*bounded posture) in //p' "$W/hostile-branch.out" 
 t_track "$HOSTILE_SCRATCH"
 assert_ok "the run reported the fixture repository it built" \
   sh -c "[ -n '$HOSTILE_SCRATCH' ] && [ -d '$HOSTILE_SCRATCH/.git' ]"
+assert_file "the injected git config reached run_one's OWN git init, not just the sibling probe" \
+  "$HOSTILE_SCRATCH/.git/hostile-config-was-live"
+assert_output "and the marker in the fixture is the one this case wrote" \
+  "the injected git environment reached run_one" cat "$HOSTILE_SCRATCH/.git/hostile-config-was-live"
 assert_eq "the fixture is on the branch run_one names, not the one the host would have given it" \
   "refs/heads/main" "$(git -C "$HOSTILE_SCRATCH" symbolic-ref HEAD 2>/dev/null)"
 # The consequence, not just the shape. This is the exact call every eval's task.md opens with, and
 # the exact call that returned rc 2 for the whole class of hosts before this was stated.
 assert_rc "and firm-new-run opens a run in that fixture, which is every eval's first instruction" \
   0 sh -c "cd '$HOSTILE_SCRATCH' && '$BIN/firm-new-run' hostile-default-branch fast_path"
+
+t_case "the eval fixture is built with the host's OTHER ambient git settings pinned out"
+# THREE MORE AMBIENT INPUTS TO THE SAME `git init`/`add`/`commit` run_one performs. Unlike
+# init.defaultBranch these abort LOUDLY -- measured against run_one's own recipe on this host:
+# commit.gpgsign=true with no usable signing program gives rc 128, a core.excludesFile matching the
+# fixture's files gives rc 1 (nothing staged), and a core.hooksPath with a failing pre-commit gives
+# rc 1. Each turns run_one into a FAIL, so an operator whose global git config carries any of them
+# cannot run a behavioural eval at all. run_one pins them with `git -c`; this case is what says so
+# mechanically instead of in a comment.
+#
+# THE SETTINGS ARE ASSERTED TO BE HOSTILE FIRST, against the UNPINNED recipe, because on a git where
+# any of them happened to be a no-op this case would be a green that proves nothing.
+HOSTILE_EXCLUDES="$W/hostile-excludes"; printf '%s\n' '*' > "$HOSTILE_EXCLUDES"
+HOSTILE_HOOKS="$W/hostile-hooks"; mkdir -p "$HOSTILE_HOOKS"
+printf '%s\n' '#!/bin/sh' 'printf "hostile pre-commit hook\n" >&2' 'exit 1' > "$HOSTILE_HOOKS/pre-commit"
+chmod +x "$HOSTILE_HOOKS/pre-commit"
+UNPINNED_PROBE="$W/unpinned-fixture-probe"; mkdir -p "$UNPINNED_PROBE"
+printf 'seed\n' > "$UNPINNED_PROBE/seed.txt"
+assert_fail "fixture precondition: these settings really do break the UNPINNED recipe on this host" \
+  env GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true \
+      GIT_CONFIG_KEY_1=core.excludesFile "GIT_CONFIG_VALUE_1=$HOSTILE_EXCLUDES" \
+      GIT_CONFIG_KEY_2=core.hooksPath "GIT_CONFIG_VALUE_2=$HOSTILE_HOOKS" \
+      sh -c "cd '$UNPINNED_PROBE' && git init -q && git symbolic-ref HEAD refs/heads/main \
+             && git add -A && git -c user.email=eval@firm -c user.name=eval commit -qm fixture"
+: > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"
+env PATH="$BEHAVIOR_STUB:/usr/bin:/bin" FIRM_PROVIDER_CALLS="$PROVIDER_CALLS" \
+  FIRM_CHECKER_CALLS="$CHECKER_CALLS" FIRM_PROVIDER_STUB_MODE=ok FIRM_CHECKER_STUB_MODE=real \
+  FIRM_EVAL_TIMEOUT_SECONDS=3 FIRM_EVAL_MAX_TURNS=2 FIRM_EVAL_MAX_CASES=2 FIRM_EVAL_KILL_GRACE=1 \
+  GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true \
+  GIT_CONFIG_KEY_1=core.excludesFile "GIT_CONFIG_VALUE_1=$HOSTILE_EXCLUDES" \
+  GIT_CONFIG_KEY_2=core.hooksPath "GIT_CONFIG_VALUE_2=$HOSTILE_HOOKS" \
+  "$BEHAVIOR_RUN" --provider claude bounded-one > "$W/hostile-settings.out" 2>&1
+hostile_settings_rc=$?
+assert_eq "the behavioral run completes under all three hostile settings" 0 "$hostile_settings_rc"
+HOSTILE_SETTINGS_SCRATCH="$(sed -n 's/.*bounded posture) in //p' "$W/hostile-settings.out" | head -1)"
+t_track "$HOSTILE_SETTINGS_SCRATCH"
+assert_ok "the run reported the fixture repository it built" \
+  sh -c "[ -n '$HOSTILE_SETTINGS_SCRATCH' ] && [ -d '$HOSTILE_SETTINGS_SCRATCH/.git' ]"
+# Not just "the directory exists": the commit is what commit.gpgsign and core.hooksPath abort, and
+# an empty commit is what core.excludesFile leaves behind, so both are asserted about the FIXTURE.
+assert_eq "the fixture really got its commit, so the gpgsign and hooksPath pins held" \
+  "1" "$(git -C "$HOSTILE_SETTINGS_SCRATCH" rev-list --count HEAD 2>/dev/null)"
+assert_ok "and the fixture's own file is IN that commit, so the excludesFile pin held" \
+  sh -c "git -C '$HOSTILE_SETTINGS_SCRATCH' ls-tree --name-only HEAD | grep -q '^seed.txt$'"
+assert_rc "and firm-new-run still opens a run in that fixture, as every eval's task.md does" \
+  0 sh -c "cd '$HOSTILE_SETTINGS_SCRATCH' && '$BIN/firm-new-run' hostile-git-settings fast_path"
 
 t_case "provider failure and wall timeout permit exactly one attempt and no retry"
 : > "$PROVIDER_CALLS"; : > "$CHECKER_CALLS"

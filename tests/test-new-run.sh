@@ -363,7 +363,19 @@ inv_p_before="$(inventory_of "$repoP")"
 err_p="$( (cd "$repoP" && "$NEW_RUN" trailing-base full_track --base "$p_older_sha") 2>&1 1>/dev/null )"; rc_p=$?
 inv_p_after="$(inventory_of "$repoP")"
 assert_eq "a --base after the positionals exits 2 instead of being discarded" 2 "$rc_p"
-assert_output "the stderr diagnostic names the argument nothing consumed" "--base" printf '%s' "$err_p"
+# THE NEEDLE IS THE DIAGNOSTIC'S OWN SENTENCE, NOT THE BARE OPTION NAME. The refusal always prints a
+# constant synopsis line naming BOTH --primary and --base, so a needle of "--base" was satisfied by
+# that line whichever argument was actually refused -- a check that could not fail for the reason its
+# title gives. Measured before this change: with "$unconsumed" replaced by a constant
+# "--wrong-option-name" in bin/firm-new-run, this file was 103 passed / 0 failed with both of these
+# assertions green.
+assert_output "the stderr diagnostic names the argument nothing consumed" \
+  "refusing argument --base" printf '%s' "$err_p"
+# And EXACTLY ONE argument is named as unconsumed. The name is EXTRACTED from the line and compared,
+# rather than matched inside it, so printing the wrong name, printing none, or naming a second one
+# beside it are all reds instead of substring hits.
+assert_eq "exactly one unconsumed argument is named, and it is that one" "--base" \
+  "$(printf '%s\n' "$err_p" | sed -n 's/^firm-new-run: refusing argument \([^ ][^ ]*\) .*$/\1/p')"
 assert_output "and says where options are read instead" "BEFORE the slug" printf '%s' "$err_p"
 assert_eq "no run dir, and no partial scaffold, is left behind" "$inv_p_before" "$inv_p_after"
 
@@ -371,7 +383,13 @@ assert_eq "no run dir, and no partial scaffold, is left behind" "$inv_p_before" 
 # position was discarded the same way, recording claude for a run that asked for codex.
 err_p2="$( (cd "$repoP" && "$NEW_RUN" trailing-primary full_track --primary codex) 2>&1 1>/dev/null )"; rc_p2=$?
 assert_eq "a --primary after the positionals is refused too" 2 "$rc_p2"
-assert_output "and that diagnostic names --primary" "--primary" printf '%s' "$err_p2"
+# The same pair, and it is this pair that makes either half discriminating: a diagnostic hard-coded
+# to say "--base" satisfies the case above and fails here, and one hard-coded to say "--primary"
+# does the reverse. Neither could be told from the truth by a needle that matched the synopsis.
+assert_output "and that diagnostic names --primary" \
+  "refusing argument --primary" printf '%s' "$err_p2"
+assert_eq "exactly one unconsumed argument is named there too, and it is --primary" "--primary" \
+  "$(printf '%s\n' "$err_p2" | sed -n 's/^firm-new-run: refusing argument \([^ ][^ ]*\) .*$/\1/p')"
 assert_eq "neither refusal leaves anything behind" "$inv_p_before" "$(inventory_of "$repoP")"
 
 t_case "the same base in the supported LEADING position still opens the run (AC-003)"

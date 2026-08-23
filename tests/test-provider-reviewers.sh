@@ -1243,9 +1243,21 @@ assert_output "the authentication phase received the exact token" "oauth=$TOKEN_
 
 # 3. THE VALUE IS NEVER AN ARTIFACT. Everything the run keeps is searched, including the attempt
 #    record that says a token WAS supplied — saying so must not mean saying what it was.
+#
+#    AND THE SUBJECT IS ASSERTED TO EXIST BEFORE IT IS ASSERTED TO BE CLEAN. `! grep -R` is silent
+#    over a tree that is empty or absent, so the negation alone cannot tell "the token is nowhere in
+#    the run" from "there is no run". The two subjects get DIFFERENT treatment because they really are
+#    different: the run tree is stated non-empty, while the private control tree is emptied by the
+#    cleanup guardian BY DESIGN -- demanding that one be non-empty would be demanding the opposite of
+#    what this harness promises, so what is stated there is that the search has a root at all, and the
+#    title says the result is belt-and-braces rather than proof.
+assert_ok "the run tree these searches cover is populated" sh -c \
+  "find '$RUN' -type f | grep -q ."
 assert_ok "the token value is absent from every artifact the run keeps" sh -c \
   "! grep -R -q -F '$TOKEN_FIXTURE' '$RUN' 2>/dev/null"
-assert_ok "the token value is absent from the private reviewer control tree" sh -c \
+assert_ok "the private reviewer control tree exists, so the search below has a root" sh -c \
+  "[ -d '$REPO/.agent-firm/private-reviewer-control' ]"
+assert_ok "belt-and-braces, over a tree the cleanup guardian empties: the token value is absent from the private reviewer control tree" sh -c \
   "! grep -R -q -F '$TOKEN_FIXTURE' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
 
 # 4. IT IS CLAUDE'S CREDENTIAL, NOT THE FIRM'S. A Claude token must never be handed to codex.
@@ -1328,14 +1340,25 @@ print(m[0][sys.argv[2]] if m else "NO-RECORD")' "$1" "$2"
 assert_rc "gpt reviews normally against the harness's own credential store" 0 review_env approve "$GPT"
 assert_output "the judge was handed the credential this test created" "cred=marker" \
   grep 'codex phase' "$ENVCAP"
+# `! (grep | grep -v)` is a negation of a PIPELINE: a capture holding no codex phase line at all
+# satisfies it exactly as well as three clean ones do. The count is stated first, so "nothing leaked"
+# cannot quietly be "nothing happened". The positive assertion above is adjacency, not a guarantee --
+# it and this one could both be answering about a file that was never written.
+assert_ne "the capture really holds codex phase lines to judge" 0 \
+  "$(grep -c 'codex phase' "$ENVCAP" | tr -d ' ')"
 assert_ok "no codex phase was handed a credential the test did not create" sh -c \
   "! grep 'codex phase' '$ENVCAP' | grep -qv 'cred=marker'"
 
 # 2. SAYING A CREDENTIAL WAS IMPORTED MUST NOT MEAN SAYING WHAT IT WAS. Same rule the Claude token
 #    gets above, for the one credential that really is written to disk.
+# Same two subjects, same two treatments, same reason as the Claude block above.
+assert_ok "the run tree these searches cover is populated" sh -c \
+  "find '$RUN' -type f | grep -q ."
 assert_ok "the fixture credential's marker is absent from every artifact the run keeps" sh -c \
   "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$RUN' 2>/dev/null"
-assert_ok "the fixture credential's marker is absent from the private reviewer control tree" sh -c \
+assert_ok "the private reviewer control tree exists, so the search below has a root" sh -c \
+  "[ -d '$REPO/.agent-firm/private-reviewer-control' ]"
+assert_ok "belt-and-braces, over a tree the cleanup guardian empties: the fixture credential's marker is absent from the private reviewer control tree" sh -c \
   "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
 
 # 3. AN EMPTY STORE IS RECORDED AS ABSENT, NOT SATISFIED FROM SOMEWHERE ELSE. This is the

@@ -46,14 +46,31 @@ RULE = ("A criterion MUST assert a property. A measured value MAY be cited as ev
 for modal in ("MUST", "MAY", "MUST NOT"):
     assert modal in RULE, ("rule is no longer normative: missing " + modal)
 
+# THE MODAL VERBS ARE CASE-SIGNIFICANT; THE REST OF THE SENTENCE IS NOT. normalise() casefolds so
+# that a rewrap, a deeper indent or a changed comment prefix cannot turn a true statement red -- but
+# casefolding the RFC-2119 modals TOO meant "a criterion MUST assert a property. a measured value may
+# be cited as evidence but must not be the criterion's threshold" satisfied every assertion in this
+# file while saying something weaker than the rule it claims to pin. Measured: with MAY and MUST NOT
+# lowercased in BOTH shipped surfaces this file was 14 passed / 0 failed, because the shipped-bytes
+# guards below pin only the first sentence's MUST.
+#
+# So each uppercase modal is swapped for a NON-ALPHABETIC sentinel before the casefold, which the
+# casefold then cannot touch. A lowercase "may" stays the letters m-a-y and can never equal "\x03".
+# Longest first, or "MUST NOT" would be eaten by the "MUST" rule and left as "\x02 NOT".
+MODALS = (("MUST NOT", "\x01"), ("MUST", "\x02"), ("MAY", "\x03"))
+
 def normalise(text):
     # Strip one leading comment marker per line (the template states the rule inside a YAML comment
     # header, the role contract states it as prose), then collapse ALL whitespace including newlines,
-    # then casefold. A rewrap at a different column, a deeper indent, or a change of comment prefix
-    # must not turn a true statement into a red test — the assertion is about the sentence, not about
-    # where the line breaks fall.
+    # then protect the modals, then casefold. A rewrap at a different column, a deeper indent, or a
+    # change of comment prefix must not turn a true statement into a red test — the assertion is
+    # about the sentence, not about where the line breaks fall. Collapsing BEFORE the swap is what
+    # keeps a "MUST NOT" broken across a line break equal to one written on a single line.
     lines = [re.sub(r"^[ \t]*#+[ \t]?", "", line) for line in text.splitlines()]
-    return re.sub(r"\s+", " ", " ".join(lines)).strip().casefold()
+    collapsed = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    for modal, sentinel in MODALS:
+        collapsed = collapsed.replace(modal, sentinel)
+    return collapsed.casefold()
 
 paths = sys.argv[1:]
 if not paths:
@@ -79,10 +96,11 @@ assert_ok "the 01-acceptance-criteria.yaml template header states it" rule_check
 # file for a contradiction. The title says what the body drives: the same sentence, in both.
 assert_ok "both surfaces carry the same sentence, after whitespace normalisation" \
   rule_check "$ROLE" "$TEMPLATE"
-# rule_check casefolds, deliberately, so that a rewrap or a case change cannot make a true statement
-# red. These two assert the SHIPPED BYTES carry the uppercase RFC-2119 form, which casefolding would
-# otherwise let slide — the needle is one unwrapped line of the sentence, so a future rewrap still
-# cannot break them for the wrong reason.
+# rule_check casefolds everything EXCEPT the modal verbs (see MODALS above), so a rewrap or a case
+# change in the prose cannot make a true statement red while a lowercased MAY or MUST NOT is refused.
+# These two remain, on the shipped bytes rather than the normalised form, because a defence that only
+# exists inside the checker is one edit away from being the thing that was softened — the needle is
+# one unwrapped line of the sentence, so a future rewrap still cannot break them for the wrong reason.
 assert_output "the shipped role contract carries the uppercase MUST, not a lowercase paraphrase" \
   "A criterion MUST assert a property." cat "$ROLE"
 assert_output "the shipped template header carries the uppercase MUST, not a lowercase paraphrase" \
@@ -140,5 +158,35 @@ out.write_text(softened, encoding="utf-8")
 PY
 assert_fail "a softened, advisory restatement does not satisfy the rule" rule_check "$softened"
 assert_rc "asked about no surface at all, the checker refuses instead of passing" 2 rule_check
+
+# ---------------------------------------------------------------------------
+t_case "lowercasing a modal verb is a softening too, and the checker refuses that as well"
+# F6. Deleting the sentence and paraphrasing it were already refused above. LOWERCASING it was not:
+# normalise() casefolded the modals along with everything else, and the shipped-bytes guards pin only
+# the first sentence's MUST, so `may be cited ... must not be the criterion's threshold` kept all 14
+# assertions in this file green while the case title above claimed the rule was stated NORMATIVELY.
+# Both halves are asserted, because "the checker refuses everything" would satisfy the second alone.
+lowered_role="$W/intake-analyst-lowercase-modals.md"
+lowered_template="$W/01-acceptance-criteria-lowercase-modals.yaml"
+t_python - "$ROLE" "$lowered_role" "$TEMPLATE" "$lowered_template" <<'PY'
+import pathlib, sys
+role_src, role_out, template_src, template_out = map(pathlib.Path, sys.argv[1:])
+def lower_modals(path):
+    text = path.read_text(encoding="utf-8")
+    # Only the modals change. Every other byte, including the uppercase MUST the shipped-bytes guards
+    # pin, is left exactly as shipped — otherwise this would be re-testing those guards instead.
+    lowered = (text.replace("MAY be cited as evidence", "may be cited as evidence")
+                   .replace("MUST NOT be the", "must not be the"))
+    assert lowered != text, "lowercasing replaced nothing in " + str(path)
+    assert "A criterion MUST assert a property" in lowered, "the mutation changed more than the modals"
+    return lowered
+role_out.write_text(lower_modals(role_src), encoding="utf-8")
+template_out.write_text(lower_modals(template_src), encoding="utf-8")
+PY
+assert_ok "CONTROL: the shipped pair is still accepted" rule_check "$ROLE" "$TEMPLATE"
+assert_fail "a role contract whose MAY and MUST NOT are lowercased is refused" rule_check "$lowered_role"
+assert_fail "a template whose MAY and MUST NOT are lowercased is refused" rule_check "$lowered_template"
+assert_fail "and the pair is refused when only one surface was softened that way" \
+  rule_check "$lowered_role" "$TEMPLATE"
 
 t_summary

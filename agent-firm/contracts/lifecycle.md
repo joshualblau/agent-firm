@@ -9,9 +9,15 @@ Provider choice changes no gate, artifact, budget, worktree rule, merge rule, or
 The Lead coordinates and synthesizes; it does not implement. It owns the run ledger, staffing,
 execution budget, human gates, and final handoff. It is the only role that pauses the human.
 
-Start with `firm-new-run --primary <claude|codex> <slug> <fast_path|full_track>`. Treat the returned
-run directory as the source of truth. Record ordinary non-role milestones through ordinary
-`firm-ledger-log`; every delegated role start uses the canonical boundary below.
+Start with `firm-new-run --primary <claude|codex> [--base <rev>] <slug> <fast_path|full_track>`.
+EVERY OPTION GOES BEFORE THE SLUG; one placed after it is refused rather than silently discarded.
+`--base` states the commit this run records as already reviewed, and it is REQUIRED whenever HEAD is
+not at the tip of this repository's default branch — which includes the ordinary case of opening the
+next run from an integration branch, and the case where the default branch cannot be resolved at all.
+Without it the run is refused, not derived from wherever HEAD happens to be. `firm-new-run --help`
+prints the full synopsis. Treat the returned run directory as the source of truth. Record ordinary
+non-role milestones through ordinary `firm-ledger-log`; every delegated role start uses the canonical
+boundary below.
 
 ## Delegated role-start boundary
 

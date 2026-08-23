@@ -41,9 +41,27 @@ set -uo pipefail
 # THIS FILE IS CLASSIFIED `requires_supported_p2` IN tests/run-tests.sh, and the reason is entirely
 # derivative: it executes tests/test-provider-reviewers.sh, which is on that list because it drives
 # real ledger mutation. On an `--unsupported-p2` host — which is what both hosted CI jobs are — every
-# ledger write in the child fails closed, so both children would fail identically, this file's
-# invariance would hold, and it would report a green that means nothing. It costs what it says it
-# costs: two full runs of the largest file in the suite, paid on local full runs and the exact-P2 job.
+# ledger write in the child fails closed and both children fail IDENTICALLY.
+#
+# WHAT THAT ACTUALLY DOES TO THIS FILE, MEASURED RATHER THAN ASSUMED. Simulated by forcing the
+# production writer's own platform rejection (FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=
+# linux, the seam tests/test-ledger-compatibility.sh uses) for one full run of this file:
+#
+#     child present: passing=136 failing=133 exit=1
+#     child missing: passing=136 failing=133 exit=1
+#     12 passed, 6 failed, rc 1
+#
+# It goes loudly RED, six assertions deep: both child exit statuses, both "no case fails" counts, and
+# both anchor-coverage counts (3 expected, 0 covered). An earlier version of this comment said such a
+# host "would report a green that means nothing", and the review carried that reason forward before
+# correcting it. It is wrong about the FILE and right only about one assertion inside it: the
+# divergence comparison at the bottom does stay green under identically-broken children, and is
+# exactly the meaningless green that sentence described — but the file has already failed six times
+# before it is reached, so no green is ever reported.
+#
+# THE CLASSIFICATION IS STILL CORRECT, on the other basis: a file that is reliably red for a purely
+# environmental reason is not a usable CI signal either. It costs what it says it costs: two full
+# runs of the largest file in the suite, paid on local full runs and the exact-P2 job.
 
 t_case "the reviewer suite's result does not depend on the machine's credential state"
 
@@ -75,12 +93,24 @@ an absent codex credential is recorded as absent
 an absent codex credential is not recorded as imported
 an empty store hands the judge no credential at all
 ANCHORS
+# NORMALISED BEFORE ANYTHING COUNTS IT OR READS IT. `wc -l` counts NEWLINES and `while read` stops at
+# them, so an entry appended later WITHOUT a trailing newline is invisible to both: the count and the
+# loop would agree with each other about a list that silently checks one anchor fewer than it names,
+# and the new anchor would never be checked at all. `awk NF` re-emits every non-blank line with a
+# terminator, which fixes the missing newline and drops a blank line -- a blank anchor would make the
+# static grep below match every file and the transcript check match every line.
+awk 'NF' "$ANCHOR_LIST" > "$ANCHOR_LIST.normalised" && mv "$ANCHOR_LIST.normalised" "$ANCHOR_LIST"
 ANCHOR_COUNT="$(wc -l < "$ANCHOR_LIST" | tr -d ' ')"
 
 # An empty list would make the loop assert nothing and the two transcript counts below compare 0 to
 # 0 -- the same shape of vacuum this whole file exists to refuse. Stated first, so it cannot happen
 # silently.
 assert_ne "the invariance anchor list names at least one case" 0 "$ANCHOR_COUNT"
+# And each anchor is named ONCE. The coverage check below counts DISTINCT anchors, so a name written
+# twice here could never be reached and this file would be permanently red for a reason that is not
+# its subject. Say that here instead.
+assert_eq "and names each of them exactly once" \
+  "$ANCHOR_COUNT" "$(sort -u "$ANCHOR_LIST" | wc -l | tr -d ' ')"
 while IFS= read -r anchor_case; do
   assert_ok "the invariance anchor is still present in the measured file: $anchor_case" \
     grep -q -F -- "$anchor_case" "$TARGET"
@@ -90,7 +120,15 @@ done < "$ANCHOR_LIST"
 # early-returned past, or renamed in one of its two halves -- satisfies the grep above and still
 # leaves the comparison at the bottom of this file unable to fail. So the child transcripts are asked
 # the same question after they are captured; see the assertions just before the divergence check.
-anchor_hits() { grep -c -x -F -f "$ANCHOR_LIST" "$1" 2>/dev/null | tr -d ' '; }
+#
+# DISTINCT ANCHORS COVERED, NOT MATCHING LINES. `grep -c` counts lines, and passing_set below
+# deliberately does not de-duplicate, so one anchor that stopped running plus another that passed
+# twice still totalled three and both assertions at the bottom stayed green. Measured: with the
+# absence case commented out in the measured file -- its name still in the source, so the static grep
+# above still found it -- and the empty-store case duplicated, this file was 17 passed / 0 failed
+# with both children at 264 passing. `-o | sort -u | wc -l` counts how many of the named anchors are
+# covered, which is what those assertions have always meant.
+anchor_hits() { grep -o -x -F -f "$ANCHOR_LIST" "$1" 2>/dev/null | sort -u | wc -l | tr -d ' '; }
 
 # Environment 1: a store that holds a credential. Its content is deliberately NOT the marker
 # tests/test-provider-reviewers.sh builds for itself — this stands in for the operator's store, and
@@ -118,7 +156,10 @@ run_child() {
 }
 
 # `sort` and not `sort -u`: a case name that passes twice in one child and once in the other is a
-# divergence, and de-duplicating would hide it.
+# divergence, and de-duplicating would hide it. That is why anchor_hits above -- not this function --
+# is where duplicates are collapsed: the anchor check asks "how many of the three are covered", which
+# a duplicate must not inflate, while the divergence check asks "is the transcript the same", which a
+# duplicate must be able to change.
 passing_set() { sed -n 's/^    ok   //p' "$WORK/$1.transcript" | sort; }
 count_ok()    { sed -n 's/^    ok   //p' "$WORK/$1.transcript" | wc -l | tr -d ' '; }
 count_fail()  { grep -c '^    FAIL ' "$WORK/$1.transcript"; }

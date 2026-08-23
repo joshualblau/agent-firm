@@ -176,8 +176,27 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   # all, and it is the spelling tests/lib.sh:mk_repo already uses for exactly this reason. It runs
   # between init and the first commit, when HEAD is still unborn, so it only names the branch the
   # commit below will create.
-  ( cd "$scratch" && git init -q && git symbolic-ref HEAD refs/heads/main && git add -A \
-      && git -c user.email=eval@firm -c user.name=eval commit -qm fixture ) || { echo "SKIP $name: git init failed"; return 4; }
+  #
+  # THE OTHER AMBIENT GIT INPUTS TO THIS FIXTURE ARE PINNED THE SAME WAY -- with `git -c`, never a
+  # config write, so nothing outside $scratch is touched. Measured against this exact recipe:
+  # commit.gpgsign=true with no usable signing program aborts the commit at rc 128; a
+  # core.excludesFile that matches the fixture's own files leaves `git add -A` nothing to stage and
+  # the commit exits 1; a core.hooksPath holding a failing pre-commit exits 1. Each makes run_one
+  # return 4 and the eval a FAIL. That is the LOUD direction, unlike init.defaultBranch above, which
+  # let the fixture build and then had the eval's own first instruction refused inside it while the
+  # run still reported rc 0 -- which is why those were the lower priority and not "no priority".
+  # tests/lib.sh:mk_repo already pins commit.gpgsign false for exactly this reason; the other two are
+  # pinned here for the first time, and user.email/user.name were already pinned this way.
+  #
+  # STILL INHERITED, named so the next reader does not have to measure it again: init.templateDir (a
+  # global template seeds files into the .git this creates -- harmless here, and it is what the
+  # hostile-host case in tests/test-run-evals-structural.sh uses to PROVE this environment reaches
+  # this `git init` rather than only a probe beside it), and core.attributesFile.
+  ( cd "$scratch" && git init -q && git symbolic-ref HEAD refs/heads/main \
+      && git -c core.excludesFile=/dev/null add -A \
+      && git -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.hooksPath=/dev/null \
+             -c user.email=eval@firm -c user.name=eval commit -qm fixture ) \
+    || { echo "SKIP $name: git init failed"; return 4; }
   local out="$scratch/.eval-out"; mkdir -p "$out"
   make_eval_settings "$out/settings.json"
 

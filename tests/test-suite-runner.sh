@@ -269,6 +269,60 @@ has   "the closing line is the fast one" \
 hasnt "and is NOT the string a passing full run prints" "
 all test files passed" "$out"
 
+# ---------------------------------------------------------------------------
+# THE FAST SCOPE'S MAPPING FOR A CHANGED TEST FILE, both halves.
+#
+# F7. The `tests/test-*.sh` arm mapped a changed test file to itself and stopped there. That is wrong
+# whenever one test file READS another: tests/test-reviewer-hermeticity.sh executes
+# tests/test-provider-reviewers.sh and hard-codes three of its case titles, so renaming one of those
+# cases guarantees a red in a file --fast would not select -- and which neither hosted CI job runs
+# either, both being --unsupported-p2. Editing the measured file selected only the measured file.
+#
+# Both cases below are built as REAL git checkouts. Outside one the scope fails open and selects
+# everything, which would make either half green for the wrong reason.
+mk_fast_repo() { # <dir> — commit the synthetic suite and echo the base sha
+  ( cd "$1" && git init -q . && git symbolic-ref HEAD refs/heads/main && git add -A \
+    && git -c user.email=t@agent-firm.local -c user.name="firm tests" -c commit.gpgsign=false \
+           -c core.excludesFile=/dev/null -c core.hooksPath=/dev/null commit -qm seed ) >/dev/null 2>&1
+  git -C "$1" rev-parse HEAD 2>/dev/null
+}
+
+t_case "the fast scope selects a changed test file AND the test files that read it"
+d="$(mk_suite)"
+mk_test "$d" anchorsource 0 1 0
+mk_test "$d" dependent 0 1 0 "# this file reads tests/test-anchorsource.sh and pins one of its case titles"
+mk_test "$d" unrelated 0 1 0
+fast_base="$(mk_fast_repo "$d")"
+assert_ne "fixture precondition: the synthetic suite really is a git checkout" "" "$fast_base"
+printf '# edited\n' >> "$d/tests/test-anchorsource.sh"
+out="$(FIRM_TEST_FAST_BASE="$fast_base" bash "$d/tests/run-tests.sh" --fast 2>&1)"; rc=$?
+assert_eq "the fast run passes" 0 "$rc"
+has "the changed file selects itself" "tests/test-anchorsource.sh -> anchorsource" "$out"
+has "and the file that reads it is selected by the same derived scan" \
+    "tests/test-anchorsource.sh -> dependent" "$out"
+has "the changed file itself ran" "synthetic anchorsource" "$out"
+has "and so did the file that reads it — this is the assertion F7 is about" "synthetic dependent" "$out"
+hasnt "while a file that reads neither stayed out of scope" "synthetic unrelated" "$out"
+
+t_case "and the additive arm did NOT become 'select everything'"
+# The control, and it is load-bearing: an arm that selected the whole suite for any changed test file
+# would satisfy every assertion above. Editing a file nothing reads still selects that file alone.
+d="$(mk_suite)"
+mk_test "$d" anchorsource 0 1 0
+mk_test "$d" dependent 0 1 0 "# this file reads tests/test-anchorsource.sh and pins one of its case titles"
+mk_test "$d" unrelated 0 1 0
+fast_base="$(mk_fast_repo "$d")"
+assert_ne "fixture precondition: the synthetic suite really is a git checkout" "" "$fast_base"
+printf '# edited\n' >> "$d/tests/test-unrelated.sh"
+out="$(FIRM_TEST_FAST_BASE="$fast_base" bash "$d/tests/run-tests.sh" --fast 2>&1)"; rc=$?
+assert_eq "the fast run passes" 0 "$rc"
+has   "the edited file ran" "synthetic unrelated" "$out"
+hasnt "the file that reads a DIFFERENT test file did not" "synthetic dependent" "$out"
+hasnt "and neither did the file it reads" "synthetic anchorsource" "$out"
+has   "the transcript says the scan found no other reader, rather than failing open" \
+      "named by no OTHER test file" "$out"
+hasnt "so the fail-open wording is not what was printed" "named by no test file, so every file" "$out"
+
 t_case "a worker that dies without its sentinel is a FAILURE, not a hang"
 # CR-02. Completion is detected by a sentinel file the worker renames into place as its last act, and
 # that is right (a finished-but-unreaped child still answers `kill -0`, so signal 0 is not a

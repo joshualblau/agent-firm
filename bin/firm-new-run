@@ -154,9 +154,33 @@ base_arg=""
 base_given=false
 # Leading options, in any order. `shift 2 || break` (not `shift 2 || true`) is deliberate: when the
 # option is the last argument, `shift 2` fails and shifts NOTHING, so looping again would spin on the
-# same argv forever. Breaking leaves argv untouched, which reproduces the pre-existing behaviour of
-# `firm-new-run --primary` exactly -- slug becomes "--primary", primary becomes "", and the
-# provider check below still exits 2.
+# same argv forever. Breaking leaves argv untouched, so `firm-new-run --primary` still exits 2 the
+# way it always did -- slug becomes "--primary", primary becomes "".
+#
+# BUT NOT BY THE SAME CHECK, and the comment that used to sit here said it was. Measured, both
+# spellings, in a one-commit repo on main:
+#
+#   base 1886f88   `firm-new-run --primary`   rc 2   "firm-new-run: --primary must be claude or codex"
+#   here           `firm-new-run --primary`   rc 2   "firm-new-run: refusing slug --primary -- it is
+#                                                     not a recognized option, ..."
+#
+# The flag-shaped-slug guard below now fires FIRST and names the refused slug; the provider check
+# never runs. Same status, different diagnostic -- and the earlier claim that "the provider check
+# below still exits 2" was simply wrong about which check fires.
+#
+# ONE REAL WIDENING, RECORDED HERE RATHER THAN DECIDED HERE. Looping accepts REPEATED leading options
+# LAST-WINS where the base exited 2:
+#
+#   base 1886f88   `--primary claude --primary codex demo`   rc 2   "track must be fast_path or
+#                                                                    full_track" (the second
+#                                                                    --primary landed on $2/track)
+#   here           `--primary claude --primary codex demo`   rc 0   run opened, primary_provider
+#                                                                    recorded as codex
+#
+# Nothing documented or shipped writes that shape, and last-wins is what every getopt-style parser
+# does, so it is not being changed here on the way past: whether an operator who names a provider
+# twice should be refused or obeyed is an argv-contract question for the Requirements gate. It is
+# named so the next reader does not have to rediscover it by measurement.
 while :; do
   case "${1:-}" in
     --primary) primary="${2:-}"; shift 2 || break ;;
