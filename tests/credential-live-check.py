@@ -140,21 +140,45 @@ for provider in wanted:
         else:
             notes.append(f"{provider}: declared passthrough authenticates (readiness = ready)")
 
-        # The canary. Reachability, not merely absence: a path inside the sealed home that RESOLVES
-        # onto the operator's surface is an escape even though the sealed home "does not contain" it.
+        # THE CANARY, AND EXACTLY WHAT IT IS. It asks one narrow question: does a path INSIDE the
+        # sealed home resolve onto the operator's real surface? That is a question about the SHAPE
+        # OF THE SEALED HOME, and it is the only question the seal itself can answer.
+        #
+        # It is NOT a filesystem-isolation check, and the earlier version of this file read as if it
+        # were. In the gpt direction it cannot be one: `-s read-only` denies writes and permits reads
+        # everywhere, so a judge that opens an ABSOLUTE path never touches the sealed home and
+        # nothing it reads that way can ever appear here. Review demonstrated precisely that,
+        # returning ~/.codex/history.jsonl and ~/.claude/settings.json verbatim from inside this
+        # environment. See READ_BOUNDARY in bin/firm-reviewer-common for what bounds reads per
+        # provider — uid for gpt, the permission system for claude.
         real_home = Path(os.path.expanduser("~"))
+        checked = []
+        absent = []
         for label, relative in CANARY.items():
             operator_path = real_home / relative
             if not operator_path.exists():
+                # Counted and NAMED, never credited. The old line said "clean over 9 surfaces" while
+                # silently skipping every surface this host happens not to have — on the review host
+                # that was 9 reported for 7 actually checked, which is the same "could not check
+                # reported as checked and fine" this file's own docstring refuses to do.
+                absent.append(label)
                 continue
+            checked.append(label)
             sealed_path = home / relative
             reachable = sealed_path.exists() and (
                 os.path.realpath(sealed_path) == os.path.realpath(operator_path))
             if reachable:
                 failures.append(
                     f"{provider}: SEAL BREACH — the operator's {label} ({relative}) is reachable "
-                    f"from the judge's home; authentication does not require it.")
-        notes.append(f"{provider}: canary clean over {len(CANARY)} operator surfaces")
+                    f"THROUGH THE SEALED HOME; authentication does not require it.")
+        summary = (f"{provider}: no operator surface is reachable through the sealed home "
+                   f"({len(checked)} of {len(CANARY)} checked")
+        summary += (f"; {len(absent)} absent on this host: {', '.join(absent)})"
+                    if absent else ")")
+        notes.append(summary)
+        boundary = published["credentials"][provider]["read_boundary"]
+        notes.append(f"{provider}: this proves nothing about absolute-path reads — the declared "
+                     f"read boundary is `{boundary['bounded_by']}`")
 
     with tempfile.TemporaryDirectory() as work:
         home = Path(work) / "sealed"

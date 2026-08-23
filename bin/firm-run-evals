@@ -98,18 +98,23 @@ fi
 # So 900 s was not a safety margin for this orientation; it was positioned a few steps before the
 # finish line, and it converted "nearly done" into "FAIL" with no signal that time was the cause.
 #
-# Why 1800 and not a number fitted to the measurement: at 900 s the work REMAINING was one stage.
-# 1800 gives that final stage as much wall clock as the entire preceding lifecycle consumed. A cap
-# fitted snugly to one observed duration is a cap that has to be raised again the first time the
-# host is busier or the model more talkative, and each of those re-raises is a decision made under
-# pressure to make a red eval go green. This one is deliberately loose enough not to need that.
+# 1800 IS A HEADROOM CHOICE, NOT A FITTED VALUE. That distinction is worth stating, because the
+# number sits among measurements and could easily be read as one. What is MEASURED is the spread —
+# three runs of the same eval on the same host:
 #
-# OBSERVED after the raise, same eval, same host, three Codex-primary runs: 451 s and 653 s to a
-# completed provider phase, against the one that exceeded 900 s and was killed. The cost of this
-# eval is not a stable number — it is a model driving a lifecycle, and it varied by better than 2x
-# across three runs. That spread is the actual argument for the headroom: a ceiling set near the
-# median of a distribution this wide is a ceiling that fails runs for being unlucky rather than for
-# being wrong, and a bound that fires on luck teaches everyone to ignore it.
+#   run A   >900 s   killed at the old ceiling, inside packaging, 7 of 8 assertions already satisfied
+#   run B    653 s   provider phase completed (status ok, exit 0)
+#   run C    451 s   whole eval completed end to end and its assertions were evaluated
+#
+# Those measurements establish two things and no more: that this workload needs somewhat more than
+# 900 s, and that it has no stable duration — it varied by better than 2x, because it is a model
+# driving a lifecycle rather than a deterministic job. They do NOT derive 1800.
+#
+# 1800 is chosen against that spread rather than against the median. A ceiling near typical cost is a
+# ceiling that fails runs for being unlucky rather than for being wrong, and a bound that fires on
+# luck is one everybody learns to ignore. Fitting it snugly would also guarantee re-raising it the
+# first time the host is busier, and every such re-raise is a decision taken under pressure to turn a
+# red eval green. The looseness is deliberate — but it is a judgement, not evidence.
 #
 # Claude-primary stays at 900 s and is marked UNMEASURED on purpose. I have not timed a Claude
 # orientation, and inventing a second number to look symmetrical would be exactly the guessing this

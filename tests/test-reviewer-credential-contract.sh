@@ -39,11 +39,33 @@ assert_eq "claude materialises exactly the login keychain and nothing else" \
 assert_ok "the published declaration carries no environment VALUE" \
   sh -c "! printf '%s' \"\$1\" | grep -q '\"USER\": *\"[^\"]'" sh "$CONTRACT"
 
-t_case "the declaration names the surfaces authentication must NOT reach"
-ISO="$(decl gpt isolated_surfaces)"
+t_case "the declaration states the READ boundary, and states it truthfully per provider"
+# This replaces an `isolated_surfaces` list that named nine operator surfaces as unreachable. In the
+# gpt direction that was FALSE: `-s read-only` denies writes and permits reads everywhere, and
+# review read ~/.codex/history.jsonl and ~/.claude/settings.json verbatim from inside this exact
+# environment. The seal redirects CONFIGURATION lookup; it does not bound reads. These cases exist
+# so the honest wording cannot quietly drift back into the reassuring one.
+assert_ok "the old, false isolation claim is gone from the published contract" \
+  sh -c "! printf '%s' \"\$1\" | grep -q 'isolated_surfaces'" sh "$CONTRACT"
+# The name may still appear in the comment that records why it was wrong — that history is the point.
+# What must not exist is the DEFINITION.
+assert_ok "the wrapper no longer defines an ISOLATED_SURFACES list" \
+  sh -c "! grep -qE '^ISOLATED_SURFACES *=' \"\$1\"" sh "$COMMON"
+assert_ok "the comment that replaced it records why the claim was false" \
+  sh -c "grep -q 'THAT CLAIM WAS FALSE' \"\$1\"" sh "$COMMON"
+assert_eq "the gpt judge's read boundary is declared as the operator's uid, not the seal" \
+  '"operator_uid"' "$(decl gpt read_boundary | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
+assert_eq "the claude judge's read boundary is declared as the permission system" \
+  '"permission_system"' "$(decl claude read_boundary | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
+assert_ok "the gpt declaration says plainly that reads are NOT bounded by the seal" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'any path readable by the operator'" sh "$(decl gpt read_boundary)"
+assert_ok "the gpt declaration records how that was established" \
+  sh -c "printf '%s' \"\$1\" | grep -q 'history.jsonl'" sh "$(decl gpt read_boundary)"
+# The smaller claim that IS true is still made, and still named for what it is.
+SEAL="$(decl gpt seal_redirects_configuration_for)"
 for surface in agent_settings hooks plugins mcp_servers skills session_history operator_projects codex_history codex_global_state; do
-  assert_ok "isolated surface is declared: $surface" \
-    sh -c "printf '%s' \"\$1\" | grep -q '\"$surface\"'" sh "$ISO"
+  assert_ok "the seal is declared to redirect configuration lookup for: $surface" \
+    sh -c "printf '%s' \"\$1\" | grep -q '\"$surface\"'" sh "$SEAL"
 done
 
 t_case "the wire-format projection loosens what is ASKED, never what is ACCEPTED"
@@ -61,6 +83,12 @@ projected=namespace["transport_schema"](canonical)
 probe=namespace["transport_schema"](
     {"type":"object","properties":{"pattern":{"type":"string","format":"uri"},
                                    "default":{"type":"string"}}})
+def carries_rule(node):
+    """Does the projected schema still TELL the judge the BLOCK/APPROVE blocker rule? The canonical
+    allOf that encodes it cannot go on the wire, so it is carried in descriptions, which the
+    projection preserves verbatim. If this ever returns False the APPROVE branch is a trap again."""
+    text = json.dumps(node).lower()
+    return ("blocker" in text and "empty" in text and "approve" in text and "block" in text)
 print(json.dumps({
     "top_keys": sorted(projected),
     "has_allOf": "allOf" in projected,
@@ -71,6 +99,14 @@ print(json.dumps({
     "keyword_named_properties_survive": sorted(probe["properties"]),
     "keyword_named_property_format_dropped": "format" not in probe["properties"]["pattern"],
     "canonical_untouched": "allOf" in canonical and "$schema" in canonical,
+    # The collateral loss, stated as a fact rather than denied by a comment. These live ONLY inside
+    # the dropped combinator, so they cannot survive it; what must survive is the RULE.
+    "const_lost": "const" not in json.dumps(projected),
+    "minitems_lost": "minItems" not in json.dumps(projected),
+    "maxitems_lost": "maxItems" not in json.dumps(projected),
+    "rule_reaches_verdict_property": carries_rule(projected["properties"]["verdict"]),
+    "rule_reaches_blockers_property": carries_rule(projected["properties"]["blockers"]),
+    "rule_reaches_blocker_objects_property": carries_rule(projected["properties"]["blocker_objects"]),
 }, sort_keys=True))
 PY
 )"
@@ -93,6 +129,60 @@ assert_eq "a verdict field named like a dropped keyword survives" \
 assert_eq "keywords are still dropped INSIDE such a field" "true" \
   "$(proj keyword_named_property_format_dropped)"
 assert_eq "the canonical schema on disk is not rewritten" "true" "$(proj canonical_untouched)"
+
+t_case "the APPROVE branch is not a trap: the one rule the combinator carried still reaches the judge"
+# The canonical allOf is a SINGLE rule and it lives nowhere else:
+#   BLOCK -> blockers/blocker_objects minItems 1; otherwise -> both maxItems 0.
+# Dropping the combinator takes `const`, `minItems` and `maxItems` with it as collateral, while the
+# projection simultaneously forces `required: [every property]`. That combination makes an
+# approve-with-nits verdict VALID on the wire and then fatal at the canonical gate — the BLOCKER-6
+# failure again, aimed at the branch that has never run live. State the loss, then prove the rule
+# still arrives by the route that survives projection.
+assert_eq "const is lost with the combinator (stated, not denied)" "true" "$(proj const_lost)"
+assert_eq "minItems is lost with the combinator" "true" "$(proj minitems_lost)"
+assert_eq "maxItems is lost with the combinator" "true" "$(proj maxitems_lost)"
+assert_eq "the rule still reaches the judge on the verdict property" "true" "$(proj rule_reaches_verdict_property)"
+assert_eq "the rule still reaches the judge on the blockers property" "true" "$(proj rule_reaches_blockers_property)"
+assert_eq "the rule still reaches the judge on the blocker_objects property" "true" \
+  "$(proj rule_reaches_blocker_objects_property)"
+assert_ok "the judge prompt states the rule too, since the wire schema cannot enforce it" \
+  sh -c "grep -q 'APPROVE/BLOCK blocker rule is enforced after you answer' \"\$1\"" sh "$COMMON"
+
+# And walk a real APPROVE-shaped verdict through the FULL path the wrapper uses: valid on the wire,
+# then valid canonically. This is the case both live runs happened to avoid by returning BLOCK.
+assert_ok "an APPROVE with empty blockers passes the wire schema AND the canonical gate" \
+  python3 - "$COMMON" "$SCHEMA" <<'PY'
+import json, sys, jsonschema
+src = open(sys.argv[1]).read()
+ns = {}
+exec(compile(src[src.index("TRANSPORT_SCHEMA_DROP = ("):src.index("def readiness_invocation")],
+             "transport", "exec"), ns)
+canonical = json.load(open(sys.argv[2]))
+wire = ns["transport_schema"](canonical)
+approve = {
+    "commit_sha": "0" * 40, "run_id": "r", "generation": 1, "provider": "gpt",
+    "attempt_id": "gpt-c1-a0001", "environment": "test", "commands_run": [{"cmd": "node --test", "exit_code": 0, "duration_s": 1.0,
+                      "artifact": "09-test-evidence/p.log"}],
+    "unit": {"status": "pass", "evidence": "09-test-evidence/p.log"},
+    "integration": {"status": "not_applicable", "evidence": "none"},
+    "e2e": {"status": "not_applicable", "evidence": "none"},
+    "visual": {"status": "not_applicable", "evidence": "none"},
+    "acceptance_criteria_coverage": [], "untested_risks": [],
+    "warnings": ["a non-blocking nit, which is where nits belong"],
+    "artifacts": [], "verdict": "APPROVE", "blockers": [], "blocker_objects": [],
+    "summary": "approve with a nit",
+}
+jsonschema.validate(approve, wire)          # the judge could legitimately return this
+jsonschema.validate(approve, canonical)     # and the gate must accept it
+# The inverse must still be rejected canonically, or the rule has been lost rather than moved.
+bad = dict(approve, blockers=["a nit recorded in the wrong field"])
+try:
+    jsonschema.validate(bad, canonical)
+except jsonschema.ValidationError:
+    pass
+else:
+    raise SystemExit("canonical schema accepted an APPROVE carrying blockers")
+PY
 
 t_case "a refused passthrough stays a trusted unavailable, never an unauthenticated judge"
 # The wrapper's fail-closed path is structural: a source that is missing, symlinked or foreign-owned

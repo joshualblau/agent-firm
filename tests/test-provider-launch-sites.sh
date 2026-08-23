@@ -38,7 +38,7 @@ mutant() { # <name> <expected substring> <mutation>...
   local args=()
   local one
   for one in "$@"; do args+=(--mutate "$one"); done
-  out="$(python3 "$SCAN" "$REPO" "${args[@]}" 2>&1)"; rc=$?
+  out="$(python3 "$SCAN" "$REPO" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ]; then
     _t_no "mutant is caught: $name" "the scan PASSED a mutated repository"
     return
@@ -75,5 +75,67 @@ mutant "a LAUNCH_OWNERS entry whose launch site no longer exists" \
   'the scan found no launch site in it' \
   'bin/firm-bootstrap:"claude":"clauded"' \
   'bin/firm-bootstrap:"codex":"codexed"'
+
+t_case "the scanner's own blind spots"
+# Two blind spots the review measured against the real scan: an argv built from an array made the
+# surface line SILENTLY VANISH from the output, and an executable held in a variable evaded both the
+# surface check and the LAUNCH_OWNERS coverage rule.
+mutant "controls built from an array expansion are CANNOT CHECK, not a silent skip" \
+  'CANNOT BE CHECKED' \
+  'bin/firm-run-evals:codex -a never exec --ephemeral:codex "${badargs[@]}" --ephemeral'
+mutant "an executable held in a variable is still a launch, and still needs an owner" \
+  'not accounted for in LAUNCH_OWNERS' \
+  "bin/firm-version:#!/usr/bin/env bash:#!/usr/bin/env bash
+CLI=codex
+\"\$CLI\" exec --ephemeral -s read-only 'variable launcher'"
+
+t_case "the escape hatch itself carries evidence, and the evidence is checked"
+# Review proved the first UNDOCUMENTED_CONTROLS was a targeted mute button: one free-text line
+# re-muted the exact firm-run-evals defect this scanner was built to catch. The mutants above prove
+# an UNLISTED control fails; these prove a LISTED one is not thereby excused. They go through
+# --measurements because mutating the scanner's own SOURCE cannot change a registry the running
+# process has already imported — which is precisely why the hatch was untested to begin with.
+measured() { # <name> <expected substring> <registry-json> [mutation]...
+  local name="$1" expect="$2" registry="$3" out rc
+  shift 3
+  local args=()
+  local one
+  for one in "$@"; do args+=(--mutate "$one"); done
+  printf '%s' "$registry" > "$T_REGISTRY"
+  out="$(python3 "$SCAN" "$REPO" --measurements "$T_REGISTRY" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _t_no "measurement is rejected: $name" "the scan PASSED with that measurement"
+  elif printf '%s' "$out" | grep -q -- "$expect"; then
+    _t_ok "measurement is rejected: $name"
+  else
+    _t_no "measurement is rejected: $name" "failed for the wrong reason: $(_t_ctx "$out")"
+  fi
+}
+T_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-measurements.XXXXXX")"; t_track "$T_REGISTRY"
+VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.238","date":"2026-08-23","argv":["claude","--max-turns","3","-p","x"],"rc":0,"observed":"ok"}}]'
+
+# Control: the real, well-formed measurement still passes through the seam, so the cases below fail
+# for their own reason and not because the seam breaks everything.
+CLEAN_SEAM="$(python3 "$SCAN" "$REPO" --measurements <(printf '%s' "$VALID") 2>&1)"; seam_rc=$?
+assert_eq "a well-formed current measurement still passes through the seam" "0" "$seam_rc"
+
+# THE ONE THAT MATTERS: a measurement must not launder the cross-surface union. `-a` is documented
+# at the codex TOP level and rejected by `codex exec`, which is the whole reason this scanner exists.
+measured "it cannot excuse a control the PARENT surface documents (the forbidden union)" \
+  'cross-surface union this scanner exists to reject' \
+  '[{"provider":"codex","subcommand":["exec"],"control":"-a","measurement":{"cli":"codex","version":"0.149.0","date":"2026-08-23","argv":["codex","exec","-a","never"],"rc":0,"observed":"fine, trust me"}}]' \
+  'bin/firm-run-evals:codex -a never exec --ephemeral:codex exec -a never --ephemeral'
+measured "a measurement against a CLI version that is not installed is stale, not evidence" \
+  'Stale evidence is not evidence' \
+  '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"0.0.0-not-installed","date":"2026-08-23","argv":["claude","--max-turns","3"],"rc":0,"observed":"ok"}}]'
+measured "a measurement whose argv does not contain the control it claims to excuse" \
+  'measured something else' \
+  '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.238","date":"2026-08-23","argv":["claude","-p","x"],"rc":0,"observed":"ok"}}]'
+measured "free text is not a measurement" \
+  'not a well-formed measurement' \
+  '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":"measured 2026-08-23: fine, trust me"}]'
+measured "a measurement with no ISO date" \
+  'no ISO date' \
+  '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.238","date":"recently","argv":["claude","--max-turns"],"rc":0,"observed":"ok"}}]'
 
 t_summary
