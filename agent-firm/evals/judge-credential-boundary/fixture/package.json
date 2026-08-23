@@ -1,0 +1,9 @@
+{
+  "name": "judge-credential-boundary-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty starting point; the firm adds sum()+test and must leave the judge able to AUTHENTICATE with a declared, credential-scoped passthrough while the rest of the operator's agent configuration stays out of its reach (see test/credential-boundary.sh).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

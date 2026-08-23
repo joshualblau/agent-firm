@@ -1,0 +1,25 @@
+name: judge-credential-boundary
+description: >-
+  Guards the 2026-08-23 defect, where the reviewer pointed HOME, XDG_CONFIG_HOME, CODEX_HOME and
+  CLAUDE_CONFIG_DIR at freshly created empty directories and seeded no credential into any of them,
+  so the judge CLI was unauthenticated on every run the firm has ever done and both provider
+  directions returned a trusted exit 3 `reason: authentication`. The firm required a second voice it
+  structurally could not obtain. The eval drives a normal lifecycle and then runs checks the defect
+  could not have satisfied: the offline credential-declaration and transport-projection check with
+  its mutants, and a LIVE binding of the declared passthrough against the installed CLIs in three
+  respects — that it authenticates in both directions, that a canary over the operator's agent
+  settings, hooks, plugins, MCP configuration, skills, session history and project files stays
+  unreachable, and that withholding the passthrough still yields a trusted classified unavailable
+  rather than an unauthenticated judge whose refusal could be mistaken for a verdict.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/sum.js
+  - file_exists: test/sum.test.js
+  - test_passes: node --test
+  - test_passes: sh test/credential-boundary.sh
+  - traceability_passes: true
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true
