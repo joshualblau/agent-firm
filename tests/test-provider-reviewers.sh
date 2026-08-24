@@ -595,6 +595,30 @@ t_case "judge manifest inventories required state, nested proof, exact digests, 
 manifest_capture="$WORK/input-manifest.json"; STUB_MANIFEST_CAPTURE="$manifest_capture"; export STUB_MANIFEST_CAPTURE
 assert_rc "GPT captures the controlled input manifest" 0 review_env approve "$GPT"
 unset STUB_MANIFEST_CAPTURE
+# A referenced path the manifest deliberately does not follow must be DECLARED, not dropped.
+# Both live judges raised the same omission independently at 5e98a9a -- "neither inventoried
+# nor declared unresolved" (GPT), "omits a referenced nested evidence file while asserting that
+# nothing is unresolved" (Claude) -- against `canonical`, which every terminal attempt record
+# names and which the manifest correctly refuses to follow because it is a mutable pointer this
+# run unlinks before it starts. The exclusion is right; the silence was the defect.
+assert_ok "an excluded reference is declared with its reason and what supersedes it" python3 - "$manifest_capture" <<'PYE'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema_version"] == 3, d["schema_version"]
+excluded = d["excluded_references"]
+entries = {x["origin_path"] for x in d["entries"]}
+assert excluded, "no canonical reference was declared, so the omission is back"
+for item in excluded:
+    assert set(item) == {"origin_path", "referenced_by", "reason", "superseded_by"}, item
+    # The exclusion must not become a politer omission: the superseding artifact has to be
+    # genuinely inventoried, or nothing covers the excluded path after all.
+    assert item["superseded_by"] in entries, (item["superseded_by"], "not inventoried")
+    assert item["reason"] == "mutable_pointer_superseded_by_immutable_attempt_local_verdict", item
+    assert item["referenced_by"].endswith(":canonical"), item
+    assert item["origin_path"].startswith("08-qa-verdict."), item
+    # And the excluded path must really be absent from the inventory, or the claim is stale.
+    assert item["origin_path"] not in entries, item["origin_path"]
+PYE
 assert_ok "manifest has exact required origins and nested referenced evidence" python3 - "$manifest_capture" "$RUN" <<'PY'
 import hashlib,json,os,sys
 manifest,run=sys.argv[1:]; d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
