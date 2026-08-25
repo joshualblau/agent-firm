@@ -25,7 +25,7 @@ install_in() { d="$1"; shift; ( cd "$d" && "$BIN/firm-install" "$@" ); }
 
 # rules_of <settings.json> <bucket> — one rule per line
 rules_of() {
-  python3 -c '
+  t_python -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
 print("\n".join(d.get("permissions",{}).get(sys.argv[2],[])))' "$1" "$2" 2>/dev/null
@@ -45,6 +45,9 @@ mk_firm_root() { # <policy-json | MISSING> -> echoes root path
   _r="$(mktemp -d "${TMPDIR:-/tmp}/firm-iroot.XXXXXX")"
   mkdir -p "$_r/bin" "$_r/.claude" "$_r/agent-firm/policy"
   cp "$BIN/firm-install" "$_r/bin/firm-install"
+  # firm-install runs the interpreter its sibling bin/firm-python resolves, so a minimal root
+  # includes the resolver; without it the tool fails closed before reading any policy.
+  cp "$BIN/firm-python" "$_r/bin/firm-python"
   cp "$FIRM_ROOT/.claude/settings.json" "$_r/.claude/settings.json"
   [ "$1" = MISSING ] || printf '%s\n' "$1" > "$_r/agent-firm/policy/retired-permissions.json"
   printf '%s' "$_r"
@@ -96,20 +99,20 @@ t_case "permission migration preserves legacy hooks and unrelated configuration 
 legacy_proj="$(mk_target '{"permissions":{"allow":["Bash(cat:*)"],"ask":[],"deny":[]},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"custom-hook"},{"type":"command","command":"firm-ledger-hook"}]}]},"custom":{"owner":"project","enabled":true}}')"
 t_track "$legacy_proj"
 LS="$legacy_proj/.claude/settings.json"
-legacy_before="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+legacy_before="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
 assert_ok "migration succeeds without claiming hook ownership" install_in "$legacy_proj" --migrate
-legacy_after="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
+legacy_after="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({"hooks":d["hooks"],"custom":d["custom"]},sort_keys=True))' "$LS")"
 assert_eq "legacy hook and unrelated config subtrees remain semantically exact" "$legacy_before" "$legacy_after"
 assert_ok "retired permission is still removed" lacks_rule "$LS" allow "Bash(cat:*)"
-assert_ok "canonical permission source no longer embeds plugin-owned hooks" python3 -c \
+assert_ok "canonical permission source no longer embeds plugin-owned hooks" t_python -c \
   "import json; d=json.load(open('$FIRM_ROOT/.claude/settings.json')); assert 'hooks' not in d"
 legacy_home="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-home.XXXXXX")"; t_track "$legacy_home"
 legacy_stubs="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-stubs.XXXXXX")"; t_track "$legacy_stubs"
 printf '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 0\n' > "$legacy_stubs/claude"
 printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 0\nexit 0\n' > "$legacy_stubs/codex"
 chmod +x "$legacy_stubs/claude" "$legacy_stubs/codex"
-python_exe="$(python3 -c 'import sys; print(sys.executable)')"
-legacy_pythonpath="$(python3 -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
+python_exe="$(t_python -c 'import sys; print(sys.executable)')"
+legacy_pythonpath="$(t_python -c 'import jsonschema,os,yaml; print(":".join(sorted({os.path.dirname(os.path.dirname(jsonschema.__file__)),os.path.dirname(os.path.dirname(yaml.__file__))})))')"
 ln -s "$python_exe" "$legacy_stubs/python3"
 legacy_hash="$(shasum -a 256 "$LS" | cut -d' ' -f1)"
 legacy_mode="$(t_file_mode "$LS")"
@@ -123,8 +126,8 @@ assert_eq "doctor detection leaves the external settings byte-identical" "$legac
   "$(shasum -a 256 "$LS" | cut -d' ' -f1)"
 assert_eq "doctor detection leaves the external settings mode identical" "$legacy_mode" \
   "$(t_file_mode "$LS")"
-legacy_config_before="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
-python3 - "$LS" <<'PY'
+legacy_config_before="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
+t_python - "$LS" <<'PY'
 import json,os,sys
 p=sys.argv[1]; mode=os.stat(p).st_mode & 0o777; d=json.load(open(p))
 for entry in d.get("hooks",{}).get("PreToolUse",[]):
@@ -133,7 +136,7 @@ with open(p,"w") as fh: json.dump(d,fh,separators=(",",":")); fh.write("\n")
 os.chmod(p,mode)
 PY
 assert_eq "fixture operator removed only the firm command" "$legacy_config_before" \
-  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
+  "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["custom"],sort_keys=True))' "$LS")"
 assert_eq "manual cleanup preserves mode" "$legacy_mode" \
   "$(t_file_mode "$LS")"
 legacy_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; legacy_clean_rc=$?
@@ -148,14 +151,14 @@ assert_eq "confirmed user duplicate blocks doctor readiness" "1" "$user_doctor_r
 assert_output "doctor identifies user scope exactly" "user Claude settings contain a confirmed legacy duplicate firm hook" printf '%s\n' "$user_doctor_out"
 assert_eq "user duplicate detection preserves full bytes" "$user_hash" "$(shasum -a 256 "$US" | cut -d' ' -f1)"
 assert_eq "user duplicate detection preserves mode" "$user_mode" "$(t_file_mode "$US")"
-python3 - "$US" <<'PY'
+t_python - "$US" <<'PY'
 import json,os,sys
 p=sys.argv[1]; mode=os.stat(p).st_mode & 0o777; d=json.load(open(p)); d["hooks"]={}
 with open(p,"w") as fh: json.dump(d,fh,separators=(",",":")); fh.write("\n")
 os.chmod(p,mode)
 PY
 assert_eq "user cleanup preserves unrelated configuration" '{"owner":"user"}' \
-  "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["custom"],separators=(",",":")))' "$US")"
+  "$(t_python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["custom"],separators=(",",":")))' "$US")"
 user_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; user_clean_rc=$?
 assert_eq "readiness returns after the user duplicate is removed" "0" "$user_clean_rc"
 
@@ -273,7 +276,7 @@ t_case "the shipped policy scopes both GRANT lists, so real allow/ask drift is s
 # agent-firm/policy/retired-permissions.json names allow AND ask for both entries, which is why the
 # "drifted into another bucket" case earlier in this file still passes. Assert that directly, so a
 # future edit that drops "ask" from the policy fails here instead of silently leaving grants behind.
-assert_ok "every shipped retirement entry names allow AND ask, and never deny" python3 -c "
+assert_ok "every shipped retirement entry names allow AND ask, and never deny" t_python -c "
 import json, sys
 entries = json.load(open('$FIRM_ROOT/agent-firm/policy/retired-permissions.json'))['retired']
 assert entries, 'no retired entries at all'
@@ -382,7 +385,7 @@ link_baks()   { find "$1/.claude" -name 'settings.json.*.bak' -type l; }
 count_lines() { printf '%s' "$1" | grep -c . | tr -d ' '; }
 # perm_of <file> — the file's own mode, four octal digits. lstat, not stat: a symlink must report as
 # a symlink here rather than silently reporting whatever it points at.
-perm_of() { python3 -c 'import os,sys; print("%04o" % (os.lstat(sys.argv[1]).st_mode & 0o7777))' "$1"; }
+perm_of() { t_python -c 'import os,sys; print("%04o" % (os.lstat(sys.argv[1]).st_mode & 0o7777))' "$1"; }
 # plant_baks <proj> <kind:link|file> <link-target-or-content> — occupy the backup names firm-install
 # is about to try. The stamp is the current UTC SECOND, so ONE plant can be dodged simply by the run
 # crossing a second boundary; a 10-second window is planted instead. All ten come from a single clock
@@ -391,7 +394,7 @@ perm_of() { python3 -c 'import os,sys; print("%04o" % (os.lstat(sys.argv[1]).st_
 # the case flaky, it makes it pass VACUOUSLY, with the trap unarmed at the moment of the write. The
 # cases below therefore also prove, after the fact, that the trap really was hit.
 plant_baks() {
-  python3 -c '
+  t_python -c '
 import os, sys, time
 d, kind, arg = sys.argv[1], sys.argv[2], sys.argv[3]
 t = time.time()
@@ -407,7 +410,7 @@ for i in range(10):
 # all_dangling <proj> — every planted .bak is a symlink AND resolves to nothing. Fails loudly (with
 # the offending path) rather than returning a bare non-zero, and refuses an empty set.
 all_dangling() {
-  python3 -c '
+  t_python -c '
 import glob, os, sys
 paths = sorted(glob.glob(os.path.join(sys.argv[1], ".claude", "settings.json.*.bak")))
 if not paths:
@@ -477,7 +480,7 @@ assert_ok "and it holds the pre-migration settings" has_rule "$coll_bak" allow "
 install_umask() { _um="$1"; _dd="$2"; shift 2; ( umask "$_um"; cd "$_dd" && "$BIN/firm-install" "$@" ); }
 # writable_by_others <file> — true if group or other holds the WRITE bit. Phrased as the invariant
 # rather than as an exact mode so it keeps meaning if the exact mode is ever revisited.
-writable_by_others() { python3 -c 'import os,sys; sys.exit(0 if os.lstat(sys.argv[1]).st_mode & 0o022 else 1)' "$1"; }
+writable_by_others() { t_python -c 'import os,sys; sys.exit(0 if os.lstat(sys.argv[1]).st_mode & 0o022 else 1)' "$1"; }
 
 t_case "a NEWLY created settings.json is 0600 whatever the umask — never group/world writable"
 # It was chmod'd to `0o666 & ~umask` on creation, so `umask 000` produced -rw-rw-rw-: every local

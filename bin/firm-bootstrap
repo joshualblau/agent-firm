@@ -7,6 +7,7 @@ set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"; ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
 want_permissions=0; want_python_deps=0
 for arg in "$@"; do
@@ -24,7 +25,7 @@ echo "  repo: $ROOT"
 # The provider transaction uses only the standard library plus WO-F's bounded-process helper. Tests
 # supply disposable fixture CLIs and recovery roots; production callers must explicitly authorize the
 # resulting provider-store mutations. This is compensation across two stores, never atomicity.
-python3 - "$ROOT" "$SELF/firm-bounded-exec" <<'PY'
+firm_python - "$ROOT" "$SELF/firm-bounded-exec" <<'PY'
 import hashlib
 import json
 import os
@@ -434,15 +435,18 @@ PY
 if [[ "${FIRM_SKIP_LINK:-0}" != "1" ]]; then "$SELF/firm-link"; else echo "  (skipping shell PATH linking — FIRM_SKIP_LINK=1)"; fi
 
 missing_py=""
-python3 -c 'import jsonschema' >/dev/null 2>&1 || missing_py="$missing_py jsonschema"
-python3 -c 'import yaml' >/dev/null 2>&1 || missing_py="$missing_py pyyaml"
+firm_python -c 'import jsonschema' >/dev/null 2>&1 || missing_py="$missing_py jsonschema"
+firm_python -c 'import yaml' >/dev/null 2>&1 || missing_py="$missing_py pyyaml"
 if [[ -n "$missing_py" ]]; then
   if [[ "$want_python_deps" == "1" ]]; then
     echo "  installing Python prerequisites:$missing_py"
-    python3 -m pip install --user jsonschema pyyaml || echo "  WARNING: pip install failed — run: python3 -m pip install --user jsonschema pyyaml" >&2
+    # Install into the interpreter the firm actually runs (bin/firm-python), never whatever
+    # `python3` PATH happens to name: installing into a different interpreter is exactly how a
+    # host ends up with the package present and firm-doctor still reporting it missing.
+    firm_python -m pip install --user jsonschema pyyaml || echo "  WARNING: pip install failed — run: bin/firm-python -m pip install --user jsonschema pyyaml" >&2
   else
     echo "  missing Python prerequisite(s):$missing_py"
-    echo "    Install with: python3 -m pip install --user jsonschema pyyaml (or re-run with --with-python-deps)"
+    echo "    Install with: bin/firm-python -m pip install --user jsonschema pyyaml (or re-run with --with-python-deps)"
   fi
 else
   echo "  Python prerequisites present (jsonschema, pyyaml)"

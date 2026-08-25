@@ -71,7 +71,7 @@ for value in bad:
     raise AssertionError(value)
 PY
 
-contract_check() { python3 "$W/contract-check.py" "$1" "$2" "$3"; }
+contract_check() { t_python "$W/contract-check.py" "$1" "$2" "$3"; }   # needs pyyaml: the firm's interpreter
 
 t_case "template, role, exported production schema, and aggregator share one exact finding contract"
 assert_ok "canonical artifact validates through the production schema and projection" \
@@ -169,13 +169,13 @@ if [ "$current_discovery_rc" -ne 0 ]; then
   _t_no "exactly one current R-02 input set is discoverable" "multiple digest-matching runs"
 elif [ -n "$CURRENT_R02_RUN" ]; then
   assert_ok "actual current inputs bind, validate, aggregate losslessly, and remain byte-identical" \
-    python3 "$W/current-artifact-check.py" "$CURRENT_R02_RUN" "$WORKFLOW" "$W/current-contract.js"
+    t_python "$W/current-artifact-check.py" "$CURRENT_R02_RUN" "$WORKFLOW" "$W/current-contract.js"
 else
   _t_ok "portable checkout has no current R-02 run; no synthetic artifact was substituted (set FIRM_R02_REVIEW_RUN for engagement proof)"
 fi
 
 t_case "real schema inner requirements, strictness, every enum, and projection are mutation-sensitive"
-python3 - "$WORKFLOW" "$W" <<'PY'
+t_python - "$WORKFLOW" "$W" <<'PY'
 import pathlib,sys
 source=pathlib.Path(sys.argv[1]).read_text(); out=pathlib.Path(sys.argv[2]); mutations={}
 mutations['inner-required']=source.replace("required: ['severity', 'confidence', 'location', 'issue', 'suggested_fix', 'status']","required: ['severity', 'confidence', 'location', 'issue', 'suggested_fix']",1)
@@ -202,13 +202,13 @@ done
 t_case "template and reviewer-role per-field mutations break canonical alignment"
 for field in lens severity confidence location issue suggested_fix status; do
   mt="$W/template-$field.yaml"; cp "$TEMPLATE" "$mt"
-  python3 - "$mt" "$field" <<'PY'
+  t_python - "$mt" "$field" <<'PY'
 import sys,yaml
 p,field=sys.argv[1:]; d=yaml.safe_load(open(p)); d['findings'][0].pop(field); yaml.safe_dump(d,open(p,'w'),sort_keys=False)
 PY
   assert_fail "template mutation removes $field" contract_check "$mt" "$ROLE" "$WORKFLOW"
   mr="$W/role-$field.md"; cp "$ROLE" "$mr"
-  python3 - "$mr" "$field" <<'PY'
+  t_python - "$mr" "$field" <<'PY'
 import sys
 p,field=sys.argv[1:]; s=open(p).read(); s=s.replace(field.replace('_',' '),'REMOVED').replace(field,'REMOVED'); open(p,'w').write(s)
 PY

@@ -5,6 +5,7 @@ set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "firm-qa-checkout: current directory is not a git repository" >&2; exit 2;
@@ -19,7 +20,7 @@ case "$run_text" in
   /*) run_dir="$run_text" ;;
   *) run_dir="$repo/$run_text" ;;
 esac
-run_dir="$(python3 - "$repo" "$run_dir" <<'PY'
+run_dir="$(firm_python - "$repo" "$run_dir" <<'PY'
 import os, re, stat, sys
 repo = os.path.abspath(sys.argv[1])
 raw = sys.argv[2]
@@ -61,7 +62,7 @@ case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][
 metadata_json="$("$SELF/firm-new-run" --metadata-view "$run_dir")" || {
   echo "firm-qa-checkout: current run metadata is unavailable or malformed" >&2; exit 2;
 }
-accepted_base="$(printf '%s' "$metadata_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["approval_eligible"] is True and d["historical"] is False; print(d["accepted_base_sha"])')" || {
+accepted_base="$(printf '%s' "$metadata_json" | firm_python -c 'import json,sys; d=json.load(sys.stdin); assert d["approval_eligible"] is True and d["historical"] is False; print(d["accepted_base_sha"])')" || {
   echo "firm-qa-checkout: historical or approval-ineligible metadata cannot capture a current candidate" >&2; exit 2;
 }
 case "$accepted_base" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "firm-qa-checkout: accepted base is not a full SHA" >&2; exit 2 ;; esac
@@ -73,7 +74,7 @@ git -C "$repo" merge-base --is-ancestor "$accepted_base" "$sha" || {
 }
 
 secure_owned_dir() {
-  python3 - "$1" "$2" <<'PY'
+  firm_python - "$1" "$2" <<'PY'
 import os, stat, sys
 root=os.path.abspath(sys.argv[1]); relative=sys.argv[2]
 parts=relative.split("/")
@@ -119,7 +120,7 @@ if [[ -e "$qa_dir" || -L "$qa_dir" ]]; then
   }
 fi
 git -C "$repo" worktree add --detach "$qa_dir" "$sha" >/dev/null
-python3 - "$qa_dir" "$qa_parent/$run_id" <<'PY' || {
+firm_python - "$qa_dir" "$qa_parent/$run_id" <<'PY' || {
 import os,stat,sys
 path,expected=sys.argv[1:]
 info=os.lstat(path)
@@ -140,7 +141,7 @@ evidence="$(secure_owned_dir "$run_dir" "09-test-evidence")" || {
   echo "firm-qa-checkout: evidence parent is unsafe or redirected" >&2; exit 2;
 }
 candidate="$evidence/qa-candidate.json"
-generation="$(python3 - "$repo" "$run_dir" "$qa_dir" "$branch" "$sha" "$accepted_base" "$candidate" <<'PY'
+generation="$(firm_python - "$repo" "$run_dir" "$qa_dir" "$branch" "$sha" "$accepted_base" "$candidate" <<'PY'
 import datetime, json, os, stat, subprocess, sys
 repo, run, checkout, branch, sha, base, target = sys.argv[1:]
 run_id=os.path.basename(run)

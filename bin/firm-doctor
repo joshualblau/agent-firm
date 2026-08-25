@@ -18,6 +18,17 @@
 #   8. both provider CLIs present and subscription login/model configuration ready
 #   9. retired permission rules (fail-closed): the retirement policy is present AND readable, and no
 #      settings.json still grants a rule it withdrew. "Could not check" counts as a FAIL, not a WARN.
+#  10. P2 ledger-write configuration (fail-closed): the process row this host actually presents —
+#      system, macOS/Darwin pair, architecture, Python version and implementation — against what
+#      bin/firm-ledger-log admits. Without it this doctor could report 8 PASS / 5 FAIL on a machine
+#      where EVERY ledger write was dead and never name the blocker, which is exactly what it did
+#      when macOS moved to a row the writer had not proven yet.
+#
+# Every python probe here runs the interpreter bin/firm-python resolves — the same one the ledger
+# writer runs — not whatever `python3` is first on PATH. A doctor that probes a different interpreter
+# than the gate is answering a different question, and the two can (and did) disagree: PATH `python3`
+# was conda 3.8.13 while the gate needs CPython 3.9.6, and an x86_64 Homebrew bash ahead of /bin/bash
+# made a universal python report x86_64, so its own arm64 wheels would not load.
 #
 # Exit 0 when no FAIL (WARN is advisory). Exit 1 on ANY fail-closed FAIL. bash-3.2 safe (macOS).
 #   --probe   also run live account/model probes — needs network and a small subscription turn.
@@ -25,11 +36,12 @@ set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+. "$SELF/firm-python"
 
 PROBE=0
 case "${1:-}" in
   --probe) PROBE=1 ;;
-  -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   '') : ;;
   *) echo "firm-doctor: unknown arg '$1' (use --probe or --help)" >&2; exit 2 ;;
 esac
@@ -204,12 +216,22 @@ else
   if [ "$SUB" = 1 ]; then warn "CLAUDE_CONFIG_DIR unset in a subscription project — set it via .envrc (CLAUDE_CONFIG_DIR=\$HOME/.claude-\$FIRM_PROFILE)."
   else info "CLAUDE_CONFIG_DIR unset (using the default ~/.claude)."; fi
 fi
-info "macOS caveat: CLAUDE_CONFIG_DIR isolates SETTINGS but does NOT switch the subscription account (auth lives in the login Keychain)."
+# macOS auth storage, re-measured on Claude Code 2.1.234 (the old text here predates it and was
+# wrong in both directions). The credential is in the login Keychain, and `claude` fetches it by
+# spawning `security find-generic-password -a "$USER" -s <service>`. TWO things scope that lookup:
+#   * HOME — the default keychain search list is resolved from the invoking user's home directory,
+#     so the identical lookup that succeeds under your HOME fails with rc 44 under any other one.
+#   * CLAUDE_CONFIG_DIR — <service> is "Claude Code-credentials" only while CLAUDE_CONFIG_DIR is
+#     UNSET. Set it, and the service becomes "Claude Code-credentials-<sha256(dir) first 8 hex>",
+#     a per-directory namespace. So on this version CLAUDE_CONFIG_DIR DOES switch the account: each
+#     config dir has its own keychain entry and its own /login. The entry is shared only across
+#     config-dir-unset invocations.
+info "macOS: the Claude credential is in the login Keychain, keyed by \$USER and namespaced per CLAUDE_CONFIG_DIR (unset ⇒ 'Claude Code-credentials'; set ⇒ '…-<sha256(dir)|8>'). It is NOT reachable from an isolated HOME."
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  pass "CLAUDE_CODE_OAUTH_TOKEN present — overrides the shared Keychain so THIS account is used (real per-project switch)"
+  pass "CLAUDE_CODE_OAUTH_TOKEN present — the one credential that needs no config dir and no Keychain, so it pins THIS account and is what firm-claude-qa's controlled root can use"
 else
-  if [ "$SUB" = 1 ]; then warn "CLAUDE_CODE_OAUTH_TOKEN not set — on macOS the account won't switch per project. Run 'claude setup-token' for this account, store it in op, and reference it from .env.op."
-  else info "CLAUDE_CODE_OAUTH_TOKEN not set."; fi
+  if [ "$SUB" = 1 ]; then warn "CLAUDE_CODE_OAUTH_TOKEN not set — firm-claude-qa's controlled root isolates HOME, which severs the Keychain, so the Claude judge will report a trusted 'unavailable' (exit 3). Run 'claude setup-token' for this account, store it in op, and reference it from .env.op."
+  else info "CLAUDE_CODE_OAUTH_TOKEN not set — firm-claude-qa's Claude judge will report a trusted 'unavailable' (exit 3) until it is."; fi
 fi
 if [ "$PROBE" = 1 ] && command -v claude >/dev/null 2>&1; then
   info "probe: run 'claude' then /status to confirm auth is subscription-OAuth-token (not an API key)."
@@ -263,16 +285,38 @@ fi
 # Python prerequisites. jsonschema is GATE-CRITICAL: without it firm-validate-verdict exits 4
 # (DEGRADED) and a QA verdict cannot clear the Final gate.
 # pyyaml is gate-critical in 0.8.0 because firm-final-qa-check parses structured two-voice state.
-if python3 -c 'import jsonschema' >/dev/null 2>&1; then
+#
+# These probe the RESOLVED interpreter, not `python3` from PATH. "Installed" is a property of one
+# interpreter: a package installed for PATH's python is not installed for the firm's, and reporting
+# the wrong one produces both false greens and false reds (an arm64 jsonschema that only fails to
+# load because a translated shell forced the probe into Rosetta was reported here as MISSING).
+info "python interpreter under test: $FIRM_PYTHON_DISPLAY"
+
+# _import_proved <module> — rc 0 only if the resolved interpreter DEMONSTRABLY imported <module>.
+#
+# `firm_python -c import X` was an exit status and nothing else, and an exit status is a number any
+# program can return without importing anything (SEC-01). A `#!/bin/sh` + `exit 0` shim named python3
+# produced PASS for both GATE-CRITICAL dependencies here with no Python executed at all. The
+# resolver refuses that shim now, but $FIRM_PYTHON on a host with no compliant interpreter can still
+# make the degraded argv something that is not an interpreter, and this check has no business
+# depending on a fix one layer down. So the probe carries proof: the marker is built FROM the module
+# name inside the interpreter, so a constant `echo` cannot answer for an arbitrary module either.
+# The program is a named constant rather than an inline multi-line string, so the `[ ... ]` test
+# below stays one readable line.
+_IMPORT_PROBE='import importlib, sys; importlib.import_module(sys.argv[1]); sys.stdout.write("FIRM_DOCTOR_IMPORTED:" + sys.argv[1])'
+_import_proved() {
+  [ "$(firm_python -c "$_IMPORT_PROBE" "$1" 2>/dev/null)" = "FIRM_DOCTOR_IMPORTED:$1" ]
+}
+if _import_proved jsonschema; then
   pass "python jsonschema present — QA verdicts can be schema-validated"
 else
-  fail "python jsonschema MISSING — firm-validate-verdict exits 4 (DEGRADED) and no QA verdict can pass the Final gate"
-  info "fix: python3 -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)"
+  fail "python jsonschema MISSING for $FIRM_PYTHON_DISPLAY — firm-validate-verdict exits 4 (DEGRADED) and no QA verdict can pass the Final gate"
+  info "fix: bin/firm-python -m pip install --user jsonschema pyyaml   (or: firm-bootstrap --with-python-deps)"
 fi
-if python3 -c 'import yaml' >/dev/null 2>&1; then
+if _import_proved yaml; then
   pass "python pyyaml present — traceability, eval assertions, and final QA can parse exactly"
 else
-  fail "python pyyaml missing — firm-final-qa-check cannot evaluate two-voice state; install with 'python3 -m pip install --user pyyaml'."
+  fail "python pyyaml missing for $FIRM_PYTHON_DISPLAY — firm-final-qa-check cannot evaluate two-voice state; install with 'bin/firm-python -m pip install --user pyyaml'."
 fi
 
 # Retired permission rules. firm-install only unions rules, so a project installed before a rule was
@@ -305,7 +349,7 @@ else
   # Validate the POLICY once, before looking at any settings file. Doing it here rather than inside
   # the per-scope loop keeps the message honest ("the policy is unusable", not "your settings.json
   # could not be checked") and costs one FAIL for one defect instead of one per settings file.
-  _pol_err="$(python3 - "$RETIRED_JSON" <<'PY' 2>&1 >/dev/null
+  _pol_err="$(firm_python - "$RETIRED_JSON" <<'PY' 2>&1 >/dev/null
 import json, sys
 try:
     entries = json.load(open(sys.argv[1])).get("retired", [])
@@ -353,8 +397,8 @@ if [ "$_pol_ok" -eq 1 ]; then
     # This re-validates the policy the guard above already validated. That duplication is deliberate:
     # this is the script that decides what gets reported as a live grant, and in a fail-closed check it
     # should not be able to produce a PASS from a policy it never checked, however it came to be run.
-    _out="$(python3 - "$RETIRED_JSON" "$_sfile" <<'PY' 2>&1
-import json, sys
+    _out="$(firm_python - "$RETIRED_JSON" "$_sfile" <<'PY' 2>&1
+import json, os, sys
 try:
     entries = json.load(open(sys.argv[1])).get("retired", [])
     if not isinstance(entries, list):
@@ -387,6 +431,10 @@ try:
             raise ValueError(f"`permissions.{k}` is not a JSON array")
     hits = sorted({r for k in ("allow", "ask") for r in perms.get(k, []) if r in scoped[k]})
     deny_hits = sorted({r for r in perms.get("deny", []) if r in every})
+    # PROOF OF EXECUTION, first line. rc 0 with no hits used to be read as "no retired rules", and a
+    # program that never ran produces exactly that: rc 0, empty stdout (SEC-01). The marker carries
+    # the settings file this run actually opened, so it cannot be answered by a constant echo either.
+    print("FIRM_DOCTOR_RETIRED_OK " + os.path.realpath(sys.argv[2]))
     print(" ".join(hits))
     print(" ".join(deny_hits))
 except Exception as e:
@@ -395,11 +443,19 @@ except Exception as e:
 PY
 )"
     _py_rc=$?
-    _hits="$(printf '%s\n' "$_out" | sed -n '1p')"
-    _deny_hits="$(printf '%s\n' "$_out" | sed -n '2p')"
+    _proof="$(printf '%s\n' "$_out" | sed -n '1p')"
+    _hits="$(printf '%s\n' "$_out" | sed -n '2p')"
+    _deny_hits="$(printf '%s\n' "$_out" | sed -n '3p')"
+    _want_proof="FIRM_DOCTOR_RETIRED_OK $(cd -P "$(dirname "$_sfile")" 2>/dev/null && pwd -P)/$(basename "$_sfile")"
     if [ "$_py_rc" -ne 0 ]; then
       fail "$_scope settings.json could not be checked for retired permission rules ($_out) — fix the file's JSON, then re-run firm-doctor."
       info "firm-doctor fails closed: a settings file it cannot parse is UNVERIFIED, not clean."
+    elif [ "$_proof" != "$_want_proof" ]; then
+      # The checker exited 0 without proving it ran. "Could not check" is a FAIL here, not a WARN,
+      # and it is emphatically not a PASS: the comment above says this check must not be able to
+      # produce a PASS from a policy it never checked, however it came to be run.
+      fail "$_scope settings were NOT checked for retired permission rules — the checker exited 0 without proving it ran (SKIPPED, not passed)"
+      info "the resolved interpreter ($FIRM_PYTHON_DISPLAY) did not execute the check. Verify it with: bin/firm-python --status"
     elif [ -n "$_hits" ]; then
       fail "$_scope settings still grant RETIRED permission rule(s): $_hits"
       info "these read around the Read-tool deny rules. Fix: firm-install$_sflag --migrate"
@@ -424,7 +480,7 @@ resolve_reviewer_tuple() {
   if [ "$_override_set" = x ]; then _resolver_args+=(--expect-model "$_override"); fi
   _resolved="$($SELF/firm-model-resolve "${_resolver_args[@]}" 2>&1)"; _resolved_rc=$?
   [ "$_resolved_rc" -eq 0 ] || { printf '%s\n' "$_resolved" >&2; return "$_resolved_rc"; }
-  printf '%s' "$_resolved" | python3 -c '
+  printf '%s' "$_resolved" | firm_python -c '
 import json,sys
 provider=sys.argv[1]; d=json.load(sys.stdin)
 assert set(d)=={"provider","selected_by","selector","tier","model","display","effort","policy_sha256"}
@@ -478,8 +534,15 @@ if [ "$MODEL_ENVELOPE_READY" = 1 ] && command -v codex >/dev/null 2>&1; then
   if run_capped 10 codex login status >/dev/null 2>&1; then
     pass "Codex ChatGPT subscription authentication is ready"
     if [ "$PROBE" = 1 ]; then
-      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only -a never \
+      # -a/--ask-for-approval is INTERACTIVE-ONLY on codex-cli 0.147.0 and is not a clap global, so
+      # `codex exec ... -a never` is `error: unexpected argument '-a' found` (rc 2) and the probe
+      # never reaches the model. That made --probe report the canonical GPT reviewer failing on a
+      # host where it works perfectly, which is the loudest possible false negative from the
+      # quietest possible cause. The same never-ask policy is stated the way exec does accept it,
+      # as the typed -c override firm-reviewer-common already sends to the real judge.
+      if run_capped 45 codex exec --skip-git-repo-check --ephemeral -s read-only \
         -m "$CODEX_REVIEW_MODEL" -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" \
+        -c "approval_policy=\"never\"" \
         "Reply with exactly: ok" >/dev/null 2>&1; then
         pass "GPT reviewer $CODEX_REVIEW_DISPLAY ($CODEX_REVIEW_MODEL, effort $CODEX_REVIEW_EFFORT) completed a bounded read-only probe"
       else
@@ -500,7 +563,7 @@ fi
 
 section "9.5. Plugin hook ownership and legacy duplicates"
 FIRM_SOURCE_ROOT="$(cd "$SELF/.." && pwd)"
-if python3 - "$FIRM_SOURCE_ROOT" <<'PY' >/dev/null 2>&1
+_hook_manifest_out="$(firm_python - "$FIRM_SOURCE_ROOT" <<'PY' 2>/dev/null
 import json, os, sys
 root = sys.argv[1]
 claude_plugin = json.load(open(os.path.join(root, ".claude-plugin", "plugin.json")))
@@ -518,18 +581,24 @@ for rel in ("hooks/claude.json", "hooks/hooks.json"):
     assert isinstance(guard.get("timeout"), int) and guard["timeout"] > 0
 settings = json.load(open(os.path.join(root, ".claude", "settings.json")))
 assert "hooks" not in settings, "tracked project settings duplicate the Claude plugin hook source"
+# Proof of execution (SEC-01): rc 0 alone was satisfied by any program that never opened a manifest.
+sys.stdout.write("FIRM_DOCTOR_HOOKS_OK")
 PY
-then
+)"; _hook_manifest_rc=$?
+if [ "$_hook_manifest_out" = "FIRM_DOCTOR_HOOKS_OK" ] && [ "$_hook_manifest_rc" -eq 0 ]; then
   pass "repository manifests declare one plugin-owned ledger/merge-guard hook adapter per runtime; runtime loader selection is unverified until Q-02; tracked settings contain no duplicate"
-else
+elif [ "$_hook_manifest_rc" -ne 0 ]; then
   fail "plugin hook ownership is ambiguous or malformed — reinstall/repair the package before running the firm"
   info "expected Claude hooks/claude.json, Codex hooks/hooks.json, and no tracked .claude/settings.json hook block."
+else
+  fail "plugin hook ownership was NOT verified — the probe exited 0 without proving it ran (SKIPPED, not passed)"
+  info "the resolved interpreter ($FIRM_PYTHON_DISPLAY) did not execute the check. Verify it with: bin/firm-python --status"
 fi
 
 check_legacy_claude_hooks() {
   _legacy_scope="$1"; _legacy_file="$2"
   [ -f "$_legacy_file" ] || return 0
-  _legacy_out="$(python3 - "$_legacy_file" <<'PY' 2>&1
+  _legacy_out="$(firm_python - "$_legacy_file" <<'PY' 2>&1
 import json, sys
 doc = json.load(open(sys.argv[1]))
 hits = []
@@ -565,7 +634,7 @@ check_legacy_claude_hooks "user" "$HOME/.claude/settings.json"
 # Codex loader scopes and runtime selection remain unverified until Q-02; bootstrap never overwrites
 # project config.
 if [ -f .codex/hooks.json ]; then
-  _codex_legacy_out="$(python3 - .codex/hooks.json <<'PY' 2>&1
+  _codex_legacy_out="$(firm_python - .codex/hooks.json <<'PY' 2>&1
 import json, sys
 doc=json.load(open(sys.argv[1]))
 hits=[]
@@ -595,6 +664,124 @@ if command -v chezmoi >/dev/null 2>&1; then
   else info "chezmoi present; ~/.config/chezmoi/chezmoi.toml has no [onepassword] mode=\"service\" yet (see docs/PHASE4.md)."; fi
 else
   info "chezmoi not installed (only needed for second-machine bootstrap)."
+fi
+
+# ==========================================================================
+# 10. P2 ledger-write configuration — the gate every lifecycle record depends on
+# ==========================================================================
+# This doctor had no platform check at all, on a host where every single ledger write was failing
+# closed with WRITE_CONFIGURATION_UNSUPPORTED: p2. It reported 8 PASS / 5 FAIL and not one of the
+# five named the blocker, so "the firm is broken" and "the doctor is green-ish" were both true. A
+# check that cannot see the gate it depends on is a false green on precisely the question being asked.
+#
+# The supported (macOS, Darwin) pairs are READ OUT OF bin/firm-ledger-log, exactly as every other
+# reader of that set does. The readers are deliberately NOT enumerated here: this comment used to
+# name two and there were three, and the one it omitted (tests/test-plugin-layout.sh) was added by
+# the same commit that wrote the list (CC-06). `grep -rl SUPPORTED_P2_OS_ROWS .` finds them all.
+# A second hand-maintained copy of the SET here could drift and report a row the production gate
+# does not actually admit — which is the same class of defect as having no check at all, only
+# harder to notice.
+#
+# Fail-closed, like check 9: an unsupported row AND an unverifiable one are both FAIL, because only
+# FAILs reach the exit code and `firm-doctor && <run the firm>` must not proceed on a host whose
+# write configuration nobody could establish.
+section "10. P2 ledger-write configuration"
+LEDGER_PRODUCER="$SELF/firm-ledger-log"
+info "interpreter under test: $FIRM_PYTHON_DISPLAY"
+if [ "$FIRM_PYTHON_P2" -ne 1 ]; then
+  info "interpreter resolution: $FIRM_PYTHON_REASON"
+fi
+_p2_rows=""
+_p2_report="$(firm_python - "$LEDGER_PRODUCER" \
+  "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
+  "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" <<'PY' 2>&1
+import ast, os, pathlib, platform, re, sys
+
+producer, want_system, want_arch, want_version, want_impl = sys.argv[1:6]
+source = pathlib.Path(producer).read_text()
+match = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+if match is None:
+    raise SystemExit("cannot read SUPPORTED_P2_OS_ROWS from " + producer)
+rows = ast.literal_eval(match.group(1))
+if not isinstance(rows, (set, frozenset)) or not rows:
+    raise SystemExit("SUPPORTED_P2_OS_ROWS in " + producer + " is not a non-empty set of rows")
+shown = ", ".join("macOS %s / Darwin %s" % row for row in sorted(rows))
+
+def emit(status, message):
+    print("%s\t%s" % (status, message))
+
+def clause(ok, label, actual, supported):
+    emit("PASS" if ok else "FAIL",
+         "%s %s (supported: %s)" % (label, actual or "<unverifiable>", supported))
+    return ok
+
+system, macos, kernel = platform.system(), platform.mac_ver()[0], platform.release()
+arch, impl = platform.machine(), getattr(sys.implementation, "name", "")
+version = ".".join(str(part) for part in sys.version_info[:3])
+executable = sys.executable
+
+ok = clause(system == want_system, "system", system, want_system)
+# Membership is by whole PAIR: a macOS value from one proven row combined with the kernel value of
+# another is NOT a supported row, and neither is an empty (unverifiable) half.
+ok = clause((macos, kernel) in rows, "macOS/Darwin row",
+            "macOS %s / Darwin %s" % (macos or "<unverifiable>", kernel or "<unverifiable>"),
+            shown) and ok
+ok = clause(arch == want_arch, "architecture", arch, want_arch) and ok
+ok = clause(version == want_version, "python version", version, want_version) and ok
+ok = clause(impl == want_impl, "python implementation", impl, want_impl) and ok
+ok = clause(isinstance(executable, str) and bool(executable) and executable.startswith("/"),
+            "python executable", executable, "an absolute path") and ok
+
+# THE CAPABILITY CLAUSES, which this section used to skip while claiming the whole verdict of the
+# gate (CC-12). NOTE, and this cost a debugging cycle: bash 3.2.57 mis-parses an APOSTROPHE inside
+# a quoted heredoc that is itself inside `$( )` -- it hunts for a closing quote to the end of the
+# file and reports "unexpected EOF" hundreds of lines away. This whole heredoc is inside one, and
+# macOS ships 3.2, so no apostrophe may appear below.
+# preflight_write_environment refuses the write on TEN conditions; six are above and these four are
+# the rest, and they live in the SAME pre-mutation preflight rather than "at write time" as the INFO
+# below used to say. On a host that passed the six and failed one of these, firm-doctor reported
+# 24 PASS / 0 FAIL while every ledger write still failed closed with the identical
+# WRITE_CONFIGURATION_UNSUPPORTED: p2 — the exact "doctor green, firm dead" split this section
+# exists to close. They are four getattr checks in a process that is already running.
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+ok = clause(isinstance(nofollow, int) and nofollow > 0,
+            "O_NOFOLLOW", repr(nofollow), "a positive int") and ok
+ok = clause(isinstance(directory, int) and directory > 0,
+            "O_DIRECTORY", repr(directory), "a positive int") and ok
+ok = clause(callable(getattr(os, "open", None)), "os.open", "callable" if callable(getattr(os, "open", None)) else "not callable", "callable") and ok
+ok = clause(os.open in getattr(os, "supports_dir_fd", ()),
+            "os.open dir_fd support",
+            "supported" if os.open in getattr(os, "supports_dir_fd", ()) else "unsupported",
+            "supported") and ok
+
+if ok:
+    emit("PASS", "ledger writes are admitted by the P2 process gate on this host — every clause of "
+                 "preflight_write_environment, process row and open capabilities alike")
+else:
+    emit("FAIL", "ledger writes FAIL CLOSED here (WRITE_CONFIGURATION_UNSUPPORTED: p2) — no run "
+                 "ledger, role start, or lifecycle record can be written until this row is proven "
+                 "and added to SUPPORTED_P2_OS_ROWS in bin/firm-ledger-log")
+emit("INFO", "this section reports the whole pre-mutation preflight. What it does NOT cover is bind "
+             "time: the writer additionally verifies that the run directory is on a local APFS "
+             "volume and exercises the open/replace/fsync sequence against the real path")
+PY
+)"; _p2_rc=$?
+if [ "$_p2_rc" -ne 0 ] || [ -z "$_p2_report" ]; then
+  fail "P2 write configuration UNVERIFIED — the row probe could not run (SKIPPED, not passed)"
+  info "probe output: $(printf '%s' "$_p2_report" | tr '\n' ' ')"
+  info "an unverifiable write configuration costs the same as a broken one here; fix the probe or the interpreter, then re-run firm-doctor."
+else
+  while IFS=$'\t' read -r _p2_status _p2_message; do
+    [ -n "$_p2_status" ] || continue
+    case "$_p2_status" in
+      PASS) pass "$_p2_message" ;;
+      FAIL) fail "$_p2_message" ;;
+      *)    info "$_p2_message" ;;
+    esac
+  done <<EOF
+$_p2_report
+EOF
 fi
 
 # ==========================================================================

@@ -121,6 +121,19 @@ Config dirs live under `$HOME` (`~/.claude-<profile>/`, `~/.codex-<profile>/`) a
 (`.claude-*/`, `.codex-*/`) so they never commit even for a repo that sits under `$HOME`.
 
 ## THE macOS Claude caveat (the load-bearing honesty item)
+
+> **Superseded on Claude Code 2.1.234 (2026-08-19) — the paragraph below was true when written and is
+> not true now.** Re-measured with `/usr/bin/security` wrapped so every lookup the CLI makes was
+> recorded: the service name is `Claude Code-credentials` only while `CLAUDE_CONFIG_DIR` is UNSET, and
+> becomes `Claude Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>` once it is set. The
+> entry is therefore **not** a single shared one — `CLAUDE_CONFIG_DIR` now does switch the account,
+> each config dir having its own keychain entry and its own `/login`. Two further facts the paragraph
+> below does not state: the account queried is `$USER`, and the login keychain is reached through
+> `HOME`, so the identical lookup that succeeds under the operator's `HOME` fails with rc 44 under any
+> other one. That last fact is why `firm-claude-qa`'s controlled root, which isolates `HOME`, cannot
+> use the Keychain at all and needs `CLAUDE_CODE_OAUTH_TOKEN`. Current behavior: `bin/firm-doctor` §6
+> and the credential block in `bin/firm-reviewer-common`.
+
 On macOS, **`CLAUDE_CONFIG_DIR` does NOT switch the Claude subscription account.** The OAuth credential
 lives in the encrypted login **Keychain** (`security find-generic-password -s "Claude Code-credentials"`),
 a single shared entry; `CLAUDE_CONFIG_DIR` only relocates the credential *file* on Linux/Windows. So the
@@ -209,7 +222,7 @@ git clone https://github.com/joshualblau/agent-firm.git ~/agent-firm && ~/agent-
 - Auth-storage finding (empirical): the Claude subscription credential is in the macOS login Keychain
   (`Claude Code-credentials`), so `CLAUDE_CONFIG_DIR` alone can't switch the account — hence the
   `CLAUDE_CODE_OAUTH_TOKEN` design; Codex auth is file-based (`~/.codex/auth.json`), so `CODEX_HOME`
-  switches cleanly.
+  switches cleanly. (Superseded for Claude on 2.1.234; see the boxed note above.)
 
 _The firm ships scaffolding + docs + `firm-doctor` only. You create the vault/service account, run
 `claude setup-token` / `codex login`, and hold the real tokens; `firm-doctor` verifies afterward._

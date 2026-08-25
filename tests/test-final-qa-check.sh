@@ -19,7 +19,7 @@ cp "$run/run.jsonl" "$ledger_baseline"
 reset_case() { # primary provider
   cp "$ledger_baseline" "$run/run.jsonl"
   chmod 600 "$run/run.jsonl"
-  python3 - "$run" "$1" <<'PY'
+  t_python - "$run" "$1" <<'PY'
 import hashlib,json,os,secrets,shutil,sys,yaml
 run,primary=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 def event_ref(path,event="evidence_produced"):
@@ -54,7 +54,7 @@ PY
 }
 
 wrapper_attempt() { # provider APPROVE|BLOCK blocker attempt-id current yes|no [affected-path] [second-blocker] [second-path]
-  python3 - "$run" "$1" "$2" "$3" "$4" "$5" "${6:-result.txt}" "${7:-}" "${8:-auth/token.txt}" <<'PY'
+  t_python - "$run" "$1" "$2" "$3" "$4" "$5" "${6:-result.txt}" "${7:-}" "${8:-auth/token.txt}" <<'PY'
 import hashlib,json,os,sys
 run,provider,word,blocker,attempt_id,current,affected_path,second_blocker,second_path=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 adir=run+"/09-test-evidence/reviewer-attempts/"+attempt_id; os.makedirs(adir,exist_ok=False)
@@ -88,7 +88,7 @@ PY
 }
 
 set_disposition() { # kind low|high blocked-attempt fresh-attempt-or-empty
-  python3 - "$run" "$1" "$2" "$3" "${4:-}" <<'PY'
+  t_python - "$run" "$1" "$2" "$3" "${4:-}" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run,kind,risk,blocked_id,fresh_id=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
 def ref(path,event_id=None,event="evidence_produced",provider=None,attempt_id=None):
@@ -117,7 +117,7 @@ PY
 }
 
 set_mixed_human_dispositions() {
-  python3 - "$run" <<'PY'
+  t_python - "$run" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
 def ref(path):
@@ -137,7 +137,7 @@ PY
 }
 
 add_record_ref() { # relative event field-name
-  python3 - "$run" "$1" "$2" "$3" <<'PY'
+  t_python - "$run" "$1" "$2" "$3" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run,rel,event,field=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); raw=open(run+"/"+rel,"rb").read(); eid="evt-record-"+secrets.token_hex(8)
 record={"ts":"2026-08-10T00:00:00Z","event":event,"event_id":eid,"run_id":os.path.basename(run),"sha":d["candidate"]["commit_sha"],"generation":str(d["candidate"]["generation"]),"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
@@ -155,7 +155,7 @@ reset_case claude; wrapper_attempt gpt APPROVE '' gpt-c1-a0101 yes
 assert_rc "Claude-primary plus GPT current wrapper APPROVE passes" 0 "$FINAL" "$run"
 reset_case codex; wrapper_attempt claude APPROVE '' claude-c1-a0101 yes
 assert_rc "Codex-primary plus Claude current wrapper APPROVE passes" 0 "$FINAL" "$run"
-python3 - "$run/08-qa-verdict.claude.json" <<'PY'
+t_python - "$run/08-qa-verdict.claude.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["attempt_id"]="orphan"; json.dump(d,open(p,"w"),indent=2)
 PY
@@ -165,7 +165,7 @@ t_case "current BLOCK low-risk dissent is mechanically derived and bounded"
 reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0201 yes
 set_disposition proceed_with_primary low '' ''
 assert_rc "positive low-risk one-round dissent passes" 0 "$FINAL" "$run"
-python3 - "$run/traceability.yaml" <<'PY'
+t_python - "$run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["risk"]="high"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
@@ -180,19 +180,19 @@ for orientation in "claude:gpt" "codex:claude"; do
   reset_case "$primary"; wrapper_attempt "$secondary" BLOCK 'secondary defect' "$secondary-c1-a0251" yes
   set_disposition proceed_with_primary low '' ''
   assert_rc "$secondary producer-bound BLOCK baseline passes" 0 "$FINAL" "$run"
-  python3 - "$run/traceability.yaml" <<'PY'
+  t_python - "$run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["secondary_blocker_id"]="obj-substituted"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
   assert_rc "$secondary substituted objection id blocks" 1 "$FINAL" "$run"
   set_disposition proceed_with_primary low '' ''
-  python3 - "$run/traceability.yaml" <<'PY'
+  t_python - "$run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["affected_paths"]=["auth/token.txt"]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
   assert_rc "$secondary contradictory affected path blocks" 1 "$FINAL" "$run"
   set_disposition proceed_with_primary low '' ''
-  python3 - "$run/08-qa-verdict.$secondary.json" <<'PY'
+  t_python - "$run/08-qa-verdict.$secondary.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); del d["blocker_objects"]; json.dump(d,open(p,"w"),indent=2)
 PY
@@ -204,7 +204,7 @@ reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0301 no
 wrapper_attempt gpt APPROVE '' gpt-c1-a0302 yes
 set_disposition fixed low gpt-c1-a0301 gpt-c1-a0302
 assert_rc "archived BLOCK objections plus current APPROVE pass" 0 "$FINAL" "$run"
-python3 - "$run" <<'PY'
+t_python - "$run" <<'PY'
 import json,sys
 run=sys.argv[1]; event=None
 for line in open(run+"/run.jsonl"):
@@ -216,7 +216,7 @@ assert_rc "duplicate outcome event blocks" 1 "$FINAL" "$run"
 
 t_case "required unavailable and high-risk human resolution return nonpassing decision_required"
 reset_case codex
-python3 - "$run" <<'PY'
+t_python - "$run" <<'PY'
 import hashlib,json,os,sys,yaml
 run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]; provider="claude"; aid="claude-c1-a0401"
 adir=run+"/09-test-evidence/reviewer-attempts/"+aid; os.makedirs(adir)
@@ -231,7 +231,7 @@ PY
 assert_rc "required unavailable without human record is decision_required, not PASS/BLOCK" 4 "$FINAL" "$run"
 decision_file="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | tail -1)"
 assert_output "decision state is structured" '"status": "decision_required"' cat "$decision_file"
-sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$run/09-test-evidence/qa-candidate.json")"
+sha="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$run/09-test-evidence/qa-candidate.json")"
 attempt_rel="09-test-evidence/reviewer-attempts/claude-c1-a0401/attempt.json"
 cat > "$run/09-test-evidence/waiver.yaml" <<EOF
 schema_version: 1
@@ -275,7 +275,7 @@ assert_rc "two missing human records yield one decision_required result" 4 "$FIN
 after_count="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
 assert_eq "exactly one aggregate decision artifact was added" 1 "$((after_count-before_count))"
 aggregate_file="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f -exec grep -l '"id": "obj-protected-defect"' {} \; | tail -1)"
-assert_ok "aggregate artifact contains both producer ids and derived risks" python3 - "$aggregate_file" <<'PY'
+assert_ok "aggregate artifact contains both producer ids and derived risks" t_python - "$aggregate_file" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1])); objects={x["id"]:x for x in d["objections"]}
 assert set(objects)=={"obj-secondary-defect","obj-protected-defect"}

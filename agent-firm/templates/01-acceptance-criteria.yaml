@@ -1,4 +1,8 @@
 # 01 · Acceptance criteria  (validates against agent-firm/schemas/acceptance-criteria.schema.json)
+#
+# AUTHORING RULE, and it binds rather than advises:
+# A criterion MUST assert a property. A measured value MAY be cited as evidence but MUST NOT be the
+# criterion's threshold.
 task_slug:
 track: full_track            # fast_path | full_track
 criteria:

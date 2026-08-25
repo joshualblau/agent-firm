@@ -41,7 +41,7 @@ JSON
 printf '{ this is not json' > "$WORK/malformed.json"
 
 # Structurally complete except `verdict`, which is the one field the fallback must still police.
-python3 - "$WORK" <<'PY'
+t_python - "$WORK" <<'PY'
 import json, os, sys
 w = sys.argv[1]
 d = json.load(open(os.path.join(w, "good.json")))
@@ -70,7 +70,7 @@ without_jsonschema() { ( PYTHONPATH="$NOSCHEMA${PYTHONPATH:+:$PYTHONPATH}" "$@" 
 
 # ---------------------------------------------------------------------------
 t_case "with jsonschema available (the declared prerequisite)"
-assert_ok "precondition: jsonschema really is importable here" python3 -c "import jsonschema"
+assert_ok "precondition: jsonschema really is importable here" t_python -c "import jsonschema"
 assert_rc "a conforming APPROVE verdict validates"  0 "$VALIDATE" "$WORK/good.json"
 assert_rc "a conforming BLOCK verdict validates"    0 "$VALIDATE" "$WORK/block.json"
 assert_output "says it used the schema" "jsonschema"  "$VALIDATE" "$WORK/good.json"
@@ -83,7 +83,7 @@ assert_rc "historical readable input is not current-valid evidence" 1 "$VALIDATE
 
 # ---------------------------------------------------------------------------
 t_case "without jsonschema — degraded, and never a silent pass"
-assert_rc "precondition: jsonschema is hidden" 1 without_jsonschema python3 -c "import jsonschema"
+assert_rc "precondition: jsonschema is hidden" 1 without_jsonschema t_python -c "import jsonschema"
 
 assert_rc "a good verdict is DEGRADED, not VALID"  4 without_jsonschema "$VALIDATE" "$WORK/good.json"
 assert_output "says DEGRADED"       "DEGRADED"      without_jsonschema "$VALIDATE" "$WORK/good.json"

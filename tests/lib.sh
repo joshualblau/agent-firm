@@ -60,6 +60,40 @@ TESTS_DIR="$(cd -P "$(dirname "$_t_src")" && pwd)"
 FIRM_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
 BIN="$FIRM_ROOT/bin"
 
+# ---- the suite's own interpreter ------------------------------------------
+# t_python runs the interpreter bin/firm-python RESOLVES — the same one every firm-* tool runs — not
+# whatever `python3` is first on PATH. Use it wherever the harness stands in for the firm: reading the
+# same YAML/JSON the firm reads (pyyaml and jsonschema are installed for ONE interpreter, and on a
+# normal machine PATH's python3 is not it), building a fixture the firm will consume, or asserting a
+# property of the interpreter a script under test will actually use. A harness that probes a different
+# python than the code under test is asserting about a different machine — which is the exact defect
+# the firm-python resolver exists to close, one layer down.
+#
+# WHERE BARE `python3` STILL SURVIVES, stated accurately (CC-08). The rule this comment used to give
+# was false in both directions: it named tests/test-merge-guard.sh as the carve-out when that file
+# had largely been converted, and it did not name the ~15 files that still use the bare form for
+# cases which have nothing to do with PATH resolution (test-bench-record, test-bootstrap-dual,
+# test-deny-rule-labeling, test-bounded-exec, test-integration-summary, test-ledger-log,
+# test-ledger-role-start, test-qa-checkout and others). What is true:
+#
+#   1. Bare `python3` is CORRECT where the test is ABOUT PATH resolution -- tests/test-merge-guard.sh
+#      and tests/test-python-interpreter.sh build PATHs on purpose, and asking the resolver there
+#      would be asking the wrong question. It is also correct in a generated `#!/bin/sh` fixture that
+#      the firm will run as a subprocess (tests/test-provider-reviewers.sh says so at its two stubs),
+#      because a shell function cannot cross into a written file.
+#   2. Bare `python3` is WRONG wherever the harness is asserting a property of the interpreter the
+#      code under test will actually use. Two such cases were converted with this comment:
+#      tests/test-plugin-layout.sh's SUPPORTED_P2_OS_ROWS reader and tests/test-merge-guard.sh's
+#      "the embedded checker compiles" case, which was compiling the guard's program under a
+#      DIFFERENT interpreter than the guard runs it with.
+#   3. Everywhere else it is simply UNCONVERTED. Those calls read JSON and YAML the test itself
+#      wrote, so the current failure mode is a false RED on a host without a PATH python3, not a
+#      false green. Converting them is a separate, larger change and is deliberately not smuggled in
+#      here; tests/test-python-interpreter.sh's bare-python3 scan therefore covers bin/ only, and
+#      says so.
+. "$BIN/firm-python"
+t_python() { firm_python "$@"; }
+
 # ---- output --------------------------------------------------------------
 _t_ok() { T_PASS=$((T_PASS+1)); printf '    ok   %s\n' "$1"; }
 _t_no() {

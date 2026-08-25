@@ -1,3 +1,39 @@
+# WHAT IS DELIBERATELY NOT LISTED, AND WHAT THAT COSTS (CR-07 / CC-09)
+#
+# bin/firm-python is NOT a pattern here, and that is a decision rather than an oversight. It is also
+# an asymmetry worth stating rather than leaving for the next reader to discover:
+#
+#   bin/firm-reviewer-common, bin/firm-bounded-exec, bin/firm-qa-checkout, bin/firm-traceability-check
+#   and bin/firm-final-qa-check are all listed below, and all five now source bin/firm-python and
+#   execute whatever interpreter it resolves. So an UNLISTED path selects the interpreter for five
+#   LISTED ones. A change confined to bin/firm-python -- reordering the candidate list so a venv wins,
+#   loosening the probe, changing FIRM_PYTHON_EXPECT_VERSION, changing the degraded fallback --
+#   changes which interpreter those five gates run under, which can change whether jsonschema and
+#   pyyaml import at all and therefore whether firm-validate-verdict returns 0 or 4 and whether
+#   firm-traceability-check can parse this policy. bin/firm-final-qa-check computes path_high = False
+#   for such a diff, so the derived cross-provider second voice is not required for it (absent a
+#   security_privacy criterion). That is a real gap in the derivation, not an untidy list.
+#
+# WHY IT IS NOT FIXED HERE. This file's categories are pinned by fixed enums with minItems/maxItems in
+# agent-firm/schemas/traceability.schema.json ($defs reviewerRiskPatterns is minItems 5 / maxItems 5),
+# and tests/test-policy-yaml-valid.sh asserts that any ADDED pattern is REJECTED. Adding
+# bin/firm-python is therefore a coupled three-file change, and the same pass should settle
+# bin/firm-ledger-log and bin/firm-merge-guard, which are absent for the same reason and are the
+# precedent that would otherwise justify the next omission. Raised as that follow-up rather than
+# taken unilaterally inside a remediation change.
+#
+# WHAT COMPENSATES TODAY, stated honestly -- none of it forces a second voice:
+#   · tests/test-python-interpreter.sh pins the resolver's expectations to the writer's gate
+#     literals, refuses a candidate that cannot PROVE it executed the probe (both the exit-3 and the
+#     exit-0 directions), and asserts no bin/firm-* spawns a bare PATH python3.
+#   · firm-doctor section 10 FAILs and gates its exit code when the resolved interpreter is not the
+#     one the P2 gate admits, and its dependency, retired-permission and hook-manifest checks now
+#     FAIL rather than PASS when the interpreter does not demonstrably run.
+#   · bin/firm-merge-guard re-checks the resolved argv and blocks rather than permits if it is
+#     unusable, and it unsets the inherited FIRM_PYTHON_* outputs before resolving.
+# What none of those do is require the cross-provider judge that editing any of the five listed files
+# directly would require.
+
 schema_version: 1
 version: 1
 default_on_ambiguity: required

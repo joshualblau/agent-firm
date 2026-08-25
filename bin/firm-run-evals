@@ -30,6 +30,7 @@ __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the 
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 EVALS="$ROOT/agent-firm/evals"
 MANUAL="$ROOT/agent-firm/contracts/lifecycle.md"  # shared provider-neutral lifecycle contract
 SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
@@ -146,7 +147,7 @@ structural_assertions() {
 # the project's bin/firm-ledger-hook, which doesn't exist in an eval scratch repo (it would fail every
 # Bash call). Strip "hooks" so the eval loads only the allow/ask/deny posture.
 make_eval_settings() { # $1 = dest file
-  python3 - "$SETTINGS" "$1" <<'PY'
+  firm_python - "$SETTINGS" "$1" <<'PY'
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 d = json.load(open(src)); d.pop("hooks", None)
@@ -162,8 +163,40 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
 
   local scratch; scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-${name}.XXXXXX")"
   cp -R "$d/fixture/." "$scratch/" 2>/dev/null || true
-  ( cd "$scratch" && git init -q && git add -A \
-      && git -c user.email=eval@firm -c user.name=eval commit -qm fixture ) || { echo "SKIP $name: git init failed"; return 4; }
+  # THE FIXTURE'S DEFAULT BRANCH IS STATED, NOT INHERITED. A bare `git init` takes the branch name
+  # from the HOST's init.defaultBranch, so on a machine set to anything but main or master this
+  # fixture came up on a branch bin/firm-new-run cannot recognize as any default branch -- and since
+  # that script started refusing to derive an already-reviewed base from a HEAD it cannot place,
+  # every behavioural eval was refused (rc 2) at its own first instruction, `firm-new-run`, before
+  # the eval had done anything. Reproduced at init.defaultBranch=trunk: base rc 0, candidate rc 2.
+  # Nothing caught it, because both hosted CI jobs run `--structural`, which builds no fixture at
+  # all, and .github/workflows/ci.yml pins init.defaultBranch=main on every runner besides.
+  #
+  # `git symbolic-ref HEAD` and not `git init -b main`: -b needs git >= 2.28, this needs no floor at
+  # all, and it is the spelling tests/lib.sh:mk_repo already uses for exactly this reason. It runs
+  # between init and the first commit, when HEAD is still unborn, so it only names the branch the
+  # commit below will create.
+  #
+  # THE OTHER AMBIENT GIT INPUTS TO THIS FIXTURE ARE PINNED THE SAME WAY -- with `git -c`, never a
+  # config write, so nothing outside $scratch is touched. Measured against this exact recipe:
+  # commit.gpgsign=true with no usable signing program aborts the commit at rc 128; a
+  # core.excludesFile that matches the fixture's own files leaves `git add -A` nothing to stage and
+  # the commit exits 1; a core.hooksPath holding a failing pre-commit exits 1. Each makes run_one
+  # return 4 and the eval a FAIL. That is the LOUD direction, unlike init.defaultBranch above, which
+  # let the fixture build and then had the eval's own first instruction refused inside it while the
+  # run still reported rc 0 -- which is why those were the lower priority and not "no priority".
+  # tests/lib.sh:mk_repo already pins commit.gpgsign false for exactly this reason; the other two are
+  # pinned here for the first time, and user.email/user.name were already pinned this way.
+  #
+  # STILL INHERITED, named so the next reader does not have to measure it again: init.templateDir (a
+  # global template seeds files into the .git this creates -- harmless here, and it is what the
+  # hostile-host case in tests/test-run-evals-structural.sh uses to PROVE this environment reaches
+  # this `git init` rather than only a probe beside it), and core.attributesFile.
+  ( cd "$scratch" && git init -q && git symbolic-ref HEAD refs/heads/main \
+      && git -c core.excludesFile=/dev/null add -A \
+      && git -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.hooksPath=/dev/null \
+             -c user.email=eval@firm -c user.name=eval commit -qm fixture ) \
+    || { echo "SKIP $name: git init failed"; return 4; }
   local out="$scratch/.eval-out"; mkdir -p "$out"
   make_eval_settings "$out/settings.json"
 
@@ -191,13 +224,16 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
     prompt="\$agent-firm:start $(cat "$d/task.md")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns."
+    # -a never is a parse error on codex exec (0.147.0): --ask-for-approval is interactive-only and
+    # is not a clap global, so this argv used to die at rc 2 without running the eval at all. The
+    # never-ask policy is stated as the typed -c override exec does accept.
     "$BOUNDED" --phase eval --provider codex --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
       env FIRM_PRIMARY_PROVIDER=codex codex exec --ephemeral \
         -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
-        -s workspace-write -a never --json "$prompt"
+        -s workspace-write -c 'approval_policy="never"' --json "$prompt"
     provider_rc=$?
   fi
 
@@ -207,7 +243,7 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
   fi
 
   if [ "$provider" = claude ]; then
-    turns="$(python3 - "$out/result.json" <<'PY'
+    turns="$(firm_python - "$out/result.json" <<'PY'
 import json, sys
 try:
     value = json.load(open(sys.argv[1], encoding="utf-8")).get("num_turns")
@@ -220,7 +256,7 @@ except Exception as e:
 PY
 )" || return 1
   else
-    turns="$(python3 - "$out/result.json" <<'PY'
+    turns="$(firm_python - "$out/result.json" <<'PY'
 import json, sys
 count = 0
 try:
@@ -244,7 +280,7 @@ PY
   echo "    accounted top-level turns: $turns/$eval_max_turns"
 
   # Show the run envelope summary for observability.
-  [ "$provider" = claude ] && python3 - "$out/result.json" <<'PY' 2>/dev/null || true
+  [ "$provider" = claude ] && firm_python - "$out/result.json" <<'PY' 2>/dev/null || true
 import json,sys
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)

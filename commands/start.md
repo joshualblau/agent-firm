@@ -33,12 +33,14 @@ to the Claude native agent launch. The producer validates and records; it does n
 The Lead performs the native launch outside repository automation and retains the exact returned
 `event_id` from the same parsed result for every downstream lifecycle record.
 
-Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0,
-arm64, local APFS, and CPython 3.9.6. The ordinary and native producers use the same centralized gate
-before any ledger mutation or creation of a coordination lock or transaction temp. Linux and every
-other mismatched or unverifiable environment are unsupported and fail closed without a success
-result; ordinary best-effort mode is not a fallback. Expanding support requires new Architecture
-approval and proving evidence.
+Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS
+26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython
+3.9.6. A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard,
+so an OS row nobody has proven is unsupported until it is proven and added. The ordinary and native
+producers use the same centralized gate before any ledger mutation or creation of a coordination lock
+or transaction temp. Linux and every other mismatched or unverifiable environment are unsupported and
+fail closed without a success result; ordinary best-effort mode is not a fallback. Expanding support
+requires new Architecture approval and proving evidence.
 
 Never manually stat or hash the contract, infer an ambient run or authority, log a role start through
 ordinary mode, transcribe or reconstruct an event id, scrape the ledger for it, or perform a second

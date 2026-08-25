@@ -42,6 +42,7 @@ while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
 SRC="$ROOT/.claude/settings.json"                              # canonical permission set lives here
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 RETIRED="$ROOT/agent-firm/policy/retired-permissions.json"     # rules the firm has withdrawn
 
 scope=project
@@ -60,7 +61,7 @@ for arg in "$@"; do
 done
 if [[ "$scope" == "user" ]]; then target="$HOME/.claude/settings.json"; else target="$(pwd)/.claude/settings.json"; fi
 
-python3 - "$SRC" "$target" "$RETIRED" "$migrate" "$scope" <<'PY'
+firm_python - "$SRC" "$target" "$RETIRED" "$migrate" "$scope" <<'PY'
 import json, os, sys, tempfile, time
 src, target, retired_path, migrate, scope = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
 
