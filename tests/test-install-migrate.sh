@@ -140,7 +140,12 @@ assert_eq "fixture operator removed only the firm command" "$legacy_config_befor
 assert_eq "manual cleanup preserves mode" "$legacy_mode" \
   "$(t_file_mode "$LS")"
 legacy_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; legacy_clean_rc=$?
-assert_eq "readiness returns after only the confirmed duplicate is removed" "0" "$legacy_clean_rc"
+if t_p2_row_supported; then
+  assert_eq "readiness returns after only the confirmed duplicate is removed" "0" "$legacy_clean_rc"
+else
+  t_skip "readiness returns after only the confirmed duplicate is removed" \
+    "firm-doctor's P2 row gate cannot pass off a supported (macOS, Darwin) host, so readiness 0 is unattainable here"
+fi
 
 mkdir -p "$legacy_home/.claude"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"firm-merge-guard --hook"}]}]},"custom":{"owner":"user"}}' > "$legacy_home/.claude/settings.json"
@@ -160,7 +165,12 @@ PY
 assert_eq "user cleanup preserves unrelated configuration" '{"owner":"user"}' \
   "$(t_python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["custom"],separators=(",",":")))' "$US")"
 user_clean_out="$(cd "$legacy_proj" && HOME="$legacy_home" PYTHONPATH="$legacy_pythonpath" PATH="$legacy_stubs:/usr/bin:/bin" "$BIN/firm-doctor" 2>&1)"; user_clean_rc=$?
-assert_eq "readiness returns after the user duplicate is removed" "0" "$user_clean_rc"
+if t_p2_row_supported; then
+  assert_eq "readiness returns after the user duplicate is removed" "0" "$user_clean_rc"
+else
+  t_skip "readiness returns after the user duplicate is removed" \
+    "firm-doctor's P2 row gate cannot pass off a supported (macOS, Darwin) host, so readiness 0 is unattainable here"
+fi
 
 # ---------------------------------------------------------------------------
 t_case "--migrate is idempotent and settles to a clean install"
