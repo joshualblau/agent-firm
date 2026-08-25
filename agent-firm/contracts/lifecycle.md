@@ -9,9 +9,15 @@ Provider choice changes no gate, artifact, budget, worktree rule, merge rule, or
 The Lead coordinates and synthesizes; it does not implement. It owns the run ledger, staffing,
 execution budget, human gates, and final handoff. It is the only role that pauses the human.
 
-Start with `firm-new-run --primary <claude|codex> <slug> <fast_path|full_track>`. Treat the returned
-run directory as the source of truth. Record ordinary non-role milestones through ordinary
-`firm-ledger-log`; every delegated role start uses the canonical boundary below.
+Start with `firm-new-run --primary <claude|codex> [--base <rev>] <slug> <fast_path|full_track>`.
+EVERY OPTION GOES BEFORE THE SLUG; one placed after it is refused rather than silently discarded.
+`--base` states the commit this run records as already reviewed, and it is REQUIRED whenever HEAD is
+not at the tip of this repository's default branch — which includes the ordinary case of opening the
+next run from an integration branch, and the case where the default branch cannot be resolved at all.
+Without it the run is refused, not derived from wherever HEAD happens to be. `firm-new-run --help`
+prints the full synopsis. Treat the returned run directory as the source of truth. Record ordinary
+non-role milestones through ordinary `firm-ledger-log`; every delegated role start uses the canonical
+boundary below.
 
 ## Delegated role-start boundary
 
@@ -37,12 +43,14 @@ instant; they do not attest later byte stability during result handling, output,
 and the direct writer has no seal against a same-UID retained writer. Any nonzero exit, missing field,
 extra field, schema mismatch, or value mismatch is BLOCKING.
 
-Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0,
-arm64, local APFS, and CPython 3.9.6. The ordinary and native producers use the same centralized gate
-before any ledger mutation or creation of a coordination lock or transaction temp. Linux and every
-other mismatched or unverifiable environment are unsupported and fail closed without a success
-result; ordinary best-effort mode is not a fallback. Expanding support requires new Architecture
-approval and proving evidence.
+Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS
+26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython
+3.9.6. A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard,
+so an OS row nobody has proven is unsupported until it is proven and added. The ordinary and native
+producers use the same centralized gate before any ledger mutation or creation of a coordination lock
+or transaction temp. Linux and every other mismatched or unverifiable environment are unsupported and
+fail closed without a success result; ordinary best-effort mode is not a fallback. Expanding support
+requires new Architecture approval and proving evidence.
 
 The Lead parses only that proof-instant receipt result, applies its exact `activation.apply.model`,
 `activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
@@ -126,7 +134,18 @@ candidate generation.
 Both wrappers share `firm-reviewer-common`. Each creates a numbered attempt, a disposable controlled
 root containing the complete judge contract and inert source snapshot, and separately bounded
 discovery, authentication, model-readiness, and judge phases. Only structured readiness output can
-establish availability. The wrappers publish atomically only after the verdict schema and exact
+establish availability, read at the surface the installed CLI actually publishes; a readiness surface
+a provider does not expose is never simulated, and configured-model readiness that cannot be
+established is recorded as not established rather than assumed. The controlled root isolates provider
+configuration and state, not identity: exactly one credential per provider crosses, and nothing else
+does. Where that credential is a file it is copied by value into the attempt-local provider directory,
+mode 0400, with the operator's own directory opened read-only and never written; where the provider
+has no credential file it is the single operator-supplied credential environment variable, forwarded
+only into the judge's own environment, size-bounded, never written to disk, and never recorded by
+value. The wrappers never create a credential — minting one stays an operator action — and no
+credential can establish readiness by itself: only the structured authentication phase can. The schema
+handed to a provider is a generation projection derived at runtime from the canonical verdict schema,
+which remains the sole validator of what comes back. The wrappers publish atomically only after the verdict schema and exact
 run/full-SHA/generation/provider/attempt identity validate, record every outcome to the explicitly
 targeted run ledger, cap and redact retained diagnostics by default, and remove the controlled root.
 Persistent raw retention is unsupported: every nonzero `--retain-raw-seconds` request is rejected

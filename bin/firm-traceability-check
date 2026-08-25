@@ -110,6 +110,10 @@ __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+# One resolved interpreter for the whole firm (see bin/firm-python): this gate reads pyyaml and the
+# ledger the P2 writer produced, so it must not run on a different python than the writer did.
+# firm-python is sourced, not exec'd, and prints nothing here -- the pure-ASCII rule above still holds.
+. "$SELF/firm-python"
 strict=0
 if [[ "${1:-}" == "--strict" ]]; then strict=1; shift; fi
 run_dir="${1:-}"
@@ -119,7 +123,7 @@ if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or se
 if [[ -f "$run_dir/09-test-evidence/qa-candidate.json" ]]; then strict=1; fi
 
 if [[ $strict -eq 1 ]]; then
-python3 - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$SELF/firm-new-run" <<'PY'
+firm_python - "$run_dir" "$verdict_path" "$ROOT/agent-firm/schemas/traceability.schema.json" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$SELF/firm-new-run" <<'PY'
 import collections
 import datetime
 import fnmatch
@@ -457,7 +461,7 @@ strict_rc=$?
 [[ $strict_rc -eq 0 ]] || exit "$strict_rc"
 fi
 
-python3 - "$run_dir" "$verdict_path" <<'PY'
+firm_python - "$run_dir" "$verdict_path" <<'PY'
 import json, re, sys, os, traceback, importlib.util
 
 # --- exit-code contract (spelled out in the shell header above) -------------

@@ -8,6 +8,9 @@ mk_version_root() {
   _d="$(mktemp -d "${TMPDIR:-/tmp}/firm-version-root.XXXXXX")"; t_track "$_d"
   mkdir -p "$_d/bin" "$_d/.claude-plugin" "$_d/.codex-plugin"
   cp "$BIN/firm-version" "$_d/bin/firm-version"
+  # firm-version runs the interpreter its sibling bin/firm-python resolves, so a scratch root
+  # includes the resolver (one python for every firm tool; see bin/firm-python).
+  cp "$BIN/firm-python" "$_d/bin/firm-python"
   cp "$FIRM_ROOT/VERSION" "$_d/VERSION"
   cp "$FIRM_ROOT/.claude-plugin/plugin.json" "$_d/.claude-plugin/plugin.json"
   cp "$FIRM_ROOT/.codex-plugin/plugin.json" "$_d/.codex-plugin/plugin.json"

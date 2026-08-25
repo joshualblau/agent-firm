@@ -24,8 +24,40 @@ STUB="$WORK/stub"; mkdir "$STUB"
 CALLS="$WORK/calls.log"; : > "$CALLS"
 printf 'redirect target must stay unchanged\n' > "$WORK/redirect-target"
 REDIRECT_SHA="$(shasum -a 256 "$WORK/redirect-target" | awk '{print $1}')"
-SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$RUN/09-test-evidence/qa-candidate.json")"
-GEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$RUN/09-test-evidence/qa-candidate.json")"
+
+# ==========================================================================================
+# THE CODEX CREDENTIAL STORE THIS FILE REVIEWS AGAINST — AND WHY IT HAS TO SAY SO
+#
+# bin/firm-reviewer-common resolves the codex credential as
+# `os.environ.get("CODEX_HOME") or str(Path.home()/".codex")` and copies that store's auth.json
+# into the attempt tree on EVERY gpt attempt (:1025-1026). That is production behaviour, it is
+# correct, and it is how the gpt judge authenticates — it is not what changed here. What was wrong
+# is that this file never said WHICH store, so every gpt case below ran against the OPERATOR's real
+# ~/.codex: a test suite consumed a live credential as a side effect of running, and the file's
+# result depended on whether the operator happened to be logged in.
+#
+# CODEX_HOME IS SET UNCONDITIONALLY, AND IS NEVER THE EMPTY STRING. The `or` above is not a
+# defaulting convenience, it is a trapdoor: "" is falsy, so an empty CODEX_HOME RE-SELECTS ~/.codex
+# while the harness looks isolated and every structural check of the fix passes. The Claude-side
+# neutralisation in review_env below is deliberately an empty string — for CLAUDE_CODE_OAUTH_TOKEN
+# and friends, empty IS absence — and copying that shape here would reproduce the exact defect this
+# fixture exists to close. `${STUB_CODEX_HOME:-$CODEX_FIXTURE}` is the form: `:-` (not `-`) so that
+# a case which clears the override falls back to a path, never to nothing.
+#
+# The store is built HERE, at run time, under this file's temp tree. Nothing credential-shaped is
+# committed, and the marker below is the only thing that distinguishes this store from any other.
+CODEX_FIXTURE="$WORK/codex-home"; mkdir -p "$CODEX_FIXTURE"
+CODEX_FIXTURE_MARKER='CODEX-FIXTURE-CREDENTIAL-2e6b'
+printf '{"OPENAI_API_KEY":null,"tokens":{"access_token":"%s"},"last_refresh":"1970-01-01T00:00:00Z"}\n' \
+  "$CODEX_FIXTURE_MARKER" > "$CODEX_FIXTURE/auth.json"
+chmod 600 "$CODEX_FIXTURE/auth.json"
+# A second store that exists and is EMPTY. Used by the absence case, which is the one case in this
+# file whose outcome differs between a host that has a credential and one that does not — see the
+# codex credential boundary at the end of the file, and tests/test-reviewer-hermeticity.sh.
+CODEX_EMPTY="$WORK/codex-home-empty"; mkdir -p "$CODEX_EMPTY"
+
+SHA="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$RUN/09-test-evidence/qa-candidate.json")"
+GEN="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$RUN/09-test-evidence/qa-candidate.json")"
 
 mkdir -p "$RUN/09-test-evidence/nested"
 printf 'captured evidence\nUNLABELED-PRIVATE-SOURCE-SENTINEL-7f31\n' > "$RUN/09-test-evidence/nested/proof.log"
@@ -35,7 +67,7 @@ proof_bytes="$(wc -c < "$RUN/09-test-evidence/nested/proof.log" | tr -d ' ')"
   "path=09-test-evidence/nested/proof.log" "sha=$SHA" "generation=$GEN" \
   "sha256=$proof_sha" "bytes=$proof_bytes" >/dev/null
 
-python3 - "$RUN" "$RUN_ID" "$SHA" "$GEN" "$proof_sha" "$proof_bytes" <<'PY'
+t_python - "$RUN" "$RUN_ID" "$SHA" "$GEN" "$proof_sha" "$proof_bytes" <<'PY'
 import json,sys,yaml
 run,run_id,sha,gen,digest,size=sys.argv[1:]
 gen=int(gen); size=int(size)
@@ -66,7 +98,7 @@ rm "$RUN/integration-draft-1.md" "$RUN/integration-draft-2.md"
 INT_HISTORY="$RUN/integration-summaries/INT-01.md"
 INT_SUMMARY="$RUN/integration-summaries/INT-02.md"
 
-python3 - "$WORK" "$RUN_ID" "$SHA" "$GEN" <<'PY'
+t_python - "$WORK" "$RUN_ID" "$SHA" "$GEN" <<'PY'
 import json,os,sys
 w,run,sha,gen=sys.argv[1:]
 base={"commit_sha":sha,"run_id":run,"generation":int(gen),"attempt_id":"__ATTEMPT__","environment":"test","commands_run":[],
@@ -91,18 +123,33 @@ for provider in ("gpt","claude"):
  duplicated["blocker_objects"]=[{"id":"obj-same","text":"first objection","affected_criteria":[],"affected_paths":[]},
                                 {"id":"obj-same","text":"second objection","affected_criteria":[],"affected_paths":[]}]
  json.dump(duplicated,open(os.path.join(w,f"{provider}-block-duplicated.json"),"w"))
+# A verdict whose blocker id violates the canonical `^obj-...` pattern. That pattern is one of the
+# keywords the GENERATION projection has to remove, because no structured-output API accepts it, so
+# this fixture is what proves removing it from the generation hint did not remove it from the gate.
+bad=dict(base); bad["provider"]="gpt"; bad["verdict"]="BLOCK"; bad["blockers"]=["fixture blocker"]
+bad["blocker_objects"]=[{"id":"BLOCK-001","text":"fixture blocker","affected_criteria":[],"affected_paths":[]}]
+json.dump(bad,open(os.path.join(w,"gpt-badid.json"),"w"))
 PY
 
+# The two provider stubs below are EXTERNAL programs the wrapper spawns, so their bodies stay on
+# PATH's `python3` (they model a CLI the firm does not own, and the wrapper hands them a PATH that
+# contains one). t_python is the harness's own interpreter and is not defined inside a /bin/sh stub.
 cat > "$STUB/codex" <<'SH'
 #!/bin/sh
 printf 'codex cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
-# Real codex-cli REJECTS a top-level-only option placed after the subcommand:
-#   $ codex exec -a never --help   ->  rc=2  error: unexpected argument '-a' found
-#   $ codex -a never exec --help   ->  rc=0
-# Modelling that refusal is the point of this block. Without it the stub accepts an argv the real CLI
-# cannot parse — which is precisely how the wrapper shipped a judge command line that had never been
-# executable at any Codex version while this suite stayed green.
+# Real codex-cli REJECTS a top-level-only option placed after the subcommand, and SILENTLY DISCARDS
+# it placed before one. Re-measured 2026-08-25 against the installed codex-cli 0.147.0:
+#   $ codex exec -a never --help    ->  rc=2  error: unexpected argument '-a' found
+#   $ codex -a never exec --help    ->  rc=0  -- parses, and the value is then thrown away
+#   $ codex -s bogus exec --help    ->  rc=0  -- the control: root options are not even VALIDATED
+#   $ codex --sandbox bogus --help  ->  rc=2  invalid value 'bogus' (the same option, no subcommand)
+# Modelling the refusal is the point of this block. Without it the stub accepts an argv the real CLI
+# cannot parse - which is precisely how the wrapper shipped a judge command line that had never been
+# executable at any Codex version while this suite stayed green. The DISCARD is not modelled here,
+# because it cannot be: a stub that accepts `-a` before `exec` is indistinguishable from the real
+# CLI, which is exactly why moving `-a` there is not a fix and why the wrapper now sends
+# `-c approval_policy="never"` with `--strict-config` instead.
 case "$all_args" in
   *"exec "*)
     after=" ${all_args#*exec } "
@@ -111,61 +158,110 @@ case "$all_args" in
         echo "error: unexpected argument '-a' found" >&2; exit 2 ;;
     esac ;;
 esac
+if [ -n "${STUB_ENV_CAPTURE:-}" ]; then
+  # WHICH STORE THE HARNESS POINTED THE WRAPPER AT IS ONLY OBSERVABLE FROM IN HERE. The wrapper
+  # copies the resolved store's auth.json to $CODEX_HOME/auth.json inside the attempt's controlled
+  # root (bin/firm-reviewer-common:931,1026), and the cleanup guardian destroys that whole root
+  # before the wrapper returns (:1483) — which the "hard-killed attempt control is gone" case below
+  # already asserts. The parent therefore CANNOT read what landed. The child can, and this is the
+  # child.
+  #
+  # A DERIVED VALUE, NEVER THE BYTES. Under the mutation this field exists to catch, the file being
+  # looked at is the operator's REAL credential. Copying it into $STUB_ENV_CAPTURE — or printing it
+  # — would write a live credential into $TMPDIR as a side effect of testing that it must never be
+  # read. `grep -q` answers the only question asked, "is this the store the test created", and emits
+  # nothing. The fallback pattern cannot match anything, so an unset marker reports `other`/`absent`
+  # rather than turning this into a check that cannot fail.
+  cred=absent
+  if [ -f "${CODEX_HOME:-}/auth.json" ]; then
+    if grep -q "${STUB_CODEX_MARKER:-NO-STUB-CODEX-MARKER-CONFIGURED}" "$CODEX_HOME/auth.json" 2>/dev/null
+    then cred=marker; else cred=other; fi
+  fi
+  printf 'codex phase=%s oauth=%s apikey=%s authtok=%s fd=%s cred=%s\n' "${1:-none}" \
+    "${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}" "${ANTHROPIC_API_KEY:-<unset>}" \
+    "${ANTHROPIC_AUTH_TOKEN:-<unset>}" "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-<unset>}" \
+    "$cred" >> "$STUB_ENV_CAPTURE"
+fi
 case "$*" in
-  "--help")
-    # Real codex-cli SPLITS its controls across surfaces, and a control must be found on the surface
-    # it is PASSED on: -a/--ask-for-approval is top level only; --ephemeral, --ignore-*, --output-*
-    # and --skip-git-repo-check are exec only; -s/-m/-c are on both. This stub once printed all eight
-    # required flags here, encoding the assumption that made the old single top-level probe look
-    # correct while it silently failed against every real Codex.
-    [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = discovery_error ] && { echo 'top-level help is unavailable' >&2; exit 7; }
-    # wrong_surface: -a is absent HERE and present under exec. The wrapper passes it at top level, so
-    # this must still be exit 3 — a control found on a surface it is not passed on is a miss.
-    [ "$STUB_MODE" = wrong_surface ] && { echo '  -s, --sandbox   -m, --model   -c, --config'; exit 0; }
-    echo '  -a, --ask-for-approval   -s, --sandbox   -m, --model   -c, --config'
-    exit 0 ;;
+  # ONE PROBED SURFACE. bin/firm-reviewer-common declares `codex exec` and nothing else now that
+  # `-a` is not passed at all, so the top-level arm below exists to be the WRONG answer: under
+  # `wrong_surface` it carries the complete set and `exec --help` does not, which is the shape that
+  # made a fully capable Codex report five controls missing.
+  # THE FLAG SET LIVES AT `exec`, NOT AT THE TOP LEVEL — this stub models codex-cli 0.147.0, where
+  # `codex --help` documents the interactive CLI and `codex exec --help` documents every control the
+  # judge sends. A probe that reads the wrong one of these two gets a wrong answer either way round,
+  # which is the whole point: `wrong_surface` below inverts them.
   "exec --help")
-    [ "$STUB_MODE" = exec_discovery_error ] && { echo 'exec help is unavailable' >&2; exit 7; }
-    # capability: --ephemeral is absent from the surface that requires it.
-    [ "$STUB_MODE" = capability ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'; exit 0; }
-    [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -a, --ask-for-approval  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'; exit 0; }
-    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral  -s, --sandbox   -m, --model   -c, --config  --output-schema  -o, --output-last-message'
+    [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    [ "$STUB_MODE" = capability ] && { echo '--ephemeral --sandbox --model'; exit 0; }
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--ephemeral --sandbox --model'; exit 0; }
+    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'
     exit 0 ;;
-  "login status")
-    # Real codex-cli 0.149.0 has NO --json form here (`codex login status --json` exits 2) and writes
-    # its one-line human answer to STDERR, both mirrored below. The stub used to answer
-    # `login status --json` with {"status":"authenticated"}, which is the assumption the defect was
-    # made of: a JSON contract no Codex has ever implemented, invented by the firm and then believed.
+  "--help")
+    # The real top level offers --sandbox/--ask-for-approval/--model and NOT the exec-only five.
+    # Under `wrong_surface` it offers the complete set, so a probe that reads here passes when it
+    # must not.
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'; exit 0; }
+    echo '--sandbox --ask-for-approval --model'
+    exit 0 ;;
+  # A STUB THAT ANSWERS A SURFACE THE REAL CLI DOES NOT HAVE IS THE DEFECT, NOT THE FIXTURE. These
+  # two cases used to reply with tidy JSON to `login status --json` and `models list --json`; neither
+  # exists on codex-cli 0.147.0, so the suite was green against a CLI shape that has never shipped
+  # while the real firm-gpt-qa died at rc 2. They now emit the exact clap refusals the real binary
+  # emits, which is what makes any regression to those commands fail here instead of in production.
+  "login status --json"|"models list --json")
+    printf "error: unexpected argument '%s' found\n" "$2" >&2; exit 2 ;;
+  "doctor --json")
     [ "$STUB_MODE" = authentication_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth ] && { echo 'Not logged in' >&2; exit 1; }
-    [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret' >&2; exit 1; }
-    # A declared READY body carrying an undeclared exit status. Body and status must agree.
-    [ "$STUB_MODE" = status_body_mismatch ] && { echo 'Logged in using ChatGPT' >&2; exit 1; }
-    # ORDERING ARMS. Both emit a DECLARED answer and then break the phase, which is the case no stub
-    # covered before: every previous hang arm emitted nothing first, so the payload was empty and the
-    # classifier returned None whatever order the checks ran in.
-    [ "$STUB_MODE" = auth_phrase_then_hang ] && { echo 'Not logged in' >&2; (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = auth_phrase_then_flood ] && {
-      echo 'Logged in using ChatGPT' >&2
-      # Past the 64 KiB default cap, so result.truncated is true. Retention keeps the PREFIX, so the
-      # declared ready line survives in the payload: if the payload were read before truncation was
-      # checked, this would classify as ready and the run would proceed to the judge.
-      awk 'BEGIN{for(i=0;i<4000;i++) print "x0123456789012345678901234567890"}'
-      exit 0; }
-    # A ready answer with a secret-shaped line beside it: ready, and nothing of it may be published.
-    [ "$STUB_MODE" = auth_ready_with_secret ] && {
-      echo 'Logged in using ChatGPT' >&2
-      echo 'account_id=admin@corp.example token=READINESS-BODY-SENTINEL-4c19' >&2
-      exit 0; }
-    # The shape the OLD wrapper accepted. It must no longer be an answer at all.
+    [ "$STUB_MODE" = ambiguous_auth ] && { echo 'not logged in token=secret'; exit 1; }
+    [ "$STUB_MODE" = auth ] && { printf '{"schemaVersion":1,"overallStatus":"fail","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"fail","summary":"no Codex credentials were found"}}}\n'; exit 1; }
+    # `codex doctor` reports the WHOLE installation, so its exit status is not the auth answer.
+    # unrelated_doctor_failure models a host where auth is configured but some other check fails.
+    [ "$STUB_MODE" = unrelated_doctor_failure ] && { printf '{"schemaVersion":1,"overallStatus":"fail","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"},"updates.status":{"id":"updates.status","category":"updates","status":"fail","summary":"update check failed"}}}\n'; exit 1; }
+    # miscategorised_auth keeps the word "ok" but moves the entry out of the auth category, so a
+    # reader that matched on status alone would wrongly say available.
+    [ "$STUB_MODE" = miscategorised_auth ] && { printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"network","status":"ok","summary":"auth is configured"}}}\n'; exit 0; }
+    # The shape the OLD wrapper invented and then believed. `{"status":"authenticated"}` fails the
+    # declared envelope (schemaVersion) before any answer is read, so it must not be an answer at
+    # all -- for either provider.
     [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
-    echo 'Logged in using ChatGPT' >&2; exit 0 ;;
-  "login status --json"|"models"|"models list"|"models list --json")
-    # No CLI answers these. `codex login status --json` exits 2; codex has no `models` subcommand at
-    # all, so `codex models ...` parses as a PROMPT. If the wrapper ever asks again, fail loudly here
-    # rather than let it fall through to the judge branch and look like a pass.
-    echo "stub: the wrapper asked codex for \`$*\`, which no real codex answers" >&2; exit 99 ;;
+    # ORDERING ARMS. Both emit a DECLARED answer and THEN break the phase, which is the case no stub
+    # covered before: every previous hang arm emitted nothing first, so the payload was empty and the
+    # classifier returned None whichever order the checks ran in.
+    [ "$STUB_MODE" = auth_phrase_then_hang ] && { printf '{"schemaVersion":1,"overallStatus":"fail","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"fail","summary":"no Codex credentials were found"}}}\n'; (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    # Past readiness_output_cap (1 MiB). Retention keeps the PREFIX, so the declared ready document
+    # survives at the head of the payload: if the payload were read before truncation was checked,
+    # this would classify as ready and the run would proceed to the judge.
+    [ "$STUB_MODE" = auth_phrase_then_flood ] && {
+      printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"}}}\n'
+      awk 'BEGIN{for(i=0;i<40000;i++) print "x0123456789012345678901234567890"}'
+      exit 0; }
+    # A ready answer with secret-shaped fields beside it: ready, and nothing of it may be published.
+    [ "$STUB_MODE" = auth_ready_with_secret ] && {
+      printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured","details":{"account":"admin@corp.example","token":"READINESS-BODY-SENTINEL-4c19"}}}}\n'
+      exit 0; }
+    printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"}}}\n'; exit 0 ;;
+  "debug models")
+    [ "$STUB_MODE" = model_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
+    # The real catalog keys entries `slug`/`display_name`. A reader that only knew `id`/`name`
+    # stringified None for every entry and never matched the configured model.
+    [ "$STUB_MODE" = incompatible ] && { echo '{"models":[{"slug":"other","display_name":"Other"}]}'; exit 0; }
+    # A READINESS DOCUMENT IS SIZED BY THE PROVIDER, NOT BY THE CONVERSATION. The real catalog is
+    # 284382 bytes on ONE line because it ships full base instructions per model, so the judge's
+    # 64 KiB --max-output default truncated it mid-record and the wrapper BLOCKed on a host whose
+    # catalog listed the configured model. large_catalog reproduces that shape: the configured model
+    # is the LAST entry, so any cap below the document size hides it.
+    if [ "$STUB_MODE" = large_catalog ]; then
+      printf '{"models":['
+      i=0; while [ $i -lt 400 ]; do
+        printf '{"slug":"filler-%s","display_name":"Filler","base_instructions":"' "$i"
+        j=0; while [ $j -lt 8 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; j=$((j+1)); done
+        printf '"},'; i=$((i+1))
+      done
+      printf '{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol"}]}\n'
+      exit 0
+    fi
+    echo '{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol"},{"slug":"gpt-5.4","display_name":"GPT-5.4"}]}'; exit 0 ;;
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
@@ -183,8 +279,12 @@ case "$STUB_MODE" in
   block) src="$STUB_GPT_BLOCK" ;;
   block_summarised) src="$STUB_GPT_SUMMARISED" ;;
   block_duplicated) src="$STUB_GPT_DUPLICATED" ;;
+  schema_constraint_violation) src="$STUB_GPT_BADID" ;;
   *) src="$STUB_GPT_APPROVE" ;;
 esac
+# The generation schema the wrapper actually handed this provider, lifted out of the controlled root
+# so the suite can assert on the real bytes rather than on a re-derivation of them.
+[ -n "${STUB_SCHEMA_CAPTURE:-}" ] && cp "$PWD/qa-verdict.generation-schema.json" "$STUB_SCHEMA_CAPTURE" 2>/dev/null
 python3 - "$FIRM_QA_BEHAVIOR_SENTINEL" "$PWD" "$HOME" "$all_args" "$STUB_MODE" "$FIRM_QA_INPUT_MANIFEST" "${STUB_MANIFEST_CAPTURE:-}" <<'PY'
 import json,os,shutil,sys
 sentinel,cwd,home,args,mode,manifest,capture=sys.argv[1:]
@@ -204,7 +304,8 @@ probe={"agents":hostile("AGENTS.md"),"claude":hostile("CLAUDE.md"),
        "hooks":os.path.exists(os.path.join(cwd,"hooks")),"plugins":os.path.exists(os.path.join(cwd,"plugins")),
        "mcp":os.path.exists(os.path.join(cwd,"mcp")),"skills":os.path.exists(os.path.join(cwd,"skills")),
        "memory":os.path.exists(os.path.join(cwd,"memory")),"network":"-s read-only" not in args,
-       "policy":hostile("AGENTS.md") or hostile("CLAUDE.md"),"approval":"-a never" not in args,
+       "policy":hostile("AGENTS.md") or hostile("CLAUDE.md"),
+       "approval":'approval_policy="never"' not in args,
        "snapshot_write":wrote}
 json.dump(probe,open(sentinel,"w"))
 PY
@@ -220,7 +321,20 @@ cat > "$STUB/claude" <<'SH'
 #!/bin/sh
 printf 'claude cwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$STUB_CALLS"
 all_args="$*"
+# WHAT THE CHILD WAS HANDED IS THE ONLY PLACE THE CREDENTIAL BOUNDARY IS OBSERVABLE. The wrapper
+# builds the judge's environment from scratch, so a claim about what crosses can only be checked
+# from inside the child. Recorded per phase, and deliberately including the three variables that
+# must NEVER cross, so widening the passthrough fails a test instead of shipping.
+if [ -n "${STUB_ENV_CAPTURE:-}" ]; then
+  printf 'claude phase=%s oauth=%s apikey=%s authtok=%s fd=%s\n' "${1:-none}" \
+    "${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}" "${ANTHROPIC_API_KEY:-<unset>}" \
+    "${ANTHROPIC_AUTH_TOKEN:-<unset>}" "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-<unset>}" \
+    >> "$STUB_ENV_CAPTURE"
+fi
 case "$*" in
+  # Claude documents its whole judge surface at the TOP level, so this is where the complete set
+  # belongs. `wrong_surface` moves it to `exec --help` — a subcommand claude has no reason to be
+  # probed at — so a probe that drifted to a subcommand for BOTH providers fails here too.
   "--help")
     # claude is invoked at TOP LEVEL (`claude -p ...`) and really does carry every control it passes
     # in `claude --help`, so this provider declares exactly one probed surface. Verified against
@@ -228,8 +342,18 @@ case "$*" in
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
     [ "$STUB_MODE" = discovery_error ] && { echo 'help is unavailable' >&2; exit 7; }
     [ "$STUB_MODE" = capability ] && { echo '--safe-mode --model'; exit 0; }
+    # `-p` and not `--print`: CAPABILITY_CONTRACT declares the EXACT token the invocation passes,
+    # with no alias map, so the help this stub prints has to carry that token verbatim the way the
+    # real `claude --help` does.
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--safe-mode --model'; exit 0; }
     echo '  -p, --print   --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'
     exit 0 ;;
+  "exec --help")
+    [ "$STUB_MODE" = wrong_surface ] && { echo '--print --safe-mode --system-prompt --strict-mcp-config --no-session-persistence --model --effort --output-format --json-schema --permission-mode --tools --disallowedTools'; exit 0; }
+    echo 'claude has no exec subcommand'; exit 1 ;;
+  # The real document is keyed loggedIn/authMethod, NOT status/authentication. Reading it for
+  # status/authentication is why a logged-in operator was classified as an untrusted result and
+  # firm-claude-qa BLOCKed on a host whose session was fine.
   "auth status --json")
     # The real Claude Code 2.1.238 payload. Authentication is reported as `loggedIn`, matching
     # neither key the old wrapper read (`status`, `authentication`) — which is why an authenticated
@@ -244,17 +368,39 @@ case "$*" in
     # where truncation-before-payload is actually pinned.
     [ "$STUB_MODE" = auth_phrase_then_flood ] && {
       echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
-      awk 'BEGIN{for(i=0;i<4000;i++) print "x0123456789012345678901234567890"}'
+      # PAST readiness_output_cap (1 MiB), not past the old 64 KiB judge default: the readiness
+      # phases read structured documents now and are capped accordingly, so an arm sized for the
+      # old cap would no longer truncate anything and this case would silently stop biting.
+      awk 'BEGIN{for(i=0;i<40000;i++) print "x0123456789012345678901234567890"}'
       exit 0; }
     [ "$STUB_MODE" = auth_ready_with_secret ] && {
       echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"admin@corp.example","token":"READINESS-BODY-SENTINEL-4c19"}'
       exit 0; }
     [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
     echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"qa@example.com","subscriptionType":"max"}'; exit 0 ;;
-  "models"|"models list"|"models list --json")
-    # `claude models list` is not a subcommand: Claude Code takes it as a PROMPT and bills a model
-    # turn to answer it in prose. A readiness gate must never be able to do that.
-    echo "stub: the wrapper asked claude for \`$*\`, which is a PROMPT, not a query" >&2; exit 99 ;;
+    # loggedIn must be the BOOLEAN, so a stringly-typed document stays untrusted.
+    [ "$STUB_MODE" = stringly_auth ] && { echo '{"loggedIn":"true","authMethod":"claude.ai"}'; exit 0; }
+    # Measured on Claude Code 2.1.234 in exactly the controlled root's shape (isolated HOME,
+    # isolated CLAUDE_CONFIG_DIR, no USER, empty provider directory): rc 0
+    # {"loggedIn":true,"authMethod":"oauth_token"} when CLAUDE_CODE_OAUTH_TOKEN is set, rc 1
+    # {"loggedIn":false,"authMethod":"none"} when it is not. The token is the ONLY input to that
+    # difference, which is what makes it credential-without-configuration.
+    if [ "$STUB_MODE" = oauth_token ]; then
+      if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        echo '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}'; exit 0
+      fi
+      echo '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'; exit 1
+    fi
+    echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"qa@example.com","subscriptionType":"max"}'; exit 0 ;;
+  # Claude Code 2.1.234 has NO `models` subcommand. `models list --json` is `unknown option`, and
+  # dropping the flag is worse than useless: bare `claude models list` is parsed as the PROMPT and
+  # starts a real session. The stub therefore refuses the first and makes the second an immediate,
+  # loud failure, so no future readiness probe can quietly start a billed session here.
+  "models list --json")
+    echo "error: unknown option '--json'" >&2; exit 1 ;;
+  "models list"|"models")
+    echo 'STUB FAILURE: a readiness probe sent claude a PROMPT ("'"$*"'") instead of a subcommand' >&2
+    printf 'claude PROMPT-AS-PROBE %s\n' "$*" >> "$STUB_CALLS"; exit 97 ;;
 esac
 echo 'Cookie: session=super-secret request_id=req-123 device_code=987 user@example.com https://oauth.example/login'
 case "$STUB_MODE" in
@@ -262,6 +408,11 @@ case "$STUB_MODE" in
   authphrase_main) echo 'authentication required; unknown model' >&2; exit 1 ;;
   hard_kill) echo 'HARD-KILL-RAW-SECRET-91b7'; sleep 30 ;;
   malformed) echo 'not-json'; exit 0 ;;
+  # Claude publishes no model catalog, so a wrong configured model cannot be caught by a pre-check
+  # and surfaces HERE instead. Measured on Claude Code 2.1.234: an unknown --model is refused
+  # locally with `[claude-code:unrecognized_model]` at duration_api_ms 0 / total_cost_usd 0 / rc 1,
+  # so the BLOCK is immediate and costs nothing. This is the strict outcome, not the lenient one.
+  incompatible) echo '[claude-code:unrecognized_model] {"model":"opus","query_source":"sdk"}' >&2; exit 1 ;;
   hold) sleep 1; src="$STUB_CLAUDE_APPROVE" ;;
   diagnostic_symlink) rm -f "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/09-test-evidence/reviewer-attempts/$FIRM_QA_ATTEMPT_ID/diagnostic.json"; src="$STUB_CLAUDE_APPROVE" ;;
   promotion_symlink) rm -f "$STUB_RUN/08-qa-verdict.claude.json"; ln -s "$STUB_REDIRECT" "$STUB_RUN/08-qa-verdict.claude.json"; src="$STUB_CLAUDE_APPROVE" ;;
@@ -308,11 +459,17 @@ review_env() { # mode wrapper [extra args]
   mode="$1"; wrapper="$2"; shift 2
   env PATH="$STUB:/usr/bin:/bin" STUB_MODE="$mode" STUB_CALLS="$CALLS" STUB_CHILD="$WORK/child.pid" \
     STUB_GPT_APPROVE="$WORK/gpt-approve.json" STUB_GPT_BLOCK="$WORK/gpt-block.json" \
+    STUB_GPT_BADID="$WORK/gpt-badid.json" STUB_SCHEMA_CAPTURE="${STUB_SCHEMA_CAPTURE:-}" \
     STUB_CLAUDE_APPROVE="$WORK/claude-approve.json" STUB_CLAUDE_BLOCK="$WORK/claude-block.json" \
     STUB_GPT_SUMMARISED="$WORK/gpt-block-summarised.json" STUB_GPT_DUPLICATED="$WORK/gpt-block-duplicated.json" \
     STUB_CLAUDE_SUMMARISED="$WORK/claude-block-summarised.json" STUB_CLAUDE_DUPLICATED="$WORK/claude-block-duplicated.json" \
     STUB_CANDIDATE="$RUN/09-test-evidence/qa-candidate.json" \
     STUB_MANIFEST_CAPTURE="${STUB_MANIFEST_CAPTURE:-}" STUB_RUN="$RUN" STUB_REDIRECT="$WORK/redirect-target" \
+    STUB_ENV_CAPTURE="${STUB_ENV_CAPTURE:-}" STUB_CODEX_MARKER="$CODEX_FIXTURE_MARKER" \
+    CODEX_HOME="${STUB_CODEX_HOME:-$CODEX_FIXTURE}" \
+    CLAUDE_CODE_OAUTH_TOKEN="${STUB_OAUTH_TOKEN:-}" \
+    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="${STUB_OAUTH_TOKEN_FD:-}" \
+    ANTHROPIC_API_KEY="${STUB_ANTHROPIC_API_KEY:-}" ANTHROPIC_AUTH_TOKEN="${STUB_ANTHROPIC_AUTH_TOKEN:-}" \
     FIRM_GPT_QA_DISCOVERY_TIMEOUT=2 FIRM_GPT_QA_READINESS_TIMEOUT=2 FIRM_GPT_QA_TIMEOUT=2 \
     FIRM_CLAUDE_QA_DISCOVERY_TIMEOUT=2 FIRM_CLAUDE_QA_READINESS_TIMEOUT=2 FIRM_CLAUDE_QA_TIMEOUT=2 \
     FIRM_QA_KILL_GRACE=1 "$wrapper" "$@" "$RUN"
@@ -335,13 +492,41 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   # The three readiness outcomes, kept sharp. Only a DECLARED unavailable answer is exit 3; every
   # other non-ready response is BLOCK exit 1 and none of them can become "available".
   assert_rc "$provider trusted authentication unavailable" 3 review_env auth "$wrapper"
+  # A CONFIGURED MODEL THE PROVIDER WILL NOT ACCEPT MUST NEVER BE SILENT, but the two CLIs can only
+  # say so at different moments, so the shared contract is "not silent", not "exit 3". codex
+  # publishes a catalog (`codex debug models`) and is caught before the judge starts, which is the
+  # LENIENT, waivable outcome. claude publishes no catalog, so nothing pre-vouches for the model and
+  # the refusal lands at the judge as a BLOCK - the strict outcome, and free, because claude rejects
+  # an unknown --model locally at duration_api_ms 0.
+  if [ "$provider" = gpt ]; then
+    assert_rc "$provider trusted model unavailable before the judge" 3 review_env incompatible "$wrapper"
+  else
+    assert_rc "$provider unaccepted model is a judge-phase BLOCK, never a pass" 1 review_env incompatible "$wrapper"
+  fi
   assert_rc "$provider unsupported mandatory capability unavailable" 3 review_env capability "$wrapper"
   assert_rc "$provider ambiguous readiness text BLOCKs" 1 review_env ambiguous_auth "$wrapper"
-  assert_rc "$provider ready body with an undeclared exit status BLOCKs" 1 review_env status_body_mismatch "$wrapper"
+  # BODY-AND-EXIT AGREEMENT IS A PER-SURFACE CLAIM, not a universal one, and READINESS_CONTRACT
+  # declares which surface it holds on. For `claude auth status --json` the exit status IS the auth
+  # answer, so a ready document delivered with an undeclared status is an unrecognised response.
+  # For `codex doctor --json` it is NOT: that command reports the whole installation, and it exited
+  # 1 in the 2026-08-25 fixture measurement purely because an unrelated check failed. Asserting the
+  # claude rule against codex would pin a BLOCK on a host whose judge is fine, which is the exact
+  # false-negative family this whole area exists to close. `unrelated_doctor_failure` and
+  # `miscategorised_auth` are the gpt-shaped members of the same "do not over-trust" family.
+  if [ "$provider" = claude ]; then
+    assert_rc "claude ready body with an undeclared exit status BLOCKs" 1 review_env status_body_mismatch "$wrapper"
+  fi
   assert_rc "$provider the old invented {\"status\":\"authenticated\"} shape BLOCKs" 1 review_env legacy_json_auth "$wrapper"
   assert_rc "$provider post-start auth/model phrases remain BLOCK" 1 review_env authphrase_main "$wrapper"
 done
-assert_rc "missing GPT CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$GPT" "$RUN"
+# THE TWO INVOCATIONS THAT DO NOT GO THROUGH review_env STILL NEED ITS ISOLATION. The credential
+# import at bin/firm-reviewer-common:1025 runs BEFORE the `shutil.which` that decides the CLI is
+# missing (:1141), so this gpt case reaches the import and would otherwise read whatever store the
+# ambient environment names — which on an operator's machine is the real one. Naming the fixture
+# here costs nothing (the case still exits 3 on the empty PATH) and keeps "no gpt case reads the
+# operator's store" true of the FILE rather than only of review_env.
+assert_rc "missing GPT CLI is trusted unavailable" 3 \
+  env PATH="/usr/bin:/bin" CODEX_HOME="$CODEX_FIXTURE" "$GPT" "$RUN"
 assert_rc "missing Claude CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$CLAUDE" "$RUN"
 
 t_case "capability discovery searches exactly the help surfaces the wrapper is invoked through"
@@ -429,7 +614,7 @@ done
 # The most recent reviewer_* ledger event, which is where "why did readiness fail" is recorded. Exit
 # status alone cannot tell a timed-out phase from an unrecognised one; both are BLOCK exit 1.
 last_reviewer_event() {
-  python3 - "$RUN/run.jsonl" <<'LEDGER'
+  t_python - "$RUN/run.jsonl" <<'LEDGER'
 import json, sys
 last = None
 for line in open(sys.argv[1], encoding="utf-8"):
@@ -442,6 +627,235 @@ for line in open(sys.argv[1], encoding="utf-8"):
 print(json.dumps(last or {}, sort_keys=True))
 LEDGER
 }
+
+t_case "capability discovery probes the surface the judge invokes, not a neighbouring one"
+# THE DEFECT THIS PINS: the probe ran `codex --help` while every flag the gpt judge sends belongs to
+# `codex exec`, so a fully capable Codex finalised `unavailable` with the trusted reason
+# `unsupported_capability`. That is the most dangerous shape available — it needs only a waiver, so
+# a Claude-primary run silently lost its cross-provider second voice while the Codex-primary
+# direction kept its Claude judge, and the two adapters were not at parity at all.
+# Asserting the exit code alone would not have caught it (exit 3 is a legitimate answer), so this
+# drives BOTH directions: the flags at the judge's own surface must be found, and the SAME flags at
+# the neighbouring surface must NOT satisfy the probe.
+: > "$CALLS"
+assert_rc "GPT reaches its judge when the controls are where the judge sends them" 0 review_env approve "$GPT"
+assert_rc "Claude reaches its judge from its own top-level surface" 0 review_env approve "$CLAUDE"
+assert_ok "each provider probed the exact argv prefix its judge then invoked" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+# The subcommand path each provider's judge is invoked at, and therefore the only --help that can
+# answer a capability question about it. Spelled out here on purpose: this is the pin.
+expected = {"codex": ["exec"], "claude": []}
+for executable, subcommand in expected.items():
+    mine = [line.split(" args=", 1)[1] for line in records if line.startswith(executable + " ")]
+    assert mine, "no %s call was recorded at all" % executable
+    probes = [args for args in mine if args.split() and args.split()[-1] == "--help"]
+    assert len(probes) == 1, "%s: expected exactly one --help probe, got %r" % (executable, probes)
+    probed = probes[0].split()[:-1]
+    assert probed == subcommand, (
+        "%s: capability discovery probed %r but the judge is invoked at %r -- a probe that reads a "
+        "surface the wrapper never invokes cannot answer a capability question about it"
+        % (executable, probed, subcommand))
+    judge = max((args.split() for args in mine), key=len)
+    assert judge[:len(probed)] == probed, (
+        "%s: the judge argv %r does not start with the probed prefix %r" % (executable, judge[:4], probed))
+PY
+# The mutation, both ways round: the complete flag set moved to the OTHER surface must be refused.
+# Without the fix the first of these passes discovery and returns 0 instead of 3.
+assert_rc "GPT controls documented only at the top level are not exec capability" 3 review_env wrong_surface "$GPT"
+assert_rc "Claude controls documented only at a subcommand are not top-level capability" 3 review_env wrong_surface "$CLAUDE"
+for provider in gpt claude; do
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  assert_eq "$provider records the wrong-surface refusal as an unsupported capability" unsupported_capability \
+    "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trusted_reason"])' "$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json")"
+done
+
+t_case "readiness asks each CLI only for surfaces that CLI actually has"
+# THE DEFECT CLASS THIS PINS: a readiness check written against a CLI shape the installed CLI does
+# not emit. Every readiness command in this wrapper was of that kind — `codex login status --json`
+# (clap rc 2), `codex models list --json` (no such subcommand), `claude models list --json` (unknown
+# option, and without the flag a PROMPT that starts a billed session), and a claude auth reader
+# looking for status/authentication in a document keyed loggedIn/authMethod. Each failed as a
+# BLOCK or an untrusted result on a host where both judges were fine, and the suite stayed green
+# because the stubs answered the imaginary surfaces. The stubs now answer only what the real
+# binaries answer, so this case is what makes a re-drift fail here rather than in production.
+: > "$CALLS"
+assert_rc "GPT reaches its judge through the readiness surfaces codex really has" 0 review_env approve "$GPT"
+assert_rc "Claude reaches its judge through the readiness surfaces claude really has" 0 review_env approve "$CLAUDE"
+assert_ok "no readiness phase addressed a subcommand or flag its CLI does not have" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+calls = {}
+for line in records:
+    executable, args = line.split(" ", 1)[0], line.split(" args=", 1)[1].strip()
+    calls.setdefault(executable, []).append(args)
+assert "PROMPT-AS-PROBE" not in open(sys.argv[1], encoding="utf-8").read(), \
+    "a readiness probe was delivered to a provider as a PROMPT; it would have started a real session"
+# Surfaces measured absent on codex-cli 0.147.0 and Claude Code 2.1.234. None of them may appear in
+# any argv the wrapper issues, at any phase.
+absent = {
+    "codex": ["login status", "models list", "models "],
+    "claude": ["models list", "auth status --json --", "doctor --json"],
+}
+for executable, forbidden in absent.items():
+    mine = calls.get(executable) or []
+    assert mine, "no %s call was recorded at all" % executable
+    for needle in forbidden:
+        offending = [args for args in mine if args.startswith(needle.strip()) and needle.strip()]
+        assert not offending, (
+            "%s was asked for %r, a surface it does not have: %r" % (executable, needle.strip(), offending))
+# And the surfaces that DO exist must be the ones actually used.
+assert any(args == "doctor --json" for args in calls["codex"]), \
+    "codex authentication readiness must read `codex doctor --json`, its only structured auth surface: %r" % (calls["codex"],)
+assert any(args == "debug models" for args in calls["codex"]), \
+    "codex model readiness must read `codex debug models`, its only structured catalog: %r" % (calls["codex"],)
+assert any(args == "auth status --json" for args in calls["claude"]), \
+    "claude authentication readiness must read `claude auth status --json`: %r" % (calls["claude"],)
+PY
+# The auth document must be read by its OWN keys and types, not by a shape no CLI emits.
+assert_rc "codex auth is the auth.credentials check, not the whole-installation exit status" 0 \
+  review_env unrelated_doctor_failure "$GPT"
+assert_rc "an ok status outside the auth category is not an auth answer" 1 \
+  review_env miscategorised_auth "$GPT"
+assert_rc "a stringly-typed loggedIn is not a trusted boolean" 1 review_env stringly_auth "$CLAUDE"
+# Configured-model readiness is recorded either way, so an absent pre-check can never be read
+# downstream as a passed one.
+: > "$CALLS"
+assert_rc "GPT records established model readiness" 0 review_env approve "$GPT"
+gpt_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_eq "GPT model readiness is established from a named surface" "debug models|True" \
+  "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1]))["model_readiness"]; print("%s|%s" % (d["surface"], d["established"]))' "$RUN/09-test-evidence/reviewer-attempts/$gpt_attempt/attempt.json")"
+assert_rc "Claude records model readiness as NOT established" 0 review_env approve "$CLAUDE"
+claude_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
+assert_eq "Claude model readiness names the absent catalog rather than claiming a pass" "None|False|no_structured_catalog" \
+  "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1]))["model_readiness"]; print("%s|%s|%s" % (d["surface"], d["established"], d["reason"]))' "$RUN/09-test-evidence/reviewer-attempts/$claude_attempt/attempt.json")"
+
+t_case "the schema a provider is given is derived from the schema that judges the answer"
+# THE DEFECT THIS PINS: one file was doing two incompatible jobs. The canonical verdict schema is a
+# draft 2020-12 document with uniqueItems, allOf/if/then/else, pattern and minLength; NEITHER
+# structured-output API will accept it. Measured verbatim against the installed CLIs -
+#   codex : invalid_json_schema ... 'uniqueItems' is not permitted
+#           invalid_json_schema ... 'allOf' is not permitted
+#           'required' is required to be supplied and to be an array including every key in
+#           properties. Missing 'blocker_objects'
+#   claude: --json-schema is not a valid JSON Schema: no schema with key or ref
+#           "https://json-schema.org/draft/2020-12/schema"
+#           strict mode: missing type "array" for keyword "minItems" ... (strictTypes) x4
+# so BOTH judges would have died at the judge phase even fully authenticated. Nobody had seen it
+# because no judge had ever reached that phase.
+: > "$CALLS"
+SCHEMA_SEEN="$WORK/generation-schema.json"; rm -f "$SCHEMA_SEEN"
+STUB_SCHEMA_CAPTURE="$SCHEMA_SEEN"; export STUB_SCHEMA_CAPTURE
+assert_rc "GPT run captures the generation schema it was handed" 0 review_env approve "$GPT"
+unset STUB_SCHEMA_CAPTURE
+assert_ok "the generation projection is provider-acceptable and loses no constraint" \
+  t_python - "$SCHEMA_SEEN" "$FIRM_ROOT/agent-firm/schemas/qa-verdict.schema.json" <<'PY'
+import json, sys
+projected = json.load(open(sys.argv[1], encoding="utf-8"))
+canonical = json.load(open(sys.argv[2], encoding="utf-8"))
+
+def keywords(node, seen=None):
+    seen = {} if seen is None else seen
+    if isinstance(node, dict):
+        for key, value in node.items():
+            seen[key] = seen.get(key, 0) + 1
+            keywords(value, seen)
+    elif isinstance(node, list):
+        for value in node:
+            keywords(value, seen)
+    return seen
+
+rejected = ["uniqueItems", "minItems", "maxItems", "minLength", "maxLength", "pattern",
+            "minimum", "maximum", "multipleOf", "allOf", "anyOf", "oneOf", "not",
+            "if", "then", "else", "$schema", "$id"]
+present = keywords(projected)
+left = [name for name in rejected if name in present]
+assert not left, "the generation projection still carries keywords a provider rejects: %r" % left
+
+# Every constraint the projection had to drop must survive as prose the provider DOES accept,
+# otherwise "we removed it from the hint" really would mean "we stopped asking for it".
+def walk(node, out):
+    if isinstance(node, dict):
+        if isinstance(node.get("description"), str):
+            out.append(node["description"])
+        for value in node.values():
+            walk(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value, out)
+prose = []
+walk(projected, prose)
+prose = " ".join(prose)
+for needle in ("^obj-[A-Za-z0-9._:-]{1,128}$", "^[0-9a-f]{40}$", "^AC-[0-9]{3}$",
+               "uniqueItems True", "minLength 1", "minimum 1"):
+    assert needle in prose, "constraint %r was dropped without being carried into a description" % needle
+
+# The canonical schema is untouched: it is still the strict document, and it is still the validator.
+canon = keywords(canonical)
+for name in ("uniqueItems", "allOf", "pattern", "minLength", "minItems", "maxItems"):
+    assert name in canon, "the CANONICAL schema lost %r -- the projection must never edit it" % name
+
+# Everything the canonical schema requires is still required after projection.
+assert set(canonical["required"]).issubset(set(projected["required"])), \
+    "projection dropped a required property"
+PY
+# And the load-bearing half: a constraint the projection had to remove is STILL enforced, because
+# the canonical schema is what validates the answer. Without that, this change would be a quiet
+# relaxation of every pattern/length/uniqueness rule in the verdict contract.
+assert_rc "a verdict violating a projected-away constraint is still refused" 1 \
+  review_env schema_constraint_violation "$GPT"
+badid_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_eq "the refusal is a validation failure, not a judge BLOCK" "invalid" \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUN/09-test-evidence/reviewer-attempts/$badid_attempt/attempt.json")"
+# Deriving the projection is not the same as USING it. Both judge argvs must carry the projection,
+# never the canonical document, or the derivation is decoration.
+: > "$CALLS"
+assert_rc "GPT judge argv is recorded" 0 review_env approve "$GPT"
+assert_rc "Claude judge argv is recorded" 0 review_env approve "$CLAUDE"
+assert_ok "each judge is handed the projection, not the canonical schema" \
+  t_python - "$CALLS" <<'PY'
+import sys
+records = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if " args=" in line]
+codex = [line.split(" args=", 1)[1] for line in records if line.startswith("codex ")]
+claude = [line.split(" args=", 1)[1] for line in records if line.startswith("claude ")]
+judge = max(codex, key=len)
+assert "--output-schema" in judge, judge
+schema_arg = judge.split("--output-schema", 1)[1].split()[0]
+assert schema_arg.endswith("qa-verdict.generation-schema.json"), (
+    "codex was handed %r; the canonical qa-verdict.schema.json is rejected by the structured-output "
+    "API with 'uniqueItems' is not permitted" % schema_arg)
+# claude's judge argv carries the whole qa-judge contract in --system-prompt, so it spans many
+# physical lines in this log; read the raw blob and slice the --json-schema payload out of it.
+blob = open(sys.argv[1], encoding="utf-8").read()
+assert "--json-schema" in blob, "claude was never handed a --json-schema payload"
+payload = blob.split("--json-schema", 1)[1].split("--permission-mode", 1)[0]
+# Match KEYS, not substrings: the carried prose deliberately names the constraint it replaced
+# ("MUST satisfy: uniqueItems True."), so a bare substring test would flag its own fix.
+for rejected in ('"uniqueItems":', '"allOf":', '"$schema":', '"pattern":', '"minLength":', '"minItems":'):
+    assert rejected not in payload, (
+        "claude was handed a schema still carrying the %s keyword; ajv strict mode refuses it "
+        "(measured: 'no schema with key or ref \"https://json-schema.org/draft/2020-12/schema\"' and "
+        "four strictTypes errors)" % rejected)
+assert "MUST satisfy" in payload, "the projected schema lost the carried constraint prose"
+assert "^obj-[A-Za-z0-9._:-]{1,128}$" in payload, "the blocker-id pattern was dropped, not carried"
+PY
+# And the readiness output ceiling: a catalog bigger than the judge's --max-output must still be
+# read whole. Below the fix this is a truncated document and a BLOCK.
+assert_rc "a catalog larger than the judge's output cap is still trusted" 0 \
+  review_env large_catalog "$GPT"
+big_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+assert_ok "the oversized catalog was retained untruncated" t_python - \
+  "$RUN/09-test-evidence/reviewer-attempts/$big_attempt/attempt.json" <<'PY'
+import json, sys
+phases = {p["phase"]: p for p in json.load(open(sys.argv[1], encoding="utf-8"))["phases"]}
+model = phases["model"]
+assert model["output_bytes"] > 65536, model
+assert model["truncated"] is False, model
+assert model["retained_bytes"] == model["output_bytes"], model
+PY
+
 
 t_case "a declared answer cut short by a timeout or the output cap is never trusted"
 # THE ORDERING TEST. timeout/turn_limit and truncation are decided BEFORE the payload is read,
@@ -475,26 +889,35 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
     sh -c "! grep -rqI 'admin@corp.example' '$RUN'"
 done
 
-t_case "the readiness phase runs exactly the declared probe, and no models gate"
-for pair in "gpt:$GPT:login status" "claude:$CLAUDE:auth status --json"; do
-  provider="${pair%%:*}"; rest="${pair#*:}"; wrapper="${rest%%:*}"; probe="${rest#*:}"
-  : > "$CALLS"
-  assert_rc "$provider reaches the judge from a real-shape ready answer" 0 review_env approve "$wrapper"
-  assert_output "$provider ran the declared readiness probe" "args=$probe" cat "$CALLS"
-  assert_ok "$provider asked for no models list" \
-    sh -c "! grep -q 'args=models' '$CALLS'"
-done
 
+# DROPPED IN THE MERGE, AND SAID SO RATHER THAN DELETED SILENTLY: this block also carried a case
+# named "the readiness phase runs exactly the declared probe, and no models gate", which asserted
+# `args=login status` for gpt and that no models list was ever requested. Both halves are now
+# false by design and are covered better above:
+#   * the gpt readiness probe is `doctor --json`, because agent-firm/contracts/lifecycle.md admits
+#     only structured readiness output and `codex login status` answers in prose. "readiness asks
+#     each CLI only for surfaces that CLI actually has" pins the declared argv for both providers.
+#   * there IS a models gate again, for gpt only, through the catalog codex really publishes
+#     (`codex debug models`). Its absence on claude is RECORDED rather than assumed, which is what
+#     the lifecycle contract now requires, and the cases above pin both halves.
 t_case "actual provider commands receive controlled roots and complete native suppression flags"
 : > "$CALLS"
 assert_rc "GPT controlled invocation succeeds" 0 review_env approve "$GPT"
 assert_output "GPT suppresses ambient config and rules" "--ignore-user-config --ignore-rules" cat "$CALLS"
-# Was one contiguous "--ephemeral -s read-only -a never" assertion. The approval control moved ahead
-# of `exec` because `codex exec` rejects it outright (rc=2), so the same two claims are now asserted
-# on the two segments they are actually passed in — non-interactive at top level, ephemeral and
-# read-only under exec. Neither claim is dropped, and the ordering is now pinned rather than assumed.
-assert_output "GPT is non-interactive, at the surface codex accepts that control" "-a never exec " cat "$CALLS"
-assert_output "GPT is ephemeral and read-only under exec" "--ephemeral -s read-only" cat "$CALLS"
+# Was one contiguous "--ephemeral -s read-only -a never" assertion, and the intervening repair moved
+# `-a never` in front of `exec`. Both are gone: `codex exec` rejects `-a` (rc 2) and the root
+# position accepts it and DISCARDS it (rc 0, not even validated -- `codex -s bogus exec --help` is
+# rc 0 while `codex --sandbox bogus --help` is rc 2). None of the three claims is dropped; each is
+# now asserted on the control that actually carries it.
+assert_ok "no -a reaches codex in either position" \
+  sh -c "! grep -qE ' -a |--ask-for-approval' \"\$1\"" sh "$CALLS"
+assert_output "GPT is ephemeral and read-only" "--ephemeral -s read-only" cat "$CALLS"
+# `codex exec` has no --ask-for-approval, so the non-interactive posture is stated as the typed
+# config override exec DOES accept, and --strict-config makes an unrecognised key a hard error
+# rather than a silent no-op. Both halves are asserted: the override alone would be a no-op if the
+# key were ever renamed away.
+assert_output "GPT is non-interactive by an override codex validates" 'approval_policy="never"' cat "$CALLS"
+assert_output "GPT rejects unrecognised config keys rather than ignoring them" "--strict-config" cat "$CALLS"
 assert_output "GPT carries explicit model reasoning" 'model_reasoning_effort="xhigh"' cat "$CALLS"
 assert_output "GPT uses wrapper-selected schema/output" "--output-schema" cat "$CALLS"
 : > "$CALLS"
@@ -506,11 +929,11 @@ assert_output "Claude carries explicit effort" "--effort xhigh" cat "$CALLS"
 for spec in "gpt:gpt-5.6-sol:GPT-5.6 sol:$GPT" "claude:opus:Opus 5:$CLAUDE"; do
   provider="${spec%%:*}"; rest="${spec#*:}"; expected_model="${rest%%:*}"; rest="${rest#*:}"
   expected_display="${rest%%:*}"; wrapper="${rest#*:}"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
   attempt="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json"
-  assert_eq "$provider attempt stores canonical model" "$expected_model" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["model"])' "$attempt")"
-  assert_eq "$provider attempt stores canonical display" "$expected_display" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["display"])' "$attempt")"
-  assert_eq "$provider attempt stores canonical effort" xhigh "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["effort"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical model" "$expected_model" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["model"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical display" "$expected_display" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["display"])' "$attempt")"
+  assert_eq "$provider attempt stores canonical effort" xhigh "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["effort"])' "$attempt")"
 done
 FIRM_GPT_QA_MODEL=noncanonical; export FIRM_GPT_QA_MODEL
 : > "$CALLS"; assert_rc "noncanonical reviewer model override is rejected" 2 review_env approve "$GPT"
@@ -519,11 +942,11 @@ assert_eq "provider did not execute for model override" "" "$(cat "$CALLS")"
 
 : > "$CALLS"
 assert_rc "fresh canonical GPT call seeds controlled-layout records" 0 review_env approve "$GPT"
-layout_gpt_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+layout_gpt_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 layout_gpt_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/root"
 layout_gpt_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_gpt_attempt/config"
 assert_rc "fresh canonical Claude call seeds controlled-layout records" 0 review_env approve "$CLAUDE"
-layout_claude_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
+layout_claude_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.claude.json")"
 layout_claude_root="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/root"
 layout_claude_home="$REPO/.agent-firm/private-reviewer-control/$RUN_ID/$layout_claude_attempt/config"
 
@@ -531,7 +954,7 @@ t_case "controlled layout keeps hostile ambient surfaces nested and records ever
 assert_output "fresh GPT provider call records exist" "codex cwd=" cat "$CALLS"
 assert_output "fresh Claude provider call records exist" "claude cwd=" cat "$CALLS"
 assert_ok "every fresh provider call uses its actual attempt-local cwd and HOME" \
-  python3 - "$CALLS" "$layout_gpt_root" "$layout_gpt_home" "$layout_claude_root" "$layout_claude_home" <<'PY'
+  t_python - "$CALLS" "$layout_gpt_root" "$layout_gpt_home" "$layout_claude_root" "$layout_claude_home" <<'PY'
 import os
 import sys
 
@@ -573,22 +996,22 @@ for executable, root, home in (
 PY
 assert_ok "controlled cwd is not the consumer repository" sh -c "! grep -q 'cwd=$REPO ' '$CALLS'"
 assert_output "controlled HOME is private and attempt-local" "/private-reviewer-control/$RUN_ID/" cat "$CALLS"
-checkout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$RUN/09-test-evidence/qa-candidate.json")"
+checkout="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$RUN/09-test-evidence/qa-candidate.json")"
 assert_no_file "provider could not write candidate snapshot" "$checkout/write-sentinel"
 assert_ok "production wrappers expose no FORCE bypass" sh -c "! grep -R 'FORCE_INCOMPAT' '$BIN/firm-gpt-qa' '$BIN/firm-claude-qa' '$BIN/firm-reviewer-common'"
 for provider in gpt claude; do
   sentinel="$(find "$RUN/09-test-evidence/reviewer-attempts" -path "*/behavior-sentinel.json" -type f | while read -r p; do grep -q '"provider": "'$provider'"' "${p%/behavior-sentinel.json}/attempt.json" && echo "$p"; done | tail -1)"
   assert_file "$provider retained pre-cleanup behavior sentinel" "$sentinel"
   for axis in agents claude settings hooks plugins mcp skills memory network policy approval snapshot_write; do
-    assert_eq "$provider $axis hostile axis stayed inactive" False "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$sentinel" "$axis")"
+    assert_eq "$provider $axis hostile axis stayed inactive" False "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$sentinel" "$axis")"
   done
 done
 for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   provider="${pair%%:*}"; wrapper="${pair#*:}"
   assert_rc "$provider controlled snapshot write is detected before cleanup" 1 review_env snapshot_write "$wrapper"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.$provider.json")"
   attempt="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/attempt.json"
-  assert_eq "$provider attempt records detected snapshot write" True "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_snapshot_write_detected"])' "$attempt")"
+  assert_eq "$provider attempt records detected snapshot write" True "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_snapshot_write_detected"])' "$attempt")"
 done
 
 t_case "judge manifest inventories required state, nested proof, exact digests, and open canonical review"
@@ -601,7 +1024,7 @@ unset STUB_MANIFEST_CAPTURE
 # nothing is unresolved" (Claude) -- against `canonical`, which every terminal attempt record
 # names and which the manifest correctly refuses to follow because it is a mutable pointer this
 # run unlinks before it starts. The exclusion is right; the silence was the defect.
-assert_ok "an excluded reference is declared with its reason and what supersedes it" python3 - "$manifest_capture" <<'PYE'
+assert_ok "an excluded reference is declared with its reason and what supersedes it" t_python - "$manifest_capture" <<'PYE'
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["schema_version"] == 3, d["schema_version"]
@@ -619,7 +1042,7 @@ for item in excluded:
     # And the excluded path must really be absent from the inventory, or the claim is stale.
     assert item["origin_path"] not in entries, item["origin_path"]
 PYE
-assert_ok "manifest has exact required origins and nested referenced evidence" python3 - "$manifest_capture" "$RUN" <<'PY'
+assert_ok "manifest has exact required origins and nested referenced evidence" t_python - "$manifest_capture" "$RUN" <<'PY'
 import hashlib,json,os,sys
 manifest,run=sys.argv[1:]; d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
 required={"01-acceptance-criteria.yaml","traceability.yaml","09-test-evidence/qa-candidate.json","run-metadata.json",
@@ -635,7 +1058,7 @@ for origin,item in entries.items():
     assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o")
     assert item["transform"]=="redacted_utf8"
 PY
-python3 - "$RUN/07-review-findings.yaml" <<'PY'
+t_python - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="open"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
@@ -664,10 +1087,118 @@ done
 
 assert_rc "GPT sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$GPT"
 assert_rc "Claude sees an open canonical blocker and returns BLOCK" 1 review_env review_blocker "$CLAUDE"
-python3 - "$RUN/07-review-findings.yaml" <<'PY'
+t_python - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["findings"][0]["status"]="resolved"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
+
+t_case "a run-relative artifact the verdict declares reaches the judge, wherever it lives in the run"
+# The wrapper used to admit ONLY strings beginning "09-test-evidence/", so a root-level run artifact
+# could not reach the judge under ANY artifact list a QA tester could write. Measured consequence on
+# run 20260818T182930Z: the primary verdict named 07-review-disposition.yaml and three canonical
+# 07-review-findings.<lens>.yaml panel files, none of them could cross, and the judge BLOCKED because
+# the manifest omitted exactly the canonical review findings its own contract requires it to
+# inventory. A wrapper defect manufacturing a blocker, uncurable by curating evidence.
+#
+# The names below are the real ones, because the shape being fixed is "a root-level run artifact",
+# and a fixture that used 09-test-evidence/something would pass against the unfixed wrapper.
+printf 'schema_version: 1\ndispositions:\n  - id: fixture-review\n    disposition: fixed\n' \
+  > "$RUN/07-review-disposition.yaml"
+printf 'schema_version: 1\nlens: security-fail-closed\nfindings: []\n' \
+  > "$RUN/07-review-findings.security-fail-closed.yaml"
+mkdir -p "$RUN/09-test-evidence/nested"
+cp "$RUN/08-qa-verdict.json" "$WORK/primary-before-artifacts.json"
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"] = ["09-test-evidence/nested/proof.log",
+                  "07-review-disposition.yaml",
+                  "07-review-findings.security-fail-closed.yaml",
+                  "07-review-findings.does-not-exist.yaml",
+                  "/etc/hosts",
+                  "../outside-the-run.txt",
+                  "integration-summaries"]
+json.dump(d,open(p,"w"),indent=2)
+PY
+manifest_b="$WORK/input-manifest-taskb.json"; STUB_MANIFEST_CAPTURE="$manifest_b"; export STUB_MANIFEST_CAPTURE
+: > "$CALLS"
+assert_rc "the attempt still runs with a mixed artifact list" 0 review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "the two root-level review artifacts crossed, with exact source digest/size/mode" \
+  t_python - "$manifest_b" "$RUN" <<'PY'
+import hashlib,json,os,sys
+manifest,run=sys.argv[1:]
+d=json.load(open(manifest)); entries={x["origin_path"]:x for x in d["entries"]}
+for origin in ("07-review-disposition.yaml","07-review-findings.security-fail-closed.yaml"):
+    assert origin in entries, (origin, sorted(entries))
+    item=entries[origin]; raw=open(os.path.join(run,origin),"rb").read()
+    assert item["source_sha256"]==hashlib.sha256(raw).hexdigest(), origin
+    assert item["source_bytes"]==len(raw), origin
+    assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o"), origin
+    assert item["controlled_sha256"] and item["controlled_bytes"], origin
+    assert item["transform"]=="redacted_utf8", origin
+    # It lands inside the disposable attempt tree, addressed relative to the controlled root.
+    assert item["controlled_path"].startswith("input/run-evidence/files/"), item["controlled_path"]
+PY
+assert_ok "and everything that could NOT cross is named with its reason, not dropped silently" \
+  t_python - "$manifest_b" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+got={x["origin_path"]:x["reason"] for x in d["unresolved_artifacts"]}
+assert got.get("07-review-findings.does-not-exist.yaml")=="not present in the run directory", got
+assert got.get("/etc/hosts")=="not a run-relative path", got
+assert got.get("../outside-the-run.txt")=="not a run-relative path", got
+assert got.get("integration-summaries")=="not a regular file", got
+# ...and none of them is in the manifest as a crossing entry.
+crossed={x["origin_path"] for x in d["entries"]}
+assert not (set(got) & crossed), set(got) & crossed
+PY
+# A symlinked component is recorded and refused: the redirect target must not cross by any name.
+ln -s "$WORK/redirect-target" "$RUN/07-review-findings.redirected.yaml"
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"].append("07-review-findings.redirected.yaml"); json.dump(d,open(p,"w"),indent=2)
+PY
+STUB_MANIFEST_CAPTURE="$WORK/input-manifest-symlink.json"; export STUB_MANIFEST_CAPTURE
+assert_rc "a symlinked declared artifact does not abort the attempt" 0 review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "  and is refused with a reason rather than followed" t_python - \
+  "$WORK/input-manifest-symlink.json" "$REDIRECT_SHA" <<'PY'
+import json,sys
+manifest,redirect_sha=sys.argv[1:]
+d=json.load(open(manifest))
+got={x["origin_path"]:x["reason"] for x in d["unresolved_artifacts"]}
+assert got.get("07-review-findings.redirected.yaml")=="a path component is a symlink", got
+for item in d["entries"]:
+    assert item["source_sha256"]!=redirect_sha, item
+PY
+rm "$RUN/07-review-findings.redirected.yaml"
+# The strings that are NOT in `artifacts` keep the original narrow rule: a path-shaped value
+# somewhere else in the verdict is not an admission ticket, or the wrapper would try to open
+# repository files as run evidence and abort on every real verdict.
+t_python - "$RUN" <<'PY'
+import json,sys
+run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p))
+d["artifacts"]=["09-test-evidence/nested/proof.log"]
+d["blocker_objects"]=[{"id":"obj-fixture","text":"fixture","affected_criteria":[],
+                       "affected_paths":["bin/firm-merge-guard","07-review-disposition.yaml"]}]
+json.dump(d,open(p,"w"),indent=2)
+PY
+STUB_MANIFEST_CAPTURE="$WORK/input-manifest-elsewhere.json"; export STUB_MANIFEST_CAPTURE
+assert_rc "a path-shaped string outside \`artifacts\` neither crosses nor aborts" 0 \
+  review_env approve "$GPT"
+unset STUB_MANIFEST_CAPTURE
+assert_ok "  and really did not cross" t_python - "$WORK/input-manifest-elsewhere.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+crossed={x["origin_path"] for x in d["entries"]}
+assert "bin/firm-merge-guard" not in crossed, crossed
+assert "07-review-disposition.yaml" not in crossed, crossed
+assert d["unresolved_artifacts"]==[], d["unresolved_artifacts"]
+PY
+cp "$WORK/primary-before-artifacts.json" "$RUN/08-qa-verdict.json"
+rm "$RUN/07-review-disposition.yaml" "$RUN/07-review-findings.security-fail-closed.yaml"
 
 t_case "manifest omission, total cap, and nested symlink fail before provider execution"
 cp "$RUN/run-baseline.json" "$WORK/run-baseline.json"
@@ -675,7 +1206,7 @@ rm "$RUN/run-baseline.json"
 : > "$CALLS"; assert_rc "missing run baseline blocks" 1 review_env approve "$GPT"
 assert_eq "provider did not run without baseline" "" "$(cat "$CALLS")"
 cp "$WORK/run-baseline.json" "$RUN/run-baseline.json"
-python3 - "$RUN/run-baseline.json" <<'PY'
+t_python - "$RUN/run-baseline.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["default_branch_start_sha"]="0"*40; json.dump(d,open(p,"w"))
 PY
@@ -692,7 +1223,7 @@ printf '# Integration summary\n\nOverwritten historical cycle.\n' > "$INT_HISTOR
 assert_eq "provider did not run for overwritten history" "" "$(cat "$CALLS")"
 mv "$WORK/integration-summary-pristine.md" "$INT_HISTORY"
 cp "$RUN/08-qa-verdict.json" "$WORK/primary.json"
-python3 - "$RUN" <<'PY'
+t_python - "$RUN" <<'PY'
 import json,os,sys
 run=sys.argv[1]; p=run+"/08-qa-verdict.json"; d=json.load(open(p)); rel="09-test-evidence/over-cap.bin"
 with open(run+"/"+rel,"wb") as fh: fh.write(b"x"*(8*1024*1024+1))
@@ -710,14 +1241,14 @@ rm "$RUN/09-test-evidence/nested"; mv "$RUN/09-test-evidence/nested-real" "$RUN/
 t_case "canonical lifecycle archives stale approval, generation-guards promotion, and uses mode 0600"
 assert_rc "fresh GPT approval promotes" 0 review_env approve "$GPT"
 canonical="$RUN/08-qa-verdict.gpt.json"
-approved_attempt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
+approved_attempt="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
 assert_eq "canonical mode is 600" 600 "$(t_file_mode "$canonical")"
 assert_rc "failed rerun cannot leave stale approval current" 1 review_env malformed "$GPT"
 assert_no_file "stale canonical approval is absent after failure" "$canonical"
 assert_file "prior immutable approval remains recoverable" "$RUN/09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json"
-latest_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+latest_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 latest_attempt="$RUN/09-test-evidence/reviewer-attempts/$latest_id/attempt.json"
-assert_eq "failed attempt points at prior immutable approval" "09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prior_verdict"])' "$latest_attempt")"
+assert_eq "failed attempt points at prior immutable approval" "09-test-evidence/reviewer-attempts/$approved_attempt/verdict.json" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["prior_verdict"])' "$latest_attempt")"
 candidate_backup="$WORK/candidate.backup"; cp "$RUN/09-test-evidence/qa-candidate.json" "$candidate_backup"
 assert_rc "candidate generation change during judge blocks promotion" 1 review_env reorder "$GPT"
 assert_no_file "reordered attempt did not promote" "$canonical"
@@ -751,7 +1282,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   state="$RUN/09-test-evidence/reviewer-state.$provider.json"; state_saved="$WORK/state-$provider.json"
   cp "$state" "$state_saved"; cp "$state" "$WORK/state-target-$provider.json"
   canonical_state_saved="$WORK/canonical-state-$provider.json"; cp "$canonical" "$canonical_state_saved"
-  predicted="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
+  predicted="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
   rm "$state"; ln -s "$WORK/state-target-$provider.json" "$state"
   assert_rc "$provider rejects symlinked mutable attempt state" 1 review_env approve "$wrapper"
   rm "$state"; mv "$state_saved" "$state"; chmod 600 "$state"
@@ -759,7 +1290,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   rm -f "$canonical"; mv "$canonical_state_saved" "$canonical"
   assert_eq "$provider state redirect target stayed byte-identical" "$(shasum -a 256 "$state" | awk '{print $1}')" "$(shasum -a 256 "$WORK/state-target-$provider.json" | awk '{print $1}')"
 
-  predicted="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
+  predicted="$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("{}-c{}-a{:04d}".format(d["provider"],d["generation"],d["last_attempt"]+1))' "$state")"
   ln -s "$WORK/redirect-target" "$RUN/09-test-evidence/reviewer-attempts/$predicted"
   assert_rc "$provider rejects preexisting symlinked attempt directory" 1 review_env approve "$wrapper"
   rm "$RUN/09-test-evidence/reviewer-attempts/$predicted"
@@ -774,7 +1305,7 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   rm "$private_run/hostile-$provider"
 
   assert_rc "$provider rejects a diagnostic target replaced during execution" 1 review_env diagnostic_symlink "$wrapper"
-  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$state")"
+  attempt_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$state")"
   diagnostic="$RUN/09-test-evidence/reviewer-attempts/$attempt_id/diagnostic.json"
   test -L "$diagnostic" && rm "$diagnostic"
 
@@ -784,22 +1315,42 @@ for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   assert_eq "$provider state mode remains 600" 600 "$(t_file_mode "$state")"
 done
 
+# pr_wait <seconds-x10> <shell-test...> — poll until the test succeeds, or give up.
+#
+# CR-08: these waits were fixed 20- and 30-iteration lists, i.e. 2.0 s and 3.0 s, and they are the
+# TIGHTEST bounded waits in the suite. bin/firm-reviewer-common shells out to bin/firm-model-resolve
+# before it creates the lock, and both of those now source bin/firm-python and pay a full resolution
+# (~200 ms each on an idle host), so ~0.4 s of the 2.0 s went to interpreter resolution before any
+# concurrency multiplier. This file is not `runs_alone` and is skipped only by --unsupported-p2, so
+# on a supported host it runs alongside up to N-1 other files. An expired poll here does not merely
+# fail: `assert_file "first concurrent attempt owns a structured lock"` fails AND the next assertion
+# becomes wrong in the MISLEADING direction, because with no live owner the second attempt can
+# legitimately return 0 — the transcript would report that the reviewer lock failed to serialise when
+# the real cause was harness timing. Widened to 10 s, matching wait_ready() in
+# tests/test-ledger-role-start.sh, which is the same pattern done with margin. It costs nothing on a
+# green run: the loop exits on the first successful test.
+pr_wait() {
+  local budget="$1" n=0; shift
+  while [ "$n" -lt "$budget" ]; do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1; n=$((n+1))
+  done
+  return 1
+}
+
 t_case "a live concurrent attempt serializes promotion and a provably dead matching lock recovers"
 review_env hold "$GPT" >"$WORK/first-concurrent.out" 2>&1 & first_pid=$!
 lock="$RUN/09-test-evidence/.reviewer-gpt.lock"
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  test -f "$lock/owner.json" && break
-  sleep 0.1
-done
+pr_wait 100 test -f "$lock/owner.json"
 assert_file "first concurrent attempt owns a structured lock" "$lock/owner.json"
 assert_rc "reordered second attempt cannot overtake the live owner" 1 review_env approve "$GPT"
 wait "$first_pid"; first_rc=$?
 assert_eq "first concurrent attempt promotes" 0 "$first_rc"
 canonical="$RUN/08-qa-verdict.gpt.json"
-current_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
-state_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
+current_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$canonical")"
+state_id="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$RUN/09-test-evidence/reviewer-state.gpt.json")"
 assert_eq "canonical projection matches the sole current attempt" "$state_id" "$current_id"
-assert_ok "current attempt has exactly one outcome event" python3 - "$RUN" "$current_id" <<'PY'
+assert_ok "current attempt has exactly one outcome event" t_python - "$RUN" "$current_id" <<'PY'
 import json,sys
 run,aid=sys.argv[1:]; attempt=json.load(open(f"{run}/09-test-evidence/reviewer-attempts/{aid}/attempt.json"))
 events=[json.loads(x) for x in open(run+"/run.jsonl") if x.strip()]
@@ -807,7 +1358,7 @@ assert sum(e.get("event_id")==attempt["outcome_event_id"] for e in events)==1
 PY
 for pair in "gpt:$GPT" "claude:$CLAUDE"; do
   provider="${pair%%:*}"; wrapper="${pair#*:}"; lock="$RUN/09-test-evidence/.reviewer-$provider.lock"
-  python3 - "$lock" "$provider" "$RUN_ID" "$SHA" "$GEN" <<'PY'
+  t_python - "$lock" "$provider" "$RUN_ID" "$SHA" "$GEN" <<'PY'
 import json,os,sys
 lock,provider,run,sha,gen=sys.argv[1:]; os.mkdir(lock,0o700)
 json.dump({"schema_version":1,"pid":99999999,"provider":provider,"run_id":run,"candidate_sha":sha,"generation":int(gen),"started_at":"2026-08-10T00:00:00Z"},open(lock+"/owner.json","w"))
@@ -837,7 +1388,7 @@ assert_eq "provider did not run for malformed metadata" "" "$(cat "$CALLS")"
 mv "$WORK/run-metadata.json" "$RUN/run-metadata.json"; chmod 600 "$RUN/run-metadata.json"
 historical="$REPO/.agent-firm/runs/historical-reviewer-fixture"; mkdir -p "$historical/09-test-evidence"
 cp "$RUN/09-test-evidence/qa-candidate.json" "$historical/09-test-evidence/qa-candidate.json"
-python3 - "$historical" "$SHA" <<'PY'
+t_python - "$historical" "$SHA" <<'PY'
 import json,os,sys
 run,sha=sys.argv[1:]; p=run+"/09-test-evidence/qa-candidate.json"; d=json.load(open(p)); d["run_id"]=os.path.basename(run); json.dump(d,open(p,"w")); os.chmod(p,0o600)
 event={"ts":"2025-01-01T00:00:00Z","event":"run_started","event_id":"evt-historical-start","run_id":os.path.basename(run),"base_sha":sha,"track":"full_track"}
@@ -864,7 +1415,7 @@ t_case "diagnostics retain allowlisted metadata only and raw output is not retai
 diag="$(find "$RUN/09-test-evidence/reviewer-attempts" -name diagnostic.json -type f | tail -1)"
 assert_file "redacted diagnostic exists" "$diag"
 assert_eq "diagnostic mode is 600" 600 "$(t_file_mode "$diag")"
-assert_ok "diagnostic is capped" python3 -c 'import os,sys; assert os.path.getsize(sys.argv[1]) <= 16384' "$diag"
+assert_ok "diagnostic is capped" t_python -c 'import os,sys; assert os.path.getsize(sys.argv[1]) <= 16384' "$diag"
 assert_output "diagnostic declares allowlisted metadata policy" '"content_policy": "allowlisted_metadata_only"' cat "$diag"
 assert_ok "credential/cookie/account/device/request values are absent" sh -c \
   "! grep -Eqi 'super-secret|user@example\.com|req-123|device[_ -]?code[=:]987|Bearer[[:space:]]+super-secret' '$diag'"
@@ -882,17 +1433,21 @@ assert_eq "no delayed raw artifact exists without another invocation" "" "$(find
 t_case "hard termination is independently cleaned without exposing raw output"
 review_env hard_kill "$GPT" >"$WORK/hard-kill.out" 2>&1 & hard_shell=$!
 hard_lock="$RUN/09-test-evidence/.reviewer-gpt.lock/owner.json"
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  test -f "$hard_lock" && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q . && break
-  sleep 0.1
-done
-hard_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
+# 3.0 s -> 10 s, for the CR-08 reason written at pr_wait above. When this poll expires the t_python
+# below raises on a lock file that is not there, hard_pid is empty, `kill -9 ""` no-ops, and the
+# hard-kill case asserts against state that was never built.
+_pr_hard_ready() {
+  test -f "$hard_lock" \
+    && find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -name '.judge.raw' -type f | grep -q .
+}
+pr_wait 100 _pr_hard_ready
+hard_pid="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$hard_lock")"
 kill -9 "$hard_pid" 2>/dev/null || true
 wait "$hard_shell" 2>/dev/null || true
-for unused in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' | grep -q . || break
-  sleep 0.1
-done
+_pr_control_gone() {
+  ! find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' | grep -q .
+}
+pr_wait 100 _pr_control_gone
 assert_eq "hard-killed attempt control is gone" "" "$(find "$REPO/.agent-firm/private-reviewer-control/$RUN_ID" -type d -name 'gpt-c*-a*' -print)"
 assert_ok "hard-kill raw secret is absent from run and private control" sh -c \
   "! grep -R 'HARD-KILL-RAW-SECRET-91b7' '$RUN' '$REPO/.agent-firm/private-reviewer-control/$RUN_ID' 2>/dev/null"
@@ -913,5 +1468,191 @@ for failed_control in "$REPO/.agent-firm/private-reviewer-control/$RUN_ID"/gpt-c
   rm -rf "$failed_control"
 done
 rm -f "$failure_marker"
+
+# ==========================================================================================
+# THE CLAUDE CREDENTIAL BOUNDARY
+#
+# codex's credential is a FILE, so the wrapper can copy exactly it and nothing else. claude's is
+# not: on macOS it is a login-Keychain item that `claude` fetches with
+# `security find-generic-password -a "$USER" -s <service>`, where <service> is
+# "Claude Code-credentials" only while CLAUDE_CONFIG_DIR is unset and
+# "Claude Code-credentials-<sha256(dir)|8>" once it is set, and where the login keychain itself is
+# resolved through HOME (the identical lookup returns rc 44 under any other HOME). The controlled
+# root isolates BOTH, so no keychain route into it exists that does not also hand over the
+# operator's whole profile.
+#
+# The one credential that is not also configuration is CLAUDE_CODE_OAUTH_TOKEN, which the operator
+# mints with `claude setup-token` and which the wrapper may only CONSUME. These cases pin the whole
+# boundary: it crosses when supplied, it is refused when it is not credential-shaped, it never
+# reaches the other provider, it never lands in an artifact, and its absence is still an honest
+# trusted unavailability rather than a guess.
+# ==========================================================================================
+t_case "the Claude judge consumes an operator-supplied CLAUDE_CODE_OAUTH_TOKEN and nothing else"
+
+TOKEN_FIXTURE='sk-ant-oat01-FIXTURE-TOKEN-8c1d4a9f0e2b'
+ENVCAP="$WORK/credential-env.log"
+STUB_ENV_CAPTURE="$ENVCAP"
+
+latest_attempt() { find "$RUN/09-test-evidence/reviewer-attempts" -type d -name "$1-c*-a*" | sort | tail -1; }
+credential_field() { # attempt-dir field
+  t_python -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/attempt.json"))["provider_credential"]
+m=[a for a in d["artifacts"] if a["artifact"]=="CLAUDE_CODE_OAUTH_TOKEN"]
+print(m[0][sys.argv[2]] if m else "NO-RECORD")' "$1" "$2"
+}
+
+# 1. NO TOKEN. The honest outcome, unchanged: a trusted authentication unavailability, exit 3 — not
+#    a BLOCK, and not a guess. This is the negative half of the trust contract and it must survive
+#    every other case below.
+STUB_OAUTH_TOKEN=""; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "absent operator token remains a trusted authentication unavailability" 3 review_env oauth_token "$CLAUDE"
+absent_attempt="$(latest_attempt claude)"
+assert_eq "absent token is recorded as absent" "absent" "$(credential_field "$absent_attempt" reason)"
+assert_eq "absent token is not recorded as imported" "False" "$(credential_field "$absent_attempt" imported)"
+assert_eq "the judge phase never started without a credential" "" "$(grep -c 'phase=-p' "$ENVCAP" | grep -v '^0$')"
+
+# 2. TOKEN SUPPLIED. It reaches the judge, byte for byte, and that is the only thing that changed.
+STUB_OAUTH_TOKEN="$TOKEN_FIXTURE"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an operator-supplied token carries the Claude judge to a verdict" 0 review_env oauth_token "$CLAUDE"
+supplied_attempt="$(latest_attempt claude)"
+assert_eq "supplied token is recorded as imported" "True" "$(credential_field "$supplied_attempt" imported)"
+assert_eq "an imported token records no refusal reason" "None" "$(credential_field "$supplied_attempt" reason)"
+assert_output "the judge phase received the exact token" "oauth=$TOKEN_FIXTURE" grep 'phase=-p' "$ENVCAP"
+assert_output "the authentication phase received the exact token" "oauth=$TOKEN_FIXTURE" grep 'phase=auth' "$ENVCAP"
+
+# 3. THE VALUE IS NEVER AN ARTIFACT. Everything the run keeps is searched, including the attempt
+#    record that says a token WAS supplied — saying so must not mean saying what it was.
+#
+#    AND THE SUBJECT IS ASSERTED TO EXIST BEFORE IT IS ASSERTED TO BE CLEAN. `! grep -R` is silent
+#    over a tree that is empty or absent, so the negation alone cannot tell "the token is nowhere in
+#    the run" from "there is no run". The two subjects get DIFFERENT treatment because they really are
+#    different: the run tree is stated non-empty, while the private control tree is emptied by the
+#    cleanup guardian BY DESIGN -- demanding that one be non-empty would be demanding the opposite of
+#    what this harness promises, so what is stated there is that the search has a root at all, and the
+#    title says the result is belt-and-braces rather than proof.
+assert_ok "the run tree these searches cover is populated" sh -c \
+  "find '$RUN' -type f | grep -q ."
+assert_ok "the token value is absent from every artifact the run keeps" sh -c \
+  "! grep -R -q -F '$TOKEN_FIXTURE' '$RUN' 2>/dev/null"
+assert_ok "the private reviewer control tree exists, so the search below has a root" sh -c \
+  "[ -d '$REPO/.agent-firm/private-reviewer-control' ]"
+assert_ok "belt-and-braces, over a tree the cleanup guardian empties: the token value is absent from the private reviewer control tree" sh -c \
+  "! grep -R -q -F '$TOKEN_FIXTURE' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
+
+# 4. IT IS CLAUDE'S CREDENTIAL, NOT THE FIRM'S. A Claude token must never be handed to codex.
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "gpt still reviews normally while a Claude token is exported" 0 review_env approve "$GPT"
+assert_ok "the codex judge never sees the Claude token" sh -c \
+  "! grep -q -F '$TOKEN_FIXTURE' '$ENVCAP'"
+assert_output "codex is handed no Claude token at all" "oauth=<unset>" grep 'codex phase' "$ENVCAP"
+
+# 5. NOT EVERY STRING IS A CREDENTIAL. A value carrying whitespace is whatever the shell left in the
+#    variable, not an opaque token; it is refused, recorded, and then behaves exactly like absence —
+#    which is exit 3, because refusing to forward can never be allowed to look like readiness.
+STUB_OAUTH_TOKEN="not a token"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "a token that is not one opaque line is refused, not forwarded" 3 review_env oauth_token "$CLAUDE"
+assert_eq "the refusal reason is recorded" "not_opaque_single_line" "$(credential_field "$(latest_attempt claude)" reason)"
+assert_ok "a refused token never reaches the provider" sh -c \
+  "! grep -q -F 'not a token' '$ENVCAP'"
+
+# 6. THE SAME BOUND THE FILE CREDENTIAL GETS. 262144 bytes is the credential bound; one byte more is
+#    not a credential.
+STUB_OAUTH_TOKEN="$(t_python -c 'import sys; sys.stdout.write("a"*262145)')"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an oversized token is refused, not forwarded" 3 review_env oauth_token "$CLAUDE"
+assert_eq "the oversize refusal reason is recorded" "exceeds_credential_bound" "$(credential_field "$(latest_attempt claude)" reason)"
+assert_output "an oversized token never reaches the provider" "oauth=<unset>" grep 'claude phase' "$ENVCAP"
+
+# 7. THE VARIABLES THAT MUST NOT CROSS. ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are METERED API
+#    credentials and would silently move a review off the subscription authentication the lifecycle
+#    contract promises; CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR names a descriptor number in the
+#    OPERATOR's process, which in the judge's process is whatever happens to occupy that slot.
+STUB_OAUTH_TOKEN="$TOKEN_FIXTURE"
+STUB_ANTHROPIC_API_KEY='sk-ant-api03-FIXTURE-METERED-KEY'
+STUB_ANTHROPIC_AUTH_TOKEN='FIXTURE-AUTH-TOKEN'
+STUB_OAUTH_TOKEN_FD='9'
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "the metered and descriptor variables do not change the outcome" 0 review_env oauth_token "$CLAUDE"
+assert_ok "no metered API key crosses into the judge" sh -c \
+  "! grep -q -F 'sk-ant-api03-FIXTURE-METERED-KEY' '$ENVCAP'"
+assert_ok "no ambient auth token crosses into the judge" sh -c \
+  "! grep -q -F 'FIXTURE-AUTH-TOKEN' '$ENVCAP'"
+assert_output "the judge is handed no API key, auth token, or token descriptor" \
+  "apikey=<unset> authtok=<unset> fd=<unset>" grep 'phase=-p' "$ENVCAP"
+STUB_ANTHROPIC_API_KEY=""; STUB_ANTHROPIC_AUTH_TOKEN=""; STUB_OAUTH_TOKEN_FD=""
+STUB_OAUTH_TOKEN=""; STUB_ENV_CAPTURE=""
+
+# ==========================================================================================
+# THE CODEX CREDENTIAL BOUNDARY
+#
+# codex's credential IS a file, so unlike claude's it can be pointed somewhere — and until this
+# block existed, nothing in this file pointed it anywhere. The wrapper's import is correct and
+# unchanged; what these two cases pin is the HARNESS's half of the boundary: that the store the
+# wrapper resolves is one this test created, that what actually reached the judge came out of that
+# store, and that an EMPTY store is recorded as absent rather than quietly satisfied from somewhere
+# else. See the fixture built at the top of this file for why CODEX_HOME is never the empty string.
+#
+# THE TWO CASES ARE ONE DESIGN AND THE SECOND MAY NOT BE DROPPED. The provenance case fails in every
+# environment once the isolation is removed, which is what makes it the right AC-006 detector and
+# also what makes it useless to tests/test-reviewer-hermeticity.sh: a case that fails everywhere
+# diverges nowhere. The absence case is the only case in this file whose OUTCOME depends on whether
+# the ambient store holds a credential, so it is the entire reason the hermeticity invariance can
+# fail at all. Merging it into the case above, or making it conditional, silently turns that file
+# into a check that cannot fail.
+# ==========================================================================================
+t_case "the codex credential the gpt judge is handed comes from the harness's own store"
+
+STUB_ENV_CAPTURE="$ENVCAP"
+codex_credential_field() { # attempt-dir field
+  t_python -c 'import json,sys
+d=json.load(open(sys.argv[1]+"/attempt.json"))["provider_credential"]
+m=[a for a in d["artifacts"] if a["artifact"]=="auth.json"]
+print(m[0][sys.argv[2]] if m else "NO-RECORD")' "$1" "$2"
+}
+
+# 1. PROVENANCE, OBSERVED WHERE IT IS OBSERVABLE. `cred=` is derived by the stub from the auth.json
+#    at its OWN $CODEX_HOME — the attempt-local copy the wrapper made — because the control tree is
+#    destroyed before the wrapper returns. `marker` means the bytes came from this file's fixture;
+#    `other` means some other store answered; `absent` means nothing was imported. Every codex phase
+#    is checked, not just the judge's, because the import happens once for the whole attempt and
+#    "which store" must not be able to differ between phases.
+: > "$ENVCAP"; : > "$CALLS"
+assert_rc "gpt reviews normally against the harness's own credential store" 0 review_env approve "$GPT"
+assert_output "the judge was handed the credential this test created" "cred=marker" \
+  grep 'codex phase' "$ENVCAP"
+# `! (grep | grep -v)` is a negation of a PIPELINE: a capture holding no codex phase line at all
+# satisfies it exactly as well as three clean ones do. The count is stated first, so "nothing leaked"
+# cannot quietly be "nothing happened". The positive assertion above is adjacency, not a guarantee --
+# it and this one could both be answering about a file that was never written.
+assert_ne "the capture really holds codex phase lines to judge" 0 \
+  "$(grep -c 'codex phase' "$ENVCAP" | tr -d ' ')"
+assert_ok "no codex phase was handed a credential the test did not create" sh -c \
+  "! grep 'codex phase' '$ENVCAP' | grep -qv 'cred=marker'"
+
+# 2. SAYING A CREDENTIAL WAS IMPORTED MUST NOT MEAN SAYING WHAT IT WAS. Same rule the Claude token
+#    gets above, for the one credential that really is written to disk.
+# Same two subjects, same two treatments, same reason as the Claude block above.
+assert_ok "the run tree these searches cover is populated" sh -c \
+  "find '$RUN' -type f | grep -q ."
+assert_ok "the fixture credential's marker is absent from every artifact the run keeps" sh -c \
+  "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$RUN' 2>/dev/null"
+assert_ok "the private reviewer control tree exists, so the search below has a root" sh -c \
+  "[ -d '$REPO/.agent-firm/private-reviewer-control' ]"
+assert_ok "belt-and-braces, over a tree the cleanup guardian empties: the fixture credential's marker is absent from the private reviewer control tree" sh -c \
+  "! grep -R -q -F '$CODEX_FIXTURE_MARKER' '$REPO/.agent-firm/private-reviewer-control' 2>/dev/null"
+
+# 3. AN EMPTY STORE IS RECORDED AS ABSENT, NOT SATISFIED FROM SOMEWHERE ELSE. This is the
+#    FileNotFoundError arm at bin/firm-reviewer-common:1045, read back out of the attempt's own
+#    durable record — attempt.json's provider_credential, the same artifact the Claude cases read.
+#    It is also the load-bearing half of tests/test-reviewer-hermeticity.sh: see the block header.
+STUB_CODEX_HOME="$CODEX_EMPTY"; : > "$ENVCAP"; : > "$CALLS"
+assert_rc "an empty credential store still carries the gpt judge to a verdict" 0 review_env approve "$GPT"
+empty_attempt="$(latest_attempt gpt)"
+assert_eq "an absent codex credential is recorded as absent" "absent" \
+  "$(codex_credential_field "$empty_attempt" reason)"
+assert_eq "an absent codex credential is not recorded as imported" "False" \
+  "$(codex_credential_field "$empty_attempt" imported)"
+assert_output "an empty store hands the judge no credential at all" "cred=absent" \
+  grep 'codex phase' "$ENVCAP"
+STUB_CODEX_HOME=""; STUB_ENV_CAPTURE=""
 
 t_summary

@@ -5,11 +5,23 @@ The firm ships as one root-source plugin through two manifests and marketplaces:
 
 ## Prerequisites
 
-Both `claude` and `codex` CLIs, `git`, and two Python packages are required:
+Both `claude` and `codex` CLIs, `git`, and two Python packages are required. Install the packages
+into the interpreter the firm actually runs, which is the one `bin/firm-python` resolves — **not**
+whatever `python3` your `PATH` happens to name:
 
 ```bash
-python3 -m pip install --user jsonschema pyyaml
+bin/firm-python -m pip install --user jsonschema pyyaml   # or: firm-bootstrap --with-python-deps
+bin/firm-python --status                                  # which interpreter, and whether it is P2
 ```
+
+This is the whole instruction; there is no `python3 -m pip install` step. A conda or pyenv `python3`
+in front of `PATH` is ordinary, the P2 ledger gate does not admit it, and packages installed into it
+are invisible to the firm — so `python3 -m pip install --user jsonschema pyyaml` on this repo's own
+reference host produces exactly the confusion `bin/firm-python` exists to end: you install the
+packages, and `firm-doctor` reports `python jsonschema MISSING for /usr/bin/arch -arm64
+/usr/bin/python3`. (Before the repository is on disk you have no `bin/firm-python` to run; in that
+case install with whatever `python3` you have, then re-check with `bin/firm-python --status` and
+re-install through it if the reported interpreter is a different one.)
 
 This is an intentional joint prerequisite: bootstrap, install refresh, and `firm-version
 --local-refresh` do not offer a one-provider mode. Before its first mutation, `firm-bootstrap` uses

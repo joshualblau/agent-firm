@@ -53,7 +53,7 @@ without_yaml() { ( PYTHONPATH="$NOYAML${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 # last resort rather than the default. tests/test-check-assertions-parsing.sh holds the assertion
 # that this preference is actually honoured.
 STUBYAML="$TESTS_DIR/fixtures/stub-yaml"
-if python3 -c 'import yaml' >/dev/null 2>&1; then
+if t_python -c 'import yaml' >/dev/null 2>&1; then
   YAML_KIND=real
   with_yaml_parser() { ( "$@" ); }
 else
@@ -64,14 +64,14 @@ printf '    (parser-present branch runs against: %s)\n' "$YAML_KIND"
 
 t_case "preconditions: the two parser branches really differ"
 assert_ok "the parser-present branch can import a working safe_load" \
-  with_yaml_parser python3 -c "import yaml; assert yaml.safe_load('a: 1') == {'a': 1}"
-assert_fail "and the pyyaml-hidden branch cannot import yaml at all" without_yaml python3 -c "import yaml"
+  with_yaml_parser t_python -c "import yaml; assert yaml.safe_load('a: 1') == {'a': 1}"
+assert_fail "and the pyyaml-hidden branch cannot import yaml at all" without_yaml t_python -c "import yaml"
 # The property the ABSENT branch is now selected BY. Asserted separately from "the import raises",
 # because those two came apart: a findable-but-failing stub also raises, and it must NOT reach the
 # fallback. Without this, every `without_yaml` case below could be silently testing the broken-install
 # path instead of the absent one — which is exactly what the old stub-file helper did.
 assert_ok "without_yaml: pyyaml is UNFINDABLE (find_spec -> None), which is genuine absence and not a broken install" \
-  without_yaml python3 -c '
+  without_yaml t_python -c '
 import importlib.util
 spec = importlib.util.find_spec("yaml")
 assert spec is None, "yaml is still findable at %s -- this simulates BROKEN, not ABSENT" % (spec,)'
@@ -421,7 +421,7 @@ ascii_locale() { ( LC_ALL=C LANG=C LC_CTYPE=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0
 UTF8_LOCALE_NAME=""
 for _cand in C.UTF-8 en_US.UTF-8 en_US.utf8 UTF-8; do
   if LC_ALL="$_cand" LANG="$_cand" LC_CTYPE="$_cand" PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 \
-       python3 -c "import sys; sys.exit(0 if 'utf' in (sys.stdout.encoding or '').lower() else 1)" \
+       t_python -c "import sys; sys.exit(0 if 'utf' in (sys.stdout.encoding or '').lower() else 1)" \
        </dev/null >/dev/null 2>&1; then
     UTF8_LOCALE_NAME="$_cand"; break
   fi
@@ -436,7 +436,7 @@ else
 fi
 printf '    (UTF-8 control runs via: %s)\n' "$UTF8_HOW"
 
-t_case "preconditions: the two locale helpers really give python3 different stdout encodings"
+t_case "preconditions: the two locale helpers really give t_python different stdout encodings"
 # Without these, every assertion below could pass because BOTH helpers ran in UTF-8 — the locale axis
 # would be named in the titles and varied nowhere, which is exactly the overclaim this suite forbids.
 # U+00B7 is written as an ASCII escape, never as a literal byte. Under a strict C locale glibc decodes
@@ -444,14 +444,14 @@ t_case "preconditions: the two locale helpers really give python3 different stdo
 # arguments — before the test body runs. macOS decodes argv as UTF-8 regardless, which is why the
 # literal form passed locally and would have reddened the Linux CI runner. The runtime value is
 # identical; only the source bytes change.
-assert_ok "the ASCII helper gives a stdout that CANNOT encode U+00B7" ascii_locale python3 -c '
+assert_ok "the ASCII helper gives a stdout that CANNOT encode U+00B7" ascii_locale t_python -c '
 import sys
 try:
     "\u00b7".encode(sys.stdout.encoding or "ascii")
 except (UnicodeEncodeError, LookupError):
     sys.exit(0)
 sys.exit(1)'
-assert_ok "the UTF-8 helper gives a stdout that CAN" utf8_locale python3 -c '
+assert_ok "the UTF-8 helper gives a stdout that CAN" utf8_locale t_python -c '
 import sys
 "\u00b7".encode(sys.stdout.encoding or "ascii")'
 
@@ -460,7 +460,7 @@ t_case "the script emits no non-ASCII byte at all (nothing to encode, so nothing
 # DATA-derived text. This assertion covers the other half: the script's own LITERALS. Both layers are
 # wanted — the first stops a future decorative bullet reintroducing the bug, the second covers text
 # the script never chose.
-assert_ok "bin/firm-traceability-check is pure ASCII" python3 -c '
+assert_ok "bin/firm-traceability-check is pure ASCII" t_python -c '
 import sys
 data = open(sys.argv[1], "rb").read()
 bad = []
@@ -812,7 +812,7 @@ os.path.exists = _boom
 PYSC
 with_internal_crash() { ( PYTHONPATH="$BOOMHOOK${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 assert_ok "precondition: the hook makes an os.path.exists the script does NOT guard raise, and is not an import problem" \
-  with_internal_crash python3 -c '
+  with_internal_crash t_python -c '
 import os.path, sys
 assert os.path.exists("/") is True, "the hook broke unrelated paths -- too blunt to attribute"
 try:
@@ -925,7 +925,7 @@ printf 'import sys\nsys.exit(0)   # module-level SystemExit: NOT an Exception\n'
 with_broken_sysexit() { ( PYTHONPATH="$BROKEN_EXIT${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 
 assert_ok "partial-install double: FINDABLE, and raises ImportError from INSIDE the package (the swallowed shape)" \
-  with_broken_partial python3 -c '
+  with_broken_partial t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -935,7 +935,7 @@ except ImportError as e:
 else:
     sys.exit("import unexpectedly succeeded")'
 assert_ok "runtime-broken double: FINDABLE, and raises a NON-ImportError (the shape that escaped)" \
-  with_broken_rt python3 -c '
+  with_broken_rt t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -947,7 +947,7 @@ except RuntimeError:
 else:
     sys.exit("import unexpectedly succeeded")'
 assert_ok "sysexit double: FINDABLE, and an 'except Exception' does NOT catch what it raises" \
-  with_broken_sysexit python3 -c '
+  with_broken_sysexit t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -1053,7 +1053,7 @@ sys.meta_path.insert(0, _ExplodingFinder)
 PYSC
 with_broken_hook() { ( PYTHONPATH="$BROKEN_HOOK${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 assert_ok "precondition: BOTH the import and the find_spec probe raise (that is what makes it inconclusive)" \
-  with_broken_hook python3 -c '
+  with_broken_hook t_python -c '
 import importlib.util
 raised = []
 try:
@@ -1097,13 +1097,13 @@ else
                 LC_ALL=C LANG=C LC_CTYPE=C PYTHONUTF8=1 "$@" ); }
 fi
 _na_enc_probe='import sys; print((sys.stdout.encoding or "?").lower())'
-na_enc_ascii="$(na_ascii python3 -c "$_na_enc_probe")"
-na_enc_utf8="$(na_utf8  python3 -c "$_na_enc_probe")"
-assert_ne "precondition: the two locale helpers give python3 DIFFERENT stdout encodings (else this axis is decorative)" \
+na_enc_ascii="$(na_ascii t_python -c "$_na_enc_probe")"
+na_enc_utf8="$(na_utf8  t_python -c "$_na_enc_probe")"
+assert_ne "precondition: the two locale helpers give t_python DIFFERENT stdout encodings (else this axis is decorative)" \
   "$na_enc_ascii" "$na_enc_utf8"
 assert_ok "precondition: the ascii helper's stdout genuinely cannot hold non-ASCII (got '$na_enc_ascii')" \
-  python3 -c 'import sys; sys.exit(0 if "utf" not in sys.argv[1] else 1)' "$na_enc_ascii"
-assert_ok "precondition: the double's message really is non-ASCII and multi-line" python3 -c '
+  t_python -c 'import sys; sys.exit(0 if "utf" not in sys.argv[1] else 1)' "$na_enc_ascii"
+assert_ok "precondition: the double's message really is non-ASCII and multi-line" t_python -c '
 import sys
 raw = open(sys.argv[1], "rb").read()
 assert any(b > 127 for b in raw), "message is pure ASCII -- wrong axis"
@@ -1121,7 +1121,7 @@ for _nafn in na_ascii na_utf8; do
   # asserted separately: this one is a statement about the REPORT's bytes, not about surviving.
   _na_out="$($_nafn "$TC" "$led3" 2>&1)"
   assert_ok "the report itself stays pure ASCII, in a file whose ASCII purity is load-bearing [$_nafn]" \
-    python3 -c '
+    t_python -c '
 import sys
 bad = [c for c in sys.argv[1] if ord(c) > 127]
 if bad:
@@ -1162,7 +1162,7 @@ t_case "regression: the partial/waiver semantics are unchanged on the genuine-ab
 noyaml_ascii() { ( PYTHONPATH="$NOYAML${PYTHONPATH:+:$PYTHONPATH}" \
                    LC_ALL=C LANG=C LC_CTYPE=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 "$@" ); }
 assert_ok "precondition: the absence helper still hides pyyaml under an ASCII locale too" \
-  noyaml_ascii python3 -c '
+  noyaml_ascii t_python -c '
 import importlib.util
 assert importlib.util.find_spec("yaml") is None, "yaml became findable under the ASCII locale"'
 for _nyfn in without_yaml noyaml_ascii; do
@@ -1202,7 +1202,7 @@ assert_rc "control: a uniformly indented mapping still PASSes" 0 without_yaml "$
 t_case "the script is STILL pure ASCII after the fix (the new messages included)"
 # The broken-install and inconclusive reports are new literals in a file whose ASCII purity is a
 # load-bearing property, so the check above is re-run here against the same file rather than trusted.
-assert_ok "bin/firm-traceability-check is pure ASCII" python3 -c '
+assert_ok "bin/firm-traceability-check is pure ASCII" t_python -c '
 import sys
 data = open(sys.argv[1], "rb").read()
 bad = []
@@ -1536,7 +1536,7 @@ mkdir -p "$led51"
 printf '%s\n' 'criteria:' '  - id: AC-001' > "$led51/01-acceptance-criteria.yaml"
 printf '{"acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"e"},{"id":"AC-caf\xc3\xa9-\xe2\x80\x94-002","covered":"yes","evidence":"e"}]}' \
   > "$led51/08-qa-verdict.json"
-assert_ok "precondition: the phantom id really does carry non-ASCII bytes" python3 -c '
+assert_ok "precondition: the phantom id really does carry non-ASCII bytes" t_python -c '
 import sys
 raw = open(sys.argv[1], "rb").read()
 assert any(b > 127 for b in raw), "the verdict is pure ASCII -- this axis would be decorative"' \
@@ -1555,7 +1555,7 @@ done
 # locale the id's own bytes legitimately reach the report, exactly as evidence strings and paths
 # already do.
 _ph_ascii_out="$(ascii_locale "$TC" "$led51" 2>&1)"
-assert_ok "under an ASCII stdout locale the report itself stays pure ASCII" python3 -c '
+assert_ok "under an ASCII stdout locale the report itself stays pure ASCII" t_python -c '
 import sys
 bad = [c for c in sys.argv[1] if ord(c) > 127]
 if bad:
@@ -1572,7 +1572,7 @@ t_case "the new output still fits the 240-character detail window its caller col
 # suite where it surfaced.
 collapsed_detail() {
   # Exactly what firm-check-assertions does to the child's output: collapse all whitespace, cut at 240.
-  "$@" 2>&1 | python3 -c 'import sys
+  "$@" 2>&1 | t_python -c 'import sys
 print(" ".join(sys.stdin.read().split())[:240])'
 }
 assert_output "the uncovered criterion's id survives the collapse (led4: AC-002 is the missing one)" \
@@ -1584,7 +1584,7 @@ assert_output "the phantom finding leads the window on a phantom ledger, where i
   "MISMATCH: 2 of these entries name NO criterion" collapsed_detail "$TC" "$led40"
 
 t_case "the script is STILL pure ASCII with the reciprocal-check messages added"
-assert_ok "bin/firm-traceability-check is pure ASCII" python3 -c '
+assert_ok "bin/firm-traceability-check is pure ASCII" t_python -c '
 import sys
 data = open(sys.argv[1], "rb").read()
 bad = []
@@ -1604,7 +1604,7 @@ strict_repo="$(mk_repo)"
 strict_run_rel="$(cat "$strict_repo/.agent-firm/CURRENT_RUN")"
 strict_run="$strict_repo/$strict_run_rel"
 strict_id="$(basename "$strict_run")"
-python3 - "$strict_run/01-acceptance-criteria.yaml" <<'PY'
+t_python - "$strict_run/01-acceptance-criteria.yaml" <<'PY'
 import sys,yaml
 yaml.safe_dump({"task_slug":"strict","track":"fast_path","criteria":[
  {"id":"AC-001","type":"functional","statement":"one","verification":"automated_test"},
@@ -1617,7 +1617,7 @@ printf 'proof one\n' > "$strict_run/09-test-evidence/ac1.log"
 printf 'proof two\n' > "$strict_run/09-test-evidence/ac2.log"
 
 strict_reset() {
-  python3 - "$strict_run" <<'PY'
+  t_python - "$strict_run" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 def ref(path):
@@ -1653,7 +1653,7 @@ yaml.safe_dump(trace,open(run+"/traceability.yaml","w"),sort_keys=False)
 PY
 }
 strict_mutate() {
-  python3 - "$strict_run/traceability.yaml" "$@" <<'PY'
+  t_python - "$strict_run/traceability.yaml" "$@" <<'PY'
 import sys,yaml
 p=sys.argv[1]; op=sys.argv[2]; d=yaml.safe_load(open(p))
 if op=="empty": d["matrix"]=[]
@@ -1691,13 +1691,13 @@ type: criterion_gate
 actor: human-maintainer
 occurred_at: 2026-08-09T15:00:00Z
 run_id: $strict_id
-candidate_sha: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$strict_run/09-test-evidence/qa-candidate.json")
+candidate_sha: $(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha"])' "$strict_run/09-test-evidence/qa-candidate.json")
 criterion_id: AC-001
 decision: waive_uncovered
 objections: [fixture-objection]
 evidence: [09-test-evidence/ac2.log]
 EOF
-python3 - "$strict_run" <<'PY'
+t_python - "$strict_run" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); c=json.load(open(run+"/09-test-evidence/qa-candidate.json"))
 rel="09-test-evidence/ac1-gate.yaml"; raw=open(run+"/"+rel,"rb").read(); event_id="evt-gate-"+secrets.token_hex(8)
@@ -1707,12 +1707,12 @@ with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(","
 d["matrix"][0]["gate_record"].update({"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":event_id,"event":"gate_recorded"}})
 yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
-python3 - "$strict_run/08-qa-verdict.json" <<'PY'
+t_python - "$strict_run/08-qa-verdict.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["acceptance_criteria_coverage"][0]={"id":"AC-001","covered":"no","evidence":"09-test-evidence/ac1-gate.yaml"}; json.dump(d,open(p,"w"),indent=2)
 PY
 assert_rc "exact structured uncovered gate is accepted" 0 "$TC" --strict "$strict_run"
-python3 - "$strict_run/09-test-evidence/ac1-gate.yaml" <<'PY'
+t_python - "$strict_run/09-test-evidence/ac1-gate.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["candidate_sha"]="0"*40; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
@@ -1720,18 +1720,18 @@ assert_rc "stale structured gate blocks" 1 "$TC" --strict "$strict_run"
 
 t_case "strict verdict and candidate identity reject abbreviated, stale, dirty, moved, and reordered state"
 strict_reset
-python3 - "$strict_run/08-qa-verdict.json" <<'PY'
+t_python - "$strict_run/08-qa-verdict.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["commit_sha"]=d["commit_sha"][:7]; json.dump(d,open(p,"w"),indent=2)
 PY
 assert_rc "abbreviated verdict SHA blocks" 1 "$TC" --strict "$strict_run"
 strict_reset
-checkout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$strict_run/09-test-evidence/qa-candidate.json")"
+checkout="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkout_path"])' "$strict_run/09-test-evidence/qa-candidate.json")"
 printf 'dirty\n' > "$checkout/untracked-sentinel"
 assert_rc "dirty persisted checkout blocks" 1 "$TC" --strict "$strict_run"
 rm "$checkout/untracked-sentinel"
 strict_reset
-python3 - "$strict_run/traceability.yaml" <<'PY'
+t_python - "$strict_run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["candidate"]["generation"]+=1; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
@@ -1740,7 +1740,7 @@ assert_rc "reordered generation blocks" 1 "$TC" --strict "$strict_run"
 t_case "strict dispositions derive identity and risk only from either provider's producer object"
 strict_objection_reset() {
   strict_reset
-  python3 - "$strict_run" "$1" <<'PY'
+  t_python - "$strict_run" "$1" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
 run,provider=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 def ref(path):
@@ -1762,19 +1762,19 @@ PY
 for secondary_provider in gpt claude; do
   strict_objection_reset "$secondary_provider"
   assert_rc "$secondary_provider producer-object baseline passes strict" 0 "$TC" --strict "$strict_run"
-  python3 - "$strict_run/traceability.yaml" <<'PY'
+  t_python - "$strict_run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["secondary_blocker_id"]="obj-substituted"; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
   assert_rc "$secondary_provider substituted producer id fails strict" 1 "$TC" --strict "$strict_run"
   strict_objection_reset "$secondary_provider"
-  python3 - "$strict_run/traceability.yaml" <<'PY'
+  t_python - "$strict_run/traceability.yaml" <<'PY'
 import sys,yaml
 p=sys.argv[1]; d=yaml.safe_load(open(p)); d["two_voice_diff"][0]["affected_paths"]=["other.txt"]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
   assert_rc "$secondary_provider contradictory affected path fails strict" 1 "$TC" --strict "$strict_run"
   strict_objection_reset "$secondary_provider"
-  python3 - "$strict_run/08-qa-verdict.$secondary_provider.json" <<'PY'
+  t_python - "$strict_run/08-qa-verdict.$secondary_provider.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); del d["blocker_objects"]; json.dump(d,open(p,"w"),indent=2)
 PY

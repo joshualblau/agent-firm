@@ -68,12 +68,14 @@ role-start logging, event-id transcription or ledger scraping, and a second mode
 valid paths. Ordinary non-role milestones continue through ordinary `firm-ledger-log`; see the
 [delegated role-start boundary](agent-firm/contracts/lifecycle.md#delegated-role-start-boundary).
 
-Ledger writes in this release are supported only on the exact P2 row: macOS 26.5.1, Darwin 25.5.0,
-arm64, local APFS, and CPython 3.9.6. The ordinary and native producers use the same centralized gate
-before any ledger mutation or creation of a coordination lock or transaction temp. Linux and every
-other mismatched or unverifiable environment are unsupported and fail closed without a success
-result; ordinary best-effort mode is not a fallback. Expanding support requires new Architecture
-approval and proving evidence.
+Ledger writes in this release are supported only on a closed allowlist of proven P2 rows: macOS
+26.5.1 with Darwin 25.5.0, or macOS 26.6.1 with Darwin 25.6.0, each on arm64, local APFS, and CPython
+3.9.6. A row is matched whole and exactly; the allowlist is never a floor, range, prefix or wildcard,
+so an OS row nobody has proven is unsupported until it is proven and added. The ordinary and native
+producers use the same centralized gate before any ledger mutation or creation of a coordination lock
+or transaction temp. Linux and every other mismatched or unverifiable environment are unsupported and
+fail closed without a success result; ordinary best-effort mode is not a fallback. Expanding support
+requires new Architecture approval and proving evidence.
 
 A printed ordinary event ID or native result followed by exit zero means the producer completed its
 final same-inode exact-byte proof and observed exactly the accepted prefix plus its one complete record
@@ -92,9 +94,32 @@ where CI runs.
 
 Hosted CI runs `tests/run-tests.sh --unsupported-p2`: it exercises modern GNU and macOS Bash 3.2/BSD
 behavior, plus the production gate's real-host fail-closed result, while omitting suites that require
-successful ledger mutation. The complete `tests/run-tests.sh` write-path proof runs locally on the
-exact P2 row or through the manual `run_exact_p2` workflow dispatch on a trusted self-hosted runner
-labelled `agent-firm-p2`. Pull-request code cannot schedule that runner.
+successful ledger mutation. The complete `tests/run-tests.sh` write-path proof runs locally on any
+proven P2 row (the set above, matched whole) or through the manual `run_exact_p2` workflow dispatch
+on a trusted self-hosted runner labelled `agent-firm-p2`. Pull-request code cannot schedule that runner.
+
+The runner executes the test **files** concurrently — one worker per CPU by default, overridden by
+`--jobs N`, `$FIRM_TEST_JOBS`, or `--serial`. This is a change of schedule and nothing else: every
+file and every assertion still runs, each file's output is still printed whole and in the order a
+serial run prints it, and any file exiting non-zero still fails the suite. It also prints a per-file
+wall-clock profile, because "which file is slow" is otherwise unanswerable. On this repo's 8-CPU
+reference host that took the full suite from 21m27s (1287s serial) to **~591s mean**, measured across
+three consecutive full runs at 581.2s / 589.4s / 602.2s. Budget a QA or CI window against ~10 minutes,
+not against the ~4m this paragraph used to claim: that number predates the scheduling change below
+and was never true of the shipped runner.
+
+The reason it is ~10m rather than ~4m is recorded at the lever in the runner's own header.
+`test-merge-guard.sh` measures the guard's parse phase against its real 4000ms production budget, and
+sharing the host does not merely narrow that assertion's margin — it changes what the assertion
+measures (2675ms alone, 3829ms co-scheduled, on the same unchanged guard). So that file is classified
+`runs_alone` and takes most of the speedup with it. The measured consequence is that the budgeted case
+now lands at 2664–2726ms, 67–68% of budget, bracketing the serial reference: **`--serial` buys that
+case nothing extra**, and running it costs 1287s to buy a margin the default schedule already
+provides.
+`--fast` narrows a run to the files
+your changes can reach and is a **development convenience only** — it announces that in its own
+output and deliberately does not print the line a passing full run prints. `full` is what runs before
+QA, the Final gate and CI. `tests/test-suite-runner.sh` holds the runner to its behaviour — ordering, skipping, exit codes, the `runs_alone` classification, and the fact that a worker killed without reporting its exit status is a named FAILURE rather than a hang. It does **not** hold the runner to the timing numbers above; those are measurements, re-measure them rather than trusting them.
 
 ## Layout
 ```
@@ -116,7 +141,16 @@ bin/firm-*                    # firm-new-run, firm-ledger-log, firm-validate-ver
                               #   firm-final-qa-check, firm-version, firm-model-resolve,
                               #   firm-propose-system-change, firm-run-evals, firm-check-assertions,
                               #   firm-visual-check, firm-visual-baseline, firm-notify, firm-install,
-                              #   firm-link, firm-bootstrap, firm-doctor
+                              #   firm-link, firm-bootstrap, firm-doctor,
+                              #   firm-python  <- decides WHICH python3 every one of the above runs;
+                              #     `bin/firm-python --status` reports it and whether it is P2.
+                              #     $FIRM_PYTHON overrides the candidate order (it is probed like any
+                              #     other candidate, so it cannot make a non-compliant interpreter
+                              #     report p2=yes)
+                              #     ONE EXCEPTION, deliberately: firm-merge-guard is a security
+                              #     control and resolves from fixed absolute paths only, consulting
+                              #     neither $FIRM_PYTHON nor $PATH. `firm-python --trusted-status`
+                              #     reports what it would run.
 .envrc.example / .env.op.example # per-project profile + op:// secret references (direnv loads .envrc)
 agent-firm/templates/visual/  # Playwright visual-regression config + specs (firm-visual-check gates on these)
 agent-firm/policy/*           # action-scopes, gate-matrix, never-rules, definition-of-done, failure-taxonomy,
@@ -127,8 +161,9 @@ agent-firm/templates/*        # run-ledger artifact templates
 agent-firm/workflows/*.js     # deterministic fan-out (build-review-test) for the Workflow tool
 agent-firm/evals/*            # golden-task evals that guard firm changes
 tests/*                       # bash+git regression suite for bin/ (tests/run-tests.sh). Also needs
-                              #   python3 and Node, plus jsonschema (test-validate-verdict) and pyyaml
-                              #   (test-policy-yaml-valid) — the same prerequisites the firm itself has
+                              #   Node, plus jsonschema (test-validate-verdict) and pyyaml
+                              #   (test-policy-yaml-valid) installed FOR THE INTERPRETER bin/firm-python
+                              #   resolves — not for PATH's python3. See docs/INSTALL.md
 .github/workflows/ci.yml      # hosted unsupported-P2 matrix + manual exact-P2 suite + structural evals
 .claude/settings.json         # permission rules (copy-mode + the source firm-install merges)
 .devcontainer/                # hardened sandbox (project-only mount, non-root, pinned base)
@@ -154,7 +189,7 @@ bench/registry.yaml           # durable specialist bench (governance, tracked). 
 - **Hardening and measurement implementation:** the firm's OWN tooling gets the same evidence-not-
   confidence bar it holds the deliverable to — a `bin/` regression suite + CI
   (`.github/workflows/ci.yml`; hosted unsupported-P2 coverage plus a manual trusted exact-P2 job,
-  bash + git + the firm's own python3/Node/jsonschema/pyyaml prerequisites, no test framework), a
+  bash + git + Node + the firm's own resolved-interpreter/jsonschema/pyyaml prerequisites, no test framework), a
   fail-closed `run-baseline.json` SHA comparison replacing the old
   commit-count heuristic for `no_default_branch_merge`/`final_gate_pending`, a negative golden eval
   (`qa-blocks-broken-build`) proving QA will actually **BLOCK**, `firm-qa-clean-check` (Lead-run, not

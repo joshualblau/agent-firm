@@ -158,6 +158,11 @@ t_case "selector/schema incompatibility blocks before either CLI mutation"
 BADROOT="$WORK/bad-root"; mkdir -p "$BADROOT/bin" "$BADROOT/.claude-plugin" "$BADROOT/.codex-plugin" "$BADROOT/.agents/plugins"
 cp "$BOOT" "$BADROOT/bin/firm-bootstrap"; cp "$BIN/firm-bounded-exec" "$BADROOT/bin/firm-bounded-exec"
 cp "$BIN/firm-version" "$BADROOT/bin/firm-version"; cp "$FIRM_ROOT/VERSION" "$BADROOT/VERSION"
+# firm-bootstrap and firm-bounded-exec both `. "$SELF/firm-python"` on their way in, so a root
+# without that sibling dies at line 10 with "No such file or directory" and rc 1 -- which is the rc
+# every assertion below expects, so all four passed while testing nothing (CR-03). The assertions are
+# now bound to the MESSAGE as well as the code, so a fixture that dies early fails loudly.
+cp "$BIN/firm-python" "$BADROOT/bin/firm-python"
 cp "$FIRM_ROOT/.claude-plugin/plugin.json" "$BADROOT/.claude-plugin/plugin.json"
 cp "$FIRM_ROOT/.codex-plugin/plugin.json" "$BADROOT/.codex-plugin/plugin.json"
 cp "$FIRM_ROOT/.claude-plugin/marketplace.json" "$BADROOT/.claude-plugin/marketplace.json"
@@ -167,9 +172,22 @@ import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d['name']='wrong'; json.dump(d,open(p,'w'))
 PY
 reset_fixture
-assert_rc "wrong Codex marketplace selector/schema is rejected" 1 env PATH="$STUB:/usr/bin:/bin" \
-  STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$BADROOT" STUB_CLAUDE_VERSION="$CLAUDE_VERSION" \
-  STUB_CODEX_VERSION="$CODEX_VERSION" FIRM_SKIP_LINK=1 "$BADROOT/bin/firm-bootstrap"
+run_bad_boot() {
+  env PATH="$STUB:/usr/bin:/bin" \
+    STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$BADROOT" STUB_CLAUDE_VERSION="$CLAUDE_VERSION" \
+    STUB_CODEX_VERSION="$CODEX_VERSION" FIRM_SKIP_LINK=1 "$BADROOT/bin/firm-bootstrap"
+}
+# THE PRECONDITION IS THE POINT (CR-03). rc 1 is what a bootstrap that never started returns too, so
+# on its own it proves nothing: with bin/firm-python absent from this root, firm-bootstrap died on
+# its source line and these two assertions passed without reading a manifest. Both halves are pinned
+# here -- the root really does run, and the refusal really is the selector/schema one.
+assert_output "precondition: this root gets far enough to print its own banner" \
+  "agent-firm dual-provider bootstrap" run_bad_boot
+assert_rc "wrong Codex marketplace selector/schema is rejected" 1 run_bad_boot
+assert_output "  and it is rejected for THAT reason, named" "selector/schema preflight mismatch" \
+  run_bad_boot
+assert_output "  naming the file whose selector was wrong" ".agents/plugins/marketplace.json" \
+  run_bad_boot
 assert_eq "schema mismatch invokes no provider mutation" "" "$(provider_mutations)"
 
 t_case "provider output parsing rejects duplicates, collisions, case drift, and unparsable targets before mutation"
@@ -227,6 +245,7 @@ CACHE_ROOT="$WORK/cache-root"
 mkdir -p "$CACHE_ROOT/bin" "$CACHE_ROOT/.claude-plugin" "$CACHE_ROOT/.codex-plugin" "$CACHE_ROOT/.agents/plugins"
 cp "$BOOT" "$CACHE_ROOT/bin/firm-bootstrap"; cp "$BIN/firm-bounded-exec" "$CACHE_ROOT/bin/firm-bounded-exec"
 cp "$BIN/firm-version" "$CACHE_ROOT/bin/firm-version"; cp "$FIRM_ROOT/VERSION" "$CACHE_ROOT/VERSION"
+cp "$BIN/firm-python" "$CACHE_ROOT/bin/firm-python"    # see $BADROOT above (CR-03)
 cp "$FIRM_ROOT/.claude-plugin/plugin.json" "$CACHE_ROOT/.claude-plugin/plugin.json"
 cp "$FIRM_ROOT/.codex-plugin/plugin.json" "$CACHE_ROOT/.codex-plugin/plugin.json"
 cp "$FIRM_ROOT/.claude-plugin/marketplace.json" "$CACHE_ROOT/.claude-plugin/marketplace.json"
@@ -256,7 +275,15 @@ for provider in claude codex; do
   else
     write_plugin_state codex 0.8.0; action=codex:plugin-add
   fi
+  # Same CR-03 precondition: without bin/firm-python this root died on its source line, so `rc 1`
+  # was satisfied by a bootstrap that never reached the version check it is named for.
+  STUB_NO_WRITE_ACTION="$action" assert_output \
+    "precondition: the $provider cachebuster root reaches the provider transaction" \
+    "agent-firm dual-provider bootstrap" run_cache_boot
   STUB_NO_WRITE_ACTION="$action" assert_rc "$provider stale provider cachebuster cannot satisfy exact success" 1 run_cache_boot
+  STUB_NO_WRITE_ACTION="$action" assert_output \
+    "  and it fails at the post-mutation VERSION verification, not before it" \
+    "post-mutation-version-verification" run_cache_boot
 done
 
 t_case "fresh install, exact version verification, and idempotent repeat refresh"

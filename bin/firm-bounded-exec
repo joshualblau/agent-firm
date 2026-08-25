@@ -2,7 +2,10 @@
 # Supervise one provider phase as a process group and emit a bounded structured result.
 # Exit: child rc, 124 wall timeout, 125 turn limit, 126 spawn failure, 2 invalid control input.
 set -euo pipefail
-exec python3 - "$@" <<'PY'
+__src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+. "$(cd -P "$(dirname "$__src")" && pwd)/firm-python"   # one resolved interpreter for the whole firm
+exec "${FIRM_PYTHON_ARGV[@]}" - "$@" <<'PY'
 import argparse
 import errno
 import json

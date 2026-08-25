@@ -7,7 +7,7 @@ POLICY="$FIRM_ROOT/agent-firm/policy/model-tiers.yaml"
 W="$(mktemp -d "${TMPDIR:-/tmp}/firm-model-tiers.XXXXXX")"; t_track "$W"
 
 t_case "canonical policy resolves every tier, role, alias, provider, and field exactly"
-assert_ok "complete canonical resolution matrix" python3 - "$RESOLVE" "$POLICY" <<'PY'
+assert_ok "complete canonical resolution matrix" t_python - "$RESOLVE" "$POLICY" <<'PY'
 import json, pathlib, subprocess, sys, yaml
 resolve, policy_path = sys.argv[1:]
 policy = yaml.safe_load(pathlib.Path(policy_path).read_text())
@@ -59,7 +59,7 @@ assert_output "override failure says no fallback" "no fallback applied" \
   "$RESOLVE" --provider codex --role reviewer --expect-effort ultra
 
 t_case "closed policy schema rejects duplicate, missing, unknown, and dangling entries"
-assert_ok "all policy-shape mutations fail with rc 2" python3 - "$RESOLVE" "$POLICY" "$W" <<'PY'
+assert_ok "all policy-shape mutations fail with rc 2" t_python - "$RESOLVE" "$POLICY" "$W" <<'PY'
 import copy, pathlib, subprocess, sys, yaml
 resolve, policy_path, workspace = sys.argv[1:]
 raw = pathlib.Path(policy_path).read_text()
@@ -92,7 +92,7 @@ for name, text in cases.items():
 PY
 
 t_case "mutation of every provider field, role mapping, and alias mapping is detected"
-assert_ok "all canonical mapping mutations fail an exact expectation" python3 - "$RESOLVE" "$POLICY" "$W" <<'PY'
+assert_ok "all canonical mapping mutations fail an exact expectation" t_python - "$RESOLVE" "$POLICY" "$W" <<'PY'
 import copy, pathlib, subprocess, sys, yaml
 resolve, policy_path, workspace = sys.argv[1:]
 base = yaml.safe_load(pathlib.Path(policy_path).read_text())
@@ -129,7 +129,7 @@ assert counter == 40, counter
 PY
 
 t_case "native adapters consume an executable resolver-bound launch object"
-assert_ok "Claude frontmatter projections match policy" python3 - "$FIRM_ROOT" <<'PY'
+assert_ok "Claude frontmatter projections match policy" t_python - "$FIRM_ROOT" <<'PY'
 import json, pathlib, subprocess, sys, yaml
 root = pathlib.Path(sys.argv[1])
 resolve = root / "bin/firm-model-resolve"
@@ -142,7 +142,7 @@ for role in [r for r in roles if r != "lead"]:
     assert front["name"] == role
     assert (front["model"], front["effort"]) == (got["model"], got["effort"]), (role, front, got)
 PY
-assert_ok "both provider adapters reject every resolver, role-start, and apply mutation" python3 - "$FIRM_ROOT" "$W" <<'PY'
+assert_ok "both provider adapters reject every resolver, role-start, and apply mutation" t_python - "$FIRM_ROOT" "$W" <<'PY'
 import copy, json, pathlib, re, shutil, subprocess, sys, yaml
 
 root, workspace = map(pathlib.Path, sys.argv[1:])
@@ -278,6 +278,9 @@ for provider in sources:
         require_rejection(provider, "output-" + field,
                           lambda target, field=field: mutate_activation_output(target, field))
 PY
+# EXTRACTED TO A FILE, not run inline. Three cases below re-run this exact checker against MUTATED
+# COPIES of bin/firm-reviewer-common, which an inline heredoc cannot do without keeping a second
+# copy of the program in sync with the first.
 cat > "$W/reviewer-envelope-check.py" <<'PY'
 import ast, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
@@ -326,17 +329,33 @@ claude = [node for node in segment_lists
 assert len(codex) == 1 and len(claude) == 1, (len(codex), len(claude))
 
 def option_pairs(node):
-    """{flag: literal-or-None} for each ("flag", value) tuple in a judge_plan options list."""
+    """{flag: [literal-or-None, ...]} for each ("flag", value) tuple in a judge_plan options list.
+
+    A LIST PER FLAG, not one value. `-c` is passed twice on the codex surface -- once for the
+    reasoning effort and once for the approval policy -- and a flag->value dict silently kept only
+    the last, so an assertion written against it would have reported the effort envelope as absent
+    the moment a second typed override was added. It also means a control that is passed twice
+    cannot be laundered into a control that is passed once."""
     pairs = {}
     for item in ast.walk(node):
         if isinstance(item, ast.Tuple) and len(item.elts) == 2 and isinstance(item.elts[0], ast.Constant):
             value = item.elts[1]
-            pairs[item.elts[0].value] = value.value if isinstance(value, ast.Constant) else None
+            pairs.setdefault(item.elts[0].value, []).append(
+                value.value if isinstance(value, ast.Constant) else None)
     return pairs
 
 cv, av = option_pairs(codex[0]), option_pairs(claude[0])
-assert cv["-m"] is None and cv["-c"] == 'model_reasoning_effort="xhigh"', cv
-assert av["--model"] is None and av["--effort"] == "xhigh", av
+assert cv["-m"] == [None], cv
+assert 'model_reasoning_effort="xhigh"' in cv["-c"], cv
+# The never-ask policy is stated as a typed -c override because `codex exec` documents no
+# --ask-for-approval in any spelling, and because the root-position form is accepted and then
+# DISCARDED (measured: `codex -s bogus exec --help` is rc 0 while `codex --sandbox bogus --help`
+# is rc 2). --strict-config is what turns a mistyped override key from a silent no-op into a hard
+# error, so the two are asserted together: neither is any use here without the other.
+assert 'approval_policy="never"' in cv["-c"], cv
+assert "--strict-config" in cv, cv
+assert "-a" not in cv and "--ask-for-approval" not in cv, cv
+assert av["--model"] == [None] and av["--effort"] == ["xhigh"], av
 
 # Uniqueness, module-wide. A second launch site anywhere — fallback, retry, env-gated branch —
 # builds its own [executable, ...] list, and is caught here rather than shipping unprobed controls.

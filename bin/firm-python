@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+# firm-python — the ONE place the firm decides which python3 it runs.
+#
+# Usage as a COMMAND (it is executable, so firm-link puts it on PATH):
+#   firm-python [args...]        exec the resolved interpreter with args (firm-python -c 'import sys')
+#   firm-python --print-argv     print the resolved argv, one word per line, and exit 0
+#   firm-python --status         print one diagnostic line:
+#                                p2=<yes|no> live=<yes|no> argv=<...> reason=<...>
+#   firm-python --trusted-status print the same line for the TRUSTED-ONLY resolution (see below),
+#                                with a leading trusted=<yes|no>. This is the question "what would
+#                                bin/firm-merge-guard run?", which --status does not answer.
+#   firm-python --require-p2 ... run only if the resolved interpreter satisfies the P2 gate,
+#                                otherwise print why and exit 17 (the write-unsupported class)
+#   firm-python -h | --help      print this header and exit 0
+#
+# Usage as a LIBRARY (this file is sourceable on purpose — one definition, not N copies):
+#   . "$SELF/firm-python"        defines firm_python(), firm_python_resolve(), and the
+#                                FIRM_PYTHON_* variables below. Sourcing resolves once, silently.
+#
+# ENVIRONMENT
+#   $FIRM_PYTHON                 an interpreter to try FIRST. It is probed exactly like every other
+#                                candidate — including the proof-of-execution sentinel below — so
+#                                setting it cannot make a non-compliant interpreter report p2=yes.
+#                                On a host where NOTHING is compliant it becomes the degraded argv,
+#                                but only when it is executable: a typo'd or since-removed path
+#                                falls through to the first executable candidate instead of making
+#                                every firm-* tool exit 127 "command not found".
+#                                IT IS IGNORED ENTIRELY IN TRUSTED-ONLY MODE — see below.
+#   $FIRM_PYTHON_TRUSTED_ONLY=1  resolve from the FIXED ABSOLUTE candidate list ONLY. Read at SOURCE
+#                                time, so a consumer sets it before `. firm-python`. It can only
+#                                make resolution STRICTER, so a caller who exports it cannot use it
+#                                to choose anything; what it removes is the caller's ability to
+#                                choose at all.
+#
+# TRUSTED-ONLY RESOLUTION, AND WHY IT EXISTS (AC-107 / WO-16)
+# The ordinary resolution above is an operator CONVENIENCE: $FIRM_PYTHON and $PATH let whoever runs
+# a firm-* tool point it at their own interpreter, and that is right for ordinary tooling. It is
+# wrong for a SECURITY CONTROL, and bin/firm-merge-guard is one: it renders its merge/push decision
+# INSIDE a python program, so whoever chooses the python chooses the decision.
+#
+# Three rounds of this engagement tried to make that safe with a better sentinel — SEC-03 removed an
+# inherited cache, AC-107 added proof-of-execution, then a per-invocation liveness nonce. Each closed
+# real vectors and none could close the last one, because a $FIRM_PYTHON deliberately written to
+# PROXY a compliant interpreter passes every check HONESTLY: it forwards `-c` to a real CPython so
+# the probe below is answered truthfully, then reads the checker off its own stdin, lifts the nonce
+# out of the source it was handed, and answers with a permit. Reproduced at 9941201 through
+# `--command`, through the `--hook` adapter, and via $PATH with $FIRM_PYTHON never set.
+#
+# No sentinel scheme survives an attacker who is permitted to BE the interpreter, so the boundary
+# moves instead: firm_python_resolve_trusted consults ONLY _firm_python_trusted_candidates — fixed
+# absolute paths compiled into this file — and publishes FIRM_PYTHON_TRUSTED=1 only when one of them
+# PASSED the same P2 probe every other candidate passes. Nothing a caller can set is consulted, so
+# there is nothing for a proxy to be selected BY. If none of them qualifies, FIRM_PYTHON_TRUSTED
+# stays 0 and the consumer must fail closed; this mode has NO degraded fallback, because "degrade to
+# something we cannot vouch for" is the whole defect.
+#
+# WHAT THIS DOES NOT CLAIM. "Trusted" here means PROVENANCE: the argv came from this file's fixed
+# list rather than from the caller's environment. It does not mean those paths are unwritable — an
+# actor who can replace /usr/bin/python3 has already won, and is the same actor who can edit this
+# file and the guard beside it (the CLIENT-SIDE disclosure in bin/firm-merge-guard's header). Nor
+# does it isolate the interpreter's own environment: $PYTHONPATH and friends still reach a trusted
+# CPython, and that is stated as a named gap by `firm-merge-guard --surface` rather than implied
+# away here.
+#
+# WHY THIS EXISTS
+# Every firm-* tool used to spawn a bare `python3` inherited from $PATH, while the ledger's P2 write
+# gate in bin/firm-ledger-log admits exactly one interpreter row: CPython 3.9.6, arm64, an absolute
+# sys.executable, on Darwin. On an ordinary developer machine those are two different interpreters,
+# and they disagreed in both directions:
+#
+#   · $PATH `python3` can be a conda/pyenv build (3.8.13 here). The gate refuses it, so EVERY ledger
+#     write failed closed with WRITE_CONFIGURATION_UNSUPPORTED: p2 — while firm-doctor, which probed
+#     that same non-gate interpreter, reported the firm healthy. A doctor and a gate that read
+#     different interpreters cannot agree, and did not.
+#   · `/usr/local/bin/bash` is an x86_64-only Homebrew bash that precedes the universal `/bin/bash`
+#     on PATH, so a `#!/usr/bin/env bash` script launched from a terminal runs TRANSLATED, and the
+#     python it spawns reports platform.machine() == "x86_64" even for a universal binary. The arm64
+#     wheels installed for that very interpreter then fail to dlopen (rpds → jsonschema), so the
+#     doctor reported a missing dependency that was installed correctly.
+#
+# So the interpreter is resolved here rather than inherited. `arch -arm64` is used when the current
+# process is translated, because the gate reads the PYTHON process's platform.machine(): pinning
+# python is sufficient and no script's `#!/usr/bin/env bash` shebang has to change. A child spawned
+# from the arm64 python (the ledger's statfs descriptor helper) inherits arm64, so the whole write
+# path lands on one interpreter.
+#
+# WHAT THE PROBE PROVES, AND WHY AN EXIT STATUS IS NOT ENOUGH
+# A candidate is accepted only when it PROVES it ran the probe: the probe writes a sentinel line to
+# stdout carrying a per-probe nonce it was handed on argv plus the four values it read out of its own
+# process, and this file requires that exact line as well as exit status 0. Status alone was a
+# fail-open: a two-line `#!/bin/sh` + `exit 0` shim named python3 is probed FIRST (it is what
+# `command -v python3` finds), answered 0, and was selected and reported p2=yes — so `--require-p2`
+# ran the shim instead of exiting 17, and firm-doctor printed PASS for jsonschema, pyyaml and the
+# retired-permission scan with no Python executed. This is the same defect bin/firm-merge-guard
+# already refuses (its FIRM_MG_DECISION sentinel, SEC-07/SEC-17); the resolver now holds the same
+# line. The bar is not cryptographic — anything handed a program can replay it — but a shim must now
+# reproduce the format, echo back a nonce it cannot predict, and assert the exact expected row, which
+# no accidental wrapper, `exit 0` stub or busy-box `true` does.
+#
+# HOW IT DEGRADES
+# The probe below tests the INTERPRETER half of the gate only (system/arch/version/implementation/
+# absolute executable). The OS half — the (macOS, Darwin) pair in SUPPORTED_P2_OS_ROWS — is a host
+# fact no interpreter choice can change, so it is not a selection criterion; firm-doctor reports it
+# clause by clause, and firm-ledger-log enforces it.
+#
+# If NO candidate satisfies the interpreter half, this does not pretend otherwise and it does not
+# silently substitute one: FIRM_PYTHON_P2 stays 0, FIRM_PYTHON_REASON names what was probed, and
+#   · `firm-python --require-p2` fails closed with exit 17 and that reason;
+#   · firm-doctor turns it into a FAIL that gates its exit code (section 10);
+#   · firm-ledger-log still reaches its centralized gate, which refuses the write with exit 17 and
+#     WRITE_CONFIGURATION_UNSUPPORTED: p2 before any mutation, lock or temp file — the established
+#     fail-closed contract, which is also what keeps the firm's non-write tooling usable on the
+#     deliberately unsupported CI hosts (see .github/workflows/ci.yml).
+# Falling back is therefore never silent: every path that depends on P2 says so out loud.
+#
+# AND THE FALLBACK ITSELF IS PROBED (AC-107). Selecting the degraded argv on `[ -x ]` alone was a
+# fail-open in the same class as SEC-03 — closed at the front door, left open at the side. `[ -x ]`
+# is true of a two-line `#!/bin/sh` + `exit 0` shim; bin/firm-merge-guard ran the degraded argv to
+# render a merge/push decision and believed its exit status, so on a host with no compliant
+# interpreter a caller-controlled $FIRM_PYTHON or $PATH python3 turned a BLOCK into a PERMIT. The
+# degraded branch now re-applies the proof-of-execution half of the same probe to the argv it
+# actually chose and publishes the answer as FIRM_PYTHON_LIVE, so no consumer has to guess:
+#   · FIRM_PYTHON_P2=1  — proved it executes python AND is the admitted row. Trustworthy.
+#   · P2=0, LIVE=1      — proved it executes python; wrong row. Usable, never vouched for. This is
+#                         the ordinary CI/Linux host and why the firm still runs there.
+#   · P2=0, LIVE=0      — proved nothing. It may not be an interpreter at all. Every control that
+#                         needs one must BLOCK, which is what bin/firm-merge-guard now does — and
+#                         it requires P2, not LIVE, because a decision is a trust question.
+#
+# bash 3.2 safe (macOS ships 3.2.57): no associative arrays, no mapfile, no process substitution, and
+# FIRM_PYTHON_ARGV is never left empty because `"${arr[@]}"` on an empty array is an unbound-variable
+# error under `set -u` in 3.2.
+
+# ---- expectations: the interpreter half of the P2 gate ---------------------
+# Stated once, here. firm-doctor reports "actual vs supported" from these, so its section 10 and this
+# resolver cannot drift apart. The OS-row half is read from SUPPORTED_P2_OS_ROWS in bin/firm-ledger-log
+# by whoever needs it — there is exactly one copy of that set and this file does not add a second.
+# The readers are not enumerated here because an enumeration goes stale silently (it did: this comment
+# named three and there were already four). `grep -rl SUPPORTED_P2_OS_ROWS .` finds them.
+FIRM_PYTHON_EXPECT_SYSTEM="Darwin"
+FIRM_PYTHON_EXPECT_ARCH="arm64"
+FIRM_PYTHON_EXPECT_VERSION="3.9.6"
+FIRM_PYTHON_EXPECT_IMPL="cpython"
+
+# Resolution outputs. FIRM_PYTHON_ARGV is the interpreter COMMAND (it can be more than one word, e.g.
+# `/usr/bin/arch -arm64 /usr/bin/python3`), which is why callers use the array or firm_python().
+FIRM_PYTHON_ARGV=(python3)
+FIRM_PYTHON_P2=0
+FIRM_PYTHON_REASON="not resolved yet"
+FIRM_PYTHON_TRIED=""
+FIRM_PYTHON_DISPLAY="python3"
+# FIRM_PYTHON_LIVE — did the SELECTED argv prove it executes a Python program it is handed?
+# 1 implies nothing about P2 and P2=1 implies LIVE=1 (the P2 probe is the same proof plus the row).
+# It exists for the degraded path, where P2 is 0 for every candidate and the only remaining question
+# about the argv every firm-* tool is about to run is whether it is an interpreter at all.
+#
+# NO CONTROL READS THIS INSTEAD OF FIRM_PYTHON_P2, and none should: bin/firm-merge-guard requires
+# P2 because a decision is a trust question, not a liveness one. Its consumers today are the two
+# places that have to TELL somebody — `--status`, and FIRM_PYTHON_REASON, which names the fallback
+# it could not vouch for and which firm-doctor prints verbatim in section 10 on any host where P2
+# is 0. So the degraded diagnosis reaches an operator without a second copy of this logic.
+FIRM_PYTHON_LIVE=0
+# FIRM_PYTHON_TRUSTED — did the selected argv come from _firm_python_trusted_candidates, this file's
+# FIXED ABSOLUTE list, rather than from anything the caller supplied? Only firm_python_resolve_trusted
+# ever sets it to 1; the ordinary resolution below leaves it 0 unconditionally, because it consults
+# $FIRM_PYTHON and $PATH and therefore cannot answer the provenance question in the affirmative.
+#
+# It is assigned here, at file scope, so it exists on EVERY path through this file. That matters to
+# its consumer: bin/firm-merge-guard reads "${FIRM_PYTHON_TRUSTED:-0}", so an OLD copy of this file
+# (a ${CLAUDE_PLUGIN_ROOT} plugin cache predating this variable) leaves it absent, which reads as 0,
+# which is a BLOCK. Unknown provenance is not trusted provenance. Same reasoning as FIRM_PYTHON_P2.
+FIRM_PYTHON_TRUSTED=0
+
+# The sentinel token. One spelling, referenced by the probe program and by the shell that checks it,
+# so the two cannot drift. tests/test-python-interpreter.sh drives both the exit-3 and the exit-0
+# shim directions against this.
+_FIRM_PYTHON_PROBE_TOKEN="FIRM_PYTHON_PROBE_OK"
+
+# ONE probe program, read at TWO bars (AC-107). It prints exactly one line:
+#   FIRM_PYTHON_PROBE_OK <nonce> <system> <machine> <version> <implementation>
+# and then exits 0 if the interpreter half of the P2 row holds and 3 if it does not. The four
+# trailing fields are read back out of the running process (not echoed from argv), so the caller's
+# comparison re-checks the row a second time on the interpreter's own testimony.
+#
+# THE LINE IS PRINTED BEFORE THE ROW IS JUDGED, DELIBERATELY. The row verdict is the EXIT STATUS;
+# the line is PROOF OF EXECUTION and nothing else. Those are two different questions and the
+# degraded path below needs the second one answered even when the first one is no — a real
+# CPython 3.13 on Linux is not P2, but it did run the program, and a `#!/bin/sh` + `exit 0` shim
+# did not. Printing only on success collapsed them into one silence, which is why the fallback had
+# no way to tell them apart and vouched for both (the AC-107 chain). Nothing about the P2 bar
+# changes: _firm_python_probe still requires status 0 AND the exact expected line, and status 0 is
+# still only reachable when every clause holds.
+_FIRM_PYTHON_PROBE='
+import os, sys, platform
+token, nonce, system, arch, version, impl = sys.argv[1:7]
+actual_version = ".".join(str(part) for part in sys.version_info[:3])
+actual_impl = getattr(sys.implementation, "name", "")
+ok = (
+    platform.system() == system
+    and platform.machine() == arch
+    and actual_version == version
+    and actual_impl == impl
+    and isinstance(sys.executable, str)
+    and bool(sys.executable)
+    and os.path.isabs(sys.executable)
+)
+sys.stdout.write("%s %s %s %s %s %s\n" % (
+    token, nonce, platform.system(), platform.machine(), actual_version, actual_impl))
+sys.exit(0 if ok else 3)
+'
+
+# _firm_python_probe <argv...> — rc 0 iff that command PROVED it is a P2-compliant interpreter.
+#
+# rc 0 is necessary and not sufficient (SEC-01/CR-04). The candidate must also return the sentinel
+# line for THIS probe: a nonce it was handed a moment ago plus the four expected values. A candidate
+# that exits 0 without running the program — the `#!/bin/sh` + `exit 0` shim, a wrapper that swallows
+# `-c`, a `true` on PATH under the name python3 — emits nothing and is refused, the same way
+# bin/firm-merge-guard refuses a checker that did not emit FIRM_MG_DECISION.
+#
+# Silent, and stdin is closed so a probe can never consume a caller's heredoc or hang on a terminal.
+# stdout is captured rather than discarded; stderr is still discarded, so a chatty-but-correct
+# interpreter is not rejected for what it writes there.
+_firm_python_probe() {
+  # A fresh nonce per probe, so a candidate cannot satisfy this with a constant `echo` and cannot
+  # replay a line it saw earlier in the same resolution. $RANDOM is a bash builtin (no subprocess).
+  _fp_nonce="fp${$}x${RANDOM}${RANDOM}x${RANDOM}${RANDOM}"
+  _fp_want="$_FIRM_PYTHON_PROBE_TOKEN $_fp_nonce $FIRM_PYTHON_EXPECT_SYSTEM $FIRM_PYTHON_EXPECT_ARCH $FIRM_PYTHON_EXPECT_VERSION $FIRM_PYTHON_EXPECT_IMPL"
+  _fp_got="$("$@" -c "$_FIRM_PYTHON_PROBE" \
+    "$_FIRM_PYTHON_PROBE_TOKEN" "$_fp_nonce" \
+    "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
+    "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" \
+    </dev/null 2>/dev/null)" || return 1
+  [ "$_fp_got" = "$_fp_want" ] || return 1
+  return 0
+}
+
+# _firm_python_live_probe <argv...> — rc 0 iff that command PROVED it EXECUTED the probe program.
+# Not "is it P2": that is _firm_python_probe above and it is a strictly stronger bar. This is the
+# weaker half on its own, and it exists because the degraded branch of firm_python_resolve has no
+# use for the stronger one — on a host where nothing is compliant, EVERY candidate fails the P2
+# bar, so re-running it there answers a question whose answer is already known and tells the
+# fallback nothing about the program it is about to hand every firm-* tool.
+#
+# WHY THE FALLBACK NEEDS AN ANSWER AT ALL (AC-107, the same class as SEC-03). The degraded branch
+# used to select $FIRM_PYTHON or $PATH's python3 on the strength of `[ -x ]` alone. `[ -x ]` is
+# true of a two-line `#!/bin/sh` + `exit 0` shim, and bin/firm-merge-guard then ran that program to
+# render a merge/push decision and believed its exit status — so on a host with no compliant
+# interpreter a caller-controlled program could turn a BLOCK into a PERMIT. The front door (the P2
+# probe) had been closed against exactly that shim; the fallback had not.
+#
+# THE BAR, STATED HONESTLY. The candidate must echo back a nonce it was handed a moment ago, in the
+# probe's own line format, having been given nothing but a Python program to read it from. That
+# refuses `exit 0`, `true`, a wrapper that swallows -c, a constant `echo` of the sentinel, and a
+# replay of a line from an earlier probe. It does NOT refuse a program deliberately written to
+# proxy a real interpreter — nothing a caller hands a program can, and this file has never claimed
+# otherwise (see the header). It is the same non-cryptographic bar the P2 probe holds, applied to
+# the one path that did not hold it.
+#
+# The exit STATUS is deliberately ignored here: 3 means "ran the program and is not P2", which is
+# the ordinary answer on an unsupported host and is exactly the case this predicate must accept.
+_firm_python_live_probe() {
+  _fp_nonce="fp${$}x${RANDOM}${RANDOM}x${RANDOM}${RANDOM}"
+  _fp_got="$("$@" -c "$_FIRM_PYTHON_PROBE" \
+    "$_FIRM_PYTHON_PROBE_TOKEN" "$_fp_nonce" \
+    "$FIRM_PYTHON_EXPECT_SYSTEM" "$FIRM_PYTHON_EXPECT_ARCH" \
+    "$FIRM_PYTHON_EXPECT_VERSION" "$FIRM_PYTHON_EXPECT_IMPL" \
+    </dev/null 2>/dev/null)"
+  # The nonce is alphanumeric by construction, so it carries no glob metacharacter into the pattern.
+  case "$_fp_got" in
+    "$_FIRM_PYTHON_PROBE_TOKEN $_fp_nonce "*) return 0 ;;
+  esac
+  return 1
+}
+
+# _firm_python_executable <word> — rc 0 iff that word can actually be executed. An absolute or
+# relative path must exist and be executable; a bare name must be findable on PATH. This is applied
+# to EVERY candidate, including the $FIRM_PYTHON fallback, which used to skip it and hand every
+# firm-* tool an argv that exits 127 instead of the documented 17 (SEC-04/CR-09). It is the same test
+# bin/firm-merge-guard's _mg_python_ready re-applies to the resolved argv[0] — which was itself
+# evidence that the check belonged in the resolver.
+_firm_python_executable() {
+  case "$1" in
+    "") return 1 ;;
+    */*) [ -x "$1" ] ;;
+    *)  command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+# _firm_python_candidates — one interpreter path per line, in preference order.
+#
+# $PATH `python3` is probed FIRST so an operator who has put a compliant interpreter (a venv, a
+# self-hosted CI runner's 3.9.6) in front keeps the packages installed for it; the absolute paths
+# after it are the macOS system interpreters, which is where 3.9.6 actually lives on this OS.
+# $FIRM_PYTHON, when set, jumps the queue — it is still probed like every other candidate, sentinel
+# included, so setting it cannot make a non-compliant interpreter REPORT p2=yes. It can still be the
+# argv on the degraded path below, where FIRM_PYTHON_P2 is 0 and every P2-dependent path says so.
+_firm_python_candidates() {
+  if [ -n "${FIRM_PYTHON:-}" ]; then printf '%s\n' "$FIRM_PYTHON"; fi
+  _fp_path="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$_fp_path" ]; then printf '%s\n' "$_fp_path"; fi
+  _firm_python_trusted_candidates
+}
+
+# _firm_python_trusted_candidates — the FIXED ABSOLUTE interpreter set, one path per line, in
+# preference order. These are the macOS system interpreters, which is where 3.9.6 actually lives on
+# this OS.
+#
+# THE DEFINING PROPERTY IS THAT NOTHING A CALLER SUPPLIES REACHES THIS LIST — no $FIRM_PYTHON, no
+# `command -v`, no $PATH, no file read. That is what firm_python_resolve_trusted (and therefore
+# bin/firm-merge-guard) rests on, and it is why the list is spelled out as literals here rather than
+# assembled: an assembled list is an input, and an input is the vector. Do not add a candidate that
+# comes from the environment, and do not add a bare NAME — a bare name is a $PATH lookup wearing a
+# different spelling, and firm_python_resolve_trusted re-checks for `/` precisely so that a future
+# edit adding one cannot quietly re-open this door.
+#
+# It is ALSO the tail of _firm_python_candidates above, so the ordinary resolution and the trusted
+# one cannot drift apart about which absolute interpreters exist on this OS. One list, two readers.
+_firm_python_trusted_candidates() {
+  printf '%s\n' \
+    /usr/bin/python3 \
+    /Library/Developer/CommandLineTools/usr/bin/python3 \
+    /Applications/Xcode.app/Contents/Developer/usr/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
+}
+
+# _firm_python_arch_prefix — set $_fp_prefix to `/usr/bin/arch -arm64`, or empty.
+#
+# One arch decision for the whole host, not one per candidate. A translated parent's direct child
+# reports x86_64 no matter which universal binary it is, so on such a parent the `arch -arm64` form
+# is the only one that can pass; on a real Intel Mac `arch -arm64` fails here in microseconds and
+# the direct form is used. HOSTTYPE is a bash builtin (the shell binary's own arch), so deciding
+# this costs no subprocess in the common native case.
+#
+# Both resolvers call this, so the trusted path cannot acquire a different arch story than the
+# ordinary one. Neither WORD it can produce is caller-supplied: `/usr/bin/arch` is absolute and
+# `-arm64` is a literal. $HOSTTYPE only selects BETWEEN those two fixed forms — forcing the wrong
+# one makes the P2 probe fail (a translated python reports x86_64), which is a refusal, not a
+# selection.
+_firm_python_arch_prefix() {
+  _fp_prefix=""
+  case "${HOSTTYPE:-}" in
+    arm64|aarch64) : ;;
+    *)
+      if [ -x /usr/bin/arch ] && /usr/bin/arch -arm64 /usr/bin/true >/dev/null 2>&1; then
+        _fp_prefix="/usr/bin/arch -arm64"
+      fi
+      ;;
+  esac
+}
+
+# firm_python_resolve — set FIRM_PYTHON_ARGV / _P2 / _LIVE / _REASON / _TRIED / _DISPLAY. Always
+# rc 0: the verdict is the variables, not the exit status, so a caller under `set -e` decides what
+# to do.
+firm_python_resolve() {
+  FIRM_PYTHON_P2=0
+  FIRM_PYTHON_LIVE=0
+  # This resolution consults $FIRM_PYTHON and $PATH, so it can never answer the provenance question
+  # in the affirmative. Assigned rather than left alone so that calling firm_python_resolve AFTER
+  # firm_python_resolve_trusted cannot leave a stale 1 behind vouching for a caller-chosen argv.
+  FIRM_PYTHON_TRUSTED=0
+  FIRM_PYTHON_REASON=""
+  FIRM_PYTHON_TRIED=""
+  _firm_python_arch_prefix
+
+  _fp_seen=""
+  _fp_first=""
+  while IFS= read -r _fp_cand; do
+    [ -n "$_fp_cand" ] || continue
+    case "$_fp_seen" in *"<$_fp_cand>"*) continue ;; esac   # probe each distinct path once
+    _fp_seen="$_fp_seen<$_fp_cand>"
+    if ! _firm_python_executable "$_fp_cand"; then
+      # Record an unusable $FIRM_PYTHON so the reason string names it. Skipping it silently is how
+      # `FIRM_PYTHON=/usr/bin/pyhton3` produced a diagnostic that listed three interpreters, none of
+      # them the one the fallback was about to run (SEC-04/CR-09).
+      if [ "$_fp_cand" = "${FIRM_PYTHON:-}" ]; then
+        FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand (not executable)"
+      fi
+      continue
+    fi
+    [ -n "$_fp_first" ] || _fp_first="$_fp_cand"
+    FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand"
+    if [ -n "$_fp_prefix" ]; then
+      if _firm_python_probe /usr/bin/arch -arm64 "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=(/usr/bin/arch -arm64 "$_fp_cand")
+        FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1     # the P2 bar IS the liveness bar plus the row; passing it proves both
+        break
+      fi
+    else
+      if _firm_python_probe "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=("$_fp_cand")
+        FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1
+        break
+      fi
+    fi
+  done <<EOF
+$(_firm_python_candidates)
+EOF
+
+  if [ "$FIRM_PYTHON_P2" -ne 1 ]; then
+    # Nothing compliant. Keep the firm runnable on a deliberately unsupported host (CI, Linux) with
+    # the plain interpreter, and say exactly why every P2-dependent path is about to refuse.
+    if [ -n "${FIRM_PYTHON:-}" ] && _firm_python_executable "$FIRM_PYTHON"; then
+      FIRM_PYTHON_ARGV=("$FIRM_PYTHON")
+    elif [ -n "$_fp_first" ]; then
+      FIRM_PYTHON_ARGV=("$_fp_first")
+    else
+      FIRM_PYTHON_ARGV=(python3)
+    fi
+    # AND THE FALLBACK IS PROBED TOO (AC-107). The candidate loop above proved only that this argv
+    # is not P2 — on this branch nothing is — so without a second question the fallback is selected
+    # on `[ -x ]`, which a `#!/bin/sh` + `exit 0` shim satisfies. The proof-of-execution half of the
+    # same probe is therefore re-applied to the argv that was actually chosen, and the answer is
+    # published rather than assumed: LIVE=1 means a real interpreter that is not the P2 row, LIVE=0
+    # means the firm has no idea what this program is and no caller may vouch for it.
+    if _firm_python_live_probe "${FIRM_PYTHON_ARGV[@]}"; then
+      FIRM_PYTHON_LIVE=1
+      _fp_live_note=""
+    else
+      FIRM_PYTHON_LIVE=0
+      _fp_live_note=" — and the fallback ${FIRM_PYTHON_ARGV[*]} did not prove it executes python at all"
+    fi
+    FIRM_PYTHON_REASON="no interpreter on this host is $FIRM_PYTHON_EXPECT_SYSTEM/$FIRM_PYTHON_EXPECT_ARCH \
+$FIRM_PYTHON_EXPECT_IMPL $FIRM_PYTHON_EXPECT_VERSION with an absolute sys.executable; probed: ${FIRM_PYTHON_TRIED:-none}$_fp_live_note"
+  fi
+
+  FIRM_PYTHON_DISPLAY="${FIRM_PYTHON_ARGV[*]}"
+  return 0
+}
+
+# firm_python_resolve_trusted — the same outputs, resolved ONLY from _firm_python_trusted_candidates.
+# Always rc 0, like its sibling: the verdict is FIRM_PYTHON_TRUSTED, not the exit status.
+#
+# WHAT IT DOES NOT DO, AND EACH ABSENCE IS THE POINT:
+#   · It never reads $FIRM_PYTHON. A caller-chosen interpreter is exactly the thing a control must
+#     not accept, and "probe it first and see" does not help — a PROXY answers the probe honestly.
+#   · It never reads $PATH. `command -v python3` is a caller-chosen interpreter with extra steps;
+#     the vector was reproduced through $PATH with $FIRM_PYTHON never set at all.
+#   · It never EXECUTES a caller-chosen program, not even to reject it. That is not fastidiousness:
+#     the guard's only consumer runs under a registered hook timeout that is MEASURED to fail OPEN
+#     when overrun (see bin/firm-merge-guard's header), so merely PROBING a $FIRM_PYTHON that
+#     sleeps would be a denial-of-service with a permit at the end of it.
+#   · It has NO degraded fallback. firm_python_resolve degrades so the firm stays usable on
+#     unsupported CI hosts, which is right for tooling and wrong for a decision: "run something we
+#     could not vouch for" is the defect, not the remedy. Here, nothing qualifying means TRUSTED=0
+#     and the consumer refuses.
+#
+# FIRM_PYTHON_ARGV is still left non-empty on failure (`python3`, this file's documented default),
+# because `"${arr[@]}"` on an empty array is an unbound-variable error under `set -u` in bash 3.2 and
+# a resolver that can crash its caller is a worse failure mode. It is NOT a fallback: TRUSTED and P2
+# are both 0 beside it, and bin/firm-merge-guard requires TRUSTED=1 AND P2=1 AND an absolute argv[0],
+# so that default cannot be run by the one caller that matters. Any future consumer must read the
+# variables, exactly as it must for FIRM_PYTHON_P2.
+firm_python_resolve_trusted() {
+  FIRM_PYTHON_ARGV=(python3)
+  FIRM_PYTHON_P2=0
+  FIRM_PYTHON_LIVE=0
+  FIRM_PYTHON_TRUSTED=0
+  FIRM_PYTHON_REASON=""
+  FIRM_PYTHON_TRIED=""
+  _firm_python_arch_prefix
+
+  while IFS= read -r _fp_cand; do
+    [ -n "$_fp_cand" ] || continue
+    # The list is absolute by construction. Re-checking it here is not redundant paranoia: it is what
+    # makes "no $PATH lookup" a property of this FUNCTION rather than of a list somebody may edit
+    # later. A bare name added above would be silently skipped, not silently looked up.
+    case "$_fp_cand" in /*) ;; *) continue ;; esac
+    # An ABSENT candidate is recorded, not skipped silently. The whole point of a fixed list is that
+    # the caller cannot extend it, so when it yields nothing the operator's only route to a repair is
+    # being told which paths were looked at — and on a host where none of them exists, silently
+    # skipping every one produces "probed: none", which names nothing and reads like a broken probe.
+    if [ ! -x "$_fp_cand" ]; then
+      FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand (absent)"
+      continue
+    fi
+    FIRM_PYTHON_TRIED="${FIRM_PYTHON_TRIED:+$FIRM_PYTHON_TRIED, }$_fp_cand"
+    # The SAME P2 probe every other candidate faces — proof-of-execution nonce included. Provenance
+    # is necessary and not sufficient: a trusted path that is not the admitted interpreter row is
+    # still not something a ledger-writing decision may rest on.
+    if [ -n "$_fp_prefix" ]; then
+      if _firm_python_probe /usr/bin/arch -arm64 "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=(/usr/bin/arch -arm64 "$_fp_cand")
+        FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1     # the P2 bar IS the liveness bar plus the row; passing it proves both
+        FIRM_PYTHON_TRUSTED=1
+        break
+      fi
+    else
+      if _firm_python_probe "$_fp_cand"; then
+        FIRM_PYTHON_ARGV=("$_fp_cand")
+        FIRM_PYTHON_P2=1
+        FIRM_PYTHON_LIVE=1
+        FIRM_PYTHON_TRUSTED=1
+        break
+      fi
+    fi
+  done <<EOF
+$(_firm_python_trusted_candidates)
+EOF
+
+  if [ "$FIRM_PYTHON_TRUSTED" -ne 1 ]; then
+    # Name the paths, because the operator's repair is "install a $FIRM_PYTHON_EXPECT_VERSION there,
+    # with pyyaml" and they cannot do it against a list they cannot see. Saying $FIRM_PYTHON and
+    # $PATH were NOT consulted is part of the diagnosis too: without it, an operator who has set
+    # $FIRM_PYTHON to a perfectly good interpreter reads this as a bug in the probe.
+    FIRM_PYTHON_REASON="no TRUSTED interpreter is $FIRM_PYTHON_EXPECT_SYSTEM/$FIRM_PYTHON_EXPECT_ARCH \
+$FIRM_PYTHON_EXPECT_IMPL $FIRM_PYTHON_EXPECT_VERSION with an absolute sys.executable. \$FIRM_PYTHON and \$PATH \
+are deliberately NOT consulted in trusted-only mode, so a caller cannot supply one; probed: ${FIRM_PYTHON_TRIED:-none}"
+  fi
+
+  FIRM_PYTHON_DISPLAY="${FIRM_PYTHON_ARGV[*]}"
+  return 0
+}
+
+# firm_python <args...> — run the resolved interpreter. Heredocs work: `firm_python - a b <<'PY'`.
+firm_python() {
+  "${FIRM_PYTHON_ARGV[@]}" "$@"
+}
+
+# `firm-python --trusted-status` selects the mode HERE, before the resolution below, and not in the
+# dispatcher where the rest of the flags are handled. The reason is the whole point of the mode: the
+# ordinary resolution EXECUTES $FIRM_PYTHON in order to probe it, so a --trusted-status that reached
+# the dispatcher the normal way would have run the caller's program on its way to reporting that it
+# ignores the caller's program. An operator runs this flag precisely when they suspect that program.
+# Only in command mode: when SOURCED, "$1" belongs to the sourcing script and is none of this file's
+# business.
+case "${BASH_SOURCE[0]:-$0}" in
+  "$0") case "${1:-}" in --trusted-status) FIRM_PYTHON_TRUSTED_ONLY=1 ;; esac ;;
+esac
+
+# Resolve once, at source/startup time. The mode is chosen by the CONSUMER, before the source, and
+# there is exactly one consumer of the trusted mode today (bin/firm-merge-guard). Reading it from
+# the environment is safe in the only direction it can be abused: setting it can REMOVE the caller's
+# own $FIRM_PYTHON/$PATH influence and can never add any, so it is a knob that only tightens.
+if [ "${FIRM_PYTHON_TRUSTED_ONLY:-0}" = "1" ]; then
+  firm_python_resolve_trusted
+else
+  firm_python_resolve
+fi
+
+# ---- command mode ---------------------------------------------------------
+# Sourced files must not run the dispatcher below, and must not change the caller's shell options.
+# $0 is the outer script when sourced and this file when executed.
+case "${BASH_SOURCE[0]:-$0}" in
+  "$0")
+    set -uo pipefail
+    _fp_require=0
+    case "${1:-}" in
+      --print-argv)
+        printf '%s\n' "${FIRM_PYTHON_ARGV[@]}"
+        exit 0
+        ;;
+      --status)
+        printf 'p2=%s live=%s argv=%s reason=%s\n' \
+          "$( [ "$FIRM_PYTHON_P2" -eq 1 ] && printf yes || printf no )" \
+          "$( [ "$FIRM_PYTHON_LIVE" -eq 1 ] && printf yes || printf no )" \
+          "$FIRM_PYTHON_DISPLAY" "${FIRM_PYTHON_REASON:-none}"
+        exit 0
+        ;;
+      --trusted-status)
+        # A SEPARATE question from --status, and it exists because the two answers differ on an
+        # ordinary developer machine: --status reports what ordinary firm tooling will run (your
+        # $FIRM_PYTHON, your venv on $PATH), and this reports what bin/firm-merge-guard will run.
+        # When the guard blocks with "no trusted interpreter", --status can say p2=yes and be
+        # perfectly correct, so pointing the operator at it would have been a dead end.
+        # The startup dispatch above already resolved in trusted-only mode for this flag, which is
+        # what keeps this from running $FIRM_PYTHON; re-resolving here would answer the same question
+        # a second time and would NOT undo that, so it is deliberately not done.
+        printf 'trusted=%s p2=%s live=%s argv=%s reason=%s\n' \
+          "$( [ "$FIRM_PYTHON_TRUSTED" -eq 1 ] && printf yes || printf no )" \
+          "$( [ "$FIRM_PYTHON_P2" -eq 1 ] && printf yes || printf no )" \
+          "$( [ "$FIRM_PYTHON_LIVE" -eq 1 ] && printf yes || printf no )" \
+          "$FIRM_PYTHON_DISPLAY" "${FIRM_PYTHON_REASON:-none}"
+        exit 0
+        ;;
+      -h|--help)
+        # The header, addressed by the END MARKER below rather than by a magic last line number.
+        # `sed -n '2,15p'` stopped on the bare heading "WHY THIS EXISTS" and printed no body, which
+        # reads as a broken install (CC-11); a fixed range truncates again every time the header
+        # grows. This prints everything above the first line of real code.
+        # The command substitution is load-bearing: it strips the trailing blank separator line, so
+        # the last line of --help is always prose.
+        _fp_help="$(sed -n '2,/^# ---- expectations/{/^# ---- expectations/!p;}' "${BASH_SOURCE[0]}" \
+          | sed 's/^# \{0,1\}//')"
+        printf '%s\n' "$_fp_help"
+        exit 0
+        ;;
+      --require-p2) _fp_require=1; shift ;;
+    esac
+    if [ "$_fp_require" -eq 1 ] && [ "$FIRM_PYTHON_P2" -ne 1 ]; then
+      printf 'firm-python: no P2-compliant interpreter — %s\n' "$FIRM_PYTHON_REASON" >&2
+      printf 'firm-python: refusing to run a non-compliant interpreter under --require-p2.\n' >&2
+      exit 17
+    fi
+    exec "${FIRM_PYTHON_ARGV[@]}" "$@"
+    ;;
+esac

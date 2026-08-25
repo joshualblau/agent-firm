@@ -6,8 +6,9 @@ __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
-exec python3 - "$ROOT/agent-firm/policy/model-tiers.yaml" "$@" <<'PY'
+exec "${FIRM_PYTHON_ARGV[@]}" - "$ROOT/agent-firm/policy/model-tiers.yaml" "$@" <<'PY'
 import argparse
 import hashlib
 import json

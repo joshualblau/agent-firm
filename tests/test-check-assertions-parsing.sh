@@ -72,7 +72,7 @@ without_yaml() { ( PYTHONPATH="$NOYAML${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 
 STUBYAML="$TESTS_DIR/fixtures/stub-yaml"   # see that file: a minimal YAML-subset double, not pyyaml
 # The probe runs with NO override, so it reports what the host genuinely has.
-if python3 -c 'import yaml' >/dev/null 2>&1; then
+if t_python -c 'import yaml' >/dev/null 2>&1; then
   YAML_KIND=real
   with_yaml_parser() { ( "$@" ); }
 else
@@ -88,24 +88,24 @@ af() { printf '%s' "$2" > "$W/$1.yaml"; printf '%s' "$W/$1.yaml"; }
 
 # ---------------------------------------------------------------------------
 t_case "preconditions: both parser branches really do what the cases below assume"
-assert_fail "without_yaml: importing yaml raises" without_yaml python3 -c "import yaml"
+assert_fail "without_yaml: importing yaml raises" without_yaml t_python -c "import yaml"
 # The property the ABSENT branch is now selected by. Asserted separately from "the import raises",
 # because those two came apart: a findable-but-failing stub also raises, and it must NOT reach the
 # fallback. Without this, every `without_yaml` case below could be silently testing the broken-install
 # path instead of the absent one.
 assert_ok   "without_yaml: pyyaml is UNFINDABLE (find_spec -> None), which is genuine absence and not a broken install" \
-  without_yaml python3 -c '
+  without_yaml t_python -c '
 import importlib.util, sys
 spec = importlib.util.find_spec("yaml")
 assert spec is None, "yaml is still findable at %s -- this simulates BROKEN, not ABSENT" % (spec,)'
 assert_ok   "with_yaml_parser: importing yaml succeeds and exposes a working safe_load" \
-  with_yaml_parser python3 -c "import yaml; assert yaml.safe_load('a: 1') == {'a': 1}"
+  with_yaml_parser t_python -c "import yaml; assert yaml.safe_load('a: 1') == {'a': 1}"
 # The regression guard for the shadowing itself. On a host WITH pyyaml this fails against the old
 # unconditional-prepend helper: the probe above says `real`, but the import would still resolve to
 # the double. On a host WITHOUT pyyaml it confirms the fallback is what got imported. Either way the
 # helper is held to what the host actually has, rather than to what the harness hoped for.
 assert_ok   "with_yaml_parser resolves to the REAL pyyaml where the host has one, and to the local double ONLY where it does not" \
-  with_yaml_parser python3 -c '
+  with_yaml_parser t_python -c '
 import os, sys, yaml
 stub_dir = os.path.realpath(sys.argv[1]) + os.sep
 imported_the_stub = os.path.realpath(yaml.__file__).startswith(stub_dir)
@@ -287,7 +287,7 @@ assert_rc "pyyaml:   FAIL=1" 1 with_yaml_parser "$CA" "$failing" "$repo"
 # not firm-check-assertions, so it must be the double that runs on every host.
 # ===========================================================================
 t_case "the double supports exactly what it claims — and raises on the rest, including valid YAML"
-stub_py() { with_stub_yaml_forced python3 -c "$1"; }
+stub_py() { with_stub_yaml_forced t_python -c "$1"; }
 
 assert_ok "SUPPORTED: top-level key: scalar, with bool/int conversion" stub_py '
 import yaml
@@ -401,7 +401,7 @@ printf 'import sys\nsys.exit(0)   # module-level SystemExit: NOT an Exception\n'
 with_broken_sysexit() { ( PYTHONPATH="$BROKEN_EXIT${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 
 assert_ok "runtime-broken double: FINDABLE, and raises a NON-ImportError (the escaping shape)" \
-  with_broken_rt python3 -c '
+  with_broken_rt t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -414,7 +414,7 @@ else:
     raise SystemExit("import unexpectedly succeeded")'
 
 assert_ok "partial-install double: FINDABLE, and raises ImportError from INSIDE the package (the swallowed shape)" \
-  with_broken_partial python3 -c '
+  with_broken_partial t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -425,7 +425,7 @@ else:
     raise SystemExit("import unexpectedly succeeded")'
 
 assert_ok "sysexit double: FINDABLE, and an 'except Exception' does NOT catch what it raises" \
-  with_broken_sysexit python3 -c '
+  with_broken_sysexit t_python -c '
 import importlib.util, sys
 assert importlib.util.find_spec("yaml") is not None, "not findable -> would be absence, wrong axis"
 try:
@@ -500,7 +500,7 @@ sys.meta_path.insert(0, _ExplodingFinder)
 PYSC
 with_broken_hook() { ( PYTHONPATH="$BROKEN_HOOK${PYTHONPATH:+:$PYTHONPATH}" "$@" ); }
 assert_ok "precondition: BOTH the import and the find_spec probe raise (that is what makes it inconclusive)" \
-  with_broken_hook python3 -c '
+  with_broken_hook t_python -c '
 import importlib.util
 raised = []
 try:
@@ -539,7 +539,7 @@ na_ascii() { ( PYTHONPATH="$BROKEN_NA${PYTHONPATH:+:$PYTHONPATH}" \
 NA_UTF8_LOC=""
 for _cand in C.UTF-8 en_US.UTF-8 en_US.utf8 UTF-8; do
   if LC_ALL="$_cand" LANG="$_cand" LC_CTYPE="$_cand" PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 \
-       python3 -c "import sys; sys.exit(0 if 'utf' in (sys.stdout.encoding or '').lower() else 1)" \
+       t_python -c "import sys; sys.exit(0 if 'utf' in (sys.stdout.encoding or '').lower() else 1)" \
        </dev/null >/dev/null 2>&1; then
     NA_UTF8_LOC="$_cand"; break
   fi
@@ -553,12 +553,12 @@ else
                 LC_ALL=C LANG=C LC_CTYPE=C PYTHONUTF8=1 "$@" ); }
 fi
 _enc_probe='import sys; print((sys.stdout.encoding or "?").lower())'
-enc_ascii="$(na_ascii python3 -c "$_enc_probe")"
-enc_utf8="$(na_utf8  python3 -c "$_enc_probe")"
-assert_ne "precondition: the two locale helpers give python3 DIFFERENT stdout encodings (else this axis is decorative)" \
+enc_ascii="$(na_ascii t_python -c "$_enc_probe")"
+enc_utf8="$(na_utf8  t_python -c "$_enc_probe")"
+assert_ne "precondition: the two locale helpers give t_python DIFFERENT stdout encodings (else this axis is decorative)" \
   "$enc_ascii" "$enc_utf8"
 assert_ok "precondition: the ascii helper's stdout genuinely cannot hold non-ASCII (got '$enc_ascii')" \
-  python3 -c 'import sys; sys.exit(0 if "utf" not in sys.argv[1] else 1)' "$enc_ascii"
+  t_python -c 'import sys; sys.exit(0 if "utf" not in sys.argv[1] else 1)' "$enc_ascii"
 for _nafn in na_ascii na_utf8; do
   assert_rc "exit 2 with a non-ASCII, multi-line exception message [$_nafn]" 2 \
     $_nafn "$CA" "$good" "$repo"
@@ -637,6 +637,9 @@ assert_rc "parse-only rejects an evaluation repo argument" 2 "$CA" --parse-only 
 # exactly one correlation axis.
 CHAIN_BIN="$W/chain-bin"; mkdir "$CHAIN_BIN"
 cp "$CA" "$CHAIN_BIN/firm-check-assertions"; chmod +x "$CHAIN_BIN/firm-check-assertions"
+# The copied checker resolves its interpreter through its sibling bin/firm-python (that is how it,
+# firm-doctor and the ledger writer stay on ONE python), so the copy needs that sibling too.
+cp "$BIN/firm-python" "$CHAIN_BIN/firm-python"; chmod +x "$CHAIN_BIN/firm-python"
 cat > "$CHAIN_BIN/firm-final-qa-check" <<'SH'
 #!/bin/sh
 printf '%s\n' "$1" >> "$FIRM_FINAL_CALLS"
@@ -649,7 +652,7 @@ printf 'assertions:\n  - trusted_unavailability_chain: true\n' > "$CHAIN_ASSERT"
 CHAIN_FINAL_CALLS="$W/chain-final-calls"
 
 make_chain() { # repo orientation
-  python3 - "$1" "$2" <<'PY'
+  t_python - "$1" "$2" <<'PY'
 import hashlib,json,os,pathlib,shutil,sys,yaml
 repo=pathlib.Path(sys.argv[1]); orientation=sys.argv[2]
 shutil.rmtree(repo,ignore_errors=True)
@@ -710,7 +713,7 @@ chain_run() { # repo orientation [final-rc]
 }
 
 mutate_chain() { # repo mutation
-  python3 - "$1" "$2" <<'PY'
+  t_python - "$1" "$2" <<'PY'
 import hashlib,json,pathlib,sys,yaml
 repo=pathlib.Path(sys.argv[1]); mutation=sys.argv[2]
 run=repo/(repo/".agent-firm"/"CURRENT_RUN").read_text().strip()

@@ -6,6 +6,7 @@ __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"   # pyyaml lives on ONE interpreter; use the firm's, not PATH's (bin/firm-python)
 
 run_dir="${1:-}"
 [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
@@ -23,7 +24,7 @@ trc=$?
 if [[ $trc -eq 1 ]]; then echo "FINAL QA: BLOCK -- primary candidate traceability is incomplete" >&2; exit 1; fi
 [[ $trc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- strict traceability rc=$trc: ${trace_detail//$'\n'/ }" >&2; exit 2; }
 
-python3 - "$run_dir" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$ROOT/agent-firm/schemas/qa-verdict.schema.json" "$ROOT/agent-firm/schemas/traceability.schema.json" "$SELF/firm-new-run" "$SELF/firm-ledger-log" <<'PY'
+firm_python - "$run_dir" "$ROOT/agent-firm/policy/high-risk-paths.yaml" "$ROOT/agent-firm/schemas/qa-verdict.schema.json" "$ROOT/agent-firm/schemas/traceability.schema.json" "$SELF/firm-new-run" "$SELF/firm-ledger-log" <<'PY'
 import collections
 import datetime
 import fnmatch

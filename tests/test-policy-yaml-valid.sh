@@ -16,20 +16,20 @@ set -uo pipefail
 t_case "every agent-firm/policy/*.yaml file parses as valid YAML"
 for f in "$FIRM_ROOT"/agent-firm/policy/*.yaml; do
   [ -f "$f" ] || continue
-  assert_ok "$(basename "$f") is valid YAML" python3 -c "import yaml; yaml.safe_load(open('$f'))"
+  assert_ok "$(basename "$f") is valid YAML" t_python -c "import yaml; yaml.safe_load(open('$f'))"
 done
 
 t_case "every agent-firm/templates/*.yaml file parses as valid YAML"
 for f in "$FIRM_ROOT"/agent-firm/templates/*.yaml; do
   [ -f "$f" ] || continue
-  assert_ok "$(basename "$f") is valid YAML" python3 -c "import yaml; yaml.safe_load(open('$f'))"
+  assert_ok "$(basename "$f") is valid YAML" t_python -c "import yaml; yaml.safe_load(open('$f'))"
 done
 
 t_case "regression pin: definition-of-done.yaml specifically has no bare colon-space mid-scalar"
 # Belt-and-braces beyond "it parses": the exact hazard class (a plain scalar list item containing
 # ": " outside a `>-`/`|-` block scalar) can reappear even in an otherwise-parseable file if a future
 # edit adds a NEW multi-line item without the same care. Scan for it directly.
-assert_ok "no unguarded colon-space in a plain scalar list item" python3 -c "
+assert_ok "no unguarded colon-space in a plain scalar list item" t_python -c "
 import re
 path = '$FIRM_ROOT/agent-firm/policy/definition-of-done.yaml'
 lines = open(path).read().splitlines()
@@ -54,7 +54,7 @@ assert not bad, f'colon-space found outside a block scalar: {bad}'
 "
 
 t_case "the actual high-risk policy satisfies its actual closed-world schema"
-assert_ok "canonical high-risk policy validates" python3 - "$FIRM_ROOT" <<'PY'
+assert_ok "canonical high-risk policy validates" t_python - "$FIRM_ROOT" <<'PY'
 import json,jsonschema,sys,yaml
 root=sys.argv[1]
 defs=json.load(open(root+"/agent-firm/schemas/traceability.schema.json"))["$defs"]
@@ -64,7 +64,7 @@ jsonschema.validate(policy,schema)
 PY
 
 t_case "removing any required category or individual pattern fails the real schema"
-assert_ok "every category/pattern deletion and unknown addition is rejected" python3 - "$FIRM_ROOT" <<'PY'
+assert_ok "every category/pattern deletion and unknown addition is rejected" t_python - "$FIRM_ROOT" <<'PY'
 import copy,json,jsonschema,sys,yaml
 root=sys.argv[1]
 defs=json.load(open(root+"/agent-firm/schemas/traceability.schema.json"))["$defs"]
