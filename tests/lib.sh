@@ -106,6 +106,44 @@ _t_ctx() { printf '%s' "$1" | tr '\n' ' ' | cut -c1-200; }
 
 t_case() { printf '  · %s\n' "$1"; }
 
+# t_skip <desc> <why> — an assertion that CANNOT be evaluated on this host, announced rather than
+# quietly dropped. It counts as neither a pass nor a failure, and it prints, so a reader of the log
+# can see exactly what was not checked. Silence here would be the worse bug: a suite that reports
+# "all passed" while a claim went unexamined is the check-that-cannot-fail this repository keeps
+# rediscovering, and the fix for one must not manufacture another.
+t_skip() {
+  printf '    SKIP %s\n         %s\n' "$1" "${2:-not evaluable on this host}"
+}
+
+# t_p2_row_supported — true when firm-doctor's readiness gate can return 0 on THIS host.
+#
+# WHY THIS EXISTS. bin/firm-doctor section 10 fail-closes unless the host's (macOS, Darwin) pair is
+# in SUPPORTED_P2_OS_ROWS. On Linux that pair can never match, so `firm-doctor` can never exit 0 and
+# any assertion expecting readiness 0 is UNATTAINABLE there -- not flaky, not environment-sensitive,
+# structurally impossible. Four such assertions turned ubuntu-latest red the day the P2 row check
+# landed, while the two runs that verified the change both ran on macOS and could not have seen it.
+#
+# The row list is READ OUT OF bin/firm-ledger-log rather than restated here, for the same reason
+# firm-doctor reads it: a second copy is a second thing to forget to update, and this predicate
+# deciding "supported" while the producer decides "unsupported" would skip a test that should have
+# run. One source of truth, parsed statically -- no import, so a host the producer refuses to load
+# on is still classifiable.
+t_p2_row_supported() {
+  t_python - "${BIN:-$(dirname "${BASH_SOURCE[0]}")/../bin}/firm-ledger-log" <<'PY' >/dev/null 2>&1
+import ast, platform, re, sys
+source = open(sys.argv[1]).read()
+m = re.search(r"^SUPPORTED_P2_OS_ROWS = frozenset\((\{.*?\})\)", source, re.M | re.S)
+if not m:
+    raise SystemExit(1)                       # cannot read the list -> not provably supported
+rows = ast.literal_eval(m.group(1))
+if not isinstance(rows, (set, frozenset)) or not rows:
+    raise SystemExit(1)
+if platform.system() != "Darwin":
+    raise SystemExit(1)
+raise SystemExit(0 if (platform.mac_ver()[0], platform.release()) in rows else 1)
+PY
+}
+
 # ---- assertions ----------------------------------------------------------
 # Every assertion below declares its working variables `local`. Without it, a bare `desc=`/`out=`/
 # `rc=`/`needle=` assignment leaks into and silently CLOBBERS any identically-named variable in the

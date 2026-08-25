@@ -19,6 +19,19 @@ name: ci
 # install and every probe below goes through bin/firm-python for that reason, and each is followed by
 # an assertion that the resolved interpreter can actually import what was just installed, so a future
 # drift is a one-line failure rather than a wall of import errors.
+#
+# JSONSCHEMA IS CAPPED AT 4.25.1 BY THE P2 INTERPRETER, AND THAT CEILING IS NOT ARBITRARY.
+# jsonschema 4.26.0 declares `requires-python >=3.10`; 4.25.1 declares `>=3.9`. The firm pins CPython
+# 3.9 as its P2 row, so 4.25.1 is the newest release the resolved interpreter can install AT ALL.
+#
+# This pairing went red the moment the line above was corrected from `python -m pip install` to
+# `bin/firm-python -m pip install`: the old line installed 4.26.0 into the setup-python 3.12 that the
+# suite never runs, so the impossible pin was satisfied by the wrong interpreter and nobody noticed.
+# Fixing the interpreter exposed the pin. The macOS job then failed at dependency install, before a
+# single test ran, with "No matching distribution found for jsonschema==4.26.0".
+#
+# So: raising this pin above 4.25.1 requires raising the P2 Python row first, in bin/firm-ledger-log,
+# with Architecture approval. Do not bump it to make a dependabot line green.
 
 "on":
   push:
@@ -92,7 +105,7 @@ jobs:
       # gives a human, and it is the only form that puts the packages where the suite will look for
       # them. See the CR-01 note in this file's header.
       - name: install the declared prerequisites (pinned, into the resolved interpreter)
-        run: bin/firm-python -m pip install --user jsonschema==4.26.0 pyyaml==6.0.3
+        run: bin/firm-python -m pip install --user jsonschema==4.25.1 pyyaml==6.0.3
       - name: the resolved interpreter is the one that got the packages
         run: |
           bin/firm-python --status
@@ -121,7 +134,7 @@ jobs:
         run: |
           p2_venv="$RUNNER_TEMP/agent-firm-p2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           python3 -m venv "$p2_venv"
-          "$p2_venv/bin/python" -m pip install jsonschema==4.26.0 pyyaml==6.0.3
+          "$p2_venv/bin/python" -m pip install jsonschema==4.25.1 pyyaml==6.0.3
           printf '%s\n' "$p2_venv/bin" >> "$GITHUB_PATH"
           printf 'P2_VENV=%s\n' "$p2_venv" >> "$GITHUB_ENV"
       # SEC-06: this probe used to run `python3` -- the venv it had just prepended to $GITHUB_PATH --

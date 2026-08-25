@@ -82,10 +82,35 @@ PY
 )"
 [ "$out" = "sourced marker" ]' _ "$FP"
 
+# interp_p2 — does the RESOLVED INTERPRETER satisfy the P2 gate? This is a DIFFERENT question from
+# host_row above, and conflating them is what turned macos-latest red.
+#
+# host_row also requires the host's (macOS, Darwin) pair to be in SUPPORTED_P2_OS_ROWS, because that
+# is what admits a LEDGER WRITE. `firm-python --status` and `--require-p2` answer only about the
+# interpreter — Darwin, arm64, 3.9.6, cpython — and its header says so. The two diverge exactly on a
+# Darwin/arm64 host that ships a compliant 3.9.6 but whose OS row has not been proven: macos-latest
+# is precisely that host, so the suite asked "is this a supported WRITE host" and asserted the answer
+# against a flag reporting "is this a supported INTERPRETER". p2=yes was correct; the prediction was
+# not.
+#
+# This never showed up before because the macOS job died at dependency install, so this arm had not
+# run in CI at all. Fixing that install exposed it.
+interp_p2="$("$FP" - <<'PY'
+import platform, sys
+print("yes" if (
+    platform.system() == "Darwin"
+    and platform.machine() == "arm64"
+    and tuple(sys.version_info[:3]) == (3, 9, 6)
+    and sys.implementation.name == "cpython"
+) else "no")
+PY
+)" || interp_p2=""
+[ -n "$interp_p2" ] || interp_p2=no
+
 t_case "the host classification the resolver reaches is the one the writer enforces"
-if [ "$host_row" = exact ]; then
-  assert_output "--status reports p2=yes on a supported host" "p2=yes" "$FP" --status
-  assert_rc "--require-p2 runs the program here" 0 "$FP" --require-p2 -c 'pass'
+if [ "$interp_p2" = yes ]; then
+  assert_output "--status reports p2=yes when the resolved interpreter is compliant" "p2=yes" "$FP" --status
+  assert_rc "--require-p2 runs the program when the interpreter is compliant" 0 "$FP" --require-p2 -c 'pass'
   assert_ok "the resolved interpreter satisfies every interpreter clause of the gate" "$FP" -c '
 import os, platform, sys
 assert platform.system() == "Darwin", platform.system()
@@ -95,9 +120,9 @@ assert sys.implementation.name == "cpython", sys.implementation.name
 assert isinstance(sys.executable, str) and sys.executable and os.path.isabs(sys.executable)
 '
 else
-  assert_output "--status reports p2=no on an unsupported host" "p2=no" "$FP" --status
+  assert_output "--status reports p2=no when no compliant interpreter resolves" "p2=no" "$FP" --status
   assert_output "--status names what it probed" "probed:" "$FP" --status
-  assert_rc "--require-p2 fails closed with the write-unsupported class" 17 "$FP" --require-p2 -c 'pass'
+  assert_rc "--require-p2 fails closed (17) when no compliant interpreter resolves" 17 "$FP" --require-p2 -c 'pass'
 fi
 
 t_case "a host with NO compliant interpreter fails closed and never silently substitutes one"

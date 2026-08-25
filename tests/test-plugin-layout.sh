@@ -150,14 +150,24 @@ rm -f "$HOOK_PROJECT/.codex/hooks.json"
 doctor_clean_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
   FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
   "$BIN/firm-doctor" 2>&1)"; doctor_clean_rc=$?
-assert_eq "readiness returns after the duplicate-only prototype is removed" "0" "$doctor_clean_rc"
+if t_p2_row_supported; then
+  assert_eq "readiness returns after the duplicate-only prototype is removed" "0" "$doctor_clean_rc"
+else
+  t_skip "readiness returns after the duplicate-only prototype is removed" \
+    "firm-doctor's P2 row gate cannot pass off a supported (macOS, Darwin) host, so readiness 0 is unattainable here"
+fi
 
 t_case "doctor binds both provider probes to the canonical reviewer envelope"
 : > "$provider_log"
 doctor_probe_out="$(cd "$HOOK_PROJECT" && HOME="$HOOK_PROJECT/home" PYTHONPATH="$hook_pythonpath" \
   FIRM_TEST_PROVIDER_LOG="$provider_log" PATH="$HOOK_PROJECT/provider-stubs:/usr/bin:/bin" \
   "$BIN/firm-doctor" --probe 2>&1)"; doctor_probe_rc=$?
-assert_eq "canonical disposable provider probes pass" "0" "$doctor_probe_rc"
+if t_p2_row_supported; then
+  assert_eq "canonical disposable provider probes pass" "0" "$doctor_probe_rc"
+else
+  t_skip "canonical disposable provider probes pass" \
+    "firm-doctor's P2 row gate cannot pass off a supported (macOS, Darwin) host, so probe rc 0 is unattainable here"
+fi
 assert_output "doctor reports both canonical reviewer displays, models, and xhigh effort" \
   "canonical reviewer models: GPT=GPT-5.6 sol (gpt-5.6-sol, xhigh) · Claude=Opus 5 (opus, xhigh)" \
   printf '%s\n' "$doctor_probe_out"
