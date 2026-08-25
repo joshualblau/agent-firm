@@ -52,7 +52,32 @@ assert marker in source, "the anchor comment moved; update this mutant"
 open(sys.argv[2], "w", encoding="utf-8").write(
     source.replace(marker, marker + "\n# reintroduce the provider" + chr(39) + "s prose apostrophe"))
 PY
-assert_fail "an apostrophe in that heredoc body is a parse error, not a silent exit 2" \
-  bash -n "$work/mutant"
+# WHICH BASH PARSES THE MUTANT MATTERS, and the original form of this case did not say so.
+# The 2026-08-23 breakage is a bash 3.2 parser limitation: an apostrophe inside a heredoc body that
+# lives in a $(...) substitution terminates the quote early THERE, and does not on bash 4+. Measured:
+# bash 3.2.57 rejects it (rc 2) and bash 5.3.15 parses the same bytes clean. The exact 3.2 wording
+# is `unexpected EOF while looking for matching "'"` followed by `syntax error: unexpected end of
+# file` -- NOT the `unexpected token '('` this comment claimed before it was checked, which matters
+# because it is the message a future reader will be grepping for. Re-measured against the mutant
+# this case builds. The limitation is also narrower than "an apostrophe": 3.2 does track double
+# quotes, so it breaks only on an apostrophe OUTSIDE a double-quoted span -- which is exactly what
+# the mutant appends, and exactly what the editor note in bin/firm-run-evals now says. Asserting the failure against whatever `bash` happens to be first on PATH therefore pins a
+# platform behaviour as if it were universal — it passes on the macOS 3.2 leg and can NEVER pass on
+# a Linux runner, which is what turned this suite red on ubuntu.
+#
+# macOS Bash 3.2 is a supported target, so the check is worth keeping. It is run against a bash that
+# actually exhibits the limitation, and where none is available it SKIPS OUT LOUD rather than passing
+# quietly — an assertion that cannot fail is worse than one that is visibly not run.
+bash32=""
+for _b in /bin/bash "$(command -v bash 2>/dev/null)"; do
+  [ -n "$_b" ] && [ -x "$_b" ] || continue
+  case "$("$_b" --version 2>/dev/null | head -1)" in *"version 3."*) bash32="$_b"; break ;; esac
+done
+if [ -n "$bash32" ]; then
+  assert_fail "an apostrophe in that heredoc body is a parse error under bash 3.2, not a silent exit 2" \
+    "$bash32" -n "$work/mutant"
+else
+  printf '      SKIP (no bash 3.2 on this host; the 2026-08-23 heredoc breakage was NOT checked)\n'
+fi
 
 t_summary

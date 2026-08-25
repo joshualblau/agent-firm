@@ -85,7 +85,17 @@ def build_environment(provider, home, seal_only):
         if value is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
             env[name] = value
     for item in declared["materialize"]:
-        source = Path(os.path.expanduser(item["source"]))
+        # The declared source may name a configurable store. `${CODEX_HOME:-~/.codex}` is resolved
+        # the way bin/firm-reviewer-common resolves it, and NOT with expanduser alone: expanduser
+        # leaves the ${...} untouched, which turned a correct declaration into CANNOT CHECK. It also
+        # matters for what this file is FOR -- tests/test-reviewer-hermeticity.sh exports a fixture
+        # CODEX_HOME so the operator's real credential is never the one being copied about.
+        spec = item["source"]
+        if spec.startswith("${CODEX_HOME:-~/.codex}"):
+            base = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+            source = Path(base) / spec[len("${CODEX_HOME:-~/.codex}/"):]
+        else:
+            source = Path(os.path.expanduser(spec))
         destination = home.joinpath(*Path(item["destination"]).parts)
         if not source.is_file() or source.is_symlink():
             cannot_check(f"declared credential source is missing or unsafe: {item['source']}")
@@ -107,20 +117,51 @@ def probe(provider, env):
                           timeout=120)
     body = (done.stdout + done.stderr).decode("utf-8", "replace")
     matched = []
+    node = None
+    if declared["shape"] == "json":
+        try:
+            data = json.loads(body)
+        except Exception:                                       # noqa: BLE001
+            data = None
+        if isinstance(data, dict):
+            # The declaration may pin the report envelope and name the entry the answer comes out
+            # of. `codex doctor --json` needs both: it reports the WHOLE installation, so a bare
+            # top-level read would take an unrelated check's `status` for the auth answer.
+            node = data
+            for key, expected in (declared.get("envelope") or {}).items():
+                if data.get(key) != expected:
+                    node = None
+                    break
+            if node is not None:
+                for step in (declared.get("path") or []):
+                    node = node.get(step) if isinstance(node, dict) else None
+                if not isinstance(node, dict):
+                    node = None
+            if node is not None:
+                for key, expected in (declared.get("require_fields") or {}).items():
+                    if node.get(key) != expected:
+                        node = None
+                        break
     for answer in declared["answers"]:
         if declared["shape"] == "json":
-            try:
-                data = json.loads(body)
-            except Exception:                                   # noqa: BLE001
+            if node is None:
                 continue
-            value = data.get(answer["key"]) if isinstance(data, dict) else None
-            if isinstance(value, bool) and value is answer["value"]:
+            value = node.get(answer["key"])
+            if isinstance(answer["value"], bool):
+                if isinstance(value, bool) and value is answer["value"]:
+                    matched.append(answer)
+            elif isinstance(value, str) and value == answer["value"]:
                 matched.append(answer)
         else:
             lines = [line.strip() for line in body.splitlines() if line.strip()]
             if any(re.fullmatch(answer["line"], line) for line in lines):
                 matched.append(answer)
-    if len(matched) != 1 or done.returncode not in matched[0]["exit_codes"]:
+    if len(matched) != 1:
+        return None, None
+    # `exit_codes: None` means the surface's exit status summarises unrelated checks and is declared
+    # not to be the auth answer, so it may not veto the document either.
+    codes = matched[0]["exit_codes"]
+    if codes is not None and done.returncode not in codes:
         return None, None
     return matched[0]["answer"], matched[0].get("reason")
 
@@ -132,13 +173,34 @@ for provider in wanted:
         home = Path(work) / "credentialed"
         home.mkdir(mode=0o700)
         env = build_environment(provider, home, seal_only=False)
-        answer, reason = probe(provider, env)
-        if answer != "ready":
-            failures.append(
-                f"{provider}: the declared passthrough did NOT authenticate "
-                f"(answer={answer!r} reason={reason!r}). The judge cannot run in this direction.")
+
+        # "THE OPERATOR HAS NOT SUPPLIED IT" IS NOT "THE DECLARATION IS WRONG", and this file has to
+        # tell them apart or it reports a host condition as a defect. The FILE half already did:
+        # build_environment() calls cannot_check() when a declared copy source is missing. The
+        # ENVIRONMENT half did not, because when it was written the only declared inheritance was
+        # USER, which every host has. The claude credential is now CLAUDE_CODE_OAUTH_TOKEN, which
+        # the OPERATOR mints with `claude setup-token` and which this wrapper may only consume --
+        # so on a host where none has been minted the honest report is UNVERIFIED, not FAIL, and
+        # the wrapper's own behaviour in that state (a trusted exit 3 authentication
+        # unavailability, never a BLOCK and never a guess) is still asserted by the fail-closed arm
+        # below and by tests/test-provider-reviewers.sh.
+        declared_credentials = [name for name in published["credentials"][provider]["inherit_environment"]
+                                if name.endswith("_TOKEN") or name.endswith("_KEY")]
+        supplied = [name for name in declared_credentials if os.environ.get(name)]
+        if declared_credentials and not supplied:
+            notes.append(
+                f"{provider}: UNVERIFIED — the declared credential "
+                f"{', '.join(declared_credentials)} is not present in this environment, so the "
+                f"authenticating half of its passthrough was NOT checked. Mint one with "
+                f"`claude setup-token` and export it to check it here.")
         else:
-            notes.append(f"{provider}: declared passthrough authenticates (readiness = ready)")
+            answer, reason = probe(provider, env)
+            if answer != "ready":
+                failures.append(
+                    f"{provider}: the declared passthrough did NOT authenticate "
+                    f"(answer={answer!r} reason={reason!r}). The judge cannot run in this direction.")
+            else:
+                notes.append(f"{provider}: declared passthrough authenticates (readiness = ready)")
 
         # THE CANARY, AND EXACTLY WHAT IT IS. It asks one narrow question: does a path INSIDE the
         # sealed home resolve onto the operator's real surface? That is a question about the SHAPE

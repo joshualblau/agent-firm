@@ -399,19 +399,27 @@ rendered = sorted((enclosing(node), ast.unparse(node)) for node in executable_li
 # launch site anywhere, including one that copies an existing argv verbatim, adds an entry.
 assert rendered == [
     ("<module>", "[executable]"),            # capability discovery probe base: + subcommand + --help
+    ("model_invocation", "[executable]"),    # the single model-catalog argv, + MODEL_CATALOG_CONTRACT
     ("readiness_invocation", "[executable]"),  # the single readiness argv, + READINESS_CONTRACT command
 ], rendered   # ...and nothing else in the module builds a provider argv
+# THE MODEL PROBE EARNED ITS ENTRY THE SAME WAY THE READINESS ONE DID. It came back in this merge --
+# `codex debug models` is a real catalog, and lifecycle.md requires configured-model readiness that
+# cannot be established to be RECORDED rather than assumed -- and it arrived written inline, as
+# `[executable, "debug", "models"]` at module scope. This assertion caught that on the first run,
+# which is exactly what it is for: an inline provider argv is how the wrapper carried three commands
+# no CLI has. It is declared in MODEL_CATALOG_CONTRACT and built by one function now, so the entry
+# above names a CONSTRUCTION, not a literal command line.
 PY
 
 t_case "reviewer launch envelopes are resolver-bound, uniquely constructed, and literal"
 assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" \
-  python3 "$W/reviewer-envelope-check.py" "$BIN/firm-reviewer-common"
+  t_python "$W/reviewer-envelope-check.py" "$BIN/firm-reviewer-common"
 # Prove the restored module-wide uniqueness assertion BITES. Review defeated the function-scoped
 # version with exactly this mutant: a second, env-gated launch site outside the judge constructors
 # carrying an undeclared control. It passed the function-scoped check AND the drift check. It must
 # not pass now — a launch line built anywhere else is a launch line no capability probe has seen.
 cp "$BIN/firm-reviewer-common" "$W/mutant-second-launch-site"
-python3 - "$W/mutant-second-launch-site" <<'MUT'
+t_python - "$W/mutant-second-launch-site" <<'MUT'
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
@@ -425,14 +433,14 @@ open(path, "w", encoding="utf-8").write(text.replace(anchor, fallback + anchor))
 MUT
 chmod +x "$W/mutant-second-launch-site"
 assert_fail "a second launch site outside the judge constructors is caught" \
-  python3 "$W/reviewer-envelope-check.py" "$W/mutant-second-launch-site"
+  t_python "$W/reviewer-envelope-check.py" "$W/mutant-second-launch-site"
 
 t_case "it bites: a second launch site hidden behind a prefix argument"
 # Review's defeat of the positional predicate. `env` (or any wrapper binary) in front of the
 # executable makes the argv invisible to a first-element rule while still launching a provider with
 # controls no capability probe has seen.
 cp "$BIN/firm-reviewer-common" "$W/mutant-prefixed-launch-site"
-python3 - "$W/mutant-prefixed-launch-site" <<'MUT'
+t_python - "$W/mutant-prefixed-launch-site" <<'MUT'
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
@@ -445,6 +453,6 @@ prefixed = (
 open(path, "w", encoding="utf-8").write(text.replace(anchor, prefixed + anchor))
 MUT
 assert_fail "a launch site behind a prefix argument is caught" \
-  python3 "$W/reviewer-envelope-check.py" "$W/mutant-prefixed-launch-site"
+  t_python "$W/reviewer-envelope-check.py" "$W/mutant-prefixed-launch-site"
 
 t_summary

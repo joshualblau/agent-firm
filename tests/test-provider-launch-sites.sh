@@ -21,7 +21,7 @@ if ! command -v codex >/dev/null 2>&1 || ! command -v claude >/dev/null 2>&1; th
 fi
 
 t_case "every launch site in the repository is accounted for and lands on a surface that accepts it"
-CLEAN="$(python3 "$SCAN" "$REPO" 2>&1)"; clean_rc=$?
+CLEAN="$(t_python "$SCAN" "$REPO" 2>&1)"; clean_rc=$?
 assert_eq "the repository-wide scan passes" "0" "$clean_rc"
 printf '%s\n' "$CLEAN" | sed 's/^/      /'
 assert_ok "the scan actually scanned files rather than finding nothing to do" \
@@ -38,7 +38,7 @@ mutant() { # <name> <expected substring> <mutation>...
   local args=()
   local one
   for one in "$@"; do args+=(--mutate "$one"); done
-  out="$(python3 "$SCAN" "$REPO" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
+  out="$(t_python "$SCAN" "$REPO" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ]; then
     _t_no "mutant is caught: $name" "the scan PASSED a mutated repository"
     return
@@ -51,14 +51,28 @@ mutant() { # <name> <expected substring> <mutation>...
 }
 
 t_case "the mutants that matter"
+# MUTATION ANCHORS ARE SOURCE LITERALS, so they moved when the source did. `codex -a never exec`
+# is no longer written anywhere: the merge that produced this comment measured that codex ACCEPTS a
+# root-position `-a` and then DISCARDS it (rc 0, and not even validated -- `codex -s bogus exec
+# --help` is rc 0 while `codex --sandbox bogus --help` is rc 2), so moving the control in front of
+# the subcommand bought a clean exit status and no approval policy at all. Every mutant below still
+# injects the SAME defect into the SAME file and still expects the same finding; only the `from`
+# side of each rewrite changed, from the intermediate repair to the argv that is actually shipped.
+#
+# WHAT NO MUTANT HERE CAN CATCH, recorded because the gap is the interesting part: this scanner asks
+# whether a surface ACCEPTS a control, never whether it HONOURS one. `codex -a never exec ...`
+# passes every check in this file. A help text cannot answer the second question, so the defence is
+# upstream -- state policy only through a control the INVOKED surface documents, and pair it with
+# --strict-config so an unrecognised key is an error rather than a silent no-op.
+#
 # THE ONE THAT WAS REAL, in the file where it was real.
 mutant "the 2026-08-23 defect itself: -a moved after exec in firm-run-evals" \
   'is passed on `codex exec --help`' \
-  'bin/firm-run-evals:codex -a never exec --ephemeral:codex exec -a never --ephemeral'
+  'bin/firm-run-evals:codex exec --ephemeral:codex exec -a never --ephemeral'
 # THE SECOND COPY, in firm-doctor, whose failure path is only a warn.
 mutant "the same defect in firm-doctor's probe" \
   'is passed on `codex exec --help`' \
-  'bin/firm-doctor:codex -a never exec --skip-git-repo-check:codex exec -a never --skip-git-repo-check'
+  'bin/firm-doctor:codex exec --skip-git-repo-check:codex exec -a never --skip-git-repo-check'
 # THE FOURTH COPY NOBODY HAS WRITTEN YET. A new file that launches a provider CLI and is not in
 # LAUNCH_OWNERS must fail on the day it is written, not by accident two changes later.
 mutant "an unregistered file that launches a provider CLI" \
@@ -82,7 +96,7 @@ t_case "the scanner's own blind spots"
 # surface check and the LAUNCH_OWNERS coverage rule.
 mutant "controls built from an array expansion are CANNOT CHECK, not a silent skip" \
   'CANNOT BE CHECKED' \
-  'bin/firm-run-evals:codex -a never exec --ephemeral:codex "${badargs[@]}" --ephemeral'
+  'bin/firm-run-evals:codex exec --ephemeral:codex "${badargs[@]}" --ephemeral'
 mutant "an executable held in a variable is still a launch, and still needs an owner" \
   'not accounted for in LAUNCH_OWNERS' \
   "bin/firm-version:#!/usr/bin/env bash:#!/usr/bin/env bash
@@ -102,7 +116,7 @@ measured() { # <name> <expected substring> <registry-json> [mutation]...
   local one
   for one in "$@"; do args+=(--mutate "$one"); done
   printf '%s' "$registry" > "$T_REGISTRY"
-  out="$(python3 "$SCAN" "$REPO" --measurements "$T_REGISTRY" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
+  out="$(t_python "$SCAN" "$REPO" --measurements "$T_REGISTRY" ${args[@]+"${args[@]}"} 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ]; then
     _t_no "measurement is rejected: $name" "the scan PASSED with that measurement"
   elif printf '%s' "$out" | grep -q -- "$expect"; then
@@ -112,11 +126,15 @@ measured() { # <name> <expected substring> <registry-json> [mutation]...
   fi
 }
 T_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-measurements.XXXXXX")"; t_track "$T_REGISTRY"
-VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.238","date":"2026-08-23","argv":["claude","--max-turns","3","-p","x"],"rc":0,"observed":"ok"}}]'
+# The control fixture has to name the version that is INSTALLED, or it fails the staleness rule
+# instead of proving the seam works -- which is what it did after this branch was written against
+# claude 2.1.238 and landed on a host running 2.1.234. Re-measured 2026-08-25; the record in
+# tests/provider-launch-scan.py was re-taken at the same time and for the same reason.
+VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.234","date":"2026-08-25","argv":["claude","--max-turns","3","-p","x"],"rc":1,"observed":"rc 1 from unrecognized_model, not from an unknown option"}}]'
 
 # Control: the real, well-formed measurement still passes through the seam, so the cases below fail
 # for their own reason and not because the seam breaks everything.
-CLEAN_SEAM="$(python3 "$SCAN" "$REPO" --measurements <(printf '%s' "$VALID") 2>&1)"; seam_rc=$?
+CLEAN_SEAM="$(t_python "$SCAN" "$REPO" --measurements <(printf '%s' "$VALID") 2>&1)"; seam_rc=$?
 assert_eq "a well-formed current measurement still passes through the seam" "0" "$seam_rc"
 
 # THE ONE THAT MATTERS: a measurement must not launder the cross-surface union. `-a` is documented
@@ -124,7 +142,7 @@ assert_eq "a well-formed current measurement still passes through the seam" "0" 
 measured "it cannot excuse a control the PARENT surface documents (the forbidden union)" \
   'cross-surface union this scanner exists to reject' \
   '[{"provider":"codex","subcommand":["exec"],"control":"-a","measurement":{"cli":"codex","version":"0.149.0","date":"2026-08-23","argv":["codex","exec","-a","never"],"rc":0,"observed":"fine, trust me"}}]' \
-  'bin/firm-run-evals:codex -a never exec --ephemeral:codex exec -a never --ephemeral'
+  'bin/firm-run-evals:codex exec --ephemeral:codex exec -a never --ephemeral'
 measured "a measurement against a CLI version that is not installed is stale, not evidence" \
   'Stale evidence is not evidence' \
   '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"0.0.0-not-installed","date":"2026-08-23","argv":["claude","--max-turns","3"],"rc":0,"observed":"ok"}}]'

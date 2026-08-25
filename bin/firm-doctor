@@ -480,16 +480,27 @@ resolve_reviewer_tuple() {
   if [ "$_override_set" = x ]; then _resolver_args+=(--expect-model "$_override"); fi
   _resolved="$($SELF/firm-model-resolve "${_resolver_args[@]}" 2>&1)"; _resolved_rc=$?
   [ "$_resolved_rc" -eq 0 ] || { printf '%s\n' "$_resolved" >&2; return "$_resolved_rc"; }
-  printf '%s' "$_resolved" | firm_python -c '
+  # A HEREDOC, NOT `-c '<multi-line>'`, and the reason is a checker rather than taste. This is the
+  # only embedded python in bin/ written as a multi-line single-quoted -c argument, and
+  # tests/provider-launch-scan.py -- which reads every tracked file looking for provider-CLI launch
+  # sites -- has to tokenise these files AS SHELL. It has strip_heredocs() for exactly this, because
+  # several firm scripts embed whole python programs; it has nothing for a quoted argument that
+  # spans lines, so this construct left its quote open across nine lines, desynchronised the
+  # tokeniser, and made the scanner report the whole provider-probe region below as CANNOT BE
+  # CHECKED. Fail-closed on the scanner's part, and correct -- but a real launch surface going
+  # unchecked, so the construct moves to the form the rest of bin/ already uses.
+  #
+  # The document arrives as argv rather than on stdin, because a heredoc IS stdin.
+  firm_python - "$_provider" "$_resolved" <<'PY'
 import json,sys
-provider=sys.argv[1]; d=json.load(sys.stdin)
+provider=sys.argv[1]; d=json.loads(sys.argv[2])
 assert set(d)=={"provider","selected_by","selector","tier","model","display","effort","policy_sha256"}
 assert d["provider"]==provider and d["selected_by"]=="role" and d["selector"]=="reviewer"
 assert d["tier"]=="heavyweight" and d["effort"]=="xhigh"
 for field in ("model","display","effort"):
  value=d[field]; assert isinstance(value,str) and value and not any(ord(ch)<32 for ch in value)
 print("\t".join((d["model"],d["display"],d["effort"])))
-' "$_provider"
+PY
 }
 
 MODEL_ENVELOPE_READY=1

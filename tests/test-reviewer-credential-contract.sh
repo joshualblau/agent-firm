@@ -20,14 +20,14 @@ CONTRACT="$("$GPT" --print-capability-contract 2>/dev/null)"
 assert_ok "introspection still succeeds with the credential declaration attached" \
   test -n "$CONTRACT"
 
-decl() { printf '%s' "$CONTRACT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["credentials"][sys.argv[1]][sys.argv[2]],sort_keys=True))' "$1" "$2"; }
+decl() { printf '%s' "$CONTRACT" | t_python -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["credentials"][sys.argv[1]][sys.argv[2]],sort_keys=True))' "$1" "$2"; }
 
 # The exact-match drift guard is on WHICH credential surfaces are passed — id, kind, source,
 # destination, exposes. It deliberately projects `caveats` out, because prose belongs in the
 # dedicated caveat cases below rather than in a byte-exact comparison that would have to be
 # rewritten every time a qualification is clarified. Nothing about which surfaces are passed is
 # loosened by that: the identity below is still pinned exactly, and "and nothing else" still holds.
-mat() { printf '%s' "$CONTRACT" | python3 -c '
+mat() { printf '%s' "$CONTRACT" | t_python -c '
 import json,sys
 items=json.load(sys.stdin)["credentials"][sys.argv[1]]["materialize"]
 print(json.dumps([{k:v for k,v in m.items() if k!="caveats"} for m in items], sort_keys=True))
@@ -35,32 +35,61 @@ print(json.dumps([{k:v for k,v in m.items() if k!="caveats"} for m in items], so
 
 assert_eq "gpt inherits NO ambient environment variable" "[]" "$(decl gpt inherit_environment)"
 assert_eq "gpt unsets nothing" "[]" "$(decl gpt unset_environment)"
-assert_eq "gpt materialises exactly a COPY of ~/.codex/auth.json and nothing else" \
-  '[{"destination": "codex/auth.json", "exposes": "codex_oauth_credential", "id": "codex_auth", "kind": "copy", "source": "~/.codex/auth.json"}]' \
+# `${CODEX_HOME:-~/.codex}` and not `~/.codex`: the store is configurable, the declaration has to
+# say so, and tests/test-reviewer-hermeticity.sh depends on it -- it runs the whole wrapper twice
+# under two synthetic CODEX_HOME values to prove the suite's result does not depend on whether the
+# operator happens to be logged in to codex. A hard-coded path here both breaks that proof and makes
+# every test run read a live operator credential.
+assert_eq "gpt materialises exactly a COPY of the codex auth credential and nothing else" \
+  '[{"destination": "codex/auth.json", "exposes": "codex_oauth_credential", "id": "codex_auth", "kind": "copy", "source": "${CODEX_HOME:-~/.codex}/auth.json"}]' \
   "$(mat gpt)"
-assert_eq "claude inherits USER and only USER" '["USER"]' "$(decl claude inherit_environment)"
-# The measured mechanism: the keychain SERVICE name is suffixed with sha256(CLAUDE_CONFIG_DIR)[:8]
-# whenever that variable is set to ANY value, so a set CLAUDE_CONFIG_DIR asks for an item that does
-# not exist. Setting it to the sealed directory is exactly what made the judge report logged out.
-assert_eq "claude UNSETS CLAUDE_CONFIG_DIR rather than sealing it" \
-  '["CLAUDE_CONFIG_DIR"]' "$(decl claude unset_environment)"
-assert_eq "claude materialises exactly the login keychain and nothing else" \
-  '[{"destination": "Library/Keychains/login.keychain-db", "exposes": "macos_login_keychain", "id": "login_keychain", "kind": "symlink", "source": "~/Library/Keychains/login.keychain-db"}]' \
-  "$(mat claude)"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# THE CLAUDE HALF WAS RULED, NOT CHOSEN, and these four cases are the ruling written down.
+#
+# This file used to assert that claude inherits USER, UNSETS CLAUDE_CONFIG_DIR, and materialises a
+# SYMLINK to ~/Library/Keychains/login.keychain-db. That mechanism WORKS -- measured, a sealed HOME
+# plus those three relieves all three keychain gates and `claude auth status --json` answers
+# {"loggedIn": true, "authMethod": "claude.ai"} without exposing the operator's ~/.claude. The claim
+# on the other side of the merge, that "no keychain route exists that does not also hand over the
+# operator's whole profile", is FALSE and that route disproves it.
+#
+# It is not declared anyway, and the reason is not a preference. The symlink is LIVE and WRITABLE --
+# an OAuth refresh writes back into the operator's own keychain item, which the original caveat
+# conceded in as many words -- and agent-firm/contracts/lifecycle.md admits a file credential only
+# "copied by value ... with the operator's own directory opened read-only and never written",
+# otherwise "the single operator-supplied credential environment variable". A live writable keychain
+# symlink is neither. Restoring it needs an operator decision AND a lifecycle.md amendment, in that
+# order; it is not an edit to bin/firm-reviewer-common alone, and these cases exist so it cannot be.
+assert_eq "claude inherits the operator-minted headless credential and only that" \
+  '["CLAUDE_CODE_OAUTH_TOKEN"]' "$(decl claude inherit_environment)"
+# The measured mechanism, kept because it is the reason the sealed value is SAFE rather than merely
+# tidy: the keychain SERVICE name is suffixed with sha256(CLAUDE_CONFIG_DIR)[:8] whenever that
+# variable is set to ANY value, so a sealed CLAUDE_CONFIG_DIR asks the keychain for an item that has
+# never existed. Unsetting it is what the keychain route needs and it has no other purpose here.
+assert_eq "claude SEALS CLAUDE_CONFIG_DIR rather than unsetting it" \
+  '[]' "$(decl claude unset_environment)"
+assert_eq "claude materialises NO file at all — the credential is not a file" \
+  '[]' "$(mat claude)"
+assert_ok "no declaration anywhere materialises a keychain, in any provider, in any spelling" \
+  sh -c "! printf '%s' \"\$1\" | grep -qi 'keychain'" sh "$CONTRACT"
+assert_ok "no declaration materialises a symlink onto a real credential surface" \
+  sh -c "! printf '%s' \"\$1\" | grep -q '\"kind\": *\"symlink\"'" sh "$CONTRACT"
+# The metered API credentials must never be forwarded: they would silently move a review off the
+# subscription authentication docs/PHASE3.md promises, and the descriptor names a file-descriptor
+# NUMBER in the operator's process, which means nothing in the judge's.
+assert_ok "no metered API credential and no descriptor is declared for inheritance" \
+  sh -c "! printf '%s' \"\$1\" | grep -qE 'ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|FILE_DESCRIPTOR'" sh "$CONTRACT"
+# ─────────────────────────────────────────────────────────────────────────────────────────────
 assert_ok "the published declaration carries no environment VALUE" \
   sh -c "! printf '%s' \"\$1\" | grep -q '\"USER\": *\"[^\"]'" sh "$CONTRACT"
 
 t_case "every exposure carries its caveats, in the same artifact as the exposure"
 # The first live GPT judge blocked on this: `macos_login_keychain` was named as an exposure while
 # both of its qualifications existed only in a handback conversation. A caveat that is not in an
-# artifact is a caveat the next reader does not get.
-KEYCHAIN="$(decl claude materialize)"
-assert_ok "the keychain exposure records that the CLI can write back through it" \
-  sh -c "printf '%s' \"\$1\" | grep -q 'WRITE BACK through it'" sh "$KEYCHAIN"
-assert_ok "the keychain exposure records that it is the one non-read-only surface" \
-  sh -c "printf '%s' \"\$1\" | grep -q 'not read-only'" sh "$KEYCHAIN"
-assert_ok "the keychain exposure records that the canary is silent on its contents" \
-  sh -c "printf '%s' \"\$1\" | grep -q 'silent on keychain CONTENTS by construction'" sh "$KEYCHAIN"
+# artifact is a caveat the next reader does not get. The keychain exposure is gone (see the ruling
+# above), so the three cases that read ITS caveats are gone with it; the pairing RULE they were
+# instances of is the last assertion in this block and covers every exposure that exists.
 assert_ok "the codex exposure records that its copy cannot be written back" \
   sh -c "printf '%s' \"\$1\" | grep -q 'cannot be written through this passthrough'" sh "$(decl gpt materialize)"
 # Guard the pairing itself: an exposure must never become publishable without its caveats.
@@ -87,9 +116,9 @@ assert_ok "the wrapper no longer defines an ISOLATED_SURFACES list" \
 assert_ok "the comment that replaced it records why the claim was false" \
   sh -c "grep -q 'THAT CLAIM WAS FALSE' \"\$1\"" sh "$COMMON"
 assert_eq "the gpt judge's read boundary is declared as the operator's uid, not the seal" \
-  '"operator_uid"' "$(decl gpt read_boundary | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
+  '"operator_uid"' "$(decl gpt read_boundary | t_python -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
 assert_eq "the claude judge's read boundary is declared as the permission system" \
-  '"permission_system"' "$(decl claude read_boundary | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
+  '"permission_system"' "$(decl claude read_boundary | t_python -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["bounded_by"]))')"
 assert_ok "the gpt declaration says plainly that reads are NOT bounded by the seal" \
   sh -c "printf '%s' \"\$1\" | grep -q 'any path readable by the operator'" sh "$(decl gpt read_boundary)"
 assert_ok "the gpt declaration records how that was established" \
@@ -102,7 +131,7 @@ for surface in agent_settings hooks plugins mcp_servers skills session_history o
 done
 
 t_case "the wire-format projection loosens what is ASKED, never what is ACCEPTED"
-PROJ="$(python3 - "$COMMON" "$SCHEMA" <<'PY'
+PROJ="$(t_python - "$COMMON" "$SCHEMA" <<'PY'
 import json,sys
 src=open(sys.argv[1]).read()
 start=src.index("TRANSPORT_SCHEMA_DROP = (")
@@ -152,7 +181,7 @@ print(json.dumps({
 }, sort_keys=True))
 PY
 )"
-proj() { printf '%s' "$PROJ" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$1"; }
+proj() { printf '%s' "$PROJ" | t_python -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$1"; }
 # claude: "--json-schema is not a valid JSON Schema: no schema with key or ref
 # https://json-schema.org/draft/2020-12/schema"
 assert_eq "the unresolvable meta-schema identity is projected away" "false" "$(proj has_schema_key)"
@@ -204,7 +233,7 @@ assert_ok "the judge prompt states the rule too, since the wire schema cannot en
 # And walk a real APPROVE-shaped verdict through the FULL path the wrapper uses: valid on the wire,
 # then valid canonically. This is the case both live runs happened to avoid by returning BLOCK.
 assert_ok "an APPROVE with empty blockers passes the wire schema AND the canonical gate" \
-  python3 - "$COMMON" "$SCHEMA" <<'PY'
+  t_python - "$COMMON" "$SCHEMA" <<'PY'
 import json, sys, jsonschema
 src = open(sys.argv[1]).read()
 ns = {}
@@ -258,7 +287,7 @@ t_case "the declaration is bound to the CLIs installed on this host"
 # are facts about the vendor binaries and this machine, so they are measured. Neither probe starts a
 # model turn. Skipped, loudly, only where a provider CLI is absent.
 if command -v codex >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
-  LIVE="$(python3 "$TESTS_DIR/credential-live-check.py" "$BIN" 2>&1)"; live_rc=$?
+  LIVE="$(t_python "$TESTS_DIR/credential-live-check.py" "$BIN" 2>&1)"; live_rc=$?
   assert_eq "the live credential binding passes (authenticates, canary clean, fails closed)" \
     "0" "$live_rc"
   printf '%s\n' "$LIVE" | sed 's/^/      /'

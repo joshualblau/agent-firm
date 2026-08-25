@@ -193,16 +193,24 @@ case "$*" in
   # which is the whole point: `wrong_surface` below inverts them.
   "exec --help")
     [ "$STUB_MODE" = discovery_hang ] && { (sleep 30) & echo $! > "$STUB_CHILD"; wait; }
-    [ "$STUB_MODE" = capability ] && { echo '--ephemeral --sandbox --model'; exit 0; }
-    [ "$STUB_MODE" = wrong_surface ] && { echo '--ephemeral --sandbox --model'; exit 0; }
-    echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'
+    [ "$STUB_MODE" = exec_discovery_error ] && { echo 'exec help is unavailable' >&2; exit 7; }
+    # capability: --ephemeral is absent from the surface that requires it.
+    [ "$STUB_MODE" = capability ] && { echo '  -s, --sandbox   -m, --model   -c, --config   --strict-config   --skip-git-repo-check --ignore-user-config --ignore-rules  --output-schema  -o, --output-last-message'; exit 0; }
+    [ "$STUB_MODE" = wrong_surface ] && { echo '  -s, --sandbox   -m, --model'; exit 0; }
+    # BOTH SPELLINGS, the way real codex prints them. CAPABILITY_CONTRACT declares the EXACT token
+    # the invocation passes and has no alias map, so a help text that offered only `--sandbox` would
+    # correctly report `-s` missing -- which is a stub defect, not a capability answer.
+    echo '  --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral  -s, --sandbox   -m, --model   -c, --config   --output-schema  -o, --output-last-message'
     exit 0 ;;
   "--help")
-    # The real top level offers --sandbox/--ask-for-approval/--model and NOT the exec-only five.
-    # Under `wrong_surface` it offers the complete set, so a probe that reads here passes when it
-    # must not.
-    [ "$STUB_MODE" = wrong_surface ] && { echo '--skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral --sandbox --config --model --output-schema --output-last-message'; exit 0; }
-    echo '--sandbox --ask-for-approval --model'
+    [ "$STUB_MODE" = discovery_error ] && { echo 'top-level help is unavailable' >&2; exit 7; }
+    # The real top level offers --sandbox/--ask-for-approval/--model and NOT the exec-only set.
+    # Under `wrong_surface` it offers the complete set, so a probe that drifted here would pass when
+    # it must not. The wrapper declares ONE gpt surface (`codex exec`), so nothing should read this
+    # arm at all during discovery -- `each provider probed the exact argv prefix its judge then
+    # invoked` is the case that pins that.
+    [ "$STUB_MODE" = wrong_surface ] && { echo '  --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral  -s, --sandbox   -m, --model   -c, --config   --output-schema  -o, --output-last-message'; exit 0; }
+    echo '  -a, --ask-for-approval   -s, --sandbox   -m, --model'
     exit 0 ;;
   # A STUB THAT ANSWERS A SURFACE THE REAL CLI DOES NOT HAVE IS THE DEFECT, NOT THE FIXTURE. These
   # two cases used to reply with tidy JSON to `login status --json` and `models list --json`; neither
@@ -377,7 +385,6 @@ case "$*" in
       echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"admin@corp.example","token":"READINESS-BODY-SENTINEL-4c19"}'
       exit 0; }
     [ "$STUB_MODE" = legacy_json_auth ] && { echo '{"status":"authenticated"}'; exit 0; }
-    echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"qa@example.com","subscriptionType":"max"}'; exit 0 ;;
     # loggedIn must be the BOOLEAN, so a stringly-typed document stays untrusted.
     [ "$STUB_MODE" = stringly_auth ] && { echo '{"loggedIn":"true","authMethod":"claude.ai"}'; exit 0; }
     # Measured on Claude Code 2.1.234 in exactly the controlled root's shape (isolated HOME,
@@ -530,13 +537,21 @@ assert_rc "missing GPT CLI is trusted unavailable" 3 \
 assert_rc "missing Claude CLI is trusted unavailable" 3 env PATH="/usr/bin:/bin" "$CLAUDE" "$RUN"
 
 t_case "capability discovery searches exactly the help surfaces the wrapper is invoked through"
-# The regression that would have caught the 2026-08-21 defect: with the required controls SPLIT
-# across `codex --help` and `codex exec --help` the way real codex-cli splits them, discovery must
-# still pass. A single top-level probe fails this; so does a single exec probe.
+# The regression that would have caught the 2026-08-21 defect. It used to say "with the required
+# controls SPLIT across `codex --help` and `codex exec --help`, discovery must probe both" -- which
+# was true only while `-a never` was passed at the top level. It is not passed at all now (`codex
+# exec` has no --ask-for-approval, and the root position accepts the flag and DISCARDS it), so the
+# gpt judge is invoked entirely at `codex exec` and that is the one surface discovery may read.
+#
+# The claim is therefore EXACTLY, not AT LEAST: probing `codex --help` as well would be a surface
+# the wrapper never invokes, which is the mirror-image defect and the one the union rule walked
+# through. `each provider probed the exact argv prefix its judge then invoked` below is the
+# structural form of the same claim.
 : > "$CALLS"
-assert_rc "GPT passes discovery with controls split across top-level and exec help" 0 review_env approve "$GPT"
-assert_output "GPT probed the top-level help surface" "args=--help" cat "$CALLS"
+assert_rc "GPT passes discovery from the one surface its judge is invoked through" 0 review_env approve "$GPT"
 assert_output "GPT probed the exec subcommand help surface, which it is invoked through" "args=exec --help" cat "$CALLS"
+assert_ok "GPT probed NOTHING else — a surface the wrapper never invokes is not a capability answer" \
+  sh -c "[ \"\$(grep -c 'args=--help' \"\$1\")\" = 0 ]" sh "$CALLS"
 : > "$CALLS"
 assert_rc "Claude passes discovery from its single correct surface" 0 review_env approve "$CLAUDE"
 assert_output "Claude probed the top-level help surface" "args=--help" cat "$CALLS"
@@ -557,24 +572,37 @@ assert_output "and says what real codex says" "unexpected argument '-a' found" \
   env STUB_CALLS=/dev/null STUB_MODE=approve "$STUB/codex" exec -a never --help
 : > "$CALLS"
 assert_rc "the real GPT invocation is one the stub accepts" 0 review_env approve "$GPT"
-assert_output "and it passes -a ahead of the exec subcommand" "args=-a never exec " cat "$CALLS"
+# `-a` IS NOT PASSED AT ALL, in either position, and this is where that is pinned on the real argv.
+# Measured on the installed codex-cli 0.147.0: `codex exec -a never --help` is rc 2, and
+# `codex -a never exec --help` is rc 0 only because root options are discarded once a subcommand
+# appears -- not even validated (`codex -s bogus exec --help` is rc 0 while `codex --sandbox bogus
+# --help` is rc 2). The policy is the typed override exec documents, with --strict-config so a
+# mistyped key is an error rather than the same silent no-op.
+assert_ok "and it passes no -a in either position" \
+  sh -c "! grep -qE ' -a | --ask-for-approval ' \"\$1\"" sh "$CALLS"
+assert_output "and it states the never-ask policy the way exec accepts it" \
+  'approval_policy=' cat "$CALLS"
+assert_output "and it refuses unrecognised config keys rather than ignoring them" \
+  "--strict-config" cat "$CALLS"
 
 t_case "a control absent from ITS OWN surface is trusted-unavailable, and says where it looked"
 assert_rc "GPT control missing from the surface that requires it stays exit 3" 3 review_env capability "$GPT"
 assert_output "the exit-3 message names the missing control and its surface" \
   '--ephemeral (required on `codex exec --help`)' review_env capability "$GPT"
 assert_output "the exit-3 message names every surface it searched" \
-  '`codex --help`, `codex exec --help`' review_env capability "$GPT"
+  '`codex exec --help`' review_env capability "$GPT"
 assert_output "Claude's exit-3 message names its one searched surface" \
   '`claude --help`' review_env capability "$CLAUDE"
 
 t_case "a control found only on a surface the wrapper does not pass it on does NOT satisfy discovery"
-# The false-positive blocker, as a regression. -a is absent from `codex --help` and present under
-# `codex exec --help`; the wrapper passes it at top level. A union rule reports this provider ready
-# and then the invocation cannot execute. Surface-scoped discovery must call it unavailable.
+# The false-positive blocker, as a regression, rebuilt on the surfaces that exist. Under
+# `wrong_surface` the stub moves the whole exec control set to `codex --help` and leaves `codex exec
+# --help` with `-s`/`-m` only. A union rule reports this provider ready off the top-level text and
+# then the judge argv cannot execute; surface-scoped discovery must call it unavailable and say
+# which surface the control was required on.
 assert_rc "wrong-surface satisfaction is still exit 3" 3 review_env wrong_surface "$GPT"
 assert_output "and the message names the control and the surface it is required on" \
-  '-a (required on `codex --help`)' review_env wrong_surface "$GPT"
+  '--ephemeral (required on `codex exec --help`)' review_env wrong_surface "$GPT"
 assert_output "and says being on another surface does not satisfy it" \
   'being present on a different surface does not satisfy it' review_env wrong_surface "$GPT"
 
@@ -582,8 +610,12 @@ t_case "a help surface that cannot be READ is a BLOCK, never a trusted unavailab
 # The distinction that made the original defect survivable at all: "the probe broke" (exit 1, BLOCK)
 # and "the provider lacks a control" (exit 3, trusted waiver path) are different facts. Collapsing
 # them would turn every transient CLI hiccup into a silently waived second voice.
-assert_rc "GPT top-level help error BLOCKs" 1 review_env discovery_error "$GPT"
-assert_rc "GPT exec help error BLOCKs even though the first surface succeeded" 1 review_env exec_discovery_error "$GPT"
+# `discovery_error` breaks the codex TOP-LEVEL help, which the wrapper no longer probes -- so it is
+# no longer a gpt case at all, and asserting a BLOCK from it would be asserting that an unread
+# surface can break a run. `exec_discovery_error` breaks the surface that IS probed, and that is the
+# one that must BLOCK rather than degrade to a waivable exit 3.
+assert_rc "GPT exec help error BLOCKs" 1 review_env exec_discovery_error "$GPT"
+assert_rc "GPT is unaffected by an error on a surface it does not probe" 0 review_env discovery_error "$GPT"
 assert_rc "Claude help error BLOCKs" 1 review_env discovery_error "$CLAUDE"
 assert_output "the BLOCK names the surface that failed" "codex exec --help" review_env exec_discovery_error "$GPT"
 
@@ -767,12 +799,40 @@ def keywords(node, seen=None):
             keywords(value, seen)
     return seen
 
-rejected = ["uniqueItems", "minItems", "maxItems", "minLength", "maxLength", "pattern",
-            "minimum", "maximum", "multipleOf", "allOf", "anyOf", "oneOf", "not",
+# MEASURED, NOT ASSUMED, AND THE LIST GOT SHORTER FOR IT.
+#
+# This list used to include pattern/minLength/maxLength/minimum/maximum/multipleOf/minItems/maxItems
+# on the reasoning that a structured-output dialect refuses assertion keywords wholesale. Re-measured
+# 2026-08-25 against the installed Claude Code 2.1.234, with an unreachable --model so the run stops
+# locally at duration_api_ms 0 and total_cost_usd 0 and nothing is billed:
+#
+#   claude --json-schema <canonical>                 Error: --json-schema is not a valid JSON Schema
+#                                                    (the CONTROL: local validation really does bite)
+#   claude --json-schema <projection WITH pattern,
+#                          minLength, minimum>       accepted; the run proceeds to the model-name
+#                                                    error, so the schema itself was not refused
+#
+# So those keywords are NOT rejected, and removing them was not free: they sit on PROPERTIES, and
+# projecting `pattern` away was measured making a live claude judge return a blocker id of
+# `BLOCKER-6` and an empty `environment`, which the canonical gate then refused -- a good verdict
+# killed by a rule the judge had never been shown. What IS refused is the top-level combinator and
+# the meta-schema identity, and `uniqueItems` is refused by codex (`invalid_json_schema ...
+# 'uniqueItems' is not permitted`). Those stay on the list.
+#
+# minItems/maxItems/const are absent from the projection anyway -- they live ONLY inside the
+# top-level allOf, which does have to go -- so they are asserted below as carried prose instead.
+rejected = ["uniqueItems", "allOf", "anyOf", "oneOf", "not",
             "if", "then", "else", "$schema", "$id"]
 present = keywords(projected)
 left = [name for name in rejected if name in present]
 assert not left, "the generation projection still carries keywords a provider rejects: %r" % left
+# The other direction, and it is the one that stops this becoming a licence to project anything
+# away: a constraint that a provider ACCEPTS must still be on the wire, not merely in prose.
+for kept in ("pattern", "minLength", "minimum"):
+    assert kept in present, (
+        "the projection dropped %r, which both providers accept. Projecting an accepted constraint "
+        "away only makes the judge likelier to return a verdict the canonical gate then refuses; "
+        "that was measured happening to a live claude judge." % kept)
 
 # Every constraint the projection had to drop must survive as prose the provider DOES accept,
 # otherwise "we removed it from the hint" really would mean "we stopped asking for it".
@@ -788,9 +848,17 @@ def walk(node, out):
 prose = []
 walk(projected, prose)
 prose = " ".join(prose)
-for needle in ("^obj-[A-Za-z0-9._:-]{1,128}$", "^[0-9a-f]{40}$", "^AC-[0-9]{3}$",
-               "uniqueItems True", "minLength 1", "minimum 1"):
-    assert needle in prose, "constraint %r was dropped without being carried into a description" % needle
+# The patterns are on the WIRE now, and they are also in the prose the canonical schema carries,
+# which is what keeps them visible to a judge whose provider ever stops accepting them.
+for needle in ("^obj-[A-Za-z0-9._:-]{1,128}$", "^[0-9a-f]{40}$", "^AC-[0-9]{3}$"):
+    assert needle in json.dumps(projected), (
+        "constraint %r is neither on the wire nor in a description" % needle)
+# The one rule the wire genuinely CANNOT carry: the top-level allOf relating `verdict` to
+# `blockers`/`blocker_objects` is rejected by claude ("input_schema does not support oneOf, allOf,
+# or anyOf at the top level"), so it must appear verbatim in the descriptions of the three fields it
+# governs. This is the assertion that stops the combinator being dropped silently.
+for needle in ("BLOCK", "blocker_objects"):
+    assert needle in prose, "the allOf rule was dropped without being carried into a description"
 
 # The canonical schema is untouched: it is still the strict document, and it is still the validator.
 canon = keywords(canonical)
@@ -833,12 +901,21 @@ assert "--json-schema" in blob, "claude was never handed a --json-schema payload
 payload = blob.split("--json-schema", 1)[1].split("--permission-mode", 1)[0]
 # Match KEYS, not substrings: the carried prose deliberately names the constraint it replaced
 # ("MUST satisfy: uniqueItems True."), so a bare substring test would flag its own fix.
-for rejected in ('"uniqueItems":', '"allOf":', '"$schema":', '"pattern":', '"minLength":', '"minItems":'):
+# What claude really refuses, measured 2026-08-25 on Claude Code 2.1.234 with an unreachable model
+# so nothing is billed: the meta-schema identity ('no schema with key or ref
+# "https://json-schema.org/draft/2020-12/schema"') and the top-level combinator ("input_schema does
+# not support oneOf, allOf, or anyOf at the top level"). NOT pattern/minLength/minimum -- a
+# projection carrying all three was accepted by the same local validator that rejects the canonical
+# document, so those are asserted PRESENT below rather than absent.
+for rejected in ('"uniqueItems":', '"allOf":', '"$schema":', '"$id":'):
     assert rejected not in payload, (
-        "claude was handed a schema still carrying the %s keyword; ajv strict mode refuses it "
-        "(measured: 'no schema with key or ref \"https://json-schema.org/draft/2020-12/schema\"' and "
-        "four strictTypes errors)" % rejected)
-assert "MUST satisfy" in payload, "the projected schema lost the carried constraint prose"
+        "claude was handed a schema still carrying the %s keyword; local --json-schema validation "
+        "refuses it (measured: the canonical document is `--json-schema is not a valid JSON Schema`)"
+        % rejected)
+for kept in ('"pattern":', '"minLength":'):
+    assert kept in payload, (
+        "claude was handed a schema WITHOUT %s. It accepts them, and dropping `pattern` was measured "
+        "making a live claude judge emit a blocker id the canonical gate then refused." % kept)
 assert "^obj-[A-Za-z0-9._:-]{1,128}$" in payload, "the blocker-id pattern was dropped, not carried"
 PY
 # And the readiness output ceiling: a catalog bigger than the judge's --max-output must still be

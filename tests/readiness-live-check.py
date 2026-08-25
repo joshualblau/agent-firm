@@ -69,6 +69,27 @@ def run(argv, env=None):
     return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
+def answer_node(declaration, data):
+    """The object readiness_answer() reads its answer OUT OF, or None.
+
+    A declaration may name an envelope the whole report must match, a path to the entry that carries
+    the answer, and fields that entry must use to identify itself. `codex doctor --json` needs all
+    three: it reports the whole installation, so `status` at the top level is the WRONG status and
+    `checks["auth.credentials"]` is the right one only when it says it is the auth check."""
+    for key, expected in (declaration.get("envelope") or {}).items():
+        if data.get(key) != expected:
+            return None
+    node = data
+    for step in (declaration.get("path") or []):
+        node = node.get(step) if isinstance(node, dict) else None
+    if not isinstance(node, dict):
+        return None
+    for key, expected in (declaration.get("require_fields") or {}).items():
+        if node.get(key) != expected:
+            return None
+    return node
+
+
 def classify(declaration, exit_code, text):
     """Apply the declaration exactly as readiness_answer() in bin/firm-reviewer-common does."""
     matched = []
@@ -79,9 +100,15 @@ def classify(declaration, exit_code, text):
             return None
         if not isinstance(data, dict):
             return None
+        node = answer_node(declaration, data)
+        if node is None:
+            return None
         for answer in declaration["answers"]:
-            value = data.get(answer["key"], None)
-            if isinstance(value, bool) and value is answer["value"]:
+            value = node.get(answer["key"], None)
+            if isinstance(answer["value"], bool):
+                if isinstance(value, bool) and value is answer["value"]:
+                    matched.append(answer)
+            elif isinstance(value, str) and value == answer["value"]:
                 matched.append(answer)
     else:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -90,9 +117,46 @@ def classify(declaration, exit_code, text):
                 matched.append(answer)
     if len(matched) != 1:
         return None
-    if exit_code not in matched[0]["exit_codes"]:
+    # `exit_codes: None` is declared only alongside exit_status_is_the_answer False, and only for a
+    # surface measured to summarise unrelated checks in its status. It is mirrored here rather than
+    # reimplemented, because this file exists to apply the wrapper's own rule to a real CLI.
+    codes = matched[0]["exit_codes"]
+    if codes is not None and exit_code not in codes:
         return None
     return matched[0]["answer"]
+
+
+def ambient_environment(name, contract, scratch):
+    """The ambient environment, with the provider's config directory redirected onto a scratch copy
+    of the declared credential. Returns None (meaning "inherit ambient unchanged") when there is no
+    file credential to copy, so nothing is silently withheld from the probe."""
+    declared = ((contract.get("credentials") or {}).get(name) or {}).get("materialize") or []
+    copies = [item for item in declared if item.get("kind") == "copy"]
+    if not copies:
+        return None
+    env = dict(os.environ)
+    provider_home = os.path.join(scratch, "provider")
+    os.makedirs(provider_home, mode=0o700, exist_ok=True)
+    seeded = False
+    for item in copies:
+        spec = item["source"]
+        if spec.startswith("${CODEX_HOME:-~/.codex}"):
+            base = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+            source = os.path.join(base, spec[len("${CODEX_HOME:-~/.codex}/"):])
+        else:
+            source = os.path.expanduser(spec)
+        target = os.path.join(provider_home, os.path.basename(item["destination"]))
+        try:
+            shutil.copyfile(source, target)
+            os.chmod(target, 0o400)
+            seeded = True
+        except OSError:
+            continue
+    if not seeded:
+        return None
+    if name == "gpt":
+        env["CODEX_HOME"] = provider_home
+    return env
 
 
 def logged_out_environment(scratch):
@@ -165,7 +229,21 @@ def main():
                     f"`unavailable` answer. The declared shape no longer matches the real CLI")
 
         # (A) the ambient arm — 'ready' here is what lets a second voice run at all.
-        rc, text = run(argv)
+        #
+        # IT RUNS AGAINST A COPY OF THE CREDENTIAL, NEVER AGAINST THE OPERATOR'S STORE. The declared
+        # gpt probe is `codex doctor --json`, and codex doctor WRITES: measured 2026-08-25, it
+        # creates `tmp/arg0/...` inside whatever CODEX_HOME it is given. A check that runs it with
+        # the ambient CODEX_HOME therefore mutates the operator's real ~/.codex as a side effect of
+        # testing a declaration, which this file must not do -- and running the probe in the
+        # operator's whole profile was never what the ambient arm was for anyway. What it is for is
+        # "does a real, AUTHENTICATED CLI classify as ready", and the thing that makes it
+        # authenticated is exactly the artifact CREDENTIAL_CONTRACT copies. So the arm is given the
+        # same environment the judge gets: a scratch provider directory holding a copy of the
+        # declared credential and nothing else. If the credential is absent the arm still runs
+        # ambient, because then there is nothing to protect and nothing to copy.
+        with tempfile.TemporaryDirectory(prefix="firm-readiness-live-") as live_scratch:
+            ambient_env = ambient_environment(name, contract, live_scratch)
+            rc, text = run(argv, env=ambient_env)
         if rc is None:
             problems.append(f"{name}: `{label}` could not run in the ambient environment: {text}")
         else:
@@ -182,7 +260,12 @@ def main():
                       f"{EXECUTABLE[name]}, so the 'ready' half of its declaration was NOT confirmed "
                       f"against a real authenticated CLI. Only the unavailable half is pinned here")
 
-        # Every declared response key must be emitted by a real CLI.
+        # Every declared response key must be emitted by a real CLI -- AT THE PLACE THE DECLARATION
+        # SAYS IT READS IT. Looking at the top level would call `status` emitted for `codex doctor
+        # --json`, which prints several unrelated ones, while the declaration reads exactly the one
+        # inside the identified auth entry. Asking the shallower question would let a key that is
+        # real somewhere else pass as a key that is real HERE, which is the same class of mistake as
+        # the union-satisfaction defect on the capability side.
         for key in declaration["keys"]:
             emitted = False
             for text in payloads:
@@ -190,7 +273,10 @@ def main():
                     data = json.loads(text)
                 except Exception:
                     continue
-                if isinstance(data, dict) and key in data:
+                if not isinstance(data, dict):
+                    continue
+                node = answer_node(declaration, data)
+                if isinstance(node, dict) and key in node:
                     emitted = True
             print(f"    declared key {key!r}: {'emitted by the real CLI' if emitted else 'NOT EMITTED'}")
             if not emitted:

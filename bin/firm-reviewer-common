@@ -94,9 +94,13 @@ CAPABILITY_CONTRACT = {
             # surface with no control on it is not a check, it is a probe that costs a subprocess
             # and can only ever pass.
             {"subcommand": ["exec"],
+             # `-c` TWICE, because the invocation passes it twice: one typed override for the
+             # reasoning effort and one for the approval policy. Declaring multiplicity is what
+             # keeps the drift check a multiset comparison rather than a set one, so two distinct
+             # controls still cannot collapse into a single declared entry.
              "controls": ["--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
-                          "--strict-config", "--ephemeral", "-s", "-m", "-c", "--output-schema",
-                          "-o"]},
+                          "--strict-config", "--ephemeral", "-s", "-m", "-c", "-c",
+                          "--output-schema", "-o"]},
         ],
     },
     "claude": {
@@ -518,6 +522,37 @@ def transport_schema(node):
         projected["additionalProperties"] = False
     return projected
 
+# MODEL_CATALOG_CONTRACT — the configured-model pre-check, declared rather than written inline.
+#
+# It is declared for the same reason READINESS_CONTRACT is: an inline `[executable, "models",
+# "list", "--json"]` is how this wrapper carried three commands NO CLI HAS for as long as it has
+# existed, green the whole time because a stub answered them. Measured 2026-08-25 / 2026-08-23:
+#
+#   codex models list --json    rc 2  `models` parses as the PROMPT operand, then `list` is
+#                                     unexpected. There is no `models` subcommand on codex at all.
+#   codex debug models          rc 0  "Render the raw model catalog as JSON"; entries are keyed
+#                                     `slug`/`display_name`, NOT the `id`/`name` this code read.
+#                                     284382 bytes on ONE line, because it ships full base
+#                                     instructions per model -- which is why the phase needs
+#                                     readiness_output_cap and not the 64 KiB judge default.
+#   claude models list --json   rc 1  `error: unknown option '--json'`
+#   claude models list          --    NOT a subcommand: taken as a PROMPT, starts a billed session.
+#
+# claude therefore declares None, and None means NOT ESTABLISHED, recorded as such. It does not mean
+# "assume fine": exit 3 is the LENIENT outcome in this phase, so declining to pre-check is the
+# fail-CLOSED direction and an unaccepted model lands at the judge as a BLOCK instead.
+MODEL_CATALOG_CONTRACT = {
+    "gpt": {"command": ["debug", "models"], "name_keys": ("slug", "id", "name")},
+    "claude": {"command": None, "reason": "no_structured_catalog"},
+}
+
+def model_invocation(provider_name, executable):
+    """The single construction of the model-catalog argv, derived from MODEL_CATALOG_CONTRACT, so a
+    command the declaration does not name cannot be sent to a provider. Returns None where the
+    provider publishes no catalog."""
+    declared = MODEL_CATALOG_CONTRACT[provider_name]["command"]
+    return None if declared is None else [executable] + list(declared)
+
 def readiness_invocation(provider_name, executable):
     """The single construction of the readiness argv, derived from READINESS_CONTRACT. The wrapper
     runs this and nothing else in the readiness phase, so a command the declaration does not name
@@ -710,6 +745,16 @@ if args.print_capability_contract:
                 "shape": entry["shape"],
                 "keys": list(entry["keys"]),
                 "answers": entry["answers"],
+                # Published, because they are load-bearing and an offline check has to be able to
+                # see them. `exit_status_is_the_answer` says whether the surface's status decides
+                # anything at all; `envelope`/`path`/`require_fields` are what pins the document
+                # when it does not, so "the body decides alone" is never the shape of a
+                # declaration -- it is either the status or an identified entry in an identified
+                # report, and both are stated here.
+                "exit_status_is_the_answer": entry["exit_status_is_the_answer"],
+                "envelope": dict(entry["envelope"]),
+                "path": list(entry["path"]),
+                "require_fields": dict(entry["require_fields"]),
                 "probe_argv": readiness_invocation(name, "EXECUTABLE")[1:],
             }
             for name, entry in READINESS_CONTRACT.items()
@@ -1858,8 +1903,12 @@ except Exception as exc:
             # be forwarding whatever the shell left in the variable. Neither policy ever records
             # the VALUE: only the name, whether it was taken, and if not, why.
             is_credential = name.endswith("_TOKEN") or name.endswith("_KEY")
-            if value is None:
-                record["refused_environment"].append({"name": name, "reason": "absent_from_environment"})
+            # An EMPTY variable is ABSENT, not malformed. `FOO=` in an environment is how a shell
+            # says "not set" in practice, and calling it `not_opaque_single_line` would tell an
+            # operator who has minted no token that the token they do not have is the wrong shape.
+            if not value:
+                record["refused_environment"].append(
+                    {"name": name, "reason": "absent" if is_credential else "absent_from_environment"})
                 continue
             if is_credential:
                 accepted = (len(value.encode("utf-8", "surrogateescape")) <= credential_bound
@@ -2179,10 +2228,11 @@ except Exception as exc:
     # nothing downstream may read an absent pre-check as a passed one. The open question - what
     # configured-model readiness should mean for a CLI that resolves aliases server-side and
     # publishes no catalog - is recorded for Architecture, not settled here.
-    model_surface = [executable, "debug", "models"] if provider == "gpt" else None
+    model_surface = model_invocation(provider, executable)
     if model_surface is None:
-        attempt["model_readiness"] = {"surface":None, "established":False, "reason":"no_structured_catalog"}
-        diagnostics["model_readiness"] = "not_established:no_structured_catalog"
+        _reason = MODEL_CATALOG_CONTRACT[provider].get("reason", "no_structured_catalog")
+        attempt["model_readiness"] = {"surface":None, "established":False, "reason":_reason}
+        diagnostics["model_readiness"] = "not_established:" + _reason
         atomic_write(attempt_path, json_bytes(attempt), 0o600)
     else:
         rc, result, raw = run_phase("model", readiness_timeout, model_surface, readiness_output_cap)
@@ -2199,7 +2249,8 @@ except Exception as exc:
             if isinstance(item, str):
                 name = item
             elif isinstance(item, dict):
-                name = item.get("slug") or item.get("id") or item.get("name")
+                name = next((item.get(key) for key in MODEL_CATALOG_CONTRACT[provider]["name_keys"]
+                             if item.get(key)), None)
             else:
                 return None
             if not isinstance(name, str) or not name:
