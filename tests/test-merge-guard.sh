@@ -45,6 +45,13 @@ mk_guard_tree() {
   # The guard resolves its interpreter through its sibling bin/firm-python (one python for the guard,
   # the ledger writer and the doctor), so a scratch copy needs that sibling or it cannot evaluate.
   cp "$BIN/firm-python" "$_d/bin/firm-python"
+  # ...and its sibling bin/firm-ledger-log, which is where the guard READS the observation shapes it
+  # is allowed to append. Without it the guard fails closed and writes nothing -- correctly, since it
+  # cannot then know what the reader admits. A bin/ holding the guard but not the writer is not an
+  # installation that exists in production, and a fixture that models one tests a host nobody runs.
+  # This is the same trap that made ~12 assertions elsewhere fail on the harness rather than on the
+  # thing under test: copying one bin/ script out of a set that resolves its siblings.
+  cp "$BIN/firm-ledger-log" "$_d/bin/firm-ledger-log"
   cp "$POLICY" "$_d/agent-firm/policy/merge-authority.yaml"
   printf '%s' "$_d"
 }
@@ -1980,19 +1987,26 @@ mk_run "$LREPO" "20260803T000000Z-guard-test"
 assert_rc "the blocked command exits non-zero" 1 mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
 LEDGER="$LREPO/.agent-firm/runs/20260803T000000Z-guard-test/run.jsonl"
 assert_file "run.jsonl was created" "$LEDGER"
+# TEST CHANGE, RECORDED DELIBERATELY. This used to read matched/gh_login/git_email/gh_status/
+# git_status/exit as SEPARATE KEYS. Those keys are exactly what made the record unclassifiable:
+# merge_guard_block is admitted only as {ts, event, cmd, decision, reason}, so the record fell to
+# the ordinary branch, demanded run_id, and raised -- after which the whole ledger was unreadable.
+# The assertion was pinning the defect. The same facts are still required, now inside `reason`,
+# AND the record must be one the real writer accepts (the arm below proves that against the
+# production reader rather than against this test's idea of it).
 assert_ok "the event names the refused command, the matched surface and BOTH identities" t_python -c "
 import json
 recs = [json.loads(l) for l in open('$LEDGER') if l.strip()]
 blocks = [r for r in recs if r.get('event') == 'merge_guard_block']
 assert blocks, f'no merge_guard_block event in {recs}'
 b = blocks[-1]
+assert set(b) == {'ts', 'event', 'cmd', 'decision', 'reason'}, sorted(b)
 assert b['cmd'] == 'git push origin main', b
-assert b['matched'] == 'git push', b
 assert b['decision'] == 'refused', b
-assert b['gh_login'] == '$ALLOWED_LOGIN', b
-assert b['git_email'] == 'nobody@example.com', b
-assert b['git_status'] == 'ok' and b['gh_status'] == 'ok', b
-assert b['exit'] == 1, b
+assert 'matched: git push' in b['reason'], b
+assert '$ALLOWED_LOGIN' in b['reason'], b
+assert 'nobody@example.com' in b['reason'], b
+assert 'exit: 1' in b['reason'], b
 assert b['ts'].endswith('Z'), b
 "
 assert_output "the message says WHICH check failed" "NOT allow-listed" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
@@ -2044,15 +2058,16 @@ t_case "AC-021 an INDETERMINATE block is recorded too, and says which source fai
 IREPO="$(mk_id_repo "$ALLOWED_EMAIL")"
 mk_run "$IREPO" "20260803T000001Z-guard-test"
 assert_rc "cannot-evaluate exits 2" 2 mg "$TREE" "$GH_UNAUTH" "$IREPO" --command 'git merge x'
-assert_ok "the event records cannot_evaluate and the unresolved source" python3 -c "
+assert_ok "the event records cannot_evaluate and the unresolved source" t_python -c "
 import json
 p='$IREPO/.agent-firm/runs/20260803T000001Z-guard-test/run.jsonl'
 recs=[json.loads(l) for l in open(p) if l.strip()]
 b=[r for r in recs if r.get('event')=='merge_guard_block'][-1]
+assert set(b) == {'ts', 'event', 'cmd', 'decision', 'reason'}, sorted(b)
 assert b['decision']=='cannot_evaluate', b
-assert b['gh_status']=='gh-failed', b
-assert b['git_status']=='ok', b
-assert b['exit']==2, b
+assert 'gh: - (gh-failed)' in b['reason'], b
+assert 'git: $ALLOWED_EMAIL (ok)' in b['reason'], b
+assert 'exit: 2' in b['reason'], b
 "
 t_case "AC-021 a PERMIT is recorded too, so an authorised merge is visible in the ledger"
 PREPO="$(mk_id_repo "$ALLOWED_EMAIL")"
@@ -2066,6 +2081,43 @@ g=[r for r in recs if r.get('event')=='merge_guard_permit'][-1]
 assert g['decision']=='permitted' and g['matched']=='git merge', g
 assert g['gh_login']=='$ALLOWED_LOGIN', g
 "
+t_case "a guard append NEVER makes the run's ledger unappendable (the shapes are the writer's)"
+# THE REGRESSION THIS FILE EXISTED WITHOUT. Every arm above reads the guard's records back with
+# json.loads -- which accepts ANY object -- so all of them passed while the records were ones
+# bin/firm-ledger-log refuses. The reader that matters is the production writer, not json.
+#
+# Measured before the fix, with the refusal record the guard actually wrote:
+#     ordinary append -> exit 0 AND the line count did not change   (silently dropped)
+#     strict append   -> exit 1, "could not append target ledger"   (every role start, forever)
+# So blocking one merge destroyed the audit trail of the run the guard was protecting.
+#
+# Both modes are asserted because they fail DIFFERENTLY, and the ordinary one fails invisibly: an
+# assertion on exit status alone would have gone green through the whole defect.
+ledger_survives() {   # <label> <email> <gh-stub> <command> <run-id>
+  local _label="$1" _email="$2" _stub="$3" _cmd="$4" _id="$5" _repo _run _led _before _after
+  _repo="$(mk_id_repo "$_email")"
+  mk_run "$_repo" "$_id"
+  _run="$(cat "$_repo/.agent-firm/CURRENT_RUN")"
+  _led="$_repo/$_run/run.jsonl"
+  mg "$TREE" "$_stub" "$_repo" --command "$_cmd" >/dev/null 2>&1
+  assert_file "[$_label] the guard wrote its observation" "$_led"
+  [ -f "$_led" ] || return 0
+  chmod 600 "$_led"
+  _before="$(wc -l < "$_led" | tr -d ' ')"
+  # ORDINARY mode: exit 0 is NOT the claim -- ordinary mode returns 0 even when it drops the record.
+  # The claim is that the line actually landed, which is the only form the defect could not fake.
+  ( cd "$_repo" && "$BIN/firm-ledger-log" --run "$_run" probe_ordinary note=after_guard ) >/dev/null 2>&1
+  _after="$(wc -l < "$_led" | tr -d ' ')"
+  assert_eq "[$_label] an ordinary append after the guard actually lands" "$((_before + 1))" "$_after"
+  # STRICT mode: what every delegated role start uses. This one does fail loudly.
+  assert_ok "[$_label] a STRICT append after the guard succeeds" \
+    bash -c 'cd "$1" && "$2" --run "$3" --strict probe_strict note=after_guard' _ \
+    "$_repo" "$BIN/firm-ledger-log" "$_run"
+}
+ledger_survives refuse nobody@example.com   "$GH_OK"     'git push origin main'  20260803T000010Z-guard-test
+ledger_survives cannot "$ALLOWED_EMAIL"     "$GH_UNAUTH" 'git merge x'           20260803T000011Z-guard-test
+ledger_survives permit "$ALLOWED_EMAIL"     "$GH_OK"     'git merge feature/x'   20260803T000012Z-guard-test
+
 t_case "AC-021/SEC-11 the ledger append is confined to the project (CURRENT_RUN is data)"
 # ledger() reads a DIRECTORY PATH out of .agent-firm/CURRENT_RUN and appends JSON there. Anything
 # able to write that file could steer the appends into any existing directory. It cannot change the

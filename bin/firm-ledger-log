@@ -75,6 +75,21 @@ NATIVE_ONLY_FIELDS = {"contract", "authority", "activation", "activation_justifi
 NATIVE_REQUIRED_FIELDS = COMMON_FIELDS | {
     "stage", "role", "agent", "contract", "authority", "activation",
 }
+# OBSERVATION SHAPES — the closed key sets this writer admits from an out-of-band observer (the
+# PreToolUse hooks). Each is matched EXACTLY: an extra key or a missing one is not a lenient
+# near-miss, it is a record from the `else` branch of classify_record, which then demands run_id and
+# raises. One malformed line makes the WHOLE ledger unreadable and therefore unappendable forever.
+#
+# They are named constants rather than literals inlined at their two use sites because a second
+# writer has to agree with them. bin/firm-merge-guard reads THESE NAMES statically and refuses to
+# append anything that does not conform, so the observer cannot poison the ledger it writes to.
+# Restating the sets there would be a copy that drifts; this is the same one-source rule the P2 row
+# list already follows.
+SHELL_OBSERVATION_FIELDS = {"ts", "event", "cmd"}
+MERGE_BLOCK_OBSERVATION_FIELDS = {"ts", "event", "cmd", "decision", "reason"}
+MERGE_PERMIT_OBSERVATION_FIELDS = {
+    "ts", "event", "cmd", "decision", "matched", "gh_login", "git_email",
+}
 FAILPOINTS = {
     "before_contract_read", "during_drift_validation", "contract_replace",
     "contract_truncate", "contract_grow", "contract_mutate", "contract_mode",
@@ -245,13 +260,13 @@ def validate_observation(record, family):
     except Exception as exc:
         raise LedgerError("invalid observation timestamp") from exc
     if family == "shell_observation":
-        if not exact_keys(record, {"ts", "event", "cmd"}) or record["event"] != "bash":
+        if not exact_keys(record, SHELL_OBSERVATION_FIELDS) or record["event"] != "bash":
             raise LedgerError("invalid shell observation")
         if not isinstance(record["cmd"], str):
             raise LedgerError("invalid observation value")
         return
     if family == "merge_observation":
-        if not exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) or record["event"] != "merge_guard_block":
+        if not exact_keys(record, MERGE_BLOCK_OBSERVATION_FIELDS) or record["event"] != "merge_guard_block":
             raise LedgerError("invalid merge observation")
         if not isinstance(record["cmd"], str):
             raise LedgerError("invalid observation value")
@@ -259,7 +274,7 @@ def validate_observation(record, family):
         if not all(printable(value, 4096) for value in values):
             raise LedgerError("invalid observation value")
         return
-    expected = {"ts", "event", "cmd", "decision", "matched", "gh_login", "git_email"}
+    expected = MERGE_PERMIT_OBSERVATION_FIELDS
     if not exact_keys(record, expected) or record["event"] != "merge_guard_permit":
         raise LedgerError("invalid merge permit observation")
     if record["decision"] != "permitted" or not isinstance(record["cmd"], str):
@@ -391,10 +406,10 @@ def classify_record(record, ledger_run_id):
     if NATIVE_ONLY_FIELDS & set(record):
         validate_native_record(record, ledger_run_id)
         families.append("native_role_start")
-    elif exact_keys(record, {"ts", "event", "cmd"}) and record.get("event") == "bash":
+    elif exact_keys(record, SHELL_OBSERVATION_FIELDS) and record.get("event") == "bash":
         validate_observation(record, "shell_observation")
         families.append("shell_observation")
-    elif exact_keys(record, {"ts", "event", "cmd", "decision", "reason"}) and record.get("event") == "merge_guard_block":
+    elif exact_keys(record, MERGE_BLOCK_OBSERVATION_FIELDS) and record.get("event") == "merge_guard_block":
         validate_observation(record, "merge_observation")
         families.append("merge_observation")
     elif record.get("event") == "merge_guard_permit":
