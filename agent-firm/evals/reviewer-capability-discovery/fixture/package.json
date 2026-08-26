@@ -1,0 +1,9 @@
+{
+  "name": "reviewer-capability-discovery-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty starting point; the firm adds probe()+test and must leave the reviewer capability probe bound to the help surfaces its judge invocation actually uses (see test/capability-discovery.sh).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

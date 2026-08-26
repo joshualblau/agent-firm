@@ -1,0 +1,24 @@
+name: reviewer-readiness-probes
+description: >-
+  Guards the reviewer readiness gate against the 2026-08-21 defect, where the wrapper asked
+  `codex login status --json`, `codex models list --json`, `claude auth status --json` and
+  `claude models list --json` and looked for a `status`/`authentication` key. Three of those four
+  commands do not exist in that form (rc=2, rc=2, rc=1) and the fourth reports authentication as
+  `loggedIn: true`, so a fully authenticated host was judged "not a trusted structured available
+  result" and the cross-provider second voice could not run in either direction. The eval drives a
+  normal lifecycle and then runs checks the defect could not have satisfied: the offline
+  declaration/probe drift check with its mutants, and a LIVE binding of each declared readiness
+  command, response key and exit status against the installed CLI in both its authenticated and its
+  forced logged-out state.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/ready.js
+  - file_exists: test/ready.test.js
+  - test_passes: node --test
+  - test_passes: sh test/readiness-probes.sh
+  - traceability_passes: true
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

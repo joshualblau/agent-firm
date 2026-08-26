@@ -179,9 +179,27 @@ assert calls == [
     ["claude", "-p", "Reply with exactly: ok", "--model", "opus", "--effort", "xhigh",
      "--output-format", "text", "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"],
     ["codex", "login", "status"],
-    # `-a never` is NOT here on purpose: --ask-for-approval is interactive-only on codex-cli
-    # 0.147.0, so sending it to `codex exec` is a rc-2 parse error and the probe never reaches the
-    # model. The never-ask policy is the typed -c override, which is what the real judge sends too.
+    # `-a never` is NOT here, in EITHER position, and the assertion below pins that.
+    #
+    # This expectation used to read
+    #   ["codex","exec","--skip-git-repo-check","--ephemeral","-s","read-only","-a","never",...]
+    # which is the 2026-08-23 defect written down as a passing test: `codex exec` rejects `-a`
+    # outright ("unexpected argument '-a' found", rc 2), so firm-doctor --probe could never have
+    # completed a Codex reviewer probe on any real host. The stub accepted it, so the test agreed
+    # with the stub and nothing else. That much is settled.
+    #
+    # The tempting repair -- move `-a never` in FRONT of `exec` -- was measured and rejected. On
+    # codex-cli 0.147.0 `codex -a never exec --help` does exit 0, but only because the root options
+    # are DISCARDED once a subcommand appears; `codex --help` says so ("If no subcommand is
+    # specified, options will be forwarded to the interactive CLI") and the control experiment
+    # proves it, since clap does not even validate them: `codex --sandbox bogus --help` is rc 2
+    # "invalid value", while `codex -s bogus exec --help` is rc 0. So that form buys a clean exit
+    # status and no approval policy at all -- a probe that looks fixed and is not.
+    #
+    # `codex exec --help` documents no --ask-for-approval in any spelling, so the never-ask policy
+    # is stated as the typed -c override exec does accept, which is what the real judge sends too.
+    # tests/test-provider-launch-sites.sh checks this argv against `codex exec --help` itself,
+    # which is the check that does not depend on a stub.
     ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
      "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"',
      "-c", 'approval_policy="never"', "Reply with exactly: ok"],

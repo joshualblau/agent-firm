@@ -36,7 +36,7 @@ assert_eq "combined retained count preserves the output cap accounting" 17 "$(re
 
 t_case "every invalid caller bound is rejected before provider execution"
 for spec in \
-  "--timeout 0" "--timeout -1" "--timeout nope" "--timeout 901" \
+  "--timeout 0" "--timeout -1" "--timeout nope" "--timeout 1801" \
   "--grace 0" "--grace -1" "--grace nope" "--grace 31" \
   "--max-output 0" "--max-output -1" "--max-output nope" "--max-output 1048577" \
   "--generation 0" "--generation nope" "--max-turns 0" "--max-turns 1001"
@@ -45,6 +45,15 @@ do
   assert_rc "rejects $spec" 2 sh -c "'$BOUND' --phase judge --provider claude $spec -- sh -c 'touch \"$WORK/invalid-sentinel\"'"
   assert_no_file "provider did not start for $spec" "$WORK/invalid-sentinel"
 done
+
+# The supervisor's outer envelope moved from 900 to 1800 on 2026-08-23 so that a Codex-primary
+# behavioural eval could finish. Pin BOTH sides of the new boundary, not just the refusal: a ceiling
+# asserted only by what it rejects can be raised to infinity without failing a test. The timeout is
+# a bound, so a child that exits immediately costs nothing to run at the boundary.
+rm -f "$WORK/boundary-sentinel"
+assert_rc "accepts the supervisor ceiling exactly" 0 sh -c \
+  "'$BOUND' --phase judge --provider claude --timeout 1800 --output '$WORK/b.out' --result '$WORK/b.json' -- sh -c 'touch \"$WORK/boundary-sentinel\"'"
+assert_file "the child really ran at the ceiling" "$WORK/boundary-sentinel"
 
 t_case "output is capped independently from child classification"
 assert_rc "large successful output still returns child success" 0 "$BOUND" --phase model --provider claude \

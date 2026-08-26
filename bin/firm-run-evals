@@ -82,14 +82,61 @@ fi
 # Behavioral mode has one provider invocation per selected eval and no retry path. Wall-clock and
 # case limits prevent an expanding eval tree or stalled provider from consuming unbounded subscription
 # turns; the result envelope is also checked against the declared top-level turn cap.
+#
+# THE WALL-CLOCK CEILING IS PER PROVIDER ORIENTATION, and each number below carries its basis.
+#
+# One number used to serve both, and it was 900 s. That number fitted one orientation and acted as a
+# guillotine on the other. Measured 2026-08-23, `firm-run-evals --provider codex greet-fast-path`
+# on codex-cli 0.149.0 (the first Codex-primary behavioural eval that has ever executed at all — see
+# the `-a never` defect fixed in this same change):
+#
+#   at the 900 s bound: SIGTERM, status=timeout, 389,023 bytes, 88 completed items. The run had
+#   already logged `final_qa_passed` and satisfied 7 of the eval's 8 assertions — APPROVE verdict,
+#   strict traceability PASS, node --test green — and was inside the PACKAGING stage when it was
+#   killed. The single failing assertion, `final_gate_pending`, failed only because the kill landed
+#   before that event was written.
+#
+# So 900 s was not a safety margin for this orientation; it was positioned a few steps before the
+# finish line, and it converted "nearly done" into "FAIL" with no signal that time was the cause.
+#
+# 1800 IS A HEADROOM CHOICE, NOT A FITTED VALUE. That distinction is worth stating, because the
+# number sits among measurements and could easily be read as one. What is MEASURED is the spread —
+# three runs of the same eval on the same host:
+#
+#   run A   >900 s   killed at the old ceiling, inside packaging, 7 of 8 assertions already satisfied
+#   run B    653 s   provider phase completed (status ok, exit 0)
+#   run C    451 s   whole eval completed end to end and its assertions were evaluated
+#
+# Those measurements establish two things and no more: that this workload needs somewhat more than
+# 900 s, and that it has no stable duration — it varied by better than 2x, because it is a model
+# driving a lifecycle rather than a deterministic job. They do NOT derive 1800.
+#
+# 1800 is chosen against that spread rather than against the median. A ceiling near typical cost is a
+# ceiling that fails runs for being unlucky rather than for being wrong, and a bound that fires on
+# luck is one everybody learns to ignore. Fitting it snugly would also guarantee re-raising it the
+# first time the host is busier, and every such re-raise is a decision taken under pressure to turn a
+# red eval green. The looseness is deliberate — but it is a judgement, not evidence.
+#
+# Claude-primary stays at 900 s and is marked UNMEASURED on purpose. I have not timed a Claude
+# orientation, and inventing a second number to look symmetrical would be exactly the guessing this
+# comment exists to end. It keeps the value it has always had; the split now makes the absence of a
+# measurement visible instead of hiding it inside a shared constant.
+#
+# These ceilings are LITERALS and are deliberately not readable from the environment. A runaway
+# control that the runaway can raise is not a control. FIRM_EVAL_TIMEOUT_SECONDS may only ask for
+# LESS than the ceiling for its orientation.
 if [ "$mode" = run ]; then
-  eval_timeout="${FIRM_EVAL_TIMEOUT_SECONDS:-900}"
+  case "$provider" in
+    codex)  eval_timeout_ceiling=1800 ;;   # measured; see the comment above
+    *)      eval_timeout_ceiling=900  ;;   # UNMEASURED: inherited value, Claude-primary
+  esac
+  eval_timeout="${FIRM_EVAL_TIMEOUT_SECONDS:-$eval_timeout_ceiling}"
   eval_max_turns="${FIRM_EVAL_MAX_TURNS:-60}"
   eval_max_cases="${FIRM_EVAL_MAX_CASES:-8}"
   for bound in "$eval_timeout" "$eval_max_turns" "$eval_max_cases"; do
     case "$bound" in ''|*[!0-9]*|0) echo "firm-run-evals: behavioral bounds must be positive integers" >&2; exit 2 ;; esac
   done
-  [ "$eval_timeout" -le 900 ] || { echo "firm-run-evals: timeout exceeds maximum 900 seconds; provider phase BLOCKED" >&2; exit 2; }
+  [ "$eval_timeout" -le "$eval_timeout_ceiling" ] || { echo "firm-run-evals: timeout exceeds the maximum $eval_timeout_ceiling seconds for a $provider-primary eval; provider phase BLOCKED" >&2; exit 2; }
   [ "$eval_max_turns" -le 1000 ] || { echo "firm-run-evals: turn cap exceeds maximum 1000; provider phase BLOCKED" >&2; exit 2; }
   [ "$eval_max_cases" -le 8 ] || { echo "firm-run-evals: case cap exceeds maximum 8; provider phase BLOCKED" >&2; exit 2; }
 fi
@@ -224,9 +271,25 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
     prompt="\$agent-firm:start $(cat "$d/task.md")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns."
-    # -a never is a parse error on codex exec (0.147.0): --ask-for-approval is interactive-only and
-    # is not a clap global, so this argv used to die at rc 2 without running the eval at all. The
-    # never-ask policy is stated as the typed -c override exec does accept.
+    # The never-ask policy is stated as a typed -c override, which is the ONLY form `codex exec`
+    # honours. Measured against the installed codex-cli 0.147.0:
+    #
+    #   codex exec -a never --help    rc 2  "error: unexpected argument '-a' found"
+    #   codex exec --ask-for-approval never --help
+    #                                 rc 2  "error: unexpected argument '--ask-for-approval' found"
+    #   codex -a never exec --help    rc 0  -- PARSES, BUT THE VALUE IS DISCARDED
+    #
+    # The third form is the trap. `codex --help` says "If no subcommand is specified, options will
+    # be forwarded to the interactive CLI", and the root options really are dropped once a
+    # subcommand appears -- they are not even validated. The control experiment is `-s`, whose
+    # values clap does check:
+    #
+    #   codex --sandbox bogus --help      rc 2  "invalid value 'bogus' for '--sandbox'"
+    #   codex -s bogus exec --help        rc 0  -- accepted, because it is thrown away
+    #
+    # So moving `-a never` in front of `exec` only buys rc 0; it does not set an approval policy.
+    # `codex exec --help` lists no --ask-for-approval at all; `-c approval_policy="never"` is how
+    # exec takes it, and it is the same form firm-reviewer-common sends to the real judge.
     "$BOUNDED" --phase eval --provider codex --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
@@ -238,7 +301,31 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
   fi
 
   if [ "$provider_rc" -ne 0 ]; then
-    echo "  ($provider was stopped or exited non-zero; rc=$provider_rc — see $out/supervision.json and result.json; no retry attempted)" >&2
+    # The supervisor distinguishes "the provider ran and failed" from "the provider never started
+    # because this harness handed the supervisor something it refuses". Those are different facts
+    # and this message used to report both as the first: a `{"status":"invalid","error":"timeout
+    # must be between 1 and 900"}` rejection was announced as "codex was stopped or exited
+    # non-zero; rc=2", which reads as a provider problem and sends the reader to the wrong file.
+    # Surface what the supervisor actually recorded.
+    sup_status="$(firm_python - "$out/supervision.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+if doc.get("status") == "invalid":
+    print(f"the supervisor REFUSED this harness's control input and no provider ran: "
+          f"{doc.get('error', 'no reason recorded')}")
+elif doc.get("status") == "timeout":
+    print(f"the provider hit the wall bound after {doc.get('duration_ms', '?')} ms and was "
+          f"terminated; this is a BOUND, not a provider failure")
+PY
+)"
+    if [ -n "$sup_status" ]; then
+      echo "  ($sup_status; rc=$provider_rc — see $out/supervision.json; no retry attempted)" >&2
+    else
+      echo "  ($provider was stopped or exited non-zero; rc=$provider_rc — see $out/supervision.json and result.json; no retry attempted)" >&2
+    fi
     return 1
   fi
 
@@ -257,13 +344,51 @@ PY
 )" || return 1
   else
     turns="$(firm_python - "$out/result.json" <<'PY'
+# `codex exec --json` writes a JSONL EVENT STREAM, but not every line of its stdout is an event:
+# it emits human preamble first. Measured 2026-08-23, the very first line of a real run is
+#
+#     Reading additional input from stdin...
+#     {"type":"thread.started","thread_id":"01a02cd4-..."}
+#
+# and this accounter called json.loads() on every line, so it died on line 1 with
+# "JSONDecodeError: Expecting value: line 1 column 1 (char 0)" and failed an eval whose provider
+# phase had just completed normally in 654 s. Nothing had ever got this far on the Codex
+# orientation — the `-a never` defect stopped every previous run in 9 ms — so the first line the
+# CLI has always printed had never been read by this code.
+#
+# Non-JSON lines are therefore skipped, but the check keeps its teeth in both directions: a stream
+# with NO parseable records at all is still a failure (that is a broken or empty stream, not a
+# preamble), and a stream that parses but records no turn is still a failure (that is the run that
+# crashed or did nothing, which is what this accounting exists to catch). Only provider prose is
+# tolerated, and only when real events follow it.
+#
+# NOTE FOR EDITORS: this heredoc sits inside a $(...) substitution, where bash 3.2 scans for the
+# closing paren without fully honouring heredoc quoting, so a lone apostrophe here ends a quote that
+# was never opened and the whole script fails to parse at a line number hundreds of lines away.
+# MEASURED, because the earlier wording over-stated it: bash 3.2.57 breaks only on an apostrophe that
+# sits OUTSIDE a double-quoted span -- the scanner does track double quotes, which is why the
+# f-strings below survive with nine apostrophes between them -- and bash 5.3.15 parses either form
+# clean. macOS ships 3.2, so treat the body as apostrophe-free anyway; that is the cheap rule, and it
+# is the one tests/test-bin-syntax.sh pins (against a bash 3.2 specifically, after the CI fix).
 import json, sys
 count = 0
+parsed = 0
 try:
     for raw in open(sys.argv[1], encoding="utf-8"):
-        event = json.loads(raw)
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        parsed += 1
         if event.get("type") in ("turn.started", "turn_start"):
             count += 1
+    if parsed < 1:
+        raise ValueError("the result stream contained no parseable JSON event at all")
     if count < 1:
         raise ValueError("no turn-start event was recorded")
     print(count)

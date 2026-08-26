@@ -278,7 +278,10 @@ for provider in sources:
         require_rejection(provider, "output-" + field,
                           lambda target, field=field: mutate_activation_output(target, field))
 PY
-assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" t_python - "$BIN/firm-reviewer-common" <<'PY'
+# EXTRACTED TO A FILE, not run inline. Three cases below re-run this exact checker against MUTATED
+# COPIES of bin/firm-reviewer-common, which an inline heredoc cannot do without keeping a second
+# copy of the program in sync with the first.
+cat > "$W/reviewer-envelope-check.py" <<'PY'
 import ast, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 source = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
@@ -291,17 +294,165 @@ def literal_values(node):
 resolver = [literal_values(node) for node in lists if "firm-model-resolve" in ast.unparse(node)]
 assert len(resolver) == 1, resolver
 assert resolver[0][1:] == ["--provider", None, "--role", "reviewer", "--format", "json"], resolver[0]
-# Only INVOCATION literals. An invocation interpolates at least one non-literal (the executable,
-# the model, the prompt); an all-literal list is a declaration -- the required-capability list names
-# the same controls and would otherwise be matched here and read as a second adapter argv.
-argvs = [node for node in lists if any(not isinstance(x, ast.Constant) for x in node.elts)]
-codex = [node for node in argvs if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
-claude = [node for node in argvs if any(isinstance(x, ast.Constant) and x.value == "--effort" for x in node.elts)
-          and any(isinstance(x, ast.Constant) and x.value == "--permission-mode" for x in node.elts)]
-assert len(codex) == 1 and len(claude) == 1
-cv, av = literal_values(codex[0]), literal_values(claude[0])
-assert cv[cv.index("-m") + 1] is None and cv[cv.index("-c") + 1] == 'model_reasoning_effort="xhigh"'
-assert av[av.index("--model") + 1] is None and av[av.index("--effort") + 1] == "xhigh"
+# TWO separate claims, because they are separate and one of them was briefly lost.
+#
+# IDENTIFICATION — find the launch envelopes by NAMING the function that builds them. The original
+# search was "the single module-level ast.List mentioning --effort and --permission-mode"; that
+# stopped identifying the launch line uniquely once the wrapper also DECLARED those controls as
+# required capabilities (CAPABILITY_CONTRACT, 2026-08-21), and this assertion then failed for a
+# reason with nothing to do with model envelopes.
+#
+# UNIQUENESS — function-scoping is stronger on identification and, on its own, WEAKER on uniqueness.
+# It asserts only "there is exactly one function with this name", never "there is no other
+# construction". Review demonstrated the gap by adding a plausible fallback launch path outside the
+# function (`if os.environ.get("FIRM_JUDGE_FALLBACK"): command = [executable, "exec", ...]`) carrying
+# an undeclared control: it passed the function-scoped check and the drift check, and would have
+# failed the original module-wide one. Uniqueness is therefore restored at the bottom of this block,
+# on a marker the capability declaration cannot collide with — a list literal containing the
+# `executable` NAME. Only the readiness probes may build one outside the judge constructors.
+definitions = [node for node in ast.walk(tree)
+               if isinstance(node, ast.FunctionDef) and node.name in ("judge_plan", "judge_invocation")]
+assert sorted(node.name for node in definitions) == ["judge_invocation", "judge_plan"], \
+    [node.name for node in definitions]
+builder = [node for node in definitions if node.name == "judge_plan"][0]
+assembler = [node for node in definitions if node.name == "judge_invocation"][0]
+returns = [node.value for node in ast.walk(builder) if isinstance(node, ast.Return)]
+assert len(returns) == 2, [ast.dump(n) for n in returns]
+# The `options` lists specifically: every element is a (flag, value) tuple. Without this the outer
+# segment list matches too and every count below doubles.
+segment_lists = [node for node in ast.walk(builder)
+                 if isinstance(node, ast.List) and node.elts
+                 and all(isinstance(item, ast.Tuple) for item in node.elts)]
+codex = [node for node in segment_lists if 'model_reasoning_effort="xhigh"' in ast.unparse(node)]
+claude = [node for node in segment_lists
+          if "'--effort'" in ast.unparse(node) and "'--permission-mode'" in ast.unparse(node)]
+assert len(codex) == 1 and len(claude) == 1, (len(codex), len(claude))
+
+def option_pairs(node):
+    """{flag: [literal-or-None, ...]} for each ("flag", value) tuple in a judge_plan options list.
+
+    A LIST PER FLAG, not one value. `-c` is passed twice on the codex surface -- once for the
+    reasoning effort and once for the approval policy -- and a flag->value dict silently kept only
+    the last, so an assertion written against it would have reported the effort envelope as absent
+    the moment a second typed override was added. It also means a control that is passed twice
+    cannot be laundered into a control that is passed once."""
+    pairs = {}
+    for item in ast.walk(node):
+        if isinstance(item, ast.Tuple) and len(item.elts) == 2 and isinstance(item.elts[0], ast.Constant):
+            value = item.elts[1]
+            pairs.setdefault(item.elts[0].value, []).append(
+                value.value if isinstance(value, ast.Constant) else None)
+    return pairs
+
+cv, av = option_pairs(codex[0]), option_pairs(claude[0])
+assert cv["-m"] == [None], cv
+assert 'model_reasoning_effort="xhigh"' in cv["-c"], cv
+# The never-ask policy is stated as a typed -c override because `codex exec` documents no
+# --ask-for-approval in any spelling, and because the root-position form is accepted and then
+# DISCARDED (measured: `codex -s bogus exec --help` is rc 0 while `codex --sandbox bogus --help`
+# is rc 2). --strict-config is what turns a mistyped override key from a silent no-op into a hard
+# error, so the two are asserted together: neither is any use here without the other.
+assert 'approval_policy="never"' in cv["-c"], cv
+assert "--strict-config" in cv, cv
+assert "-a" not in cv and "--ask-for-approval" not in cv, cv
+assert av["--model"] == [None] and av["--effort"] == ["xhigh"], av
+
+# Uniqueness, module-wide. A second launch site anywhere — fallback, retry, env-gated branch —
+# builds its own [executable, ...] list, and is caught here rather than shipping unprobed controls.
+inside = {id(node) for scope in (builder, assembler) for node in ast.walk(scope)}
+parents = {}
+for node in ast.walk(tree):
+    for child in ast.iter_child_nodes(node):
+        parents[id(child)] = node
+
+def enclosing(node):
+    """The function a construction lives in — 'where', not just 'what'."""
+    current = parents.get(id(node))
+    while current is not None:
+        if isinstance(current, ast.FunctionDef):
+            return current.name
+        current = parents.get(id(current))
+    return "<module>"
+
+# MEMBERSHIP, not position. An earlier revision of this test required elts[0] to be `executable`,
+# reasoning that a provider argv begins with the executable. Review demonstrated the escape in one
+# line: a second launch site written as ["/usr/bin/env", executable, "models", "list"] — or through
+# any interpreter, sandbox or nice/timeout prefix — has a Constant first, is invisible to the
+# positional rule, and would ship an unprobed argv. The membership rule catches it, and the mutant
+# below keeps it caught. (The stated reason for narrowing was also wrong: the list it was aimed at,
+# [Path(executable).name], is an ast.List and did register — it stopped existing because the BLOCK
+# message was rewritten not to build a list, so the narrowing bought nothing on any source.)
+executable_lists = [node for node in ast.walk(tree)
+                    if isinstance(node, ast.List) and id(node) not in inside
+                    and any(isinstance(x, ast.Name) and x.id == "executable" for x in ast.walk(node))]
+rendered = sorted((enclosing(node), ast.unparse(node)) for node in executable_lists)
+# CHANGED 2026-08-21, and STRENGTHENED while changing. This list used to name three probe argvs
+# built inline: `login status --json`, `auth status --json` and `models list --json`. Two of those
+# commands do not exist on any real CLI (`codex login status --json` exits 2; `codex models list`
+# and `claude models list` are not subcommands at all — on claude it is a PROMPT that bills a model
+# turn), so the model gate was removed outright and the authentication probe now has exactly ONE
+# construction, readiness_invocation(), built from READINESS_CONTRACT. Pinning the literal argvs
+# here is what let the wrapper keep three impossible commands written down and passing tests.
+#
+# Each entry is now (enclosing function, source), so this pins WHERE each provider argv is built as
+# well as what it looks like — strictly more than the previous string-only comparison. A second
+# launch site anywhere, including one that copies an existing argv verbatim, adds an entry.
+assert rendered == [
+    ("<module>", "[executable]"),            # capability discovery probe base: + subcommand + --help
+    ("model_invocation", "[executable]"),    # the single model-catalog argv, + MODEL_CATALOG_CONTRACT
+    ("readiness_invocation", "[executable]"),  # the single readiness argv, + READINESS_CONTRACT command
+], rendered   # ...and nothing else in the module builds a provider argv
+# THE MODEL PROBE EARNED ITS ENTRY THE SAME WAY THE READINESS ONE DID. It came back in this merge --
+# `codex debug models` is a real catalog, and lifecycle.md requires configured-model readiness that
+# cannot be established to be RECORDED rather than assumed -- and it arrived written inline, as
+# `[executable, "debug", "models"]` at module scope. This assertion caught that on the first run,
+# which is exactly what it is for: an inline provider argv is how the wrapper carried three commands
+# no CLI has. It is declared in MODEL_CATALOG_CONTRACT and built by one function now, so the entry
+# above names a CONSTRUCTION, not a literal command line.
 PY
+
+t_case "reviewer launch envelopes are resolver-bound, uniquely constructed, and literal"
+assert_ok "reviewer wrappers consume resolver and apply literal heavyweight/xhigh envelopes" \
+  t_python "$W/reviewer-envelope-check.py" "$BIN/firm-reviewer-common"
+# Prove the restored module-wide uniqueness assertion BITES. Review defeated the function-scoped
+# version with exactly this mutant: a second, env-gated launch site outside the judge constructors
+# carrying an undeclared control. It passed the function-scoped check AND the drift check. It must
+# not pass now — a launch line built anywhere else is a launch line no capability probe has seen.
+cp "$BIN/firm-reviewer-common" "$W/mutant-second-launch-site"
+t_python - "$W/mutant-second-launch-site" <<'MUT'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+anchor = '    attempt["launch"] = {'
+assert text.count(anchor) == 1, "mutation anchor is not unique; update this test"
+fallback = (
+    '    if os.environ.get("FIRM_JUDGE_FALLBACK"):\n'
+    '        command = [executable, "exec", "--ephemeral", "--search", "-m", model, prompt]\n'
+)
+open(path, "w", encoding="utf-8").write(text.replace(anchor, fallback + anchor))
+MUT
+chmod +x "$W/mutant-second-launch-site"
+assert_fail "a second launch site outside the judge constructors is caught" \
+  t_python "$W/reviewer-envelope-check.py" "$W/mutant-second-launch-site"
+
+t_case "it bites: a second launch site hidden behind a prefix argument"
+# Review's defeat of the positional predicate. `env` (or any wrapper binary) in front of the
+# executable makes the argv invisible to a first-element rule while still launching a provider with
+# controls no capability probe has seen.
+cp "$BIN/firm-reviewer-common" "$W/mutant-prefixed-launch-site"
+t_python - "$W/mutant-prefixed-launch-site" <<'MUT'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+anchor = '    attempt["launch"] = {'
+assert text.count(anchor) == 1, "mutation anchor is not unique; update this test"
+prefixed = (
+    '    if os.environ.get("FIRM_JUDGE_PREFIX"):\n'
+    '        command = ["/usr/bin/env", executable, "models", "list"]\n'
+)
+open(path, "w", encoding="utf-8").write(text.replace(anchor, prefixed + anchor))
+MUT
+assert_fail "a launch site behind a prefix argument is caught" \
+  t_python "$W/reviewer-envelope-check.py" "$W/mutant-prefixed-launch-site"
 
 t_summary

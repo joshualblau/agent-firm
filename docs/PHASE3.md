@@ -19,9 +19,15 @@ dissents on that point; high-risk disagreement remains blocking.
   configuration, inert committed-source snapshot, bounded evidence/diff bundle, controlled HOME and
   provider state, and provider-native read-only/tool restrictions. It does not depend on a consumer
   repository's `AGENTS.md` or `CLAUDE.md` for judge mode.
-- Discovery, authentication, configured-model readiness, and judge execution are separate bounded
-  process groups. Trusted structured CLI/auth/model output establishes readiness; a phrase in mixed
-  stderr cannot. Default/max seconds are discovery 15/120, readiness 30/180, judge 300/900, and kill
+- Discovery, authentication readiness, and judge execution are separate bounded process groups.
+  Readiness is established only by a response the wrapper DECLARES for that provider in
+  `READINESS_CONTRACT` — command, body and exit status together (`codex login status` answering
+  `Logged in using ...` with exit 0; `claude auth status --json` answering `loggedIn: true` with
+  exit 0). A declared unavailable answer is the trusted exit 3 path; an error, timeout, truncated
+  stream, unrecognised body, or a ready-looking body with an undeclared exit status is BLOCK exit 1
+  and is never upgraded to available. There is no configured-model readiness probe: neither CLI
+  implements `models list` (on claude it is a prompt, not a query), and the resolved model is
+  enforced by the judge invocation itself, which fails loudly on an unknown model. Default/max seconds are discovery 15/120, readiness 30/180, judge 300/900, and kill
   grace 2/30. Output defaults to 64 KiB and is capped at 1 MiB.
 - The wrapper validates schema and exact run/full-SHA/generation/provider/attempt identity, rechecks
   candidate generation, then atomically publishes `08-qa-verdict.gpt.json` for Claude-primary runs or

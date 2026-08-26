@@ -6,76 +6,208 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "verdict", "commit_sha", "run_id", "generation", "provider", "attempt_id",
-    "environment", "commands_run",
-    "unit", "integration", "e2e", "visual",
-    "acceptance_criteria_coverage", "untested_risks", "blockers", "warnings", "artifacts", "summary"
+    "verdict",
+    "commit_sha",
+    "run_id",
+    "generation",
+    "provider",
+    "attempt_id",
+    "environment",
+    "commands_run",
+    "unit",
+    "integration",
+    "e2e",
+    "visual",
+    "acceptance_criteria_coverage",
+    "untested_risks",
+    "blockers",
+    "warnings",
+    "artifacts",
+    "summary"
   ],
   "properties": {
-    "verdict": { "type": "string", "enum": ["APPROVE", "BLOCK"] },
-    "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Full SHA of the clean integration checkout QA ran against" },
-    "run_id": { "type": "string", "minLength": 1, "description": "Run id bound during final QA" },
-    "generation": { "type": "integer", "minimum": 1, "description": "Candidate generation bound during final QA" },
-    "provider": { "type": "string", "enum": ["primary", "gpt", "claude"] },
-    "attempt_id": { "type": "string", "minLength": 1 },
-    "environment": { "type": "string", "description": "e.g. 'devcontainer node20 / pinned playwright image'" },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "APPROVE",
+        "BLOCK"
+      ],
+      "description": "APPROVE or BLOCK. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full SHA of the clean integration checkout QA ran against"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Run id bound during final QA"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Candidate generation bound during final QA"
+    },
+    "provider": {
+      "type": "string",
+      "enum": [
+        "primary",
+        "gpt",
+        "claude"
+      ]
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "environment": {
+      "type": "string",
+      "description": "e.g. 'devcontainer node20 / pinned playwright image'"
+    },
     "commands_run": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["cmd", "exit_code", "duration_s", "artifact"],
+        "required": [
+          "cmd",
+          "exit_code",
+          "duration_s",
+          "artifact"
+        ],
         "properties": {
-          "cmd": { "type": "string" },
-          "exit_code": { "type": "integer" },
-          "duration_s": { "type": "number" },
-          "artifact": { "type": "string", "description": "path to captured output under 09-test-evidence/" }
+          "cmd": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "duration_s": {
+            "type": "number"
+          },
+          "artifact": {
+            "type": "string",
+            "description": "path to captured output under 09-test-evidence/"
+          }
         }
       }
     },
-    "unit":        { "$ref": "#/$defs/stageResult" },
-    "integration": { "$ref": "#/$defs/stageResult" },
-    "e2e":         { "$ref": "#/$defs/stageResult" },
-    "visual":      { "$ref": "#/$defs/stageResult" },
+    "unit": {
+      "$ref": "#/$defs/stageResult"
+    },
+    "integration": {
+      "$ref": "#/$defs/stageResult"
+    },
+    "e2e": {
+      "$ref": "#/$defs/stageResult"
+    },
+    "visual": {
+      "$ref": "#/$defs/stageResult"
+    },
     "acceptance_criteria_coverage": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "covered", "evidence"],
+        "required": [
+          "id",
+          "covered",
+          "evidence"
+        ],
         "properties": {
-          "id": { "type": "string", "description": "acceptance criterion id, e.g. AC-001" },
-          "covered": { "type": "string", "enum": ["yes", "no", "partial"] },
-          "evidence": { "type": "string", "description": "test name(s) / artifact path, or why not covered" }
+          "id": {
+            "type": "string",
+            "description": "acceptance criterion id, e.g. AC-001"
+          },
+          "covered": {
+            "type": "string",
+            "enum": [
+              "yes",
+              "no",
+              "partial"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "description": "test name(s) / artifact path, or why not covered"
+          }
         }
       }
     },
-    "untested_risks": { "type": "array", "items": { "type": "string" }, "description": "what was NOT tested and why it matters" },
-    "blockers": { "type": "array", "items": { "type": "string" } },
+    "untested_risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "what was NOT tested and why it matters"
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Blocking objections as plain text, in the same order as blocker_objects. The PAIRING RULE, which is REQUIRED and is enforced after you answer: blockers and blocker_objects are parallel arrays of the same length, and blocker_objects[i].text must be the EXACT SAME STRING as blockers[i] — character for character, not a summary, not a paraphrase, not a shortened restatement. Every blocker_objects[i].id must be unique. A verdict whose object text differs from its blocker text in any way is discarded, so put the full objection in both fields and use `id`, `affected_criteria` and `affected_paths` for the parts that are not prose. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
+    },
     "blocker_objects": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/blockerObject" },
-      "description": "Immutable producer-authored identity and risk mapping for every BLOCK objection"
+      "items": {
+        "$ref": "#/$defs/blockerObject"
+      },
+      "description": "Immutable producer-authored identity and risk mapping for every BLOCK objection. The PAIRING RULE, which is REQUIRED and is enforced after you answer: blockers and blocker_objects are parallel arrays of the same length, and blocker_objects[i].text must be the EXACT SAME STRING as blockers[i] — character for character, not a summary, not a paraphrase, not a shortened restatement. Every blocker_objects[i].id must be unique. A verdict whose object text differs from its blocker text in any way is discarded, so put the full objection in both fields and use `id`, `affected_criteria` and `affected_paths` for the parts that are not prose. The APPROVE/BLOCK blocker rule, which is REQUIRED and is enforced after you answer: if verdict is BLOCK then blockers and blocker_objects must each have at least one entry; if verdict is APPROVE then blockers and blocker_objects must BOTH be empty arrays. An APPROVE carrying any blocker, or a BLOCK carrying none, is rejected outright. Report non-blocking observations in `warnings`, never in `blockers`."
     },
-    "warnings": { "type": "array", "items": { "type": "string" } },
-    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "paths to logs, screenshots, reports" },
-    "summary": { "type": "string", "description": "2-4 sentence human-readable verdict rationale" }
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "paths to logs, screenshots, reports"
+    },
+    "summary": {
+      "type": "string",
+      "description": "2-4 sentence human-readable verdict rationale"
+    }
   },
   "allOf": [
     {
-      "if": {"properties": {"verdict": {"const": "BLOCK"}}, "required": ["verdict"]},
-      "then": {
-        "required": ["blocker_objects"],
+      "if": {
         "properties": {
-          "blockers": {"minItems": 1},
-          "blocker_objects": {"minItems": 1}
+          "verdict": {
+            "const": "BLOCK"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "required": [
+          "blocker_objects"
+        ],
+        "properties": {
+          "blockers": {
+            "minItems": 1
+          },
+          "blocker_objects": {
+            "minItems": 1
+          }
         }
       },
       "else": {
         "properties": {
-          "blockers": {"maxItems": 0},
-          "blocker_objects": {"maxItems": 0}
+          "blockers": {
+            "maxItems": 0
+          },
+          "blocker_objects": {
+            "maxItems": 0
+          }
         }
       }
     }
@@ -84,29 +216,60 @@
     "blockerObject": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "text", "affected_criteria", "affected_paths"],
+      "required": [
+        "id",
+        "text",
+        "affected_criteria",
+        "affected_paths"
+      ],
       "properties": {
-        "id": { "type": "string", "pattern": "^obj-[A-Za-z0-9._:-]{1,128}$" },
-        "text": { "type": "string", "minLength": 1 },
+        "id": {
+          "type": "string",
+          "pattern": "^obj-[A-Za-z0-9._:-]{1,128}$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The blocker text. Must be the EXACT SAME STRING as blockers[i] for the same index i — character for character, not a summary, not a paraphrase, not a shortened restatement."
+        },
         "affected_criteria": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^AC-[0-9]{3}$" }
+          "items": {
+            "type": "string",
+            "pattern": "^AC-[0-9]{3}$"
+          }
         },
         "affected_paths": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
     "stageResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "evidence"],
+      "required": [
+        "status",
+        "evidence"
+      ],
       "properties": {
-        "status": { "type": "string", "enum": ["pass", "fail", "not_applicable"] },
-        "evidence": { "type": "string", "description": "artifact path or reason for not_applicable" }
+        "status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "not_applicable"
+          ]
+        },
+        "evidence": {
+          "type": "string",
+          "description": "artifact path or reason for not_applicable"
+        }
       }
     }
   }

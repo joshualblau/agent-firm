@@ -6,8 +6,8 @@ Firm lifecycle for the primary provider recorded by `firm-new-run`. This eval is
 and Codex-primary must select only `firm-claude-qa`.
 
 Precondition: the selected opposite-provider wrapper must reach a genuine trusted readiness outcome
-of exit 3 in the disposable eval environment (missing CLI, authentication, supported capability, or
-model readiness). If it does not, report the eval precondition as unmet; never use a production force
+of exit 3 in the disposable eval environment (missing CLI, a declared unavailable authentication
+answer, or an unsupported capability; model readiness is no longer a probe). If it does not, report the eval precondition as unmet; never use a production force
 switch, call a wrapper directly outside the engagement, or manufacture an unavailable event.
 
 For the trusted unavailable result, retain the provider-specific attempt record and matching target-
