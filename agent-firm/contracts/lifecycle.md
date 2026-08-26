@@ -52,6 +52,38 @@ or transaction temp. Linux and every other mismatched or unverifiable environmen
 fail closed without a success result; ordinary best-effort mode is not a fallback. Expanding support
 requires new Architecture approval and proving evidence.
 
+**"P2" names two different predicates, and they are not interchangeable.** The *write-host row* is
+the whole tuple above — OS pair, architecture, filesystem and interpreter together — matched entire,
+and it is the only thing that admits a ledger write. The *interpreter row* is narrower: Darwin,
+arm64, CPython 3.9.6, implementation `cpython`, with no OS-pair clause at all. It decides which
+interpreter every `firm-*` tool executes, and it is what `firm-python --status` reports as
+`p2=<yes|no>` and what `firm-python --require-p2` enforces with exit 17. `SUPPORTED_P2_OS_ROWS` in
+`bin/firm-ledger-log` is the sole source for the OS-pair half; the resolver deliberately carries no
+copy of it.
+
+The two answers coincide on most machines, which is exactly why the distinction has to be written
+down rather than inferred. They diverge on a Darwin/arm64 host that ships a compliant CPython 3.9.6
+whose OS pair has never been proven — a supported *interpreter* on an unsupported *write host*.
+Therefore `firm-python --status` reporting `p2=yes` is not a statement that ledger writes are
+admitted here, `firm-doctor` exiting 0 does not follow from a compliant interpreter, and neither
+answer may be derived from the other. Anything that needs the write-host answer asks the producer's
+gate; anything that needs the interpreter answer asks the resolver. A check that reads one and
+asserts about the other is wrong even when it happens to be green.
+
+**A change touching either predicate is verified on a host where they diverge, or it is not
+verified.** A green run on a fully proven row demonstrates nothing about the distinction, so it does
+not discharge this requirement; the divergent case is exercised directly, or modelled by refusing the
+host's own row and re-running. Where a claim is genuinely unattainable on the host at hand, it is
+skipped visibly and by name — never quietly passed, and never quietly dropped, because a suite that
+reports success while a claim went unexamined is the failure this rule exists to prevent.
+
+That distinction is not academic. Both CI platforms went red on 2026-08-25 from this single
+confusion, at two different layers: four assertions expected `firm-doctor` readiness `0` on hosts
+whose OS pair can never match, and three predicted `firm-python --status` from the whole-tuple
+answer. Both were introduced by correct changes that made the distinction observable for the first
+time, and neither was caught before landing, because verification ran only on a proven P2 row —
+the one configuration where the two predicates cannot disagree.
+
 The Lead parses only that proof-instant receipt result, applies its exact `activation.apply.model`,
 `activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
 and retains its exact `event_id` for downstream start, stop, block, and completion records. The
