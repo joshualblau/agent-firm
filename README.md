@@ -77,6 +77,31 @@ or transaction temp. Linux and every other mismatched or unverifiable environmen
 fail closed without a success result; ordinary best-effort mode is not a fallback. Expanding support
 requires new Architecture approval and proving evidence.
 
+**"P2" names two different predicates, and they are not interchangeable.** The *write-host row* is
+the whole tuple above — OS pair, architecture, filesystem and interpreter together — matched entire,
+and it is the only thing that admits a ledger write. The *interpreter row* is narrower: Darwin,
+arm64, CPython 3.9.6, implementation `cpython`, with no OS-pair clause at all. It decides which
+interpreter every `firm-*` tool executes, and it is what `firm-python --status` reports as
+`p2=<yes|no>` and what `firm-python --require-p2` enforces with exit 17. `SUPPORTED_P2_OS_ROWS` in
+`bin/firm-ledger-log` is the sole source for the OS-pair half; the resolver deliberately carries no
+copy of it.
+
+The two answers coincide on most machines, which is exactly why the distinction has to be written
+down rather than inferred. They diverge on a Darwin/arm64 host that ships a compliant CPython 3.9.6
+whose OS pair has never been proven — a supported *interpreter* on an unsupported *write host*.
+Therefore `firm-python --status` reporting `p2=yes` is not a statement that ledger writes are
+admitted here, `firm-doctor` exiting 0 does not follow from a compliant interpreter, and neither
+answer may be derived from the other. Anything that needs the write-host answer asks the producer's
+gate; anything that needs the interpreter answer asks the resolver. A check that reads one and
+asserts about the other is wrong even when it happens to be green.
+
+**A change touching either predicate is verified on a host where they diverge, or it is not
+verified.** A green run on a fully proven row demonstrates nothing about the distinction, so it does
+not discharge this requirement; the divergent case is exercised directly, or modelled by refusing the
+host's own row and re-running. Where a claim is genuinely unattainable on the host at hand, it is
+skipped visibly and by name — never quietly passed, and never quietly dropped, because a suite that
+reports success while a claim went unexamined is the failure this rule exists to prevent.
+
 A printed ordinary event ID or native result followed by exit zero means the producer completed its
 final same-inode exact-byte proof and observed exactly the accepted prefix plus its one complete record
 at that proof instant. It does not attest that those bytes remain stable during later result handling,

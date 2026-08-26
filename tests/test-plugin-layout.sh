@@ -421,6 +421,31 @@ for path in copies:
     # catching, and the cost of the stricter rule is that a deliberate rewrap must touch all four.
     seen.setdefault(found[0], []).append(path.name)
 assert len(seen) == 1, {text[:40]: names for text, names in seen.items()}
+
+# The SAME four files also carry the two-predicates warning, under the same byte-identical rule and
+# for the same reason. It is duplicated deliberately: a role reading only one of these four must not
+# be the role that misses it, and the cost of that redundancy is exactly this check.
+#
+# Scoped from the bolded opening to the closing "this rule exists to prevent." -- a terminator that
+# appears nowhere else -- so lifecycle.md may carry extra rationale after the block without the four
+# copies of the block itself being allowed to drift apart.
+warning = re.compile(
+    r'\*\*"P2" names two different predicates.*?this rule exists to prevent\.',
+    re.S,
+)
+warn_seen = {}
+for path in copies:
+    found = warning.findall(path.read_text())
+    assert len(found) == 1, ("two-predicates warning", path, len(found))
+    warn_seen.setdefault(found[0], []).append(path.name)
+assert len(warn_seen) == 1, {text[:40]: names for text, names in warn_seen.items()}
+
+# The warning must keep naming BOTH surfaces it exists to separate. Deleting either name would leave
+# four byte-identical copies of a paragraph that no longer says the thing, and the check above would
+# still pass -- the identity rule proves agreement, not content.
+one = next(iter(warn_seen))
+for needle in ("firm-python --status", "firm-doctor", "SUPPORTED_P2_OS_ROWS", "--require-p2"):
+    assert needle in one, ("two-predicates warning lost a surface", needle)
 PY
 
 assert_ok "independent mutations kill both provider call patterns" python3 - "$FIRM_ROOT" <<'PY'

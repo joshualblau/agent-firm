@@ -70,19 +70,19 @@ answer may be derived from the other. Anything that needs the write-host answer 
 gate; anything that needs the interpreter answer asks the resolver. A check that reads one and
 asserts about the other is wrong even when it happens to be green.
 
-That last sentence is not hypothetical. Both CI platforms went red on 2026-08-25 from this single
-confusion, at two different layers: four assertions expected `firm-doctor` readiness `0` on hosts
-whose OS pair can never match, and three predicted `firm-python --status` from the whole-tuple
-answer. Both were introduced by correct changes that made the distinction observable for the first
-time, and neither was caught before landing, because verification ran only on a proven P2 row —
-the one configuration where the two predicates cannot disagree.
-
 **A change touching either predicate is verified on a host where they diverge, or it is not
 verified.** A green run on a fully proven row demonstrates nothing about the distinction, so it does
 not discharge this requirement; the divergent case is exercised directly, or modelled by refusing the
 host's own row and re-running. Where a claim is genuinely unattainable on the host at hand, it is
 skipped visibly and by name — never quietly passed, and never quietly dropped, because a suite that
-reports success while a claim went unexamined is the failure this contract exists to prevent.
+reports success while a claim went unexamined is the failure this rule exists to prevent.
+
+That distinction is not academic. Both CI platforms went red on 2026-08-25 from this single
+confusion, at two different layers: four assertions expected `firm-doctor` readiness `0` on hosts
+whose OS pair can never match, and three predicted `firm-python --status` from the whole-tuple
+answer. Both were introduced by correct changes that made the distinction observable for the first
+time, and neither was caught before landing, because verification ran only on a proven P2 row —
+the one configuration where the two predicates cannot disagree.
 
 The Lead parses only that proof-instant receipt result, applies its exact `activation.apply.model`,
 `activation.apply.display`, `activation.apply.effort`, and `agent` to the provider-native launch,
