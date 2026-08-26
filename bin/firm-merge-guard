@@ -389,6 +389,7 @@ MODE    = os.environ.get("FIRM_MG_MODE", "")
 POLICY  = os.environ.get("FIRM_MG_POLICY", "")
 PAYLOAD = os.environ.get("FIRM_MG_PAYLOAD", "")
 COMMAND = os.environ.get("FIRM_MG_COMMAND", "")
+LEDGER_LOG = os.environ.get("FIRM_MG_LEDGER_LOG", "")
 
 # The DECISION codes (what the ledger records and what the bash wrapper reports as the contract).
 PERMIT, REFUSE, CANNOT = 0, 1, 2
@@ -1533,10 +1534,50 @@ def ledger(event, fields):
         import datetime
         rec = {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "event": event}
         rec.update(fields)
+        # DO NOT WRITE A SHAPE THE READER REFUSES. This append is best-effort, but "best-effort" was
+        # only ever about THIS record -- it must not cost the run every LATER record too. One line
+        # the writer cannot classify makes the whole ledger unreadable: ordinary appends are then
+        # dropped while still exiting 0, and every role start fails closed. Silently skipping an
+        # observation is recoverable; poisoning the ledger is not, so this asymmetry decides it.
+        if not conforms_to_ledger_shape(rec):
+            return
         with open(os.path.join(target, "run.jsonl"), "a") as fh:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
     except Exception:
         pass
+
+
+def conforms_to_ledger_shape(rec):
+    """True when bin/firm-ledger-log's reader would classify `rec` as an observation it admits.
+
+    The admitted key sets are READ OUT OF the writer, statically, rather than restated here. Two
+    files that must agree are one file plus a copy that drifts -- and the drift is silent until a
+    run's ledger is already destroyed. Same one-source rule SUPPORTED_P2_OS_ROWS follows.
+
+    Fails CLOSED: if the writer cannot be located or its constants cannot be read, this returns
+    False and the observation is skipped. An unrecorded block is a gap in the audit trail; an
+    unappendable ledger is the end of it.
+    """
+    try:
+        import ast, re
+        if not LEDGER_LOG or not os.path.isfile(LEDGER_LOG):
+            return False
+        with open(LEDGER_LOG) as fh:
+            source = fh.read()
+        shapes = {}
+        for name, event in (("MERGE_BLOCK_OBSERVATION_FIELDS", "merge_guard_block"),
+                            ("MERGE_PERMIT_OBSERVATION_FIELDS", "merge_guard_permit")):
+            m = re.search(r"^%s = (\{.*?\})\n" % name, source, re.M | re.S)
+            if m is None:
+                return False
+            fields = ast.literal_eval(m.group(1))
+            if not isinstance(fields, set) or not fields:
+                return False
+            shapes[event] = fields
+        expected = shapes.get(rec.get("event"))
+        return expected is not None and set(rec) == expected
+    except Exception:
+        return False
 
 # ---- the command under test ----------------------------------------------------------------
 def command_from_payload():
@@ -1632,8 +1673,12 @@ def main():
         err("  allowlist       : %s" % POLICY)
         err("  Fix the allowlist file; an unreadable allowlist is never treated as empty or as")
         err("  allow-everything. See agent-firm/policy/merge-authority.yaml.")
-        ledger("merge_guard_block", {"decision": "cannot_evaluate", "reason": str(e),
-                                     "cmd": cmd[:2000], "matched": hit})
+        # `matched` is folded into reason, not carried as its own key: the merge_guard_block shape
+        # the writer admits is exactly {ts, event, cmd, decision, reason}, and an extra key does not
+        # degrade to a lenient record -- it poisons the ledger for good. (See ledger() below.)
+        ledger("merge_guard_block", {"decision": "cannot_evaluate",
+                                     "reason": "%s [matched: %s]" % (e, hit),
+                                     "cmd": cmd[:2000]})
         return CANNOT
 
     gh_login, gh_status, gh_detail = resolve_gh()
@@ -1704,12 +1749,21 @@ def main():
     err("")
     err("  NOTE: this control is CLIENT-SIDE and bypassable by anyone with repo write access. It")
     err("  is not a security boundary and is not branch protection — see docs/ENFORCEMENT.md.")
+    # THE RECORD FOR THE MOST IMPORTANT THING THIS GUARD EVER DOES -- a refusal -- used to carry
+    # `matched`, `gh_login`, `gh_status`, `git_email`, `git_status` and `exit` as separate keys, and
+    # no `reason` at all. That is not the merge_guard_block shape, so classify_record fell through to
+    # the ordinary branch, demanded run_id, and raised. From that point the run's ledger was
+    # unreadable: ordinary appends were dropped while still exiting 0, and every role start (strict)
+    # failed with "could not append target ledger". The guard blocking a merge permanently destroyed
+    # the audit trail of the run it was protecting.
+    #
+    # The forensic detail is kept -- it is folded into `reason`, which admits 4096 printable chars --
+    # and the record now conforms to the shape the writer declares.
     ledger("merge_guard_block", {
         "decision": "refused" if code == REFUSE else "cannot_evaluate",
-        "cmd": cmd[:2000], "matched": hit,
-        "gh_login": gh_login or "", "gh_status": gh_status,
-        "git_email": git_email or "", "git_status": git_status,
-        "exit": code})
+        "cmd": cmd[:2000],
+        "reason": "matched: %s; gh: %s (%s); git: %s (%s); exit: %s" % (
+            hit, gh_login or "-", gh_status, git_email or "-", git_status, code)})
     return code
 
 def finish(code):
@@ -1871,7 +1925,8 @@ if [ "$MODE" = "surface" ]; then
     exit 2
   fi
   _mg_nonce_new
-  FIRM_MG_MODE=surface FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="" _mg_py
+  FIRM_MG_MODE=surface FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" FIRM_MG_COMMAND="" \
+    FIRM_MG_LEDGER_LOG="$SELF/firm-ledger-log" _mg_py
   exit $?
 fi
 
@@ -1933,7 +1988,7 @@ if [ "$MODE" = "command" ]; then
   # nothing to compare against.
   _mg_nonce_new
   _mg_out="$(FIRM_MG_MODE=command FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="" \
-             FIRM_MG_COMMAND="$CMD" _mg_py)"
+             FIRM_MG_COMMAND="$CMD" FIRM_MG_LEDGER_LOG="$SELF/firm-ledger-log" _mg_py)"
   _mg_report_rc "$?" "$_mg_out" 1
 fi
 
@@ -2000,7 +2055,7 @@ fi
 
 _mg_nonce_new
 _mg_out="$(FIRM_MG_MODE=hook FIRM_MG_POLICY="$POLICY" FIRM_MG_PAYLOAD="$payload" \
-           FIRM_MG_COMMAND="" _mg_py)"
+           FIRM_MG_COMMAND="" FIRM_MG_LEDGER_LOG="$SELF/firm-ledger-log" _mg_py)"
 # THE CALLER CONTRACT (AC-016): anything other than 0 is a block, and a PreToolUse hook only
 # actually blocks on exit 2 in this Claude Code version (measured — exit 1 lets the command run).
 # So a refusal (3) and a cannot-evaluate (2) both become 2 here; they are deliberately NOT
