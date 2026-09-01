@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Private candidate-tool authority used only by firm-run-evals.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __dir="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__dir/$__src";; esac; done
+__self="$(cd -P "$(dirname "$__src")" && pwd)"
+. "$__self/firm-python"
+exec "${FIRM_PYTHON_ARGV[@]}" - "$__src" "$@" <<'PY'
+import argparse, hashlib, hmac, json, os, re, secrets, shlex, signal, socket, stat, subprocess, sys, time
+from pathlib import Path
+
+SELF = Path(sys.argv[1]).resolve()
+ARGV = sys.argv[2:]
+PATCH_BASE = "369c86b18027281fcfec1288efaa1255df315c35"
+PATCH_BYTES = 144413
+PATCH_SHA256 = "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829"
+MAX_MESSAGE = 256 * 1024
+HEX64 = set("0123456789abcdef")
+
+def fail(message):
+    print("firm-eval-authority: INPUT_INVALID: " + message, file=sys.stderr)
+    raise SystemExit(2)
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+def digest_bytes(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def read_bytes(path, maximum=16 * 1024 * 1024):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > maximum:
+            fail("unsafe file")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk: break
+            total += len(chunk)
+            if total > maximum: fail("oversized file")
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if identity(st) != identity(after): fail("file changed while read")
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+def identity(st):
+    return {"dev": st.st_dev, "ino": st.st_ino, "uid": st.st_uid,
+            "mode": stat.S_IMODE(st.st_mode), "nlink": st.st_nlink,
+            "bytes": st.st_size}
+
+def no_symlink_components(path):
+    path = Path(path)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if stat.S_ISLNK(os.lstat(str(current)).st_mode): fail("symlinked path component")
+
+def git(root, *args, binary=False):
+    value = subprocess.check_output(["git", "-C", str(root)] + list(args), stderr=subprocess.DEVNULL)
+    return value if binary else value.decode("utf-8", "strict").strip()
+
+def prove_patch(root, head):
+    commits = git(root, "rev-list", "--first-parent", head).splitlines()
+    for commit in commits:
+        parents = git(root, "show", "-s", "--format=%P", commit).split()
+        if parents == [PATCH_BASE]:
+            raw = git(root, "diff", "--binary", "--full-index", PATCH_BASE, commit, binary=True)
+            if len(raw) == PATCH_BYTES and digest_bytes(raw) == PATCH_SHA256:
+                return commit
+            fail("immutable patch identity mismatch")
+    fail("immutable patch commit not found")
+
+def exact_keys(value, keys):
+    return isinstance(value, dict) and set(value) == set(keys)
+
+def validate_tool(tool, root):
+    keys = {"name","path","dev","ino","uid","mode","nlink","bytes","sha256"}
+    if not exact_keys(tool, keys): fail("tool schema")
+    path = Path(tool["path"])
+    if path.parent != root / "bin" or path.name != tool["name"] or path.resolve() != path:
+        fail("tool path escape")
+    no_symlink_components(path)
+    raw, st = read_bytes(path)
+    if identity(st) != {key: tool[key] for key in ("dev","ino","uid","mode","nlink","bytes")}:
+        fail("tool identity changed")
+    if st.st_nlink != 1 or not (st.st_mode & stat.S_IXUSR) or digest_bytes(raw) != tool["sha256"]:
+        fail("tool bytes or mode changed")
+    return raw, st
+
+def load_manifest(path):
+    raw, st = read_bytes(Path(path), 4 * 1024 * 1024)
+    if stat.S_IMODE(st.st_mode) != 0o600: fail("manifest mode")
+    try: doc = json.loads(raw.decode("utf-8", "strict"))
+    except Exception: fail("manifest JSON")
+    keys = {"schema_version","purpose","invocation","eval","provider","candidate_root",
+            "candidate_commit","candidate_tree","patch_base","patch_commit","patch_bytes",
+            "patch_sha256","scratch_root","scratch_dev","scratch_ino","request_root","response_root","runner","tools"}
+    if not exact_keys(doc, keys) or doc["schema_version"] != 1 or doc["purpose"] != "candidate_eval":
+        fail("manifest schema")
+    root = Path(doc["candidate_root"])
+    if root.resolve() != root: fail("candidate root")
+    if doc["patch_base"] != PATCH_BASE or doc["patch_bytes"] != PATCH_BYTES or doc["patch_sha256"] != PATCH_SHA256:
+        fail("patch binding")
+    if doc["provider"] not in ("claude","codex") or doc["eval"] != "final-evidence-seal": fail("scope")
+    request_root, response_root = Path(doc["request_root"]), Path(doc["response_root"])
+    scratch = Path(doc["scratch_root"])
+    if os.path.commonpath((str(scratch),str(request_root))) != str(scratch): fail("request root")
+    if response_root.parent != Path(path).resolve().parent: fail("response root")
+    for directory in (request_root,response_root):
+        dst=os.lstat(str(directory))
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid!=os.getuid() or stat.S_IMODE(dst.st_mode)!=0o700: fail("transport root")
+    if not isinstance(doc["tools"], list) or not doc["tools"]: fail("empty tools")
+    names = [item.get("name") for item in doc["tools"] if isinstance(item, dict)]
+    if len(names) != len(doc["tools"]) or len(names) != len(set(names)): fail("duplicate tools")
+    for tool in doc["tools"]: validate_tool(tool, root)
+    return doc, raw
+
+def prepare(ns):
+    root = Path(ns.root).resolve(); scratch = Path(ns.scratch).resolve()
+    manifest = Path(ns.manifest); shims = Path(ns.shims)
+    request_root = Path(ns.request_root).resolve(); response_root = Path(ns.response_root).resolve()
+    no_symlink_components(root); no_symlink_components(scratch)
+    if git(root, "rev-parse", "--show-toplevel") != str(root): fail("repository root")
+    if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty candidate")
+    head = git(root, "rev-parse", "HEAD"); tree = git(root, "rev-parse", "HEAD^{tree}")
+    patch_commit = prove_patch(root, head)
+    scratch_st = os.lstat(str(scratch))
+    if not stat.S_ISDIR(scratch_st.st_mode) or scratch_st.st_uid != os.getuid() or stat.S_IMODE(scratch_st.st_mode) & 0o022:
+        fail("unsafe scratch")
+    tools = []
+    for path in sorted((root / "bin").glob("firm-*")):
+        if path.is_symlink() or not path.is_file() or not os.access(str(path), os.X_OK): continue
+        raw, st = read_bytes(path)
+        if st.st_nlink != 1: fail("hardlinked candidate tool")
+        item = {"name":path.name,"path":str(path),"sha256":digest_bytes(raw)}
+        item.update(identity(st)); tools.append(item)
+    if not any(item["name"] == "firm-ledger-log" for item in tools): fail("writer missing")
+    runner = next((item for item in tools if item["name"] == "firm-run-evals"), None)
+    doc = {"schema_version":1,"purpose":"candidate_eval","invocation":secrets.token_hex(24),
+           "eval":ns.eval,"provider":ns.provider,"candidate_root":str(root),
+           "candidate_commit":head,"candidate_tree":tree,"patch_base":PATCH_BASE,
+           "patch_commit":patch_commit,"patch_bytes":PATCH_BYTES,"patch_sha256":PATCH_SHA256,
+           "scratch_root":str(scratch),"scratch_dev":scratch_st.st_dev,"scratch_ino":scratch_st.st_ino,
+           "request_root":str(request_root),"response_root":str(response_root),
+           "runner":runner,"tools":tools}
+    raw = (canonical(doc) + "\n").encode("ascii")
+    manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(str(manifest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
+    try: os.write(fd, raw); os.fsync(fd)
+    finally: os.close(fd)
+    request_root.mkdir(mode=0o700); response_root.mkdir(mode=0o700)
+    shims.mkdir(mode=0o700)
+    shim_body = b'''#!/bin/sh\nset -eu\nexec "$FIRM_EVAL_AUTHORITY_BIN" request-exec --request-root "$FIRM_EVAL_AUTHORITY_REQUEST_ROOT" --response-root "$FIRM_EVAL_AUTHORITY_RESPONSE_ROOT" --manifest "$FIRM_EVAL_AUTHORITY_MANIFEST" --digest "$FIRM_EVAL_AUTHORITY_DIGEST" --invocation "$FIRM_EVAL_INVOCATION" --tool "$(basename "$0")" -- "$@"\n'''
+    for tool in tools:
+        path = shims / tool["name"]
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o700)
+        try: os.write(fd, shim_body); os.fsync(fd)
+        finally: os.close(fd)
+    shell_env = manifest.parent / "shell-env"
+    shell_env.mkdir(mode=0o700)
+    exports = {
+        "PATH": str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+        "FIRM_EVAL_AUTHORITY_BIN": str(SELF),
+        "FIRM_EVAL_AUTHORITY_REQUEST_ROOT": doc["request_root"],
+        "FIRM_EVAL_AUTHORITY_RESPONSE_ROOT": doc["response_root"],
+        "FIRM_EVAL_AUTHORITY_MANIFEST": str(manifest),
+        "FIRM_EVAL_AUTHORITY_DIGEST": digest_bytes(raw),
+        "FIRM_EVAL_INVOCATION": doc["invocation"],
+    }
+    shell_raw = "".join("export %s=%s\n" % (key, shlex.quote(value)) for key,value in exports.items()).encode("utf-8")
+    for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin", ".bash-env", ".sh-env"):
+        path = shell_env / name
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
+        try: os.write(fd, shell_raw); os.fsync(fd)
+        finally: os.close(fd)
+    print(canonical({"schema_version":1,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
+                     "invocation":doc["invocation"],"shim_dir":str(shims),"candidate_commit":head,
+                     "candidate_tree":tree,"patch_commit":patch_commit,"tool_count":len(tools),
+                     "shell_env":str(shell_env)}))
+
+def send_message(request_root, response_root, request):
+    request_id=secrets.token_hex(24)
+    envelope={"schema_version":1,"request_id":request_id,"request":request}
+    request_path=Path(request_root)/(request_id+".request")
+    response_path=Path(response_root)/(request_id+".response")
+    payload=(canonical(envelope)+"\n").encode("ascii")
+    fd=os.open(str(request_path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    try: os.write(fd,payload); os.fsync(fd)
+    finally: os.close(fd)
+    deadline=time.monotonic()+10.0
+    while time.monotonic()<deadline and not response_path.exists(): time.sleep(0.01)
+    if not response_path.exists(): fail("broker response timeout")
+    raw,st=read_bytes(response_path,MAX_MESSAGE)
+    if stat.S_IMODE(st.st_mode)!=0o600: fail("broker response mode")
+    try:
+        envelope=json.loads(raw.decode("ascii"))
+        if not exact_keys(envelope,{"schema_version","request_id","response"}) or envelope["schema_version"]!=1 or envelope["request_id"]!=request_id: raise ValueError()
+        response=envelope["response"]
+    except Exception: fail("broker response JSON")
+    if not isinstance(response,dict) or response.get("ok") is not True: fail("broker refused request")
+    return response
+
+def append_receipt(path, record):
+    raw=(canonical(record)+"\n").encode("ascii")
+    fd=os.open(path, os.O_WRONLY|os.O_APPEND|getattr(os,"O_NOFOLLOW",0))
+    try: os.write(fd,raw); os.fsync(fd)
+    finally: os.close(fd)
+
+def serve(ns):
+    doc, raw = load_manifest(ns.manifest); digest=digest_bytes(raw)
+    if digest != ns.digest or doc["invocation"] != ns.invocation: fail("broker binding")
+    request_root=Path(ns.request_root).resolve(); response_root=Path(ns.response_root).resolve(); receipts=Path(ns.receipts)
+    if str(request_root)!=doc["request_root"] or str(response_root)!=doc["response_root"]: fail("broker transport")
+    fd=os.open(str(receipts), os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600); os.close(fd)
+    pending={}; seen=set(); session_secret=secrets.token_bytes(32); stopping=[False]
+    def stop(*_): stopping[0]=True
+    signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
+    tools={item["name"]:item for item in doc["tools"]}; sequence=0
+    while not stopping[0]:
+        names=sorted(name for name in os.listdir(str(request_root)) if re.fullmatch(r"[0-9a-f]{48}\.request",name))
+        if not names: time.sleep(0.01); continue
+        for name in names:
+            request_id=name[:-8]
+            if request_id in seen: continue
+            seen.add(request_id); response={"ok":False}
+            try:
+                data,_=read_bytes(request_root/name,MAX_MESSAGE)
+                envelope=json.loads(data.decode("ascii"))
+                if not exact_keys(envelope,{"schema_version","request_id","request"}) or envelope["schema_version"]!=1 or envelope["request_id"]!=request_id: raise ValueError()
+                req=envelope["request"]
+                if req.get("manifest_digest") != digest or req.get("invocation") != doc["invocation"]: raise ValueError()
+                if req.get("op") == "exec" and exact_keys(req,{"op","manifest_digest","invocation","tool","argv","cwd"}):
+                    tool=tools.get(req["tool"])
+                    if tool is None or not isinstance(req["argv"],list) or not all(isinstance(x,str) and len(x)<=65536 for x in req["argv"]): raise ValueError()
+                    validate_tool(tool,Path(doc["candidate_root"])); sequence += 1
+                    receipt={"schema_version":1,"sequence":sequence,"kind":"execution","tool":tool["name"],"path":tool["path"],"bytes":tool["bytes"],"sha256":tool["sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"argv_sha256":digest_bytes(canonical(req["argv"]).encode("ascii")),"cwd":req["cwd"]}
+                    append_receipt(str(receipts),receipt); response={"ok":True,"tool":tool,"receipt":receipt}
+                    if tool["name"] == "firm-ledger-log" and "--run" in req["argv"]:
+                        pos=req["argv"].index("--run")
+                        if pos+1 >= len(req["argv"]): raise ValueError()
+                        cwd=Path(req["cwd"])
+                        if not cwd.is_absolute() or cwd.resolve()!=cwd: raise ValueError()
+                        run=Path(req["argv"][pos+1]); run=(cwd/run).resolve() if not run.is_absolute() else run.resolve(); scratch=Path(doc["scratch_root"])
+                        if os.path.commonpath((str(scratch),str(run))) != str(scratch) or run == scratch: raise ValueError()
+                        rst=os.lstat(str(run))
+                        if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.getuid(): raise ValueError()
+                        token={"schema_version":1,"purpose":"eval_p2_write","token":secrets.token_hex(32),"invocation":doc["invocation"],"manifest_digest":digest,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"patch_sha256":doc["patch_sha256"],"eval":doc["eval"],"provider":doc["provider"],"writer_path":tool["path"],"writer_sha256":tool["sha256"],"scratch_root":str(scratch),"scratch_dev":doc["scratch_dev"],"scratch_ino":doc["scratch_ino"],"run_path":str(run),"run_dev":rst.st_dev,"run_ino":rst.st_ino,"macos":"26.5.1","kernel":"25.5.0","architecture":"arm64","python":"3.9.6","implementation":"cpython","filesystem":"apfs","issued_monotonic_ns":time.monotonic_ns(),"expires_monotonic_ns":time.monotonic_ns()+30_000_000_000}
+                        token["auth"]=hmac.new(session_secret,canonical(token).encode("ascii"),hashlib.sha256).hexdigest(); pending[token["token"]]=token; response["p2_attestation"]=token
+                elif req.get("op") == "validate_p2" and exact_keys(req,{"op","manifest_digest","invocation","token","writer_path","writer_sha256","run_path"}):
+                    token=req["token"] if isinstance(req["token"],dict) else {}; expected=pending.pop(token.get("token",None),None)
+                    unsigned=dict(token); auth=unsigned.pop("auth",None); valid_auth=isinstance(auth,str) and hmac.compare_digest(auth,hmac.new(session_secret,canonical(unsigned).encode("ascii"),hashlib.sha256).hexdigest())
+                    if expected is None or token != expected or not valid_auth or time.monotonic_ns()>token["expires_monotonic_ns"]: raise ValueError()
+                    if req["writer_path"]!=token["writer_path"] or req["writer_sha256"]!=token["writer_sha256"] or req["run_path"]!=token["run_path"]: raise ValueError()
+                    sequence += 1; append_receipt(str(receipts),{"schema_version":1,"sequence":sequence,"kind":"p2_consumed","tool":"firm-ledger-log","path":token["writer_path"],"bytes":tools["firm-ledger-log"]["bytes"],"sha256":token["writer_sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"run_path":token["run_path"],"token":token["token"]})
+                    response={"ok":True,"modeled":{"system":"Darwin","macos":token["macos"],"kernel":token["kernel"],"architecture":token["architecture"],"python":token["python"],"implementation":token["implementation"],"filesystem":token["filesystem"]}}
+            except Exception: response={"ok":False}
+            response_envelope=(canonical({"schema_version":1,"request_id":request_id,"response":response})+"\n").encode("ascii")
+            response_path=response_root/(request_id+".response")
+            fd=os.open(str(response_path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+            try: os.write(fd,response_envelope); os.fsync(fd)
+            finally: os.close(fd)
+
+def request_exec(ns, rest):
+    doc, raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("shim binding")
+    response=send_message(ns.request_root,ns.response_root,{"op":"exec","manifest_digest":ns.digest,"invocation":ns.invocation,"tool":ns.tool,"argv":rest,"cwd":os.path.realpath(os.getcwd())})
+    tool=response.get("tool"); validate_tool(tool,Path(doc["candidate_root"]))
+    env=os.environ.copy()
+    if "p2_attestation" in response: env["FIRM_EVAL_P2_ATTESTATION"]=canonical(response["p2_attestation"])
+    os.execve(tool["path"],[tool["path"]]+rest,env)
+
+def validate_p2(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("writer binding")
+    try: token=json.loads(ns.token)
+    except Exception: fail("token JSON")
+    response=send_message(ns.request_root,ns.response_root,{"op":"validate_p2","manifest_digest":ns.digest,"invocation":ns.invocation,"token":token,"writer_path":ns.writer_path,"writer_sha256":ns.writer_sha256,"run_path":ns.run_path})
+    print(canonical(response))
+
+def verify(ns):
+    doc, raw=load_manifest(ns.manifest); expected=digest_bytes(raw)
+    if expected!=ns.digest: fail("verify digest")
+    receipt_raw,_=read_bytes(Path(ns.receipts),8*1024*1024)
+    rows=[]
+    for line in receipt_raw.splitlines():
+        try: row=json.loads(line.decode("ascii"))
+        except Exception: fail("receipt JSON")
+        if row.get("manifest_digest")!=expected or row.get("invocation")!=doc["invocation"]: fail("receipt binding")
+        rows.append(row)
+    if not rows or not any(r.get("tool")=="firm-ledger-log" for r in rows) or not any(r.get("kind")=="p2_consumed" for r in rows): fail("missing required receipt")
+    output={"schema_version":1,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
+            "patch_commit":doc["patch_commit"],"patch_bytes":doc["patch_bytes"],"patch_sha256":doc["patch_sha256"],
+            "manifest_digest":expected,"invocation":doc["invocation"],"tool_count":len(doc["tools"]),
+            "execution_receipts":sum(r.get("kind")=="execution" for r in rows),"p2_receipts":sum(r.get("kind")=="p2_consumed" for r in rows),
+            "receipt_sha256":digest_bytes(receipt_raw),"receipt_bytes":len(receipt_raw)}
+    print(canonical(output))
+
+def main():
+    p=argparse.ArgumentParser(add_help=False); sub=p.add_subparsers(dest="command",required=True)
+    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--scratch",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True)
+    q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
+    q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)
+    q=sub.add_parser("validate-p2"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--token",required=True); q.add_argument("--writer-path",required=True); q.add_argument("--writer-sha256",required=True); q.add_argument("--run-path",required=True)
+    q=sub.add_parser("verify"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--receipts",required=True)
+    ns,rest=p.parse_known_args(ARGV)
+    if ns.command=="prepare": prepare(ns)
+    elif ns.command=="serve": serve(ns)
+    elif ns.command=="request-exec":
+        if not rest or rest[0]!="--": fail("missing argv boundary")
+        request_exec(ns,rest[1:])
+    elif ns.command=="validate-p2": validate_p2(ns)
+    else: verify(ns)
+main()
+PY

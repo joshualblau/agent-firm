@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm.local/schemas/eval-execution-authority.schema.json",
+  "title": "Candidate-bound eval execution authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "purpose": {"const": "candidate_eval"},
+    "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"},
+    "eval": {"const": "final-evidence-seal"},
+    "provider": {"enum": ["claude", "codex"]},
+    "candidate_root": {"type": "string", "minLength": 1},
+    "candidate_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "patch_base": {"const": "369c86b18027281fcfec1288efaa1255df315c35"},
+    "patch_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "patch_bytes": {"const": 144413},
+    "patch_sha256": {"const": "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829"},
+    "scratch_root": {"type": "string", "minLength": 1},
+    "scratch_dev": {"type": "integer", "minimum": 0},
+    "scratch_ino": {"type": "integer", "minimum": 1},
+    "request_root": {"type": "string", "minLength": 1},
+    "response_root": {"type": "string", "minLength": 1},
+    "runner": {"$ref": "#/$defs/tool"},
+    "tools": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/tool"}}
+  },
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^firm-[a-z0-9-]+$"},
+        "path": {"type": "string", "minLength": 1},
+        "dev": {"type": "integer", "minimum": 0},
+        "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 256, "maximum": 511},
+        "nlink": {"const": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

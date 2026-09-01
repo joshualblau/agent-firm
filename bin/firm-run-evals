@@ -36,6 +36,7 @@ MANUAL="$ROOT/agent-firm/contracts/lifecycle.md"  # shared provider-neutral life
 SETTINGS="$ROOT/.claude/settings.json"   # the firm's canonical allow/ask/deny posture
 CHECKER="$SELF/firm-check-assertions"
 BOUNDED="$SELF/firm-bounded-exec"
+EVAL_AUTHORITY="$SELF/firm-eval-authority"
 
 mode=run; provider=claude; want=""; operation_seen=0
 while [ $# -gt 0 ]; do
@@ -203,7 +204,11 @@ PY
 }
 
 run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
-  local d="$1" name="$2" provider_rc turns prompt checker_rc
+  local d="$1" name="$2" provider_rc turns prompt checker_rc provider_executable
+  local codex_command claude_command
+  codex_command=codex; claude_command=claude
+  local control="" broker_pid="" authority_manifest="" authority_digest="" authority_invocation="" candidate_path=""
+  local shell_env="${ZDOTDIR:-${HOME:-/tmp}}" shell_bash_env="${BASH_ENV:-}" shell_sh_env="${ENV:-}"
   [ -x "$CHECKER" ] || { echo "FAIL $name: missing executable firm-check-assertions at $CHECKER; provider phase not started" >&2; return 1; }
   command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
   [ -x "$BOUNDED" ] || { echo "FAIL $name: missing executable firm-bounded-exec" >&2; return 1; }
@@ -247,6 +252,42 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   local out="$scratch/.eval-out"; mkdir -p "$out"
   make_eval_settings "$out/settings.json"
 
+  # The evidence-seal golden is candidate-specific. Build its command capsule outside provider write
+  # scope, prove the immutable patch and final candidate first, and invoke the selected provider by
+  # its pre-resolved absolute path so PATH contains no ambient firm installation or checkout.
+  if [ "$name" = final-evidence-seal ]; then
+    [ -x "$EVAL_AUTHORITY" ] || { echo "FAIL $name: missing candidate authority" >&2; return 1; }
+    provider_executable="$(command -v "$provider" 2>/dev/null || true)"
+    [ -n "$provider_executable" ] || { echo "SKIP $name: '$provider' not found"; return 4; }
+    case "$provider_executable" in /*) ;; *) provider_executable="$(cd -P "$(dirname "$provider_executable")" && pwd)/$(basename "$provider_executable")" ;; esac
+    [ "$provider" = codex ] && codex_command="$provider_executable" || claude_command="$provider_executable"
+    control="$(mktemp -d "/tmp/firm-eval-authority.XXXXXX")" || return 1
+    chmod 700 "$control" || return 1
+    authority_manifest="$control/manifest.json"
+    authority_prepare="$($EVAL_AUTHORITY prepare --root "$ROOT" --eval "$name" --provider "$provider" \
+      --scratch "$scratch" --manifest "$authority_manifest" --shims "$control/shims" \
+      --request-root "$out/authority-requests" --response-root "$control/responses")" || { rm -rf "$control"; return 1; }
+    authority_digest="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["manifest_digest"])')" || { rm -rf "$control"; return 1; }
+    authority_invocation="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')" || { rm -rf "$control"; return 1; }
+    shell_env="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["shell_env"])')" || { rm -rf "$control"; return 1; }
+    shell_bash_env="$shell_env/.bash-env"; shell_sh_env="$shell_env/.sh-env"
+    candidate_path="$control/shims:/usr/bin:/bin:/usr/sbin:/sbin"
+    "$EVAL_AUTHORITY" serve --manifest "$authority_manifest" --digest "$authority_digest" \
+      --invocation "$authority_invocation" --request-root "$out/authority-requests" \
+      --response-root "$control/responses" --receipts "$control/receipts.jsonl" &
+    broker_pid=$!
+    authority_ready=0; authority_wait=0
+    while [ "$authority_wait" -lt 100 ]; do
+      [ -f "$control/receipts.jsonl" ] && { authority_ready=1; break; }
+      kill -0 "$broker_pid" 2>/dev/null || break
+      sleep 0.02; authority_wait=$((authority_wait+1))
+    done
+    [ "$authority_ready" -eq 1 ] || { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; rm -rf "$control"; echo "FAIL $name: candidate authority did not start" >&2; return 1; }
+    trap 'kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; [ -z "$control" ] || rm -rf "$control"' EXIT HUP INT TERM
+  else
+    provider_executable="$(command -v "$provider" 2>/dev/null || true)"
+  fi
+
   echo "==> $name: driving the $provider-primary firm headlessly (bounded posture) in $scratch"
   echo "    bounds: wall=${eval_timeout}s top-level-turns=$eval_max_turns cases=$eval_max_cases attempts=1 retries=0"
   # AskUserQuestion / merge / push are deliberately NOT allow-listed, so the firm cannot autonomously
@@ -255,7 +296,12 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     "$BOUNDED" --phase eval --provider claude --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --generation 1 --output "$out/result.json" --result "$out/supervision.json" --cwd "$scratch" -- \
-      claude -p "$(cat "$d/task.md")" \
+      /usr/bin/env PATH="${candidate_path:-$PATH}" \
+        ZDOTDIR="$shell_env" BASH_ENV="$shell_bash_env" ENV="$shell_sh_env" \
+        FIRM_EVAL_AUTHORITY_BIN="$EVAL_AUTHORITY" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
+        FIRM_EVAL_AUTHORITY_RESPONSE_ROOT="$control/responses" \
+        FIRM_EVAL_AUTHORITY_MANIFEST="$authority_manifest" FIRM_EVAL_AUTHORITY_DIGEST="$authority_digest" \
+        FIRM_EVAL_INVOCATION="$authority_invocation" "$claude_command" -p "$(cat "$d/task.md")" \
         --append-system-prompt "$(cat "$MANUAL")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns." \
@@ -294,10 +340,27 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
-      env FIRM_PRIMARY_PROVIDER=codex codex exec --ephemeral \
+      /usr/bin/env PATH="${candidate_path:-$PATH}" FIRM_PRIMARY_PROVIDER=codex \
+        ZDOTDIR="$shell_env" BASH_ENV="$shell_bash_env" ENV="$shell_sh_env" \
+        FIRM_EVAL_AUTHORITY_BIN="$EVAL_AUTHORITY" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
+        FIRM_EVAL_AUTHORITY_RESPONSE_ROOT="$control/responses" \
+        FIRM_EVAL_AUTHORITY_MANIFEST="$authority_manifest" FIRM_EVAL_AUTHORITY_DIGEST="$authority_digest" \
+        FIRM_EVAL_INVOCATION="$authority_invocation" "$codex_command" exec --ephemeral \
         -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
         -s workspace-write -c 'approval_policy="never"' --json "$prompt"
     provider_rc=$?
+  fi
+
+  if [ -n "$broker_pid" ]; then
+    kill "$broker_pid" 2>/dev/null || true
+    wait "$broker_pid" 2>/dev/null || true
+    cp "$control/receipts.jsonl" "$out/candidate-execution-receipts.jsonl" 2>/dev/null || provider_rc=1
+    chmod 600 "$out/candidate-execution-receipts.jsonl" 2>/dev/null || provider_rc=1
+    "$EVAL_AUTHORITY" verify --manifest "$authority_manifest" --digest "$authority_digest" \
+      --receipts "$control/receipts.jsonl" > "$out/candidate-execution-summary.json" || provider_rc=1
+    chmod 600 "$out/candidate-execution-summary.json" 2>/dev/null || provider_rc=1
+    rm -rf "$control"; control=""; broker_pid=""
+    trap - EXIT HUP INT TERM
   fi
 
   if [ "$provider_rc" -ne 0 ]; then

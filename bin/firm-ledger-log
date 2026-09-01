@@ -32,6 +32,7 @@ import platform
 import re
 import secrets
 import select
+import socket
 import stat
 import subprocess
 import sys
@@ -1138,16 +1139,94 @@ def guarded_p2_test_rejection(run_path):
     return requested
 
 
+def consume_eval_p2_attestation(run_path):
+    """Consume one broker-held eval token; absent token leaves production discovery untouched."""
+    raw = os.environ.get("FIRM_EVAL_P2_ATTESTATION", "")
+    if not raw:
+        return None
+    request_root = os.environ.get("FIRM_EVAL_AUTHORITY_REQUEST_ROOT", "")
+    response_root = os.environ.get("FIRM_EVAL_AUTHORITY_RESPONSE_ROOT", "")
+    authority_bin = os.environ.get("FIRM_EVAL_AUTHORITY_BIN", "")
+    manifest_path = os.environ.get("FIRM_EVAL_AUTHORITY_MANIFEST", "")
+    manifest_digest = os.environ.get("FIRM_EVAL_AUTHORITY_DIGEST", "")
+    invocation = os.environ.get("FIRM_EVAL_INVOCATION", "")
+    if (
+        not request_root or not response_root or not authority_bin or not manifest_path
+        or not manifest_digest or not invocation
+        or len(raw.encode("utf-8")) > MAX_JSON_OPERAND
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest_digest)
+        or not re.fullmatch(r"[0-9a-f]{48}", invocation)
+        or not inside_trusted_temp(request_root) or not inside_trusted_temp(response_root)
+    ):
+        role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+    try:
+        if not owned_private_directory(request_root) or not owned_private_directory(response_root):
+            role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+        token = parse_json_unique(raw)
+        writer_path = os.path.realpath(str(TOOL_ROOT / "bin" / "firm-ledger-log"))
+        expected_path = os.path.abspath(str(TOOL_ROOT / "bin" / "firm-ledger-log"))
+        if writer_path != expected_path:
+            role_fail(2, "INPUT_INVALID", "eval-p2-writer")
+        writer_fd = os.open(writer_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            writer_stat = os.fstat(writer_fd)
+            if not stat.S_ISREG(writer_stat.st_mode) or writer_stat.st_uid != os.getuid():
+                role_fail(2, "INPUT_INVALID", "eval-p2-writer")
+            writer_digest = hashlib.sha256()
+            while True:
+                chunk = os.read(writer_fd, CHUNK)
+                if not chunk:
+                    break
+                writer_digest.update(chunk)
+        finally:
+            os.close(writer_fd)
+        expected_authority = os.path.realpath(str(TOOL_ROOT / "bin" / "firm-eval-authority"))
+        if os.path.realpath(authority_bin) != expected_authority or authority_bin != expected_authority:
+            role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+        result = subprocess.run([
+            authority_bin, "validate-p2", "--request-root", request_root,
+            "--response-root", response_root, "--manifest", manifest_path,
+            "--digest", manifest_digest, "--invocation", invocation,
+            "--token", raw, "--writer-path", writer_path,
+            "--writer-sha256", writer_digest.hexdigest(),
+            "--run-path", os.path.realpath(str(run_path)),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+           text=True, timeout=15, check=False)
+        if result.returncode != 0 or len(result.stdout.encode("utf-8")) > MAX_JSON_OPERAND:
+            role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+        response = parse_json_unique(result.stdout.strip())
+        if not exact_keys(response, {"ok", "modeled"}) or response["ok"] is not True:
+            role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+        modeled = response["modeled"]
+        if not exact_keys(modeled, {"system", "macos", "kernel", "architecture", "python", "implementation", "filesystem"}):
+            role_fail(2, "INPUT_INVALID", "eval-p2-model")
+        if (
+            modeled["system"] != "Darwin"
+            or (modeled["macos"], modeled["kernel"]) not in SUPPORTED_P2_OS_ROWS
+            or modeled["architecture"] != "arm64" or modeled["python"] != "3.9.6"
+            or modeled["implementation"] != "cpython" or modeled["filesystem"] != "apfs"
+        ):
+            role_fail(2, "INPUT_INVALID", "eval-p2-model")
+        return modeled
+    except RoleFailure:
+        raise
+    except Exception:
+        role_fail(2, "INPUT_INVALID", "eval-p2-authority")
+
+
 def preflight_write_environment(run_path):
     """Pure process/capability classification before RunBinding consumes security primitives."""
     reject = guarded_p2_test_rejection(run_path)
+    modeled = consume_eval_p2_attestation(run_path)
+    if reject is not None and modeled is not None:
+        role_fail(2, "INPUT_INVALID", "test-support")
     try:
-        system = platform.system()
-        macos = platform.mac_ver()[0]
-        kernel = platform.release()
-        architecture = platform.machine()
-        python = tuple(sys.version_info[:3])
-        implementation = getattr(sys.implementation, "name", "")
+        system = modeled["system"] if modeled else platform.system()
+        macos = modeled["macos"] if modeled else platform.mac_ver()[0]
+        kernel = modeled["kernel"] if modeled else platform.release()
+        architecture = modeled["architecture"] if modeled else platform.machine()
+        python = tuple(int(part) for part in modeled["python"].split(".")) if modeled else tuple(sys.version_info[:3])
+        implementation = modeled["implementation"] if modeled else getattr(sys.implementation, "name", "")
         python_executable = sys.executable
         if reject == "linux":
             system = "Linux"
@@ -1201,7 +1280,7 @@ def preflight_write_environment(run_path):
             unsupported_write_configuration()
         return {
             "reject": reject, "nofollow": nofollow, "directory": directory,
-            "python_executable": python_executable,
+            "python_executable": python_executable, "modeled_filesystem": modeled is not None,
         }
     except RoleFailure:
         raise
@@ -1614,7 +1693,11 @@ def require_supported_write_environment(run, preflight):
         if not same_filesystem:
             unsupported_write_configuration()
         device = held_stats[0].st_dev
-        filesystem = descriptor_filesystem_fact(run, preflight["python_executable"])
+        filesystem = (
+            {"filesystem": "apfs", "flags": P2_MNT_LOCAL}
+            if preflight.get("modeled_filesystem")
+            else descriptor_filesystem_fact(run, preflight["python_executable"])
+        )
         if reject == "filesystem_unverifiable":
             filesystem = None
         elif reject == "filesystem_type_mismatch":

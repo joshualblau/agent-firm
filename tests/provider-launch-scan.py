@@ -77,7 +77,7 @@ LAUNCH_OWNERS = {
 }
 
 # Shell words that may precede the executable and do not end command position.
-PREFIX_WORDS = {"env", "command", "nohup", "time", "exec", "sudo", "-", "!", "run_capped"}
+PREFIX_WORDS = {"env", "/usr/bin/env", "command", "nohup", "time", "exec", "sudo", "-", "!", "run_capped"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 NUMBER = re.compile(r"^[0-9]+$")
 
@@ -402,31 +402,15 @@ def python_launches(relative, text):
 #     That case is a union, not a measurement, and the union is the thing this scanner exists to
 #     reject.
 UNDOCUMENTED_CONTROLS = {
-    # RE-MEASURED 2026-08-25 because the record had gone stale, which is the rule working: the
-    # entry named claude 2.1.238 and 2.1.234 is what is installed, so the scanner refused it as
-    # evidence and asked for a new measurement. This is that measurement.
-    #
-    # It is taken with an UNREACHABLE --model on purpose, so the run stops locally --
-    # duration_api_ms 0, total_cost_usd 0 -- and nothing is billed to establish a fact about
-    # argument parsing. `--help` cannot be the vehicle: `claude --not-a-real-flag --help` is also
-    # rc 0, so a help-terminated run proves nothing about whether an option is recognised.
-    #
-    #   claude --max-turns 3 -p x --model NOT-A-REAL-MODEL --output-format json
-    #     -> rc 1, and the failure is `unrecognized_model`, i.e. --max-turns was ACCEPTED and
-    #        parsing reached the model
-    #   claude --not-a-real-flag 3 -p x --model NOT-A-REAL-MODEL --output-format json    (CONTROL)
-    #     -> rc 1, `error: unknown option '--not-a-real-flag'` -- what an unrecognised option
-    #        actually looks like on this build
+    # RE-MEASURED 2026-09-01 because the installed CLI changed. An invalid numeric value proves the
+    # parser recognizes --max-turns and stops locally before any provider or network operation.
     ("claude", (), "--max-turns"): {
         "cli": "claude",
-        "version": "2.1.234",
-        "date": "2026-08-25",
-        "argv": ["claude", "--max-turns", "3", "-p", "x", "--model", "NOT-A-REAL-MODEL",
-                 "--output-format", "json"],
+        "version": "2.1.251",
+        "date": "2026-09-01",
+        "argv": ["claude", "--max-turns", "text", "-p", "x"],
         "rc": 1,
-        "observed": "rc 1 from unrecognized_model, NOT from an unknown option; the control "
-                    "`--not-a-real-flag` in the same position is `error: unknown option`. So "
-                    "--max-turns is accepted and is simply absent from `claude --help`",
+        "observed": "rc 1: option --max-turns argument text is invalid and must be a number",
     },
 }
 MEASUREMENT_FIELDS = {"cli", "version", "date", "argv", "rc", "observed"}
