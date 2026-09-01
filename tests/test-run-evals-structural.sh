@@ -22,6 +22,31 @@ assert_rc "unknown structural selector is usage failure" 2 "$RUN" --structural d
 assert_rc "unknown behavioral selector fails before a provider lookup" 2 "$RUN" definitely-not-an-eval
 assert_output "unknown selector gives valid names" "valid eval names:" "$RUN" --structural definitely-not-an-eval
 assert_output "unknown selector gives a copyable correction" "firm-run-evals --list" "$RUN" --structural definitely-not-an-eval
+
+t_case "golden launch is guardian-first and one provider-neutral Seatbelt boundary wraps both providers"
+assert_ok "guardian readiness precedes every golden filesystem allocation and preparation" t_python - "$RUN" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+start=raw.index('guardian-start --parent /private/tmp')
+allocation=raw.index('local out="$scratch/.eval-out"')
+prepare=raw.index('authority_prepare="$($EVAL_AUTHORITY prepare')
+assert start < allocation < prepare
+PY
+assert_eq "runner contains exactly one provider-neutral sandbox-exec construction" 1 \
+  "$(rg -c 'seatbelt_prefix=\( /usr/bin/sandbox-exec' "$RUN")"
+assert_eq "the same Seatbelt prefix reaches both provider argv shapes" 2 \
+  "$(rg -c '"\$\{seatbelt_prefix\[@\]\}" PATH=' "$RUN")"
+assert_output "bounded supervisor remains outside Seatbelt" \
+  'guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec' cat "$RUN"
+assert_eq "runner has no recursive control/capsule deletion fallback" 0 \
+  "$(rg -c 'rm -rf .*\$control|rm -rf .*\$scratch' "$RUN" || printf '0\n')"
+assert_ok "all four load-bearing concurrent barriers are wired" t_python - "$BIN/firm-eval-authority" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+for phase in ("manifest_read","dispatch_commit","use_exec","cleanup_commit"):
+    assert ('"%s"'%phase) in raw
+assert "shutil.rmtree" not in raw
+PY
 assert_rc "list is successful" 0 "$RUN" --list
 assert_output "list makes no behavioral or structural claim" "listing only" "$RUN" --list
 

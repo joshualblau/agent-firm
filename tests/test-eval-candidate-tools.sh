@@ -45,20 +45,71 @@ assert_no_file "brokerless claim creates no lock" "$bad_run/run.jsonl.lock"
 assert_eq "brokerless claim creates no transaction temp" 0 \
   "$(find "$bad_run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 
+t_case "all four authenticated barriers overlap an independent mutator and fail closed"
+for phase in manifest_read dispatch_commit use_exec cleanup_commit; do
+  barrier_root="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-barrier.XXXXXX")"; t_track "$barrier_root"; chmod 700 "$barrier_root"
+  token="$(t_python -c 'import secrets; print(secrets.token_hex(32))')"
+  invocation="$(t_python -c 'import secrets; print(secrets.token_hex(24))')"
+  target="$barrier_root/target"; printf 'before-%s\n' "$phase" > "$target"; chmod 600 "$target"
+  t_python - "$barrier_root" "$token" "$phase" "$invocation" "$target" <<'PY' &
+import json,os,sys,time
+root,token,phase,invocation,target=sys.argv[1:]
+prefix=os.path.join(root,token+"."+phase)
+ready,mutated,resume,release=[prefix+suffix for suffix in (".ready",".mutated",".resume",".release")]
+deadline=time.monotonic()+10
+while time.monotonic()<deadline and not os.path.exists(ready): time.sleep(.002)
+if not os.path.exists(ready): raise SystemExit(3)
+authority=json.load(open(ready,encoding="ascii"))["authority_pid"]
+os.kill(authority,0)
+original=target+".original"; os.rename(target,original)
+fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+os.write(fd,("mutated-%s\n"%phase).encode("ascii")); os.fsync(fd); os.close(fd)
+record={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
+        "mutator_pid":os.getpid(),"mutate_monotonic_ns":time.monotonic_ns(),
+        "changed":{"original":original,"replacement":target}}
+fd=os.open(mutated,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+os.write(fd,(json.dumps(record,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.close(fd)
+while time.monotonic()<deadline and not os.path.exists(resume): time.sleep(.002)
+if not os.path.exists(resume): raise SystemExit(4)
+release_doc={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
+             "mutator_pid":os.getpid(),"release_monotonic_ns":time.monotonic_ns()}
+fd=os.open(release,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+os.write(fd,(json.dumps(release_doc,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.close(fd)
+PY
+  mutator=$!
+  "$AUTH" test-barrier-probe --root "$barrier_root" --token "$token" --invocation "$invocation" \
+    --candidate a57a8d0b4754ed92b74c023c340aab3154845abb --phase "$phase" --target "$target" \
+    > "$barrier_root/authority.out" 2> "$barrier_root/authority.err"
+  barrier_rc=$?
+  wait "$mutator"; mutator_rc=$?
+  if [ "$barrier_rc" -eq 2 ] && [ "$mutator_rc" -eq 0 ] \
+      && grep -q "concurrent $phase mutation detected" "$barrier_root/authority.err"; then
+    _t_ok "$phase overlaps a live authority and is rejected after release"
+  else
+    _t_no "$phase overlaps a live authority and is rejected after release" "authority_rc=$barrier_rc mutator_rc=$mutator_rc"
+  fi
+done
+
 t_case "clean exact candidate gets one-use execution and P2-consumption receipts"
 if [ -n "$(git -C "$FIRM_ROOT" status --porcelain --untracked-files=all)" ]; then
   t_skip "live capsule dynamic" "candidate checkout is dirty; prepare correctly refuses an ambiguous candidate"
 else
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-capsule.XXXXXX")"; t_track "$scratch"
-  chmod 700 "$scratch"
+  guardian="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+  scratch="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["capsule"])')"
+  control="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+  guardian_root="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+  guardian_token="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+  guardian_pid="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+  guardian_marker="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["failure_marker"])')"
+  invocation="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
   mkdir -p "$scratch/.eval-out"
-  control="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-control.XXXXXX")"; t_track "$control"; chmod 700 "$control"
   prepared="$($AUTH prepare --root "$FIRM_ROOT" --eval final-evidence-seal --provider codex \
+    --provider-executable /usr/bin/true --guardian-root "$guardian_root" --guardian-pid "$guardian_pid" \
+    --guardian-token "$guardian_token" --guardian-failure-marker "$guardian_marker" --invocation "$invocation" \
     --scratch "$scratch" --fixture "$FIRM_ROOT/agent-firm/evals/final-evidence-seal/fixture" \
     --manifest "$control/manifest.json" --shims "$control/shims" \
     --request-root "$scratch/.eval-out/authority-requests" --response-root "$control/responses")"
   digest="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["manifest_digest"])')"
-  invocation="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
   project="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["project_root"])')"
   authority_bin="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["authority_bin"])')"
   common="$(cd "$scratch/git-common" && pwd -P)"
@@ -69,7 +120,11 @@ else
     "$(git -C "$project" rev-parse --path-format=absolute --git-common-dir)"
   assert_eq "candidate anchor is immutable payload" a57a8d0b4754ed92b74c023c340aab3154845abb \
     "$(git -C "$project" rev-parse refs/firm-eval/candidate)"
-  "$AUTH" serve --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation" \
+  assert_ok "exact Seatbelt wrapper denies canonical and alias real-common reads/writes" \
+    "$AUTH" seatbelt-probe --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation"
+  guardian_sequence=1
+  "$AUTH" guardian-exec --control "$control" --token "$guardian_token" --invocation "$invocation" --sequence "$guardian_sequence" -- \
+    "$AUTH" serve --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation" \
     --request-root "$scratch/.eval-out/authority-requests" --response-root "$control/responses" \
     --receipts "$control/receipts.jsonl" &
   broker=$!
@@ -135,10 +190,12 @@ else
       "$(git -C "$linked" rev-parse --path-format=absolute --git-common-dir)"
     assert_ok "normal Git linked worktree cleanup stays contained" git -C "$project" worktree remove "$linked"
     chmod 755 "$scratch"
-    assert_rc "cleanup refuses ambiguous capsule mode" 2 "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest"
+    assert_rc "cleanup refuses ambiguous capsule mode" 2 "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
+      --invocation "$invocation" --control "$control" --token "$guardian_token" --sequence 2
     chmod 700 "$scratch"
-    assert_ok "guardian removes complete capsule" "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest"
-    assert_no_file "capsule leaves no reusable residue" "$scratch"
+    assert_ok "guardian removes complete capsule" "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
+      --invocation "$invocation" --control "$control" --token "$guardian_token" --sequence 2
+    assert_no_file "capsule leaves no reusable residue" "$guardian_root"
   else
     kill "$broker" 2>/dev/null || true; wait "$broker" 2>/dev/null || true
     _t_no "private authority broker starts" "socket unavailable"

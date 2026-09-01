@@ -4,9 +4,9 @@
   "title": "Disposable-Git candidate-bound eval execution authority",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "harness_root", "harness_commit", "harness_tree", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools", "capsule"],
+  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "harness_root", "harness_commit", "harness_tree", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools", "capsule", "guardian", "seatbelt", "test_barrier"],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "purpose": {"const": "disposable_git_candidate_eval"},
     "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"},
     "eval": {"const": "final-evidence-seal"},
@@ -28,7 +28,10 @@
     "response_root": {"type": "string", "minLength": 1},
     "runner": {"$ref": "#/$defs/tool"},
     "tools": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/tool"}},
-    "capsule": {"$ref": "#/$defs/capsule"}
+    "capsule": {"$ref": "#/$defs/capsule"},
+    "guardian": {"$ref": "#/$defs/guardian"},
+    "seatbelt": {"$ref": "#/$defs/seatbelt"},
+    "test_barrier": {"$ref": "#/$defs/testBarrier"}
   },
   "$defs": {
     "tool": {
@@ -67,6 +70,65 @@
            "nlink": {"const": 1}, "bytes": {"type": "integer", "minimum": 0},
            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
          }}
+      ]
+    },
+    "externalFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1}, "dev": {"type": "integer", "minimum": 0},
+        "ino": {"type": "integer", "minimum": 1}, "uid": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0, "maximum": 4095}, "nlink": {"const": 1},
+        "bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "guardian": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pid", "root", "root_identity", "control", "token_sha256", "failure_marker"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1}, "root": {"type": "string", "minLength": 1},
+        "root_identity": {"$ref": "#/$defs/identity"}, "control": {"type": "string", "minLength": 1},
+        "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "failure_marker": {"type": "string", "minLength": 1}
+      }
+    },
+    "probeReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result", "stdout_sha256", "profile_sha256", "wrapper_sha256", "monotonic_ns"],
+      "properties": {
+        "result": {
+          "type": "object", "additionalProperties": false,
+          "required": ["canonical_read", "canonical_write", "alias_read", "alias_write", "capsule_read_write"],
+          "properties": {"canonical_read": {"const": true}, "canonical_write": {"const": true},
+            "alias_read": {"const": true}, "alias_write": {"const": true}, "capsule_read_write": {"const": true}}
+        },
+        "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "profile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "wrapper_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "monotonic_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "seatbelt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "wrapper", "provider", "real_common", "real_common_identity", "alias", "probe_file", "probe_file_identity", "capsule_sentinel", "supervisor_argv_prefix", "prepare_probe"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/externalFile"}, "wrapper": {"$ref": "#/$defs/externalFile"},
+        "provider": {"$ref": "#/$defs/externalFile"}, "real_common": {"type": "string", "minLength": 1},
+        "real_common_identity": {"$ref": "#/$defs/identity"}, "alias": {"type": "string", "minLength": 1},
+        "probe_file": {"type": "string", "minLength": 1}, "probe_file_identity": {"$ref": "#/$defs/externalFile"},
+        "capsule_sentinel": {"type": "string", "minLength": 1},
+        "supervisor_argv_prefix": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "string", "minLength": 1}},
+        "prepare_probe": {"$ref": "#/$defs/probeReceipt"}
+      }
+    },
+    "testBarrier": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"const": false}}},
+        {"type": "object", "additionalProperties": false, "required": ["enabled", "root", "token", "phase", "invocation"],
+         "properties": {"enabled": {"const": true}, "root": {"type": "string", "minLength": 1},
+           "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit"]},
+           "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"}}}
       ]
     },
     "protectedFile": {

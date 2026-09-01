@@ -6,7 +6,7 @@ while [ -L "$__src" ]; do __dir="$(cd -P "$(dirname "$__src")" && pwd)"; __src="
 __self="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$__self/firm-python"
 exec "${FIRM_PYTHON_ARGV[@]}" - "$__src" "$@" <<'PY'
-import argparse, hashlib, hmac, json, os, re, secrets, shlex, shutil, signal, socket, stat, subprocess, sys, time
+import argparse, errno, hashlib, hmac, json, os, re, secrets, shlex, shutil, signal, socket, stat, subprocess, sys, tempfile, time
 from pathlib import Path
 
 SELF = Path(sys.argv[1]).resolve()
@@ -19,6 +19,10 @@ PATCH_SHA256 = "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829
 MAX_MESSAGE = 256 * 1024
 HEX64 = set("0123456789abcdef")
 GIT = str(Path(shutil.which("git") or "/usr/bin/git").resolve())
+SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+PROFILE_SOURCE = b'''(version 1)\n(allow default)\n(deny file-read* file-write* (subpath (param "REAL_COMMON")))\n'''
+GUARDIAN_COMMAND_RE = re.compile(r"[0-9]{8}\\.json")
+TEST_BARRIER_PHASES = {"manifest_read", "dispatch_commit", "use_exec", "cleanup_commit"}
 SAFE_GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_COUNT": "0",
@@ -125,6 +129,359 @@ def tree_inventory(root):
             else: fail("special path in protected tree")
     raw=(canonical(rows)+"\n").encode("ascii")
     return {"entries":len(rows),"sha256":digest_bytes(raw),"bytes":len(raw)}
+
+def owned_directory(path, mode=0o700):
+    st=os.lstat(str(path))
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid!=os.getuid()
+            or stat.S_IMODE(st.st_mode)!=mode):
+        fail("unsafe owned directory")
+    return st
+
+def guardian_auth(token, record):
+    return hmac.new(bytes.fromhex(token),canonical(record).encode("ascii"),hashlib.sha256).hexdigest()
+
+def write_failure_marker(marker, invocation, root, reason):
+    value={"schema_version":1,"status":"BLOCK","invocation":invocation,"root":str(root),
+           "reason":str(reason)[:1000],"guardian_pid":os.getpid(),"monotonic_ns":time.monotonic_ns()}
+    raw=(canonical(value)+"\n").encode("ascii")
+    path=Path(marker)
+    try:
+        fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    except FileExistsError:
+        path=path.with_name(path.name+"."+secrets.token_hex(4))
+        fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    try: os.write(fd,raw); os.fsync(fd)
+    finally: os.close(fd)
+
+def remove_owned_tree_fd(fd):
+    for entry in list(os.scandir(fd)):
+        st=os.stat(entry.name,dir_fd=fd,follow_symlinks=False)
+        if st.st_uid!=os.getuid(): raise RuntimeError("foreign cleanup entry")
+        if stat.S_ISDIR(st.st_mode):
+            child=os.open(entry.name,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0),dir_fd=fd)
+            try: remove_owned_tree_fd(child)
+            finally: os.close(child)
+            os.rmdir(entry.name,dir_fd=fd)
+        elif stat.S_ISREG(st.st_mode):
+            if st.st_nlink!=1: raise RuntimeError("hardlinked cleanup entry")
+            os.unlink(entry.name,dir_fd=fd)
+        elif stat.S_ISLNK(st.st_mode):
+            os.unlink(entry.name,dir_fd=fd)
+        else: raise RuntimeError("special cleanup entry")
+
+def raw_test_barrier(config, phase, observed):
+    if not config or not config.get("enabled") or config.get("phase")!=phase: return
+    root=Path(config["root"]); owned_directory(root)
+    token=config["token"]
+    if not re.fullmatch(r"[0-9a-f]{64}",token) or config.get("invocation") is None:
+        fail("test barrier binding")
+    prefix=str(root/(token+"."+phase))
+    ready=Path(prefix+".ready")
+    mutated=Path(prefix+".mutated")
+    resume=Path(prefix+".resume")
+    release=Path(prefix+".release")
+    if release.exists(): return
+    record={"schema_version":1,"phase":phase,"token":token,"invocation":config["invocation"],
+            "authority_pid":os.getpid(),"enter_monotonic_ns":time.monotonic_ns(),"observed":observed}
+    put_file(ready,(canonical(record)+"\n").encode("ascii"),0o600)
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not mutated.exists(): time.sleep(0.005)
+    if not mutated.exists(): fail("test barrier mutation timeout")
+    mutation_raw,_=read_bytes(mutated,MAX_MESSAGE)
+    try: mutation=json.loads(mutation_raw.decode("ascii"))
+    except Exception: fail("test barrier mutation JSON")
+    required={"schema_version","phase","token","invocation","mutator_pid","mutate_monotonic_ns","changed"}
+    if (not exact_keys(mutation,required) or mutation["schema_version"]!=1 or mutation["phase"]!=phase
+            or mutation["token"]!=token or mutation["invocation"]!=config["invocation"]
+            or not isinstance(mutation["mutator_pid"],int) or mutation["mutator_pid"]<=0
+            or not isinstance(mutation["mutate_monotonic_ns"],int)
+            or mutation["mutate_monotonic_ns"]<=record["enter_monotonic_ns"]
+            or not isinstance(mutation["changed"],dict) or not mutation["changed"]):
+        fail("test barrier mutation binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except ProcessLookupError: fail("test barrier mutator not concurrent")
+    resume_ns=time.monotonic_ns()
+    put_file(resume,(canonical({"schema_version":1,"phase":phase,"token":token,"invocation":config["invocation"],
+                               "authority_pid":os.getpid(),"resume_monotonic_ns":resume_ns})+"\n").encode("ascii"),0o600)
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not release.exists(): time.sleep(0.005)
+    if not release.exists(): fail("test barrier release timeout")
+    release_raw,_=read_bytes(release,MAX_MESSAGE)
+    try: release_doc=json.loads(release_raw.decode("ascii"))
+    except Exception: fail("test barrier release JSON")
+    if (not exact_keys(release_doc,{"schema_version","phase","token","invocation","mutator_pid","release_monotonic_ns"})
+            or release_doc["schema_version"]!=1 or release_doc["phase"]!=phase or release_doc["token"]!=token
+            or release_doc["invocation"]!=config["invocation"] or release_doc["mutator_pid"]!=mutation["mutator_pid"]
+            or not isinstance(release_doc["release_monotonic_ns"],int) or release_doc["release_monotonic_ns"]<resume_ns):
+        fail("test barrier release binding")
+
+def test_barrier(doc,phase,observed):
+    config=doc.get("test_barrier",{"enabled":False})
+    supplied={"root":os.environ.get("FIRM_EVAL_TEST_BARRIER_ROOT"),
+              "token":os.environ.get("FIRM_EVAL_TEST_BARRIER_TOKEN"),
+              "invocation":os.environ.get("FIRM_EVAL_TEST_BARRIER_INVOCATION"),
+              "phase":os.environ.get("FIRM_EVAL_TEST_BARRIER_PHASE")}
+    if config.get("enabled"):
+        expected={key:config[key] for key in supplied}
+        if supplied!=expected: fail("test barrier environment binding")
+        raw_test_barrier(config,phase,observed)
+    elif any(value is not None for value in supplied.values()):
+        fail("production invocation rejects test barrier")
+
+def terminate_groups(groups):
+    for pgid in sorted(set(groups)):
+        try: os.killpg(pgid,signal.SIGTERM)
+        except ProcessLookupError: pass
+        except PermissionError: raise RuntimeError("cannot signal registered group")
+    deadline=time.monotonic()+2
+    while time.monotonic()<deadline:
+        alive=[]
+        for pgid in groups:
+            try: os.killpg(pgid,0); alive.append(pgid)
+            except ProcessLookupError: pass
+        if not alive: return
+        time.sleep(0.02)
+    for pgid in sorted(set(groups)):
+        try: os.killpg(pgid,signal.SIGKILL)
+        except ProcessLookupError: pass
+
+def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
+    root=None; root_fd=None
+    try:
+        root=Path(tempfile.mkdtemp(prefix="firm-eval-"+invocation[:12]+".",dir=parent)).resolve()
+        capsule=root/"capsule"; control=root/"control"; commands=control/"commands"
+        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700); commands.mkdir(mode=0o700)
+        root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+        root_id=identity(os.fstat(root_fd)); marker=str(Path(parent)/("firm-eval-block-"+invocation+".json"))
+        unsigned={"schema_version":1,"status":"ready","invocation":invocation,"guardian_pid":os.getpid(),
+                  "launcher_pid":launcher_pid,"root":str(root),"capsule":str(capsule),"control":str(control),
+                  "root_identity":root_id,"failure_marker":marker,"token_sha256":digest_bytes(bytes.fromhex(token))}
+        unsigned["auth"]=guardian_auth(token,unsigned)
+        interrupted=[False]
+        def request_cleanup(*_): interrupted[0]=True
+        for signum in (signal.SIGHUP,signal.SIGINT,signal.SIGTERM): signal.signal(signum,request_cleanup)
+        os.write(ready_fd,(canonical(unsigned)+"\n").encode("ascii")); os.close(ready_fd)
+        seen=set(); groups=[]; cleanup=False; sequence=0
+        while not cleanup:
+            if interrupted[0]: cleanup=True
+            try: os.kill(launcher_pid,0)
+            except ProcessLookupError: cleanup=True
+            if not cleanup:
+                for name in sorted(os.listdir(str(commands))):
+                    if not GUARDIAN_COMMAND_RE.fullmatch(name) or name in seen: continue
+                    raw,_=read_bytes(commands/name,MAX_MESSAGE); record=json.loads(raw.decode("ascii"))
+                    auth=record.pop("auth",None)
+                    if auth!=guardian_auth(token,record) or record.get("invocation")!=invocation:
+                        raise RuntimeError("guardian command authentication")
+                    if record.get("sequence")!=sequence+1: raise RuntimeError("guardian command sequence")
+                    sequence+=1; seen.add(name)
+                    if record.get("action")=="register" and exact_keys(record,{"schema_version","sequence","action","invocation","pid","pgid"}):
+                        if record["pid"]<=0 or record["pgid"]<=0: raise RuntimeError("guardian registration")
+                        os.kill(record["pid"],0); groups.append(record["pgid"])
+                    elif record.get("action")=="cleanup" and exact_keys(record,{"schema_version","sequence","action","invocation"}):
+                        cleanup=True
+                    else: raise RuntimeError("guardian command shape")
+            if not cleanup: time.sleep(0.01)
+        terminate_groups(groups)
+        path_st=os.lstat(str(root))
+        stable=("dev","ino","uid","mode")
+        if (any(identity(path_st)[key]!=root_id[key] for key in stable)
+                or any(identity(os.fstat(root_fd))[key]!=root_id[key] for key in stable)):
+            raise RuntimeError("guardian root identity drift")
+        raw_test_barrier(barrier,"cleanup_commit",root_id)
+        if any(identity(os.lstat(str(root)))[key]!=root_id[key] for key in stable): raise RuntimeError("guardian cleanup race")
+        remove_owned_tree_fd(root_fd); os.close(root_fd); root_fd=None
+        os.rmdir(str(root))
+        if root.exists() or root.is_symlink(): raise RuntimeError("guardian cleanup residue")
+    except BaseException as exc:
+        try:
+            if root is not None:
+                marker=str(Path(parent)/("firm-eval-block-"+invocation+".json"))
+                write_failure_marker(marker,invocation,root,"%s: %s"%(type(exc).__name__,exc))
+        finally: os._exit(1)
+    os._exit(0)
+
+def guardian_start(ns):
+    parent=Path(ns.parent).resolve(); pst=os.lstat(str(parent))
+    if not stat.S_ISDIR(pst.st_mode) or stat.S_ISLNK(pst.st_mode): fail("guardian parent")
+    if str(parent)!="/private/tmp": fail("guardian parent")
+    if ns.launcher_pid<=0:
+        fail("guardian launcher pid")
+    try: os.kill(ns.launcher_pid,0)
+    except ProcessLookupError: fail("guardian launcher not live")
+    invocation=ns.invocation or secrets.token_hex(24); token=secrets.token_hex(32)
+    barrier={"enabled":False}
+    if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
+        if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("guardian test barrier")
+        root=Path(ns.test_barrier_root).resolve(); owned_directory(root)
+        if not re.fullmatch(r"[0-9a-f]{64}",ns.test_barrier_token): fail("guardian test barrier token")
+        barrier={"enabled":True,"root":str(root),"token":ns.test_barrier_token,"phase":ns.test_barrier_phase,"invocation":invocation}
+    left,right=socket.socketpair(); pid=os.fork()
+    if pid==0:
+        left.close(); os.setsid()
+        # The bootstrap parent alone publishes readiness.  The independent child must not retain the
+        # launcher's command-substitution pipe (or any future provider-visible inherited descriptor),
+        # and closing descriptors performs no filesystem allocation before the guardian's mkdtemp.
+        for descriptor in (0,1,2):
+            try: os.close(descriptor)
+            except OSError: pass
+        guardian_daemon(right.detach(),str(parent),ns.launcher_pid,invocation,token,barrier)
+    right.close(); data=b""; deadline=time.monotonic()+10
+    while time.monotonic()<deadline and b"\n" not in data:
+        left.settimeout(max(0.01,deadline-time.monotonic()))
+        try: data+=left.recv(MAX_MESSAGE-len(data))
+        except socket.timeout: break
+    left.close()
+    try: receipt=json.loads(data.decode("ascii")); auth=receipt.pop("auth")
+    except Exception: fail("guardian readiness")
+    if auth!=guardian_auth(token,receipt) or receipt.get("guardian_pid")!=pid or receipt.get("status")!="ready": fail("guardian readiness binding")
+    receipt["auth"]=auth; receipt["token"]=token; receipt["test_barrier"]=barrier
+    print(canonical(receipt))
+
+def guardian_write_command(control,token,invocation,sequence,record):
+    commands=Path(control)/"commands"; owned_directory(commands)
+    unsigned={"schema_version":1,"sequence":sequence,"invocation":invocation,**record}
+    unsigned["auth"]=guardian_auth(token,unsigned)
+    put_file(commands/("%08d.json"%sequence),(canonical(unsigned)+"\n").encode("ascii"),0o600)
+
+def guardian_command(ns):
+    if not re.fullmatch(r"[0-9a-f]{64}",ns.token): fail("guardian token")
+    record={"action":ns.action}
+    if ns.action=="register":
+        if ns.pid is None or ns.pgid is None: fail("guardian registration")
+        record.update({"pid":ns.pid,"pgid":ns.pgid})
+    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,record)
+    if ns.action=="cleanup":
+        root=Path(ns.control).parent; marker=Path("/private/tmp")/("firm-eval-block-"+ns.invocation+".json")
+        deadline=time.monotonic()+60
+        while time.monotonic()<deadline and root.exists() and not marker.exists(): time.sleep(0.01)
+        if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
+        if root.exists() or root.is_symlink(): fail("guardian cleanup timeout")
+        print(canonical({"schema_version":1,"status":"cleanup_complete","invocation":ns.invocation,"root":str(root)}))
+
+def guardian_exec(ns, rest):
+    if not rest: fail("guardian exec argv")
+    os.setsid(); pid=os.getpid(); pgid=os.getpgrp()
+    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,{"action":"register","pid":pid,"pgid":pgid})
+    os.execv(rest[0],rest)
+
+def external_file_record(path, maximum=64*1024*1024):
+    path=Path(path)
+    if path.resolve()!=path or not path.is_absolute(): fail("external executable path")
+    no_symlink_components(path)
+    fd=os.open(str(path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>maximum:
+            fail("external executable identity")
+        raw=b""
+        while len(raw)<=maximum:
+            part=os.read(fd,65536)
+            if not part: break
+            raw+=part
+        after=os.fstat(fd)
+        if identity(before)!=identity(after) or len(raw)!=before.st_size: fail("external executable drift")
+    finally: os.close(fd)
+    return {**identity(before),"sha256":digest_bytes(raw),"path":str(path)}
+
+def find_probe_file(real_common):
+    for current,dirs,files in os.walk(str(real_common),topdown=True,followlinks=False):
+        dirs.sort(); files.sort()
+        for name in files:
+            path=Path(current)/name; st=os.lstat(str(path))
+            if (stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid()
+                    and st.st_mode&stat.S_IRUSR and st.st_mode&stat.S_IWUSR):
+                return path
+    fail("no safe real-common probe file")
+
+def run_seatbelt_probe(seatbelt, capsule):
+    profile=Path(seatbelt["profile"]["path"]); real_common=Path(seatbelt["real_common"])
+    alias=Path(seatbelt["alias"]); probe=Path(seatbelt["probe_file"]); sentinel=Path(seatbelt["capsule_sentinel"])
+    rel=probe.relative_to(real_common); alias_probe=alias/rel
+    script=r'''import errno,json,os,sys
+real,alias,sentinel=sys.argv[1:]
+def denied(path,flags):
+    try:
+        fd=os.open(path,flags)
+    except OSError as exc:
+        return exc.errno in (errno.EACCES,errno.EPERM)
+    else:
+        os.close(fd); return False
+ok={"canonical_read":denied(real,os.O_RDONLY),
+    "canonical_write":denied(real,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0)),
+    "alias_read":denied(alias,os.O_RDONLY),
+    "alias_write":denied(alias,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0))}
+with open(sentinel,"rb") as handle: before=handle.read()
+fd=os.open(sentinel,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0)); os.write(fd,b"seatbelt-capsule-ok\n"); os.fsync(fd); os.close(fd)
+with open(sentinel,"rb") as handle: after=handle.read()
+ok["capsule_read_write"]=before==b"seatbelt-capsule-ok\n" and after==before
+print(json.dumps(ok,sort_keys=True,separators=(",",":")))
+raise SystemExit(0 if all(ok.values()) else 3)
+'''
+    done=subprocess.run([seatbelt["wrapper"]["path"],"-D","REAL_COMMON="+str(real_common),"-f",str(profile),
+                         sys.executable,"-c",script,str(probe),str(alias_probe),str(sentinel)],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,close_fds=True,timeout=10)
+    if done.returncode!=0: fail("Seatbelt denial self-probe")
+    try: result=json.loads(done.stdout.decode("ascii"))
+    except Exception: fail("Seatbelt probe result")
+    expected={"canonical_read":True,"canonical_write":True,"alias_read":True,"alias_write":True,"capsule_read_write":True}
+    if result!=expected: fail("Seatbelt probe incomplete")
+    return {"result":result,"stdout_sha256":digest_bytes(done.stdout),"profile_sha256":seatbelt["profile"]["sha256"],
+            "wrapper_sha256":seatbelt["wrapper"]["sha256"],"monotonic_ns":time.monotonic_ns()}
+
+def prepare_seatbelt(real_common, capsule_root, control, provider_executable):
+    if sys.platform!="darwin" or not SANDBOX_EXEC.exists(): fail("Seatbelt unsupported")
+    wrapper=external_file_record(SANDBOX_EXEC)
+    provider=external_file_record(Path(provider_executable).resolve())
+    profile=control/"provider.sb"; put_file(profile,PROFILE_SOURCE,0o400)
+    alias=control/"real-common-alias"; os.symlink(str(real_common),str(alias))
+    sentinel=control/"seatbelt-capsule-sentinel"; put_file(sentinel,b"seatbelt-capsule-ok\n",0o600)
+    probe=find_probe_file(real_common)
+    seatbelt={"profile":{"path":str(profile),**path_record(profile)},"wrapper":wrapper,"provider":provider,
+              "real_common":str(real_common),"real_common_identity":path_record(real_common,False),
+              "alias":str(alias),"probe_file":str(probe),"probe_file_identity":{"path":str(probe),**path_record(probe)},
+              "capsule_sentinel":str(sentinel),"supervisor_argv_prefix":[str(SANDBOX_EXEC),"-D","REAL_COMMON="+str(real_common),"-f",str(profile)]}
+    seatbelt["prepare_probe"]=run_seatbelt_probe(seatbelt,{})
+    return seatbelt
+
+def validate_seatbelt(doc, post=False):
+    seatbelt=doc["seatbelt"]
+    if external_file_record(Path(seatbelt["wrapper"]["path"]))!=seatbelt["wrapper"]: fail("Seatbelt wrapper drift")
+    if external_file_record(Path(seatbelt["provider"]["path"]))!=seatbelt["provider"]: fail("provider executable drift")
+    profile={"path":seatbelt["profile"]["path"],**path_record(Path(seatbelt["profile"]["path"]))}
+    if profile!=seatbelt["profile"] or Path(seatbelt["profile"]["path"]).read_bytes()!=PROFILE_SOURCE: fail("Seatbelt profile drift")
+    real=Path(seatbelt["real_common"])
+    if path_record(real,False)!=seatbelt["real_common_identity"] or tree_inventory(real)!=doc["capsule"]["real_common_before"]:
+        fail("real common identity drift")
+    alias=Path(seatbelt["alias"])
+    if not alias.is_symlink() or Path(os.readlink(str(alias)))!=real: fail("Seatbelt alias drift")
+    if {"path":seatbelt["probe_file"],**path_record(Path(seatbelt["probe_file"]))}!=seatbelt["probe_file_identity"]: fail("Seatbelt probe target drift")
+    receipt=run_seatbelt_probe(seatbelt,doc["capsule"])
+    receipt["phase"]="post" if post else "prelaunch"
+    return receipt
+
+def seatbelt_probe(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("Seatbelt invocation binding")
+    receipt=validate_seatbelt(doc,ns.post)
+    print(canonical(receipt))
+
+def test_barrier_probe(ns):
+    root=Path(ns.root).resolve(); owned_directory(root)
+    target=Path(ns.target).resolve()
+    if target.parent!=root or not re.fullmatch(r"[0-9a-f]{64}",ns.token) or not re.fullmatch(r"[0-9a-f]{48}",ns.invocation):
+        fail("test barrier probe binding")
+    if ns.phase not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{40}",ns.candidate): fail("test barrier probe scope")
+    before_raw,before_st=read_bytes(target,MAX_MESSAGE)
+    before={"candidate":ns.candidate,"identity":identity(before_st),"sha256":digest_bytes(before_raw)}
+    config={"enabled":True,"root":str(root),"token":ns.token,"phase":ns.phase,"invocation":ns.invocation}
+    raw_test_barrier(config,ns.phase,before)
+    try: after_raw,after_st=read_bytes(target,MAX_MESSAGE)
+    except BaseException: fail("concurrent "+ns.phase+" mutation detected")
+    after={"identity":identity(after_st),"sha256":digest_bytes(after_raw)}
+    if after["identity"]!=before["identity"] or after["sha256"]!=before["sha256"]:
+        fail("concurrent "+ns.phase+" mutation detected")
+    fail("test barrier mutation not detected")
 
 def object_closure(root, commit):
     names=git(root,"rev-list","--objects","--no-object-names",commit).splitlines()
@@ -308,15 +665,36 @@ def validate_tool(tool, root):
     return raw, st
 
 def load_manifest(path):
-    raw, st = read_bytes(Path(path), 4 * 1024 * 1024)
-    if stat.S_IMODE(st.st_mode) != 0o600: fail("manifest mode")
-    try: doc = json.loads(raw.decode("utf-8", "strict"))
-    except Exception: fail("manifest JSON")
+    manifest_path=Path(path); fd=os.open(str(manifest_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        st=os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_nlink!=1
+                or st.st_size>4*1024*1024 or stat.S_IMODE(st.st_mode)!=0o600): fail("manifest mode")
+        raw=b""
+        while True:
+            part=os.read(fd,65536)
+            if not part: break
+            raw+=part
+            if len(raw)>4*1024*1024: fail("oversized manifest")
+        try: doc=json.loads(raw.decode("utf-8","strict"))
+        except Exception: fail("manifest JSON")
+        if not isinstance(doc,dict): fail("manifest JSON")
+        test_barrier(doc,"manifest_read",identity(st))
+        os.lseek(fd,0,os.SEEK_SET); second=b""
+        while True:
+            part=os.read(fd,65536)
+            if not part: break
+            second+=part
+        after=os.fstat(fd); named=os.lstat(str(manifest_path))
+        if raw!=second or identity(st)!=identity(after) or identity(after)!=identity(named):
+            fail("manifest changed across read interval")
+    finally: os.close(fd)
     keys = {"schema_version","purpose","invocation","eval","provider","harness_root",
             "harness_commit","harness_tree","candidate_root","candidate_commit","candidate_tree",
             "patch_base","patch_commit","patch_bytes","patch_sha256","scratch_root","scratch_dev",
-            "scratch_ino","request_root","response_root","runner","tools","capsule"}
-    if not exact_keys(doc, keys) or doc["schema_version"] != 2 or doc["purpose"] != "disposable_git_candidate_eval":
+            "scratch_ino","request_root","response_root","runner","tools","capsule","guardian",
+            "seatbelt","test_barrier"}
+    if not exact_keys(doc, keys) or doc["schema_version"] != 3 or doc["purpose"] != "disposable_git_candidate_eval":
         fail("manifest schema")
     root = Path(doc["candidate_root"])
     if root.resolve() != root: fail("candidate root")
@@ -334,6 +712,21 @@ def load_manifest(path):
     names = [item.get("name") for item in doc["tools"] if isinstance(item, dict)]
     if len(names) != len(doc["tools"]) or len(names) != len(set(names)): fail("duplicate tools")
     for tool in doc["tools"]: validate_tool(tool, root)
+    barrier=doc["test_barrier"]
+    if barrier.get("enabled"):
+        required={"enabled","root","token","phase","invocation"}
+        if (not exact_keys(barrier,required) or barrier["enabled"] is not True or barrier["invocation"]!=doc["invocation"]
+                or barrier["phase"] not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{64}",barrier["token"])): fail("test barrier manifest")
+    elif barrier!={"enabled":False}: fail("test barrier manifest")
+    guardian=doc["guardian"]
+    if (not exact_keys(guardian,{"pid","root","root_identity","control","token_sha256","failure_marker"})
+            or guardian["pid"]<=0 or Path(guardian["root"]).resolve()!=Path(doc["scratch_root"]).parent
+            or Path(guardian["control"]).resolve()!=Path(path).resolve().parent
+            or not re.fullmatch(r"[0-9a-f]{64}",guardian["token_sha256"])): fail("guardian manifest")
+    try: os.kill(guardian["pid"],0)
+    except ProcessLookupError:
+        write_failure_marker(guardian["failure_marker"],doc["invocation"],guardian["root"],"guardian dead")
+        fail("guardian dead")
     return doc, raw
 
 def prepare(ns):
@@ -341,6 +734,26 @@ def prepare(ns):
     fixture = Path(ns.fixture).resolve()
     manifest = Path(ns.manifest); shims = Path(ns.shims)
     request_root = Path(ns.request_root).resolve(); response_root = Path(ns.response_root).resolve()
+    guardian_root=Path(ns.guardian_root).resolve(); control=manifest.resolve().parent
+    if scratch.parent!=guardian_root or control.parent!=guardian_root or scratch.name!="capsule" or control.name!="control":
+        fail("guardian containment")
+    root_st=owned_directory(guardian_root); owned_directory(scratch); owned_directory(control)
+    if not re.fullmatch(r"[0-9a-f]{64}",ns.guardian_token) or ns.guardian_pid<=0: fail("guardian binding")
+    try: os.kill(ns.guardian_pid,0)
+    except ProcessLookupError: fail("guardian not live")
+    invocation=ns.invocation
+    if not re.fullmatch(r"[0-9a-f]{48}",invocation): fail("invocation binding")
+    test_barrier_doc={"enabled":False}
+    barrier_env=("FIRM_EVAL_TEST_BARRIER_ROOT","FIRM_EVAL_TEST_BARRIER_TOKEN",
+                 "FIRM_EVAL_TEST_BARRIER_INVOCATION","FIRM_EVAL_TEST_BARRIER_PHASE")
+    if any(os.environ.get(key) is not None for key in barrier_env) and not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase):
+        fail("inherited test barrier environment")
+    if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
+        if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("test barrier arguments")
+        barrier_root=Path(ns.test_barrier_root).resolve(); owned_directory(barrier_root)
+        if not re.fullmatch(r"[0-9a-f]{64}",ns.test_barrier_token): fail("test barrier token")
+        test_barrier_doc={"enabled":True,"root":str(barrier_root),"token":ns.test_barrier_token,
+                          "phase":ns.test_barrier_phase,"invocation":invocation}
     no_symlink_components(root); no_symlink_components(scratch)
     if git(root, "rev-parse", "--show-toplevel") != str(root): fail("repository root")
     if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty harness")
@@ -363,16 +776,21 @@ def prepare(ns):
     runner_raw,runner_st=read_bytes(SELF.parent/"firm-run-evals")
     runner={"name":"firm-run-evals","path":str(SELF.parent/"firm-run-evals"),"sha256":digest_bytes(runner_raw)}
     runner.update(identity(runner_st))
-    doc = {"schema_version":2,"purpose":"disposable_git_candidate_eval","invocation":secrets.token_hex(24),
+    guardian={"pid":ns.guardian_pid,"root":str(guardian_root),"root_identity":identity(root_st),
+              "control":str(control),"token_sha256":digest_bytes(bytes.fromhex(ns.guardian_token)),
+              "failure_marker":ns.guardian_failure_marker}
+    seatbelt=prepare_seatbelt(Path(capsule["real_common"]),scratch,control,ns.provider_executable)
+    doc = {"schema_version":3,"purpose":"disposable_git_candidate_eval","invocation":invocation,
            "eval":ns.eval,"provider":ns.provider,"harness_root":str(root),"harness_commit":head,
            "harness_tree":tree,"candidate_root":str(candidate_root),
            "candidate_commit":PAYLOAD_COMMIT,"candidate_tree":capsule["payload_tree"],"patch_base":PATCH_BASE,
            "patch_commit":patch_commit,"patch_bytes":PATCH_BYTES,"patch_sha256":PATCH_SHA256,
            "scratch_root":str(scratch),"scratch_dev":scratch_st.st_dev,"scratch_ino":scratch_st.st_ino,
            "request_root":str(request_root),"response_root":str(response_root),
-           "runner":runner,"tools":tools,"capsule":capsule}
+           "runner":runner,"tools":tools,"capsule":capsule,"guardian":guardian,"seatbelt":seatbelt,
+           "test_barrier":test_barrier_doc}
     raw = (canonical(doc) + "\n").encode("ascii")
-    manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if manifest.resolve().parent!=control: fail("manifest control root")
     fd = os.open(str(manifest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
     try: os.write(fd, raw); os.fsync(fd)
     finally: os.close(fd)
@@ -403,11 +821,14 @@ def prepare(ns):
         try: os.write(fd, shell_raw); os.fsync(fd)
         finally: os.close(fd)
     validate_capsule(doc)
-    print(canonical({"schema_version":2,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
+    print(canonical({"schema_version":3,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
                      "invocation":doc["invocation"],"shim_dir":str(shims),"candidate_commit":PAYLOAD_COMMIT,
                      "candidate_tree":capsule["payload_tree"],"patch_commit":patch_commit,"tool_count":len(tools),
                      "shell_env":str(shell_env),"project_root":str(candidate_root),"capsule_root":str(scratch),
-                     "authority_bin":str(candidate_root/"bin"/"firm-eval-authority")}))
+                     "authority_bin":str(candidate_root/"bin"/"firm-eval-authority"),
+                     "seatbelt_profile":seatbelt["profile"]["path"],"real_common":seatbelt["real_common"],
+                     "provider_executable":seatbelt["provider"]["path"],
+                     "guardian_pid":ns.guardian_pid,"guardian_root":str(guardian_root)}))
 
 def send_message(request_root, response_root, request):
     request_id=secrets.token_hex(24)
@@ -464,6 +885,8 @@ def serve(ns):
                 if req.get("op") == "exec" and exact_keys(req,{"op","manifest_digest","invocation","tool","argv","cwd"}):
                     tool=tools.get(req["tool"])
                     if tool is None or not isinstance(req["argv"],list) or not all(isinstance(x,str) and len(x)<=65536 for x in req["argv"]): raise ValueError()
+                    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"]))
+                    test_barrier(doc,"dispatch_commit",{"tool":tool["name"],"identity":{key:tool[key] for key in ("dev","ino","bytes","sha256")}})
                     validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"])); sequence += 1
                     receipt={"schema_version":1,"sequence":sequence,"kind":"execution","tool":tool["name"],"path":tool["path"],"bytes":tool["bytes"],"sha256":tool["sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"argv_sha256":digest_bytes(canonical(req["argv"]).encode("ascii")),"cwd":req["cwd"]}
                     append_receipt(str(receipts),receipt); response={"ok":True,"tool":tool,"receipt":receipt}
@@ -498,6 +921,8 @@ def request_exec(ns, rest):
     reject_git_environment(); validate_capsule(doc)
     response=send_message(ns.request_root,ns.response_root,{"op":"exec","manifest_digest":ns.digest,"invocation":ns.invocation,"tool":ns.tool,"argv":rest,"cwd":os.path.realpath(os.getcwd())})
     tool=response.get("tool"); validate_tool(tool,Path(doc["candidate_root"]))
+    test_barrier(doc,"use_exec",{"tool":tool["name"],"identity":{key:tool[key] for key in ("dev","ino","bytes","sha256")}})
+    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"]))
     env=os.environ.copy()
     if "p2_attestation" in response: env["FIRM_EVAL_P2_ATTESTATION"]=canonical(response["p2_attestation"])
     os.execve(tool["path"],[tool["path"]]+rest,env)
@@ -523,7 +948,7 @@ def verify(ns):
         if row.get("manifest_digest")!=expected or row.get("invocation")!=doc["invocation"]: fail("receipt binding")
         rows.append(row)
     if not rows or not any(r.get("tool")=="firm-ledger-log" for r in rows) or not any(r.get("kind")=="p2_consumed" for r in rows): fail("missing required receipt")
-    output={"schema_version":2,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
+    output={"schema_version":3,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
             "patch_commit":doc["patch_commit"],"patch_bytes":doc["patch_bytes"],"patch_sha256":doc["patch_sha256"],
             "manifest_digest":expected,"invocation":doc["invocation"],"tool_count":len(doc["tools"]),
             "execution_receipts":sum(r.get("kind")=="execution" for r in rows),"p2_receipts":sum(r.get("kind")=="p2_consumed" for r in rows),
@@ -532,33 +957,46 @@ def verify(ns):
 
 def cleanup(ns):
     doc,raw=load_manifest(ns.manifest)
-    if digest_bytes(raw)!=ns.digest: fail("cleanup digest")
-    validate_capsule(doc,final=True)
-    root=Path(doc["scratch_root"])
-    st=os.lstat(str(root))
-    actual=path_record(root,False); expected=doc["capsule"]["root_identity"]
-    if any(actual[name]!=expected[name] for name in ("dev","ino","uid","mode")): fail("cleanup ownership ambiguity")
-    shutil.rmtree(str(root))
-    if root.exists() or root.is_symlink(): fail("capsule cleanup residue")
-    print(canonical({"schema_version":1,"cleanup":"complete","capsule_root":str(root),
-                     "real_common_sha256":doc["capsule"]["real_common_before"]["sha256"]}))
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("cleanup digest")
+    validate_capsule(doc,final=True); validate_seatbelt(doc,post=True)
+    if (doc["guardian"]["control"]!=str(Path(ns.control).resolve())
+            or doc["guardian"]["token_sha256"]!=digest_bytes(bytes.fromhex(ns.token))): fail("cleanup guardian binding")
+    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,{"action":"cleanup"})
+    root=Path(doc["guardian"]["root"]); marker=Path(doc["guardian"]["failure_marker"])
+    deadline=time.monotonic()+60
+    while time.monotonic()<deadline and root.exists() and not marker.exists(): time.sleep(0.01)
+    if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
+    if root.exists() or root.is_symlink(): fail("guardian cleanup timeout")
+    print(canonical({"schema_version":1,"status":"cleanup_complete","invocation":ns.invocation,"root":str(root)}))
 
 def main():
     p=argparse.ArgumentParser(add_help=False); sub=p.add_subparsers(dest="command",required=True)
-    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True)
+    q=sub.add_parser("guardian-start"); q.add_argument("--parent",required=True); q.add_argument("--launcher-pid",type=int,required=True); q.add_argument("--invocation"); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
+    q=sub.add_parser("guardian-command"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--action",choices=("register","cleanup"),required=True); q.add_argument("--pid",type=int); q.add_argument("--pgid",type=int)
+    q=sub.add_parser("guardian-exec"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--sequence",type=int,required=True)
+    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--provider-executable",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--guardian-root",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--guardian-token",required=True); q.add_argument("--guardian-failure-marker",required=True); q.add_argument("--invocation",required=True); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
     q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
     q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)
     q=sub.add_parser("validate-p2"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--token",required=True); q.add_argument("--writer-path",required=True); q.add_argument("--writer-sha256",required=True); q.add_argument("--run-path",required=True)
     q=sub.add_parser("verify"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--receipts",required=True)
-    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True)
+    q=sub.add_parser("seatbelt-probe"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--post",action="store_true")
+    q=sub.add_parser("test-barrier-probe"); q.add_argument("--root",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--candidate",required=True); q.add_argument("--phase",required=True); q.add_argument("--target",required=True)
+    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--sequence",type=int,required=True)
     ns,rest=p.parse_known_args(ARGV)
-    if ns.command=="prepare": prepare(ns)
+    if ns.command=="guardian-start": guardian_start(ns)
+    elif ns.command=="guardian-command": guardian_command(ns)
+    elif ns.command=="guardian-exec":
+        if not rest or rest[0]!="--": fail("missing argv boundary")
+        guardian_exec(ns,rest[1:])
+    elif ns.command=="prepare": prepare(ns)
     elif ns.command=="serve": serve(ns)
     elif ns.command=="request-exec":
         if not rest or rest[0]!="--": fail("missing argv boundary")
         request_exec(ns,rest[1:])
     elif ns.command=="validate-p2": validate_p2(ns)
     elif ns.command=="verify": verify(ns)
+    elif ns.command=="seatbelt-probe": seatbelt_probe(ns)
+    elif ns.command=="test-barrier-probe": test_barrier_probe(ns)
     else: cleanup(ns)
 main()
 PY
