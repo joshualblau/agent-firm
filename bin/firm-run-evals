@@ -211,7 +211,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   local guardian_token="" guardian_pid="" guardian_root="" guardian_marker="" guardian_sequence=0 guardian_roles="" seatbelt_profile="" real_common=""
   # Bash 3.2 with `set -u` rejects an expansion of an empty array.  Keep the ordinary provider-child
   # prefix nonempty; the golden replaces it with the authenticated guardian registration gate.
-  local -a guardian_prefix=( /usr/bin/env ) seatbelt_prefix=( /usr/bin/env )
+  local -a guardian_prefix=( /usr/bin/env ) provider_prefix=( /usr/bin/env ) seatbelt_prefix=( /usr/bin/env )
   local shell_env="${ZDOTDIR:-${HOME:-/tmp}}" shell_bash_env="${BASH_ENV:-}" shell_sh_env="${ENV:-}"
   [ -x "$CHECKER" ] || { echo "FAIL $name: missing executable firm-check-assertions at $CHECKER; provider phase not started" >&2; return 1; }
   command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
@@ -280,6 +280,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     provider_executable="$(command -v "$provider" 2>/dev/null || true)"
     [ -n "$provider_executable" ] || { echo "SKIP $name: '$provider' not found"; return 4; }
     case "$provider_executable" in /*) ;; *) provider_executable="$(cd -P "$(dirname "$provider_executable")" && pwd)/$(basename "$provider_executable")" ;; esac
+    provider_executable="$(firm_python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$provider_executable")" || return 1
     [ "$provider" = codex ] && codex_command="$provider_executable" || claude_command="$provider_executable"
     authority_manifest="$control/manifest.json"
     authority_prepare="$($EVAL_AUTHORITY prepare --root "$ROOT" --eval "$name" --provider "$provider" \
@@ -331,8 +332,9 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     guardian_sequence=$((guardian_sequence+1))
     guardian_roles="broker,provider"
     guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --role provider -- )
+    provider_prefix=( "$EVAL_AUTHORITY" provider-exec --manifest "$authority_manifest" --digest "$authority_digest" --invocation "$authority_invocation" -- )
     seatbelt_prefix=( /usr/bin/sandbox-exec -D "REAL_COMMON=$real_common" -f "$seatbelt_profile" /usr/bin/env )
-    seatbelt_prefix=( "${guardian_prefix[@]}" "${seatbelt_prefix[@]}" )
+    seatbelt_prefix=( "${guardian_prefix[@]}" "${provider_prefix[@]}" "${seatbelt_prefix[@]}" )
   fi
 
   echo "==> $name: driving the $provider-primary firm headlessly (bounded posture) in $scratch"

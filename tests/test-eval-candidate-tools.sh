@@ -30,6 +30,301 @@ assert_output "runner pins the provider PATH to candidate shims plus system root
 assert_output "the provider executable is resolved before PATH confinement" \
   'provider_executable=' cat "$RUNNER"
 
+provider_harness() {
+  t_python - "$AUTH" "$@" <<'PY'
+import json,os,resource,sys,time,types
+from pathlib import Path
+authority=sys.argv[1]; action=sys.argv[2]; args=sys.argv[3:]
+raw=Path(authority).read_text(encoding="utf-8")
+source=raw.split("<<'PY'\n",1)[1].rsplit("\nPY\n",1)[0]
+saved_argv=list(sys.argv); sys.argv=["-",authority]
+scope={"__name__":"firm_eval_authority_provider_test"}
+exec(compile(source,authority,"exec"),scope)
+sys.argv=saved_argv
+
+def emit(value): print(scope["canonical"](value))
+def record(provider,path,barrier=None):
+    return scope["provider_executable_record"](provider,path,barrier)
+
+if action=="record":
+    provider,path=args[:2]
+    value=record(provider,path)
+    if len(args)>2 and args[2]=="memory":
+        maximum=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        value["maximum_rss_bytes"]=maximum if sys.platform=="darwin" else maximum*1024
+    emit(value)
+elif action=="external":
+    emit(scope["external_file_record"](Path(args[0])))
+elif action=="instrument":
+    mode,provider,path=args[:3]
+    original_read=scope["os"].read
+    if mode=="read-size":
+        maximum=[0]
+        def measured(fd,amount):
+            maximum[0]=max(maximum[0],amount); return original_read(fd,amount)
+        scope["os"].read=measured
+        value=record(provider,path); value["observed_maximum_read"]=maximum[0]; emit(value)
+    elif mode=="read-error":
+        scope["os"].read=lambda *_: (_ for _ in ()).throw(OSError(5,"injected read error"))
+        record(provider,path)
+    elif mode=="short-read":
+        used=[False]
+        def short(fd,amount):
+            if not used[0]: used[0]=True; return original_read(fd,max(1,amount-1))
+            return original_read(fd,amount)
+        scope["os"].read=short; record(provider,path)
+    elif mode=="timeout-before-read":
+        base=time.monotonic_ns(); values=iter((base,base+scope["PROVIDER_EXECUTABLE_TIMEOUT_NS"]+1))
+        scope["time"].monotonic_ns=lambda: next(values,base+scope["PROVIDER_EXECUTABLE_TIMEOUT_NS"]+1)
+        record(provider,path)
+    elif mode=="nonterminating-read":
+        original_timer=scope["signal"].setitimer
+        def fast_timer(which,seconds=0,interval=0):
+            return original_timer(which,min(seconds,.05) if seconds else 0,interval)
+        scope["signal"].setitimer=fast_timer
+        scope["os"].read=lambda *_: time.sleep(20)
+        record(provider,path)
+    else: raise SystemExit("unknown instrumentation")
+elif action=="mismatch":
+    field,provider,path=args[:3]
+    attribute={"dev":"st_dev","ino":"st_ino","uid":"st_uid","mode":"st_mode",
+               "nlink":"st_nlink","bytes":"st_size"}[field]
+    original_lstat=scope["os"].lstat
+    class ChangedStat:
+        def __init__(self,value): self.value=value
+        def __getattr__(self,name):
+            current=getattr(self.value,name)
+            return current+1 if name==attribute else current
+    def changed_lstat(candidate,*rest,**kwargs):
+        value=original_lstat(candidate,*rest,**kwargs)
+        return ChangedStat(value) if os.fspath(candidate)==path else value
+    scope["os"].lstat=changed_lstat; record(provider,path)
+elif action=="sparse-stat":
+    provider,path=args[:2]; original_lstat=scope["os"].lstat
+    class SparseStat:
+        def __init__(self,value): self.value=value
+        def __getattr__(self,name): return 0 if name=="st_blocks" else getattr(self.value,name)
+    def sparse_lstat(candidate,*rest,**kwargs):
+        value=original_lstat(candidate,*rest,**kwargs)
+        return SparseStat(value) if os.fspath(candidate)==path else value
+    scope["os"].lstat=sparse_lstat; record(provider,path)
+elif action=="reprove":
+    mutation,provider,path=args[:3]
+    expected=record(provider,path)
+    if mutation=="missing": expected.pop(args[3])
+    elif mutation=="digest": expected["sha256"]="0"*64
+    elif mutation=="maximum": expected["maximum_bytes"]+=1
+    else: raise SystemExit("unknown reproof mutation")
+    scope["reprove_provider_executable"](expected)
+elif action=="barrier":
+    provider,path,root,token,phase,invocation=args[:6]
+    emit(record(provider,path,{"enabled":True,"root":root,"token":token,"phase":phase,"invocation":invocation}))
+elif action=="descriptor-swap":
+    provider,path,replacement=args[:3]
+    def swap(_config,phase,observed):
+        if phase!="provider_preexec": return
+        for descriptor in range(3,256):
+            try: value=os.fstat(descriptor)
+            except OSError: continue
+            if value.st_dev==observed["dev"] and value.st_ino==observed["ino"]:
+                other=os.open(replacement,os.O_RDONLY|os.O_NOFOLLOW)
+                try: os.dup2(other,descriptor)
+                finally: os.close(other)
+                return
+        raise RuntimeError("provider descriptor not found")
+    scope["raw_test_barrier"]=swap
+    record(provider,path,{"enabled":True,"phase":"provider_preexec"})
+elif action=="exec":
+    mutation,provider,path,wrapper,profile,marker=args[:7]
+    expected=record(provider,path)
+    if mutation=="digest": expected["sha256"]="0"*64
+    doc={"invocation":"a"*48,"test_barrier":{"enabled":False},
+         "seatbelt":{"provider":expected,"supervisor_argv_prefix":[wrapper,"-D","REAL_COMMON=/private/absent","-f",profile]}}
+    manifest_raw=b"authenticated-manifest\n"
+    scope["load_manifest"]=lambda _:(doc,manifest_raw)
+    ns=types.SimpleNamespace(manifest="ignored",digest=scope["digest_bytes"](manifest_raw),invocation=doc["invocation"])
+    executable=path if mutation!="argv" else wrapper
+    scope["provider_exec"](ns,[wrapper,"-D","REAL_COMMON=/private/absent","-f",profile,
+                                    "/usr/bin/env","PROVIDER_MARKER="+marker,executable])
+else:
+    raise SystemExit("unknown action")
+PY
+}
+
+t_case "provider executable records have a closed policy and bounded descriptor stream"
+provider_root="$(mktemp -d "${TMPDIR:-/tmp}/firm-provider-identity.XXXXXX")"; t_track "$provider_root"; chmod 700 "$provider_root"
+provider_root="$(cd "$provider_root" && pwd -P)"
+provider_small="$provider_root/provider-small"
+printf '#!/bin/sh\nexit 0\n' > "$provider_small"; chmod 700 "$provider_small"
+small_record="$(provider_harness record codex "$provider_small")"
+assert_ok "Codex record binds the immutable cap, chunk, timeout, canonical identity, and digest" t_python - "$small_record" "$provider_small" <<'PY'
+import hashlib,json,os,sys
+d=json.loads(sys.argv[1]); raw=open(sys.argv[2],'rb').read(); st=os.stat(sys.argv[2])
+assert d["provider"]=="codex" and d["maximum_bytes"]==247464144
+assert d["chunk_bytes"]==1048576 and d["timeout_ns"]==10000000000
+assert d["path"]==os.path.realpath(sys.argv[2]) and d["bytes"]==len(raw)==st.st_size
+assert d["sha256"]==hashlib.sha256(raw).hexdigest() and d["nlink"]==1
+PY
+assert_ok "provider schema binds exact provider maxima and rejects missing, extra, crossed, and oversize state" \
+  t_python - "$SCHEMA" "$small_record" <<'PY'
+import copy,json,sys
+from jsonschema import Draft202012Validator
+schema=json.load(open(sys.argv[1])); validator=Draft202012Validator(schema["$defs"]["providerExecutable"])
+valid=json.loads(sys.argv[2]); validator.validate(valid)
+for mutate in (
+    lambda d:d.pop("sha256"), lambda d:d.update(extra=True),
+    lambda d:d.update(maximum_bytes=197220928), lambda d:d.update(provider="unknown"),
+    lambda d:d.update(bytes=247464145)):
+    candidate=copy.deepcopy(valid); mutate(candidate)
+    assert not validator.is_valid(candidate),candidate
+claude=copy.deepcopy(valid); claude.update(provider="claude",maximum_bytes=197220928,bytes=197220928)
+validator.validate(claude); claude["bytes"]+=1; assert not validator.is_valid(claude)
+PY
+claude_record="$(provider_harness record claude "$provider_small")"
+assert_ok "Claude selects only its exact immutable ceiling" t_python - "$claude_record" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); assert d["provider"]=="claude" and d["maximum_bytes"]==197220928
+PY
+assert_rc "unknown provider is rejected before path discovery" 2 provider_harness record unknown "$provider_root/does-not-exist"
+
+provider_codex="$provider_root/codex-247464144"
+t_python - "$provider_codex" <<'PY'
+import os,sys
+remaining=247464144; chunk=b'x'*(1024*1024)
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o700)
+try:
+    while remaining:
+        part=chunk[:min(len(chunk),remaining)]; os.write(fd,part); remaining-=len(part)
+    os.fsync(fd)
+finally: os.close(fd)
+PY
+memory_record="$(provider_harness record codex "$provider_codex" memory)"
+assert_ok "measured 247464144-byte Codex boundary streams below a 192 MiB resident-memory ceiling" \
+  t_python - "$memory_record" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); assert d["bytes"]==247464144 and d["maximum_rss_bytes"]<192*1024*1024,d
+PY
+read_record="$(provider_harness instrument read-size codex "$provider_small")"
+assert_ok "every provider read request is at most 1 MiB" t_python - "$read_record" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); assert 0<d["observed_maximum_read"]<=1048576
+PY
+printf x >> "$provider_codex"
+assert_rc "Codex policy rejects its exact maximum plus one before launch" 2 provider_harness record codex "$provider_codex"
+t_python -c 'import os,sys; os.truncate(sys.argv[1],247464144)' "$provider_codex"
+assert_rc "ordinary external-file identity still rejects a provider-sized file at the unchanged 64 MiB cap" 2 \
+  provider_harness external "$provider_codex"
+
+t_case "provider executable shape, path, stream, and manifest disagreements fail closed"
+chmod 720 "$provider_small"
+assert_rc "group-writable executable is rejected" 2 provider_harness record codex "$provider_small"
+chmod 600 "$provider_small"
+assert_rc "non-executable provider file is rejected" 2 provider_harness record codex "$provider_small"
+chmod 700 "$provider_small"
+provider_link="$provider_root/provider-link"; ln "$provider_small" "$provider_link"
+assert_rc "hardlinked provider file is rejected" 2 provider_harness record codex "$provider_small"
+rm "$provider_link"
+provider_alias="$provider_root/provider-alias"; ln -s "$provider_small" "$provider_alias"
+assert_rc "provider pathname alias is rejected" 2 provider_harness record codex "$provider_alias"
+provider_real_dir="$provider_root/real-dir"; mkdir "$provider_real_dir"; cp "$provider_small" "$provider_real_dir/provider"; chmod 700 "$provider_real_dir/provider"
+ln -s "$provider_real_dir" "$provider_root/alias-dir"
+assert_rc "symlinked provider path component is rejected" 2 provider_harness record codex "$provider_root/alias-dir/provider"
+assert_rc "allocated-size sparse provider state is rejected" 2 provider_harness sparse-stat codex "$provider_small"
+for field in uid mode nlink dev ino bytes; do
+  assert_rc "path/descriptor $field disagreement is rejected" 2 provider_harness mismatch "$field" codex "$provider_small"
+done
+for field in provider maximum_bytes chunk_bytes timeout_ns path dev ino uid mode nlink bytes sha256; do
+  assert_rc "missing recorded $field is rejected by reproof" 2 provider_harness reprove missing codex "$provider_small" "$field"
+done
+assert_rc "recorded digest mismatch is rejected by reproof" 2 provider_harness reprove digest codex "$provider_small"
+assert_rc "recorded provider maximum mismatch is rejected by reproof" 2 provider_harness reprove maximum codex "$provider_small"
+assert_rc "descriptor read error is rejected" 2 provider_harness instrument read-error codex "$provider_small"
+assert_rc "descriptor short read is rejected" 2 provider_harness instrument short-read codex "$provider_small"
+assert_rc "expired monotonic deadline rejects before another read" 2 provider_harness instrument timeout-before-read codex "$provider_small"
+assert_rc "a nonterminating read is interrupted and rejected" 2 provider_harness instrument nonterminating-read codex "$provider_small"
+
+provider_replacement="$provider_root/provider-replacement"
+printf '#!/bin/sh\nexit 9\n' > "$provider_replacement"; chmod 700 "$provider_replacement"
+assert_rc "descriptor swap after hashing is rejected by the final descriptor proof" 2 \
+  provider_harness descriptor-swap codex "$provider_small" "$provider_replacement"
+
+t_case "provider-exec permits only the manifest provider and never launches after identity failure"
+provider_marker="$provider_root/provider-marker"; provider_stub="$provider_root/provider-stub"
+printf '#!/bin/sh\n: > "$PROVIDER_MARKER"\n' > "$provider_stub"; chmod 700 "$provider_stub"
+wrapper_stub="$provider_root/sandbox-stub"; profile_stub="$provider_root/provider.sb"
+printf '#!/bin/sh\nshift 4\nexec "$@"\n' > "$wrapper_stub"; chmod 700 "$wrapper_stub"; printf 'profile\n' > "$profile_stub"; chmod 600 "$profile_stub"
+assert_ok "provider-exec reproof retains the descriptor through the terminal wrapper exec" \
+  provider_harness exec clean codex "$provider_stub" "$wrapper_stub" "$profile_stub" "$provider_marker"
+assert_file "the exact local provider stub executes after successful reproof" "$provider_marker"
+rm -f "$provider_marker"
+assert_rc "digest disagreement blocks before the provider marker" 2 \
+  provider_harness exec digest codex "$provider_stub" "$wrapper_stub" "$profile_stub" "$provider_marker"
+assert_no_file "digest failure launches no provider stub" "$provider_marker"
+assert_rc "alternate executable argv blocks before the provider marker" 2 \
+  provider_harness exec argv codex "$provider_stub" "$wrapper_stub" "$profile_stub" "$provider_marker"
+assert_no_file "argv failure launches no provider stub" "$provider_marker"
+
+t_case "synchronized provider streaming and pre-exec mutations fail before launch"
+for specification in \
+  "provider_stream growth" \
+  "provider_stream truncation" \
+  "provider_stream content" \
+  "provider_preexec content" \
+  "provider_preexec replacement"; do
+  set -- $specification; provider_phase="$1"; provider_mutation="$2"
+  race_root="$(mktemp -d "${TMPDIR:-/tmp}/firm-provider-race.XXXXXX")"; t_track "$race_root"; chmod 700 "$race_root"
+  race_root="$(cd "$race_root" && pwd -P)"
+  race_target="$race_root/provider"; cp "$provider_small" "$race_target"; chmod 700 "$race_target"
+  race_token="$(t_python -c 'import secrets; print(secrets.token_hex(32))')"
+  race_invocation="$(t_python -c 'import secrets; print(secrets.token_hex(24))')"
+  t_python - "$race_root" "$race_token" "$provider_phase" "$race_invocation" "$race_target" "$provider_mutation" <<'PY' &
+import json,os,shutil,sys,time
+root,token,phase,invocation,target,mutation=sys.argv[1:]
+prefix=os.path.join(root,token+"."+phase)
+ready,mutated,resume,release=[prefix+suffix for suffix in (".ready",".mutated",".resume",".release")]
+deadline=time.monotonic()+10
+while time.monotonic()<deadline and not os.path.exists(ready): time.sleep(.002)
+if not os.path.exists(ready): raise SystemExit(3)
+ready_doc=json.load(open(ready,encoding="ascii")); authority=ready_doc["authority_pid"]; os.kill(authority,0)
+changed={"mutation":mutation,"target":target}
+if mutation=="growth":
+    fd=os.open(target,os.O_WRONLY|os.O_APPEND); os.write(fd,b"x"); os.fsync(fd); os.close(fd)
+elif mutation=="truncation":
+    os.truncate(target,os.stat(target).st_size-1)
+elif mutation=="content":
+    fd=os.open(target,os.O_WRONLY); os.write(fd,b"X"); os.fsync(fd); os.close(fd)
+elif mutation=="replacement":
+    original=target+".original"; os.rename(target,original); shutil.copyfile(original,target); os.chmod(target,0o700)
+    changed["original"]=original
+else: raise SystemExit(5)
+record={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
+        "mutator_pid":os.getpid(),"mutate_monotonic_ns":max(time.monotonic_ns(),ready_doc["enter_monotonic_ns"]+1),
+        "changed":changed}
+def publish(path,value):
+    temporary=path+".publishing"
+    fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    os.write(fd,(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.fsync(fd); os.close(fd)
+    os.rename(temporary,path)
+publish(mutated,record)
+while time.monotonic()<deadline and not os.path.exists(resume): time.sleep(.002)
+if not os.path.exists(resume): raise SystemExit(4)
+release_doc={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
+             "mutator_pid":os.getpid(),"release_monotonic_ns":time.monotonic_ns()}
+publish(release,release_doc)
+PY
+  race_mutator=$!
+  provider_harness barrier codex "$race_target" "$race_root" "$race_token" "$provider_phase" "$race_invocation" \
+    > "$race_root/authority.out" 2> "$race_root/authority.err"
+  race_rc=$?; wait "$race_mutator"; race_mutator_rc=$?
+  if [ "$race_rc" -eq 2 ] && [ "$race_mutator_rc" -eq 0 ]; then
+    _t_ok "$provider_phase $provider_mutation overlaps descriptor proof and is rejected"
+  else
+    _t_no "$provider_phase $provider_mutation overlaps descriptor proof and is rejected" \
+      "authority_rc=$race_rc mutator_rc=$race_mutator_rc stderr=$(_t_ctx "$(cat "$race_root/authority.err")")"
+  fi
+  assert_no_file "$provider_phase $provider_mutation leaves the provider launch marker absent" "$provider_marker"
+done
+
 t_case "environment-only or brokerless P2 claims fail before ledger residue"
 bad_repo="$(mk_repo)"; mk_run "$bad_repo" bad-authority
 bad_run="$bad_repo/.agent-firm/runs/bad-authority"
@@ -45,8 +340,8 @@ assert_no_file "brokerless claim creates no lock" "$bad_run/run.jsonl.lock"
 assert_eq "brokerless claim creates no transaction temp" 0 \
   "$(find "$bad_run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
 
-t_case "all four authenticated barriers overlap an independent mutator and fail closed"
-for phase in manifest_read dispatch_commit use_exec cleanup_commit; do
+t_case "all six authenticated barriers overlap an independent mutator and fail closed"
+for phase in manifest_read dispatch_commit use_exec cleanup_commit provider_stream provider_preexec; do
   barrier_root="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-barrier.XXXXXX")"; t_track "$barrier_root"; chmod 700 "$barrier_root"
   token="$(t_python -c 'import secrets; print(secrets.token_hex(32))')"
   invocation="$(t_python -c 'import secrets; print(secrets.token_hex(24))')"
@@ -59,22 +354,25 @@ ready,mutated,resume,release=[prefix+suffix for suffix in (".ready",".mutated","
 deadline=time.monotonic()+10
 while time.monotonic()<deadline and not os.path.exists(ready): time.sleep(.002)
 if not os.path.exists(ready): raise SystemExit(3)
-authority=json.load(open(ready,encoding="ascii"))["authority_pid"]
+ready_doc=json.load(open(ready,encoding="ascii")); authority=ready_doc["authority_pid"]
 os.kill(authority,0)
 original=target+".original"; os.rename(target,original)
 fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 os.write(fd,("mutated-%s\n"%phase).encode("ascii")); os.fsync(fd); os.close(fd)
 record={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
-        "mutator_pid":os.getpid(),"mutate_monotonic_ns":time.monotonic_ns(),
+        "mutator_pid":os.getpid(),"mutate_monotonic_ns":max(time.monotonic_ns(),ready_doc["enter_monotonic_ns"]+1),
         "changed":{"original":original,"replacement":target}}
-fd=os.open(mutated,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-os.write(fd,(json.dumps(record,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.close(fd)
+def publish(path,value):
+    temporary=path+".publishing"
+    fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    os.write(fd,(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.fsync(fd); os.close(fd)
+    os.rename(temporary,path)
+publish(mutated,record)
 while time.monotonic()<deadline and not os.path.exists(resume): time.sleep(.002)
 if not os.path.exists(resume): raise SystemExit(4)
 release_doc={"schema_version":1,"phase":phase,"token":token,"invocation":invocation,
              "mutator_pid":os.getpid(),"release_monotonic_ns":time.monotonic_ns()}
-fd=os.open(release,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-os.write(fd,(json.dumps(release_doc,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")); os.close(fd)
+publish(release,release_doc)
 PY
   mutator=$!
   "$AUTH" test-barrier-probe --root "$barrier_root" --token "$token" --invocation "$invocation" \
@@ -192,7 +490,7 @@ else
   invocation="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
   mkdir -p "$scratch/.eval-out"
   prepared="$($AUTH prepare --root "$FIRM_ROOT" --eval final-evidence-seal --provider codex \
-    --provider-executable /usr/bin/true --guardian-root "$guardian_root" --guardian-pid "$guardian_pid" \
+    --provider-executable "$provider_small" --guardian-root "$guardian_root" --guardian-pid "$guardian_pid" \
     --guardian-token "$guardian_token" --guardian-failure-marker "$guardian_marker" --invocation "$invocation" \
     --scratch "$scratch" --fixture "$FIRM_ROOT/agent-firm/evals/final-evidence-seal/fixture" \
     --manifest "$control/manifest.json" --shims "$control/shims" \

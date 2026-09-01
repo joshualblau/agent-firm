@@ -32,12 +32,28 @@ allocation=raw.index('local out="$scratch/.eval-out"')
 prepare=raw.index('authority_prepare="$($EVAL_AUTHORITY prepare')
 assert start < allocation < prepare
 PY
-assert_eq "runner contains exactly one shared sandbox-exec construction" 1 \
-  "$(rg -c 'seatbelt_prefix=\( /usr/bin/sandbox-exec' "$RUN")"
+assert_ok "runner contains exactly one shared sandbox-exec construction" t_python - "$RUN" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+assert raw.count("seatbelt_prefix=( /usr/bin/sandbox-exec")==1
+PY
 assert_eq "the same Seatbelt prefix reaches both provider argv shapes" 2 \
   "$(rg -c '"\$\{seatbelt_prefix\[@\]\}" PATH=' "$RUN")"
-assert_output "authenticated registration gate is inserted inside the bounded child and before Seatbelt" \
-  'seatbelt_prefix=( "${guardian_prefix[@]}" "${seatbelt_prefix[@]}" )' cat "$RUN"
+assert_output "provider lookup is resolved through the final canonical real path before authority preparation" \
+  'os.path.realpath(sys.argv[1])' cat "$RUN"
+assert_output "authenticated registration and provider reproof are inserted before Seatbelt" \
+  'seatbelt_prefix=( "${guardian_prefix[@]}" "${provider_prefix[@]}" "${seatbelt_prefix[@]}" )' cat "$RUN"
+assert_ok "the exact terminal chain is guardian-exec to provider-exec to sandbox-exec to env to canonical provider" \
+  t_python - "$RUN" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+guardian=raw.index('guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec')
+provider=raw.index('provider_prefix=( "$EVAL_AUTHORITY" provider-exec',guardian)
+sandbox=raw.index('seatbelt_prefix=( /usr/bin/sandbox-exec',provider)
+join=raw.index('seatbelt_prefix=( "${guardian_prefix[@]}" "${provider_prefix[@]}" "${seatbelt_prefix[@]}" )',sandbox)
+assert guardian < provider < sandbox < join
+assert raw.count('provider_prefix=( "$EVAL_AUTHORITY" provider-exec')==1
+PY
 assert_ok "both golden orientations put bounded supervision before registration and Seatbelt" t_python - "$RUN" <<'PY'
 import sys
 raw=open(sys.argv[1],encoding="utf-8").read()
@@ -53,12 +69,19 @@ assert '--role provider --' in raw and '--role broker --' in raw
 PY
 assert_eq "runner has no recursive control/capsule deletion fallback" 0 \
   "$(rg -c 'rm -rf .*\$control|rm -rf .*\$scratch' "$RUN" || printf '0\n')"
-assert_ok "all four load-bearing concurrent barriers are wired" t_python - "$BIN/firm-eval-authority" <<'PY'
+assert_ok "all six load-bearing concurrent barriers are wired" t_python - "$BIN/firm-eval-authority" <<'PY'
 import sys
 raw=open(sys.argv[1],encoding="utf-8").read()
-for phase in ("manifest_read","dispatch_commit","use_exec","cleanup_commit"):
+for phase in ("manifest_read","dispatch_commit","use_exec","cleanup_commit","provider_stream","provider_preexec"):
     assert ('"%s"'%phase) in raw
 assert "shutil.rmtree" not in raw
+PY
+assert_ok "focused suites contain no live final-evidence-seal provider invocation" \
+  t_python - "$FIRM_ROOT/tests/test-eval-candidate-tools.sh" "$FIRM_ROOT/tests/test-run-evals-structural.sh" <<'PY'
+import re,sys
+provider_names="co"+"dex|cl"+"aude"
+pattern=re.compile(r"firm-run-evals.*--provider (?:"+provider_names+r").*final-evidence-seal")
+assert not any(pattern.search(open(path,encoding="utf-8").read()) for path in sys.argv[1:])
 PY
 assert_rc "list is successful" 0 "$RUN" --list
 assert_output "list makes no behavioral or structural claim" "listing only" "$RUN" --list

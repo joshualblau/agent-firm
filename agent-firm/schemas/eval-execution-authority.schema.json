@@ -119,7 +119,7 @@
       "required": ["profile", "wrapper", "provider", "real_common", "real_common_identity", "alias", "probe_file", "probe_file_identity", "capsule_sentinel", "supervisor_argv_prefix", "prepare_probe"],
       "properties": {
         "profile": {"$ref": "#/$defs/externalFile"}, "wrapper": {"$ref": "#/$defs/externalFile"},
-        "provider": {"$ref": "#/$defs/externalFile"}, "real_common": {"type": "string", "minLength": 1},
+        "provider": {"$ref": "#/$defs/providerExecutable"}, "real_common": {"type": "string", "minLength": 1},
         "real_common_identity": {"$ref": "#/$defs/identity"}, "alias": {"type": "string", "minLength": 1},
         "probe_file": {"type": "string", "minLength": 1}, "probe_file_identity": {"$ref": "#/$defs/externalFile"},
         "capsule_sentinel": {"type": "string", "minLength": 1},
@@ -127,13 +127,34 @@
         "prepare_probe": {"$ref": "#/$defs/probeReceipt"}
       }
     },
+    "providerExecutable": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "maximum_bytes", "chunk_bytes", "timeout_ns", "path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "provider": {"enum": ["claude", "codex"]},
+        "maximum_bytes": {"type": "integer"}, "chunk_bytes": {"const": 1048576},
+        "timeout_ns": {"const": 10000000000}, "path": {"type": "string", "minLength": 1},
+        "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 1, "maximum": 4095},
+        "nlink": {"const": 1}, "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "oneOf": [
+        {"required": ["provider", "maximum_bytes", "bytes"],
+         "properties": {"provider": {"const": "codex"}, "maximum_bytes": {"const": 247464144},
+                        "bytes": {"type": "integer", "minimum": 1, "maximum": 247464144}}},
+        {"required": ["provider", "maximum_bytes", "bytes"],
+         "properties": {"provider": {"const": "claude"}, "maximum_bytes": {"const": 197220928},
+                        "bytes": {"type": "integer", "minimum": 1, "maximum": 197220928}}}
+      ]
+    },
     "testBarrier": {
       "oneOf": [
         {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"const": false}}},
         {"type": "object", "additionalProperties": false, "required": ["enabled", "root", "token", "phase", "invocation"],
          "properties": {"enabled": {"const": true}, "root": {"type": "string", "minLength": 1},
            "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit"]},
+           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit", "provider_stream", "provider_preexec"]},
            "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"}}}
       ]
     },
