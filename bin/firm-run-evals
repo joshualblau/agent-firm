@@ -207,14 +207,14 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   local d="$1" name="$2" provider_rc turns prompt checker_rc provider_executable
   local codex_command claude_command
   codex_command=codex; claude_command=claude
-  local control="" broker_pid="" authority_manifest="" authority_digest="" authority_invocation="" candidate_path=""
+  local control="" broker_pid="" authority_manifest="" authority_digest="" authority_invocation="" candidate_path="" candidate_project="" candidate_authority=""
   local shell_env="${ZDOTDIR:-${HOME:-/tmp}}" shell_bash_env="${BASH_ENV:-}" shell_sh_env="${ENV:-}"
   [ -x "$CHECKER" ] || { echo "FAIL $name: missing executable firm-check-assertions at $CHECKER; provider phase not started" >&2; return 1; }
   command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
   [ -x "$BOUNDED" ] || { echo "FAIL $name: missing executable firm-bounded-exec" >&2; return 1; }
 
   local scratch; scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-${name}.XXXXXX")"
-  cp -R "$d/fixture/." "$scratch/" 2>/dev/null || true
+  chmod 700 "$scratch" || return 1
   # THE FIXTURE'S DEFAULT BRANCH IS STATED, NOT INHERITED. A bare `git init` takes the branch name
   # from the HOST's init.defaultBranch, so on a machine set to anything but main or master this
   # fixture came up on a branch bin/firm-new-run cannot recognize as any default branch -- and since
@@ -244,11 +244,14 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   # global template seeds files into the .git this creates -- harmless here, and it is what the
   # hostile-host case in tests/test-run-evals-structural.sh uses to PROVE this environment reaches
   # this `git init` rather than only a probe beside it), and core.attributesFile.
-  ( cd "$scratch" && git init -q && git symbolic-ref HEAD refs/heads/main \
-      && git -c core.excludesFile=/dev/null add -A \
-      && git -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.hooksPath=/dev/null \
-             -c user.email=eval@firm -c user.name=eval commit -qm fixture ) \
-    || { echo "SKIP $name: git init failed"; return 4; }
+  if [ "$name" != final-evidence-seal ]; then
+    cp -R "$d/fixture/." "$scratch/" 2>/dev/null || true
+    ( cd "$scratch" && git init -q && git symbolic-ref HEAD refs/heads/main \
+        && git -c core.excludesFile=/dev/null add -A \
+        && git -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.hooksPath=/dev/null \
+               -c user.email=eval@firm -c user.name=eval commit -qm fixture ) \
+      || { echo "SKIP $name: git init failed"; return 4; }
+  fi
   local out="$scratch/.eval-out"; mkdir -p "$out"
   make_eval_settings "$out/settings.json"
 
@@ -265,11 +268,13 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     chmod 700 "$control" || return 1
     authority_manifest="$control/manifest.json"
     authority_prepare="$($EVAL_AUTHORITY prepare --root "$ROOT" --eval "$name" --provider "$provider" \
-      --scratch "$scratch" --manifest "$authority_manifest" --shims "$control/shims" \
+      --scratch "$scratch" --fixture "$d/fixture" --manifest "$authority_manifest" --shims "$control/shims" \
       --request-root "$out/authority-requests" --response-root "$control/responses")" || { rm -rf "$control"; return 1; }
     authority_digest="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["manifest_digest"])')" || { rm -rf "$control"; return 1; }
     authority_invocation="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')" || { rm -rf "$control"; return 1; }
     shell_env="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["shell_env"])')" || { rm -rf "$control"; return 1; }
+    candidate_project="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["project_root"])')" || { rm -rf "$control"; return 1; }
+    candidate_authority="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["authority_bin"])')" || { rm -rf "$control"; return 1; }
     shell_bash_env="$shell_env/.bash-env"; shell_sh_env="$shell_env/.sh-env"
     candidate_path="$control/shims:/usr/bin:/bin:/usr/sbin:/sbin"
     "$EVAL_AUTHORITY" serve --manifest "$authority_manifest" --digest "$authority_digest" \
@@ -283,7 +288,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
       sleep 0.02; authority_wait=$((authority_wait+1))
     done
     [ "$authority_ready" -eq 1 ] || { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; rm -rf "$control"; echo "FAIL $name: candidate authority did not start" >&2; return 1; }
-    trap 'kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; [ -z "$control" ] || rm -rf "$control"' EXIT HUP INT TERM
+    trap 'kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; [ -z "$authority_manifest" ] || "$EVAL_AUTHORITY" cleanup --manifest "$authority_manifest" --digest "$authority_digest" >/dev/null 2>&1 || true; [ -z "$control" ] || rm -rf "$control"' EXIT HUP INT TERM
   else
     provider_executable="$(command -v "$provider" 2>/dev/null || true)"
   fi
@@ -297,11 +302,15 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --generation 1 --output "$out/result.json" --result "$out/supervision.json" --cwd "$scratch" -- \
       /usr/bin/env PATH="${candidate_path:-$PATH}" \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_COUNT=0 GIT_TERMINAL_PROMPT=0 GIT_PROTOCOL_FROM_USER=0 \
         ZDOTDIR="$shell_env" BASH_ENV="$shell_bash_env" ENV="$shell_sh_env" \
-        FIRM_EVAL_AUTHORITY_BIN="$EVAL_AUTHORITY" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
+        FIRM_EVAL_AUTHORITY_BIN="$candidate_authority" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
         FIRM_EVAL_AUTHORITY_RESPONSE_ROOT="$control/responses" \
         FIRM_EVAL_AUTHORITY_MANIFEST="$authority_manifest" FIRM_EVAL_AUTHORITY_DIGEST="$authority_digest" \
-        FIRM_EVAL_INVOCATION="$authority_invocation" "$claude_command" -p "$(cat "$d/task.md")" \
+        FIRM_EVAL_INVOCATION="$authority_invocation" "$claude_command" -p "The provider starts in a non-repository disposable capsule. The sole project root is $candidate_project; run every repository and Agent Firm command from it. Do not inspect or use any repository outside that root.
+
+$(cat "$d/task.md")" \
         --append-system-prompt "$(cat "$MANUAL")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns." \
@@ -314,7 +323,9 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
         --output-format json
     provider_rc=$?
   else
-    prompt="\$agent-firm:start $(cat "$d/task.md")
+    prompt="\$agent-firm:start The provider starts in a non-repository disposable capsule. The sole project root is project; run every repository and Agent Firm command from \"$candidate_project\". Do not inspect or use any repository outside that root.
+
+$(cat "$d/task.md")
 
 Execution envelope: this eval permits one provider attempt, no retries, and at most $eval_max_turns top-level turns."
     # The never-ask policy is stated as a typed -c override, which is the ONLY form `codex exec`
@@ -341,11 +352,14 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
       /usr/bin/env PATH="${candidate_path:-$PATH}" FIRM_PRIMARY_PROVIDER=codex \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_COUNT=0 GIT_TERMINAL_PROMPT=0 GIT_PROTOCOL_FROM_USER=0 \
         ZDOTDIR="$shell_env" BASH_ENV="$shell_bash_env" ENV="$shell_sh_env" \
-        FIRM_EVAL_AUTHORITY_BIN="$EVAL_AUTHORITY" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
+        FIRM_EVAL_AUTHORITY_BIN="$candidate_authority" FIRM_EVAL_AUTHORITY_REQUEST_ROOT="$out/authority-requests" \
         FIRM_EVAL_AUTHORITY_RESPONSE_ROOT="$control/responses" \
         FIRM_EVAL_AUTHORITY_MANIFEST="$authority_manifest" FIRM_EVAL_AUTHORITY_DIGEST="$authority_digest" \
         FIRM_EVAL_INVOCATION="$authority_invocation" "$codex_command" exec --ephemeral \
+        --skip-git-repo-check \
         -m "${FIRM_CODEX_LEAD_MODEL:-gpt-5.6-sol}" -c 'model_reasoning_effort="xhigh"' \
         -s workspace-write -c 'approval_policy="never"' --json "$prompt"
     provider_rc=$?
@@ -359,8 +373,7 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
     "$EVAL_AUTHORITY" verify --manifest "$authority_manifest" --digest "$authority_digest" \
       --receipts "$control/receipts.jsonl" > "$out/candidate-execution-summary.json" || provider_rc=1
     chmod 600 "$out/candidate-execution-summary.json" 2>/dev/null || provider_rc=1
-    rm -rf "$control"; control=""; broker_pid=""
-    trap - EXIT HUP INT TERM
+    broker_pid=""
   fi
 
   if [ "$provider_rc" -ne 0 ]; then
@@ -389,6 +402,9 @@ PY
     else
       echo "  ($provider was stopped or exited non-zero; rc=$provider_rc — see $out/supervision.json and result.json; no retry attempted)" >&2
     fi
+    [ -z "$authority_manifest" ] || "$EVAL_AUTHORITY" cleanup --manifest "$authority_manifest" --digest "$authority_digest" >/dev/null || true
+    [ -z "$control" ] || rm -rf "$control"; control=""; authority_manifest=""
+    trap - EXIT HUP INT TERM
     return 1
   fi
 
@@ -476,9 +492,14 @@ print("    envelope:", {k:d.get(k) for k in ("subtype","is_error","num_turns","s
 print("    permission_denials:", len(d.get("permission_denials") or []))
 PY
 
-  FIRM_EVAL_PROVIDER="$provider" "$CHECKER" "$d/assertions.yaml" "$scratch" "$out/result.json"
+  FIRM_EVAL_PROVIDER="$provider" "$CHECKER" "$d/assertions.yaml" "${candidate_project:-$scratch}" "$out/result.json"
   checker_rc=$?
-  echo "    (scratch: $scratch — inspect .eval-out/ and .agent-firm/ on failure)"
+  if [ -n "$authority_manifest" ]; then
+    "$EVAL_AUTHORITY" cleanup --manifest "$authority_manifest" --digest "$authority_digest" >/dev/null || checker_rc=1
+    rm -rf "$control"; control=""; authority_manifest=""
+    trap - EXIT HUP INT TERM
+  fi
+  echo "    (disposable capsule cleaned after assertion evaluation)"
   case "$checker_rc" in
     0) return 0 ;;
     1) echo "  (assertion checker completed: one or more assertions failed; no retry attempted)" >&2 ;;

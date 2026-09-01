@@ -6,16 +6,24 @@ while [ -L "$__src" ]; do __dir="$(cd -P "$(dirname "$__src")" && pwd)"; __src="
 __self="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$__self/firm-python"
 exec "${FIRM_PYTHON_ARGV[@]}" - "$__src" "$@" <<'PY'
-import argparse, hashlib, hmac, json, os, re, secrets, shlex, signal, socket, stat, subprocess, sys, time
+import argparse, hashlib, hmac, json, os, re, secrets, shlex, shutil, signal, socket, stat, subprocess, sys, time
 from pathlib import Path
 
 SELF = Path(sys.argv[1]).resolve()
 ARGV = sys.argv[2:]
 PATCH_BASE = "369c86b18027281fcfec1288efaa1255df315c35"
+PATCH_COMMIT = "36acf5dd5ec1a3a22b797a30b053d4e592ce5c60"
+PAYLOAD_COMMIT = "a57a8d0b4754ed92b74c023c340aab3154845abb"
 PATCH_BYTES = 144413
 PATCH_SHA256 = "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829"
 MAX_MESSAGE = 256 * 1024
 HEX64 = set("0123456789abcdef")
+GIT = str(Path(shutil.which("git") or "/usr/bin/git").resolve())
+SAFE_GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_COUNT": "0",
+    "GIT_TERMINAL_PROMPT": "0", "GIT_PROTOCOL_FROM_USER": "0",
+}
 
 def fail(message):
     print("firm-eval-authority: INPUT_INVALID: " + message, file=sys.stderr)
@@ -60,7 +68,10 @@ def no_symlink_components(path):
         if stat.S_ISLNK(os.lstat(str(current)).st_mode): fail("symlinked path component")
 
 def git(root, *args, binary=False):
-    value = subprocess.check_output(["git", "-C", str(root)] + list(args), stderr=subprocess.DEVNULL)
+    env = {"PATH":"/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL":"C"}
+    env.update(SAFE_GIT_ENV)
+    value = subprocess.check_output([GIT, "-C", str(root)] + list(args),
+                                    stderr=subprocess.DEVNULL, env=env)
     return value if binary else value.decode("utf-8", "strict").strip()
 
 def prove_patch(root, head):
@@ -73,6 +84,211 @@ def prove_patch(root, head):
                 return commit
             fail("immutable patch identity mismatch")
     fail("immutable patch commit not found")
+
+def put_file(path, raw, mode):
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), mode)
+    try:
+        view = memoryview(raw)
+        while view:
+            count = os.write(fd, view); view = view[count:]
+        os.fsync(fd)
+    finally: os.close(fd)
+
+def path_record(path, content=True):
+    path = Path(path); no_symlink_components(path)
+    st = os.lstat(str(path))
+    if st.st_uid != os.getuid() or (stat.S_ISREG(st.st_mode) and st.st_nlink != 1):
+        fail("unsafe owned path identity")
+    item = identity(st)
+    if stat.S_ISREG(st.st_mode) and content:
+        raw, after = read_bytes(path, 512 * 1024 * 1024)
+        if identity(after) != item: fail("identity changed while recorded")
+        item["sha256"] = digest_bytes(raw)
+    return item
+
+def tree_inventory(root):
+    root = Path(root); rows=[]
+    for current, dirs, files in os.walk(str(root), topdown=True, followlinks=False):
+        dirs.sort(); files.sort()
+        for name in dirs + files:
+            path=Path(current)/name; st=os.lstat(str(path)); rel=str(path.relative_to(root))
+            if stat.S_ISLNK(st.st_mode): fail("symlink in protected tree")
+            if st.st_uid != os.getuid(): fail("foreign path in protected tree")
+            if stat.S_ISREG(st.st_mode):
+                if st.st_nlink != 1: fail("hardlink in protected tree")
+                raw,after=read_bytes(path,512*1024*1024)
+                if identity(st)!=identity(after): fail("protected tree changed while read")
+                rows.append({"path":rel,"kind":"file","mode":stat.S_IMODE(st.st_mode),
+                             "bytes":len(raw),"sha256":digest_bytes(raw)})
+            elif stat.S_ISDIR(st.st_mode):
+                rows.append({"path":rel,"kind":"dir","mode":stat.S_IMODE(st.st_mode)})
+            else: fail("special path in protected tree")
+    raw=(canonical(rows)+"\n").encode("ascii")
+    return {"entries":len(rows),"sha256":digest_bytes(raw),"bytes":len(raw)}
+
+def object_closure(root, commit):
+    names=git(root,"rev-list","--objects","--no-object-names",commit).splitlines()
+    if not names or len(names)!=len(set(names)) or any(not re.fullmatch(r"[0-9a-f]{40}",x) for x in names):
+        fail("noncanonical object closure")
+    proc=subprocess.Popen([GIT,"-C",str(root),"cat-file","--batch"],stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                          env={**SAFE_GIT_ENV,"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+    out,err=proc.communicate(("\n".join(names)+"\n").encode("ascii"))
+    if proc.returncode: fail("cannot read payload object closure")
+    cursor=0; rows=[]
+    for expected in names:
+        end=out.find(b"\n",cursor)
+        if end<0: fail("truncated object closure")
+        header=out[cursor:end].decode("ascii").split(); cursor=end+1
+        if len(header)!=3 or header[0]!=expected or header[1] not in ("blob","tree","commit","tag"):
+            fail("object closure header")
+        size=int(header[2]); body=out[cursor:cursor+size]; cursor+=size
+        if len(body)!=size or out[cursor:cursor+1]!=b"\n": fail("object closure framing")
+        cursor+=1; rows.append({"oid":expected,"type":header[1],"size":size,
+                               "sha256":digest_bytes(body)})
+    if cursor!=len(out): fail("extra object closure bytes")
+    return rows
+
+def copy_fixture(src, dst):
+    src=Path(src); dst=Path(dst); no_symlink_components(src)
+    for current,dirs,files in os.walk(str(src),topdown=True,followlinks=False):
+        dirs.sort(); files.sort(); rel=Path(current).relative_to(src)
+        for name in dirs:
+            source=Path(current)/name; st=os.lstat(str(source))
+            if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode): fail("unsafe fixture directory")
+            target=dst/rel/name
+            if target.exists() or target.is_symlink(): fail("fixture collision")
+            target.mkdir(mode=stat.S_IMODE(st.st_mode)&0o755)
+        for name in files:
+            source=Path(current)/name; st=os.lstat(str(source)); target=dst/rel/name
+            if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_nlink!=1:
+                fail("unsafe fixture file")
+            if target.exists() or target.is_symlink(): fail("fixture collision")
+            if hasattr(os,"listxattr") and os.listxattr(str(source)): fail("fixture xattr")
+            raw,_=read_bytes(source,16*1024*1024); put_file(target,raw,stat.S_IMODE(st.st_mode)&0o755)
+
+def isolated_git(cwd, args, data=None, extra=None):
+    env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"}; env.update(SAFE_GIT_ENV)
+    if extra: env.update(extra)
+    done=subprocess.run([GIT,"-C",str(cwd)]+list(args),input=data,stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,env=env)
+    if done.returncode:
+        detail=done.stderr.decode("utf-8","replace").strip().replace("\n"," ")[:500]
+        fail("contained git command failed (%s): %s"%(" ".join(args[:4]),detail))
+    return done.stdout
+
+def build_capsule(root, scratch, fixture):
+    if (scratch/".git").exists() or (scratch/"project").exists() or (scratch/"git-common").exists():
+        fail("capsule must begin outside a repository")
+    real_common=Path(git(root,"rev-parse","--path-format=absolute","--git-common-dir"))
+    no_symlink_components(real_common); before=tree_inventory(real_common)
+    chain=[git(root,"rev-parse",x) for x in (PATCH_BASE,PATCH_COMMIT,PAYLOAD_COMMIT)]
+    if chain!=[PATCH_BASE,PATCH_COMMIT,PAYLOAD_COMMIT] or git(root,"show","-s","--format=%P",PATCH_COMMIT)!=PATCH_BASE or git(root,"show","-s","--format=%P",PAYLOAD_COMMIT)!=PATCH_COMMIT:
+        fail("payload parent chain")
+    payload_tree=git(root,"rev-parse",PAYLOAD_COMMIT+"^{tree}")
+    closure=object_closure(root,PAYLOAD_COMMIT)
+    project=scratch/"project"; common=scratch/"git-common"; hooks=scratch/"no-hooks"
+    project.mkdir(mode=0o700); common.mkdir(mode=0o700); hooks.mkdir(mode=0o500)
+    for rel in ("objects","objects/pack","objects/info","refs","refs/heads","refs/firm-eval","info","worktrees"):
+        (common/rel).mkdir(mode=0o700)
+    config=("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+            "\tlogallrefupdates = true\n\tworktree = %s\n\thooksPath = %s\n"
+            "[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"%(project,hooks)).encode("utf-8")
+    put_file(common/"config",config,0o400)
+    put_file(common/"HEAD",b"ref: refs/heads/main\n",0o600)
+    pack=isolated_git(root,["pack-objects","--revs","--stdout"],(PAYLOAD_COMMIT+"\n").encode("ascii"))
+    env={"GIT_OBJECT_DIRECTORY":str(common/"objects")}
+    isolated_git(root,["--git-dir",str(common),"index-pack","--stdin","--fix-thin"],pack,env)
+    pack_files=[]
+    for path in sorted((common/"objects/pack").iterdir()):
+        if path.suffix not in (".pack",".idx",".rev") or path.is_symlink():
+            fail("unexpected initial pack: "+path.name)
+        os.chmod(str(path),0o400); item={"path":str(path.relative_to(scratch))}; item.update(path_record(path)); pack_files.append(item)
+    if len(pack_files) not in (2,3): fail("protected pack shape")
+    put_file(common/"refs/heads/main",(PAYLOAD_COMMIT+"\n").encode("ascii"),0o600)
+    put_file(common/"refs/firm-eval/candidate",(PAYLOAD_COMMIT+"\n").encode("ascii"),0o400)
+    put_file(common/"refs/firm-eval/base",(PATCH_BASE+"\n").encode("ascii"),0o400)
+    gitfile=("gitdir: %s\n"%common).encode("utf-8"); put_file(project/".git",gitfile,0o400)
+    isolated_git(project,["reset","--hard",PAYLOAD_COMMIT])
+    if git(project,"rev-parse","HEAD")!=PAYLOAD_COMMIT or git(project,"rev-parse","HEAD^{tree}")!=payload_tree:
+        fail("payload checkout identity")
+    # The launcher-owned authority is the one intentional harness overlay.  Candidate tools remain
+    # byte-exact a57 payload files; the a57 writer requires its authority at TOOL_ROOT/bin, so the
+    # manifest classifies and protects this path as harness identity rather than relabelling it.
+    authority_raw,_=read_bytes(SELF)
+    os.unlink(str(project/"bin/firm-eval-authority"))
+    put_file(project/"bin/firm-eval-authority",authority_raw,0o500)
+    copy_fixture(fixture,project)
+    isolated_git(project,["add","-A"])
+    fixed={"GIT_AUTHOR_NAME":"Firm Eval","GIT_AUTHOR_EMAIL":"eval@firm.invalid",
+           "GIT_COMMITTER_NAME":"Firm Eval","GIT_COMMITTER_EMAIL":"eval@firm.invalid",
+           "GIT_AUTHOR_DATE":"2000-01-01T00:00:00Z","GIT_COMMITTER_DATE":"2000-01-01T00:00:00Z"}
+    isolated_git(project,["commit","-m","fixture"],extra=fixed)
+    fixture_tip=git(project,"rev-parse","HEAD"); fixture_tree=git(project,"rev-parse","HEAD^{tree}")
+    if git(project,"status","--porcelain","--untracked-files=all"): fail("dirty fixture tip")
+    present=set(git(project,"cat-file","--batch-all-objects","--batch-check=%(objectname)").splitlines())
+    if not set(row["oid"] for row in closure).issubset(present): fail("payload object omission")
+    if tree_inventory(real_common)!=before: fail("real common changed during materialization")
+    protected={"gitfile":{"path":"project/.git",**path_record(project/".git")},
+               "config":{"path":"git-common/config",**path_record(common/"config")},
+               "candidate_ref":{"path":"git-common/refs/firm-eval/candidate",**path_record(common/"refs/firm-eval/candidate")},
+               "base_ref":{"path":"git-common/refs/firm-eval/base",**path_record(common/"refs/firm-eval/base")},
+               "harness_authority":{"path":"project/bin/firm-eval-authority",**path_record(project/"bin/firm-eval-authority")},
+               "packs":pack_files}
+    return {"project":str(project),"common":str(common),"hooks":str(hooks),
+            "root_identity":path_record(scratch,False),"project_identity":path_record(project,False),
+            "common_identity":path_record(common,False),"objects_identity":path_record(common/"objects",False),
+            "hooks_identity":path_record(hooks,False),
+            "payload_tree":payload_tree,"closure":closure,"fixture_tip":fixture_tip,
+            "fixture_tree":fixture_tree,"protected":protected,
+            "real_root":str(root),"real_common":str(real_common),"real_common_before":before}
+
+def validate_capsule(doc, final=False):
+    cap=doc["capsule"]; root=Path(doc["scratch_root"]); project=Path(cap["project"]); common=Path(cap["common"])
+    for path,key in ((root,"root_identity"),(project,"project_identity"),(common,"common_identity"),(common/"objects","objects_identity"),(Path(cap["hooks"]),"hooks_identity")):
+        actual=path_record(path,False); expected=cap[key]
+        if path.resolve()!=path or any(actual[name]!=expected[name] for name in ("dev","ino","uid","mode")):
+            fail("capsule directory identity")
+        if os.path.commonpath((str(root),str(path)))!=str(root): fail("capsule containment")
+    if (root/".git").exists() or (root/".git").is_symlink(): fail("outer capsule became repository")
+    for item in [cap["protected"]["gitfile"],cap["protected"]["config"],cap["protected"]["candidate_ref"],cap["protected"]["base_ref"],cap["protected"]["harness_authority"]]+cap["protected"]["packs"]:
+        path=root/item["path"]
+        if path_record(path)!={k:v for k,v in item.items() if k!="path"}: fail("protected capsule bytes changed")
+    if (project/".git").read_bytes() != ("gitdir: %s\n"%common).encode(): fail("gitfile escape")
+    resolved=[git(project,"rev-parse","--show-toplevel"),git(project,"rev-parse","--path-format=absolute","--git-dir"),git(project,"rev-parse","--path-format=absolute","--git-common-dir"),git(project,"rev-parse","--path-format=absolute","--git-path","objects")]
+    if resolved != [str(project),str(common),str(common),str(common/"objects")]: fail("resolved git path escape")
+    if git(project,"rev-parse","refs/firm-eval/candidate")!=PAYLOAD_COMMIT or git(project,"rev-parse","refs/firm-eval/base")!=PATCH_BASE:
+        fail("anchor ref changed")
+    for forbidden in (common/"objects/info/alternates",common/"info/grafts",common/"shallow",common/"packed-refs"):
+        if forbidden.exists() or forbidden.is_symlink(): fail("forbidden git indirection")
+    if any((common/"refs/replace").glob("*")) if (common/"refs/replace").exists() else False: fail("replace ref")
+    if list(Path(cap["hooks"]).iterdir()): fail("hook appeared")
+    config=(common/"config").read_text("utf-8")
+    for token in ("remote \"","include","promisor","partialclonefilter","submodule","credential","filter \""):
+        if token.lower() in config.lower(): fail("unsafe repository config")
+    for current,dirs,files in os.walk(str(common),topdown=True,followlinks=False):
+        for name in dirs+files:
+            path=Path(current)/name; st=os.lstat(str(path))
+            if stat.S_ISLNK(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink!=1): fail("git metadata link escape")
+            if os.path.commonpath((str(root),str(path.resolve())))!=str(root): fail("git metadata path escape")
+    for path in (common/"worktrees").glob("*"):
+        if not path.is_dir() or path.is_symlink(): fail("worktree administration shape")
+        gitdir=(path/"gitdir").read_text("utf-8").strip(); commondir=(path/"commondir").read_text("utf-8").strip()
+        if Path(gitdir).resolve().name!=".git" or os.path.commonpath((str(root),str(Path(gitdir).resolve())))!=str(root): fail("linked worktree gitfile escape")
+        if (path/commondir).resolve()!=common: fail("linked worktree common-dir escape")
+    if tree_inventory(Path(cap["real_common"]))!=cap["real_common_before"]: fail("real repository changed")
+
+def reject_git_environment():
+    denied={"GIT_DIR","GIT_WORK_TREE","GIT_COMMON_DIR","GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES","GIT_REPLACE_REF_BASE","GIT_NAMESPACE",
+            "GIT_INDEX_FILE","GIT_SHALLOW_FILE","GIT_CEILING_DIRECTORIES","GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_PARAMETERS","GIT_TEMPLATE_DIR","GIT_EXEC_PATH","GIT_SSH","GIT_SSH_COMMAND",
+            "GIT_ASKPASS","GIT_PROTOCOL"}
+    for key,value in os.environ.items():
+        if key in SAFE_GIT_ENV and SAFE_GIT_ENV[key]!=value:
+            fail("unsafe Git environment")
+        if key in denied or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            fail("unsafe Git environment")
 
 def exact_keys(value, keys):
     return isinstance(value, dict) and set(value) == set(keys)
@@ -96,10 +312,11 @@ def load_manifest(path):
     if stat.S_IMODE(st.st_mode) != 0o600: fail("manifest mode")
     try: doc = json.loads(raw.decode("utf-8", "strict"))
     except Exception: fail("manifest JSON")
-    keys = {"schema_version","purpose","invocation","eval","provider","candidate_root",
-            "candidate_commit","candidate_tree","patch_base","patch_commit","patch_bytes",
-            "patch_sha256","scratch_root","scratch_dev","scratch_ino","request_root","response_root","runner","tools"}
-    if not exact_keys(doc, keys) or doc["schema_version"] != 1 or doc["purpose"] != "candidate_eval":
+    keys = {"schema_version","purpose","invocation","eval","provider","harness_root",
+            "harness_commit","harness_tree","candidate_root","candidate_commit","candidate_tree",
+            "patch_base","patch_commit","patch_bytes","patch_sha256","scratch_root","scratch_dev",
+            "scratch_ino","request_root","response_root","runner","tools","capsule"}
+    if not exact_keys(doc, keys) or doc["schema_version"] != 2 or doc["purpose"] != "disposable_git_candidate_eval":
         fail("manifest schema")
     root = Path(doc["candidate_root"])
     if root.resolve() != root: fail("candidate root")
@@ -121,32 +338,39 @@ def load_manifest(path):
 
 def prepare(ns):
     root = Path(ns.root).resolve(); scratch = Path(ns.scratch).resolve()
+    fixture = Path(ns.fixture).resolve()
     manifest = Path(ns.manifest); shims = Path(ns.shims)
     request_root = Path(ns.request_root).resolve(); response_root = Path(ns.response_root).resolve()
     no_symlink_components(root); no_symlink_components(scratch)
     if git(root, "rev-parse", "--show-toplevel") != str(root): fail("repository root")
-    if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty candidate")
+    if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty harness")
     head = git(root, "rev-parse", "HEAD"); tree = git(root, "rev-parse", "HEAD^{tree}")
-    patch_commit = prove_patch(root, head)
+    patch_commit = prove_patch(root, PAYLOAD_COMMIT)
     scratch_st = os.lstat(str(scratch))
     if not stat.S_ISDIR(scratch_st.st_mode) or scratch_st.st_uid != os.getuid() or stat.S_IMODE(scratch_st.st_mode) & 0o022:
         fail("unsafe scratch")
+    capsule = build_capsule(root,scratch,fixture)
+    candidate_root=Path(capsule["project"])
     tools = []
-    for path in sorted((root / "bin").glob("firm-*")):
+    for path in sorted((candidate_root / "bin").glob("firm-*")):
+        if path.name == "firm-eval-authority": continue
         if path.is_symlink() or not path.is_file() or not os.access(str(path), os.X_OK): continue
         raw, st = read_bytes(path)
         if st.st_nlink != 1: fail("hardlinked candidate tool")
         item = {"name":path.name,"path":str(path),"sha256":digest_bytes(raw)}
         item.update(identity(st)); tools.append(item)
     if not any(item["name"] == "firm-ledger-log" for item in tools): fail("writer missing")
-    runner = next((item for item in tools if item["name"] == "firm-run-evals"), None)
-    doc = {"schema_version":1,"purpose":"candidate_eval","invocation":secrets.token_hex(24),
-           "eval":ns.eval,"provider":ns.provider,"candidate_root":str(root),
-           "candidate_commit":head,"candidate_tree":tree,"patch_base":PATCH_BASE,
+    runner_raw,runner_st=read_bytes(SELF.parent/"firm-run-evals")
+    runner={"name":"firm-run-evals","path":str(SELF.parent/"firm-run-evals"),"sha256":digest_bytes(runner_raw)}
+    runner.update(identity(runner_st))
+    doc = {"schema_version":2,"purpose":"disposable_git_candidate_eval","invocation":secrets.token_hex(24),
+           "eval":ns.eval,"provider":ns.provider,"harness_root":str(root),"harness_commit":head,
+           "harness_tree":tree,"candidate_root":str(candidate_root),
+           "candidate_commit":PAYLOAD_COMMIT,"candidate_tree":capsule["payload_tree"],"patch_base":PATCH_BASE,
            "patch_commit":patch_commit,"patch_bytes":PATCH_BYTES,"patch_sha256":PATCH_SHA256,
            "scratch_root":str(scratch),"scratch_dev":scratch_st.st_dev,"scratch_ino":scratch_st.st_ino,
            "request_root":str(request_root),"response_root":str(response_root),
-           "runner":runner,"tools":tools}
+           "runner":runner,"tools":tools,"capsule":capsule}
     raw = (canonical(doc) + "\n").encode("ascii")
     manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(str(manifest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
@@ -164,23 +388,26 @@ def prepare(ns):
     shell_env.mkdir(mode=0o700)
     exports = {
         "PATH": str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin",
-        "FIRM_EVAL_AUTHORITY_BIN": str(SELF),
+        "FIRM_EVAL_AUTHORITY_BIN": str(candidate_root / "bin" / "firm-eval-authority"),
         "FIRM_EVAL_AUTHORITY_REQUEST_ROOT": doc["request_root"],
         "FIRM_EVAL_AUTHORITY_RESPONSE_ROOT": doc["response_root"],
         "FIRM_EVAL_AUTHORITY_MANIFEST": str(manifest),
         "FIRM_EVAL_AUTHORITY_DIGEST": digest_bytes(raw),
         "FIRM_EVAL_INVOCATION": doc["invocation"],
     }
+    exports.update(SAFE_GIT_ENV)
     shell_raw = "".join("export %s=%s\n" % (key, shlex.quote(value)) for key,value in exports.items()).encode("utf-8")
     for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin", ".bash-env", ".sh-env"):
         path = shell_env / name
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
         try: os.write(fd, shell_raw); os.fsync(fd)
         finally: os.close(fd)
-    print(canonical({"schema_version":1,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
-                     "invocation":doc["invocation"],"shim_dir":str(shims),"candidate_commit":head,
-                     "candidate_tree":tree,"patch_commit":patch_commit,"tool_count":len(tools),
-                     "shell_env":str(shell_env)}))
+    validate_capsule(doc)
+    print(canonical({"schema_version":2,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
+                     "invocation":doc["invocation"],"shim_dir":str(shims),"candidate_commit":PAYLOAD_COMMIT,
+                     "candidate_tree":capsule["payload_tree"],"patch_commit":patch_commit,"tool_count":len(tools),
+                     "shell_env":str(shell_env),"project_root":str(candidate_root),"capsule_root":str(scratch),
+                     "authority_bin":str(candidate_root/"bin"/"firm-eval-authority")}))
 
 def send_message(request_root, response_root, request):
     request_id=secrets.token_hex(24)
@@ -213,6 +440,7 @@ def append_receipt(path, record):
 def serve(ns):
     doc, raw = load_manifest(ns.manifest); digest=digest_bytes(raw)
     if digest != ns.digest or doc["invocation"] != ns.invocation: fail("broker binding")
+    validate_capsule(doc)
     request_root=Path(ns.request_root).resolve(); response_root=Path(ns.response_root).resolve(); receipts=Path(ns.receipts)
     if str(request_root)!=doc["request_root"] or str(response_root)!=doc["response_root"]: fail("broker transport")
     fd=os.open(str(receipts), os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600); os.close(fd)
@@ -236,7 +464,7 @@ def serve(ns):
                 if req.get("op") == "exec" and exact_keys(req,{"op","manifest_digest","invocation","tool","argv","cwd"}):
                     tool=tools.get(req["tool"])
                     if tool is None or not isinstance(req["argv"],list) or not all(isinstance(x,str) and len(x)<=65536 for x in req["argv"]): raise ValueError()
-                    validate_tool(tool,Path(doc["candidate_root"])); sequence += 1
+                    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"])); sequence += 1
                     receipt={"schema_version":1,"sequence":sequence,"kind":"execution","tool":tool["name"],"path":tool["path"],"bytes":tool["bytes"],"sha256":tool["sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"argv_sha256":digest_bytes(canonical(req["argv"]).encode("ascii")),"cwd":req["cwd"]}
                     append_receipt(str(receipts),receipt); response={"ok":True,"tool":tool,"receipt":receipt}
                     if tool["name"] == "firm-ledger-log" and "--run" in req["argv"]:
@@ -267,6 +495,7 @@ def serve(ns):
 def request_exec(ns, rest):
     doc, raw=load_manifest(ns.manifest)
     if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("shim binding")
+    reject_git_environment(); validate_capsule(doc)
     response=send_message(ns.request_root,ns.response_root,{"op":"exec","manifest_digest":ns.digest,"invocation":ns.invocation,"tool":ns.tool,"argv":rest,"cwd":os.path.realpath(os.getcwd())})
     tool=response.get("tool"); validate_tool(tool,Path(doc["candidate_root"]))
     env=os.environ.copy()
@@ -276,6 +505,7 @@ def request_exec(ns, rest):
 def validate_p2(ns):
     doc,raw=load_manifest(ns.manifest)
     if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("writer binding")
+    reject_git_environment(); validate_capsule(doc)
     try: token=json.loads(ns.token)
     except Exception: fail("token JSON")
     response=send_message(ns.request_root,ns.response_root,{"op":"validate_p2","manifest_digest":ns.digest,"invocation":ns.invocation,"token":token,"writer_path":ns.writer_path,"writer_sha256":ns.writer_sha256,"run_path":ns.run_path})
@@ -284,6 +514,7 @@ def validate_p2(ns):
 def verify(ns):
     doc, raw=load_manifest(ns.manifest); expected=digest_bytes(raw)
     if expected!=ns.digest: fail("verify digest")
+    validate_capsule(doc,final=True)
     receipt_raw,_=read_bytes(Path(ns.receipts),8*1024*1024)
     rows=[]
     for line in receipt_raw.splitlines():
@@ -292,20 +523,34 @@ def verify(ns):
         if row.get("manifest_digest")!=expected or row.get("invocation")!=doc["invocation"]: fail("receipt binding")
         rows.append(row)
     if not rows or not any(r.get("tool")=="firm-ledger-log" for r in rows) or not any(r.get("kind")=="p2_consumed" for r in rows): fail("missing required receipt")
-    output={"schema_version":1,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
+    output={"schema_version":2,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
             "patch_commit":doc["patch_commit"],"patch_bytes":doc["patch_bytes"],"patch_sha256":doc["patch_sha256"],
             "manifest_digest":expected,"invocation":doc["invocation"],"tool_count":len(doc["tools"]),
             "execution_receipts":sum(r.get("kind")=="execution" for r in rows),"p2_receipts":sum(r.get("kind")=="p2_consumed" for r in rows),
             "receipt_sha256":digest_bytes(receipt_raw),"receipt_bytes":len(receipt_raw)}
     print(canonical(output))
 
+def cleanup(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest: fail("cleanup digest")
+    validate_capsule(doc,final=True)
+    root=Path(doc["scratch_root"])
+    st=os.lstat(str(root))
+    actual=path_record(root,False); expected=doc["capsule"]["root_identity"]
+    if any(actual[name]!=expected[name] for name in ("dev","ino","uid","mode")): fail("cleanup ownership ambiguity")
+    shutil.rmtree(str(root))
+    if root.exists() or root.is_symlink(): fail("capsule cleanup residue")
+    print(canonical({"schema_version":1,"cleanup":"complete","capsule_root":str(root),
+                     "real_common_sha256":doc["capsule"]["real_common_before"]["sha256"]}))
+
 def main():
     p=argparse.ArgumentParser(add_help=False); sub=p.add_subparsers(dest="command",required=True)
-    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--scratch",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True)
+    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True)
     q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
     q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)
     q=sub.add_parser("validate-p2"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--token",required=True); q.add_argument("--writer-path",required=True); q.add_argument("--writer-sha256",required=True); q.add_argument("--run-path",required=True)
     q=sub.add_parser("verify"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--receipts",required=True)
+    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True)
     ns,rest=p.parse_known_args(ARGV)
     if ns.command=="prepare": prepare(ns)
     elif ns.command=="serve": serve(ns)
@@ -313,6 +558,7 @@ def main():
         if not rest or rest[0]!="--": fail("missing argv boundary")
         request_exec(ns,rest[1:])
     elif ns.command=="validate-p2": validate_p2(ns)
-    else: verify(ns)
+    elif ns.command=="verify": verify(ns)
+    else: cleanup(ns)
 main()
 PY
