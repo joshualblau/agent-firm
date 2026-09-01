@@ -75,6 +75,10 @@ NATIVE_ONLY_FIELDS = {"contract", "authority", "activation", "activation_justifi
 NATIVE_REQUIRED_FIELDS = COMMON_FIELDS | {
     "stage", "role", "agent", "contract", "authority", "activation",
 }
+SEAL_PUBLISH_FIELDS = COMMON_FIELDS | {
+    "sha", "generation", "seal_path", "seal_sha256", "seal_bytes",
+    "projection_sha256", "prefix_sha256", "prefix_bytes", "prefix_records", "artifacts",
+}
 # OBSERVATION SHAPES — the closed key sets this writer admits from an out-of-band observer (the
 # PreToolUse hooks). Each is matched EXACTLY: an extra key or a missing one is not a lenient
 # near-miss, it is a record from the `else` branch of classify_record, which then demands run_id and
@@ -399,11 +403,47 @@ def validate_native_record(record, ledger_run_id):
     validate_stored_activation(record["activation"], role, record.get("activation_justification"))
 
 
+def validate_seal_publish_record(record, ledger_run_id):
+    if not exact_keys(record, SEAL_PUBLISH_FIELDS) or record.get("event") != "evidence_seal_published":
+        raise LedgerError("invalid evidence seal publication fields")
+    validate_common_record(record, ledger_run_id)
+    if not re.fullmatch(r"[0-9a-f]{40}", str(record.get("sha", ""))):
+        raise LedgerError("invalid evidence seal candidate")
+    for key in ("seal_sha256", "projection_sha256", "prefix_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(record.get(key, ""))):
+            raise LedgerError("invalid evidence seal digest")
+    for key in ("generation", "seal_bytes", "prefix_bytes", "prefix_records"):
+        if not re.fullmatch(r"[0-9]+", str(record.get(key, ""))):
+            raise LedgerError("invalid evidence seal count")
+    try:
+        validate_relative_path(record["seal_path"], "09-test-evidence")
+        artifacts = parse_json_unique(record["artifacts"])
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise LedgerError("invalid evidence seal artifacts") from exc
+    if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 16:
+        raise LedgerError("invalid evidence seal artifacts")
+    previous = None
+    for item in artifacts:
+        if not exact_keys(item, {"path", "kind", "bytes", "sha256"}):
+            raise LedgerError("invalid evidence seal artifact")
+        validate_relative_path(item["path"], "09-test-evidence")
+        if previous is not None and item["path"] <= previous:
+            raise LedgerError("unsorted evidence seal artifacts")
+        previous = item["path"]
+        if (not printable(item["kind"], 64) or isinstance(item["bytes"], bool)
+                or not isinstance(item["bytes"], int) or item["bytes"] < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", str(item["sha256"]))):
+            raise LedgerError("invalid evidence seal artifact identity")
+
+
 def classify_record(record, ledger_run_id):
     if not isinstance(record, dict):
         raise LedgerError("ledger line is not an object")
     families = []
-    if NATIVE_ONLY_FIELDS & set(record):
+    if record.get("event") == "evidence_seal_published":
+        validate_seal_publish_record(record, ledger_run_id)
+        families.append("evidence_seal_published")
+    elif NATIVE_ONLY_FIELDS & set(record):
         validate_native_record(record, ledger_run_id)
         families.append("native_role_start")
     elif exact_keys(record, SHELL_OBSERVATION_FIELDS) and record.get("event") == "bash":
@@ -428,6 +468,54 @@ def classify_record(record, ledger_run_id):
     if len(families) != 1:
         raise LedgerError("ambiguous ledger family")
     return families[0]
+
+
+def classify_ledger_file(argv):
+    """Read-only canonical classifier entry point used by seal creation and verification."""
+    if len(argv) != 3 or argv[0] != "--classify-ledger-file" or not SAFE_RUN.fullmatch(argv[1]):
+        raise SystemExit(2)
+    path = Path(argv[2])
+    if (not path.is_absolute() or path.is_symlink() or path.name != "run.jsonl"
+            or path.parent.name != argv[1] or path.parent.parent.name != "runs"
+            or path.parent.parent.parent.name != ".agent-firm"):
+        raise SystemExit(1)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        before = os.fstat(fd)
+        raw = b""
+        while len(raw) <= MAX_LEDGER_LINE * 4:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+        after = os.fstat(fd)
+    except OSError:
+        raise SystemExit(1)
+    finally:
+        if "fd" in locals():
+            os.close(fd)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if (not stat.S_ISREG(after.st_mode) or after.st_uid != os.getuid() or after.st_nlink != 1
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or identity(before) != identity(after) or identity(after) != identity(os.lstat(path))):
+        raise SystemExit(1)
+    if not raw or len(raw) > MAX_LEDGER_LINE * 4 or not raw.endswith(b"\n") or b"\n\n" in raw:
+        raise SystemExit(1)
+    seen = set()
+    try:
+        for line in raw.splitlines():
+            record = parse_json_unique(line.decode("utf-8", "strict"))
+            family = classify_record(record, argv[1])
+            if family not in ("shell_observation", "merge_observation", "merge_permit_observation"):
+                event_id = record["event_id"]
+                if event_id in seen:
+                    raise LedgerError("duplicate event id")
+                seen.add(event_id)
+    except (UnicodeError, ValueError, json.JSONDecodeError, KeyError, LedgerError, ValidationError) as exc:
+        print(f"classifier: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"valid:{len(raw)}:{hashlib.sha256(raw).hexdigest()}")
+    raise SystemExit(0)
 
 
 def stat_identity(st):
@@ -1784,7 +1872,7 @@ def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=()):
     for record in ledger_records(fd, copy_fd):
         family = classify_record(record, ledger_run_id)
         count += 1
-        if family not in ("ordinary", "native_role_start"):
+        if family not in ("ordinary", "native_role_start", "evidence_seal_published"):
             continue
         event_id = record["event_id"]
         if event_id in event_ids:
@@ -2204,6 +2292,99 @@ def ordinary_main(argv):
     raise SystemExit(0)
 
 
+def seal_publish_main(argv):
+    if not argv or argv.pop(0) != "--seal-publish":
+        role_fail(2, "INPUT_INVALID", "seal-publish")
+    target = None
+    raw_publication = None
+    while argv:
+        flag = argv.pop(0)
+        if flag == "--run" and argv:
+            target = argv.pop(0)
+        elif flag == "--publication-json" and argv:
+            raw_publication = argv.pop(0)
+        else:
+            role_fail(2, "INPUT_INVALID", "seal-publish-argv")
+    if target is None or raw_publication is None or len(raw_publication.encode("utf-8")) > MAX_JSON_OPERAND:
+        role_fail(2, "INPUT_INVALID", "seal-publish-argv")
+    try:
+        publication = parse_json_unique(raw_publication)
+    except (ValueError, json.JSONDecodeError):
+        role_fail(2, "INPUT_INVALID", "seal-publication-json")
+    required = {
+        "event_id", "sha", "generation", "seal_path", "seal_sha256", "seal_bytes",
+        "projection_sha256", "prefix_sha256", "prefix_bytes", "prefix_records", "artifacts",
+    }
+    if not exact_keys(publication, required):
+        role_fail(2, "INPUT_INVALID", "seal-publication-schema")
+    try:
+        repo, run_path = validate_run(target, True)
+        run = prepare_write_run(repo, run_path)
+    except RoleFailure:
+        raise
+    except ValidationError:
+        role_fail(10, "RUN_INVALID", Path(target).name)
+    event_id = publication["event_id"]
+    if not isinstance(event_id, str) or not SAFE_EVENT_ID.fullmatch(event_id):
+        run.close()
+        role_fail(2, "INPUT_INVALID", "seal-event-id")
+    artifacts = publication["artifacts"]
+    if not isinstance(artifacts, list):
+        run.close()
+        role_fail(2, "INPUT_INVALID", "seal-artifacts")
+    artifact_json = json.dumps(artifacts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    record = {
+        "ts": format_ts(utc_now()), "event": "evidence_seal_published", "event_id": event_id,
+        "run_id": run.name, "sha": str(publication["sha"]),
+        "generation": str(publication["generation"]), "seal_path": str(publication["seal_path"]),
+        "seal_sha256": str(publication["seal_sha256"]), "seal_bytes": str(publication["seal_bytes"]),
+        "projection_sha256": str(publication["projection_sha256"]),
+        "prefix_sha256": str(publication["prefix_sha256"]),
+        "prefix_bytes": str(publication["prefix_bytes"]),
+        "prefix_records": str(publication["prefix_records"]), "artifacts": artifact_json,
+    }
+    try:
+        validate_seal_publish_record(record, run.name)
+    except (LedgerError, ValidationError):
+        run.close()
+        role_fail(2, "INPUT_INVALID", "seal-publication-schema")
+    held = []
+    try:
+        held = acquire_locks(run, [])
+        fd, _ = open_ledger(run)
+        if fd is None:
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
+        try:
+            length, digest = descriptor_digest(fd, "append")
+            scan = scan_ledger(fd, run.name)
+        finally:
+            os.close(fd)
+        if (str(length) != record["prefix_bytes"] or digest.hexdigest() != record["prefix_sha256"]
+                or str(scan["count"]) != record["prefix_records"]):
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", "sealed-prefix")
+        if any(item == event_id for item in scan["event_ids"]):
+            role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", event_id)
+        atomic_commit(run, record, event_id, lock_check=lambda: prove_locks(held))
+        result = {
+            "schema_version": 1, "event_id": event_id, "run_id": run.name,
+            "event": "evidence_seal_published", "seal_path": record["seal_path"],
+            "seal_sha256": record["seal_sha256"], "seal_bytes": int(record["seal_bytes"]),
+            "projection_sha256": record["projection_sha256"],
+            "prefix_sha256": record["prefix_sha256"], "prefix_bytes": int(record["prefix_bytes"]),
+            "prefix_records": int(record["prefix_records"]),
+        }
+        print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+    except RoleFailure:
+        raise
+    except (DuplicateEvent, LedgerError, CommitError):
+        role_fail(15, "APPEND_OR_DURABILITY_FAILED", event_id)
+    finally:
+        for _, fd, _ in reversed(held):
+            os.close(fd)
+        run.close()
+    raise SystemExit(0)
+
+
 def role_main(argv):
     values = parse_role_options(argv)
     role = values["role"]
@@ -2353,6 +2534,10 @@ def role_main(argv):
 
 
 try:
+    if ARGS and ARGS[0] == "--classify-ledger-file":
+        classify_ledger_file(list(ARGS))
+    if ARGS and ARGS[0] == "--seal-publish":
+        seal_publish_main(list(ARGS))
     if "--role-start" in ARGS:
         role_main(list(ARGS))
     ordinary_main(list(ARGS))

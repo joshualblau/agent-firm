@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Lead-owned final primary evidence closure. All targets are explicit.
+set -euo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
+SELF="$(cd -P "$(dirname "$__src")" && pwd)"
+ROOT="$(cd "$SELF/.." && pwd)"
+. "$SELF/firm-python"
+
+exec "${FIRM_PYTHON_ARGV[@]}" - "$ROOT" "$0" "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+cli = os.path.realpath(sys.argv[2])
+sys.path.insert(0, str(root / "agent-firm" / "lib"))
+from evidence_seal import (  # noqa: E402
+    SealError, canonical_json_bytes, create_seal, extract_pr_body, seal_state, verify_seal,
+)
+
+parser = argparse.ArgumentParser(prog="firm-seal-qa-evidence")
+parser.add_argument("--run")
+parser.add_argument("--opt-in-legacy", action="store_true")
+parser.add_argument("--verify", action="store_true")
+parser.add_argument("--phase", choices=("publication", "wrapper-preflight", "reviewer-snapshot"), default="publication")
+parser.add_argument("--provider", choices=("gpt", "claude"))
+parser.add_argument("--attempt-id")
+parser.add_argument("--extract-pr-body", action="store_true")
+parser.add_argument("--input")
+parser.add_argument("--output")
+args = parser.parse_args(sys.argv[3:])
+policy = root / "agent-firm" / "policy" / "evidence-privacy.yaml"
+
+def fail(error, code=1):
+    if isinstance(error, SealError):
+        print(f"firm-seal-qa-evidence: BLOCK {error.category}: {error.detail}", file=sys.stderr)
+    else:
+        print(f"firm-seal-qa-evidence: CANNOT EVALUATE: {error}", file=sys.stderr)
+    raise SystemExit(code)
+
+def cleanup_proven_unpublished(run_path, publication):
+    """Remove only an unchanged complete bundle when the ledger provably did not append."""
+    try:
+        run = Path(run_path)
+        ledger = run / "run.jsonl"
+        ledger_info = os.lstat(ledger)
+        if stat.S_ISLNK(ledger_info.st_mode) or not stat.S_ISREG(ledger_info.st_mode):
+            return False
+        ledger_raw = ledger.read_bytes()
+        if (len(ledger_raw) != int(publication["prefix_bytes"])
+                or hashlib.sha256(ledger_raw).hexdigest() != publication["prefix_sha256"]):
+            return False
+        seal_path = Path(publication["seal_path"])
+        bundle_rel = seal_path.parent
+        if (bundle_rel.parts[:2] != ("09-test-evidence", "final-evidence")
+                or len(bundle_rel.parts) != 3 or not bundle_rel.name.startswith("g")):
+            return False
+        bundle = run / bundle_rel
+        info = os.lstat(bundle)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        for item in publication["artifacts"]:
+            target = run / item["path"]
+            target_info = os.lstat(target)
+            if stat.S_ISLNK(target_info.st_mode) or not stat.S_ISREG(target_info.st_mode):
+                return False
+            raw = target.read_bytes()
+            if len(raw) != item["bytes"] or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                return False
+        shutil.rmtree(bundle)
+        return True
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+
+try:
+    if args.extract_pr_body:
+        if args.run or args.verify or args.opt_in_legacy or not args.input or not args.output:
+            fail("extract mode requires only --input and --output", 2)
+        source = Path(args.input)
+        if source.is_symlink() or not source.is_file():
+            fail("input is not a regular no-follow file", 2)
+        body, _, _ = extract_pr_body(source.read_bytes())
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(output, flags, 0o600)
+        try:
+            os.write(fd, body)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        print(json.dumps({"schema_version": 1, "path": str(output), "bytes": len(body)},
+                         sort_keys=True, separators=(",", ":")))
+        raise SystemExit(0)
+    if not args.run or args.input or args.output:
+        fail("create/verify mode requires --run and no input/output", 2)
+    if args.phase == "reviewer-snapshot" and (not args.provider or not args.attempt_id):
+        fail("reviewer-snapshot requires --provider and --attempt-id", 2)
+    if args.verify:
+        receipt = verify_seal(args.run, policy, args.phase, args.provider, args.attempt_id)
+        sys.stdout.buffer.write(canonical_json_bytes(receipt))
+        raise SystemExit(0)
+    if args.provider or args.attempt_id or args.phase != "publication":
+        fail("provider/attempt/phase are verify-only", 2)
+    state = seal_state(Path(args.run))
+    if args.opt_in_legacy:
+        if state["required"]:
+            fail("run is already seal-required")
+        done = subprocess.run(
+            [str(root / "bin" / "firm-ledger-log"), "--run", os.path.abspath(args.run), "--strict",
+             "evidence_seal_required", "protocol=1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if done.returncode != 0:
+            if done.returncode == 17:
+                raise SystemExit(17)
+            fail("legacy opt-in publication failed")
+    publication = create_seal(
+        args.run, policy, [cli] + sys.argv[3:], os.getcwd()
+    )
+    publication_json = canonical_json_bytes(publication).decode("utf-8").rstrip("\n")
+    done = subprocess.run(
+        [str(root / "bin" / "firm-ledger-log"), "--seal-publish", "--run", os.path.abspath(args.run),
+         "--publication-json", publication_json], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if done.returncode != 0:
+        cleanup_proven_unpublished(args.run, publication)
+        if done.returncode == 17:
+            raise SystemExit(17)
+        fail(done.stderr.strip() or "seal publication failed")
+    receipt = verify_seal(args.run, policy, "publication")
+    receipt["publication_receipt"] = json.loads(done.stdout)
+    sys.stdout.buffer.write(canonical_json_bytes(receipt))
+except SealError as exc:
+    fail(exc)
+except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+    fail(f"{type(exc).__name__}: {exc}", 2)
+PY

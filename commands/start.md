@@ -93,6 +93,8 @@ failure: block
 
 Use the existing Claude subagents as provider adapters; their bodies load the same shared role
 contracts used by Codex. Claude primary QA writes `08-qa-verdict.json`, then calls `firm-gpt-qa`.
+For protocol v1, first freeze the draft handoff and run
+`firm-seal-qa-evidence --run <exact-run-dir>`; any nonzero result blocks reviewer launch.
 The Lead must run `firm-validate-verdict`, `firm-traceability-check`, `firm-qa-clean-check`, and
 `firm-final-qa-check` before packaging. Never merge, push, deploy, publish, or manufacture approval.
 Both provider CLIs and adapters are mandatory. A trusted exit-3 secondary is unavailable, never an

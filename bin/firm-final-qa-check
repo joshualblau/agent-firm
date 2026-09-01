@@ -16,6 +16,9 @@ if [[ -z "$run_dir" || ! -d "$run_dir" || -L "$run_dir" ]]; then
 fi
 primary="$run_dir/08-qa-verdict.json"
 [[ -f "$primary" && ! -L "$primary" ]] || { echo "FINAL QA: CANNOT EVALUATE -- missing primary verdict" >&2; exit 2; }
+seal_detail="$("$SELF/firm-seal-qa-evidence" --verify --run "$run_dir" --phase publication 2>&1)"
+seal_rc=$?
+[[ $seal_rc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- final evidence seal validation rc=$seal_rc: ${seal_detail//$'\n'/ }" >&2; exit 2; }
 "$SELF/firm-validate-verdict" "$primary" >/dev/null 2>&1
 pvalid=$?
 [[ $pvalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- primary verdict validation rc=$pvalid" >&2; exit 2; }

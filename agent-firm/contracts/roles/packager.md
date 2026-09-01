@@ -13,3 +13,8 @@ pre-index runs with no `integration-summaries/index.json` remain packageable fro
 
 Do not merge, tag, publish, or deploy. Verify every applicable Definition-of-Done item or record a
 human-approved waiver with a reason.
+
+Before the opposite-provider wrapper, create the clearly marked non-ship-ready draft with exactly one
+complete local PR body between the canonical markers. The Lead then runs
+`firm-seal-qa-evidence --run <exact-run-dir>`. Do not change the draft or sealed evidence bytes;
+changed evidence requires a new candidate generation and seal, never an in-place reseal.

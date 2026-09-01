@@ -9,6 +9,12 @@ QAC="$BIN/firm-qa-checkout"
 repo="$(mk_repo)"
 ( cd "$repo" && "$NEW" --primary claude final-foundation fast_path >/dev/null )
 run_rel="$(cat "$repo/.agent-firm/CURRENT_RUN")"; run="$repo/$run_rel"; run_id="$(basename "$run")"
+# Existing Final-gate corpus intentionally exercises markerless manifest-v3 compatibility.
+t_python - "$run/run.jsonl" <<'PY'
+import json,sys
+p=sys.argv[1]; rows=[json.loads(line) for line in open(p)]; rows[0].pop("evidence_seal_protocol",None)
+open(p,"w").writelines(json.dumps(row,separators=(",",":"))+"\n" for row in rows)
+PY
 ( cd "$repo" && git checkout -qb "integration/$run_id" && mkdir -p auth && printf 'safe\n' > result.txt && printf 'token\n' > auth/token.txt && git add -A && git commit -qm candidate && git checkout -q main )
 ( cd "$repo" && "$QAC" >/dev/null )
 printf 'proof\n' > "$run/09-test-evidence/proof.log"

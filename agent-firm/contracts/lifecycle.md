@@ -115,6 +115,7 @@ role-to-tier/model authority.
 | Integrate | integrator | immutable `integration-summaries/<stage-instance>.md` + digest-bound index, integration branch | none |
 | Review | reviewer panel | `07-review-findings.yaml` | crit; human when risky |
 | Test | primary qa-tester | `08-qa-verdict.json`, `09-test-evidence/` | none |
+| Seal | Lead + draft packager | immutable `09-test-evidence/final-evidence/gN/` | none |
 | Cross-provider QA | opposite provider | `.gpt.json` or `.claude.json` verdict | two-voice rule |
 | Package | packager | draft then finalized `10-handoff.md` | Final, always |
 | Close | Lead | `11-retrospective.md`, proposed system changes | human per proposal |
@@ -159,6 +160,13 @@ SHA, base SHA, checkout identity, and monotonically increasing generation in
 exact one-row-per-criterion coverage and current hashed evidence with `firm-traceability-check
 --strict`, and records what was not tested. The Lead then runs `firm-qa-clean-check` against that same
 candidate generation.
+
+For evidence-seal protocol v1, the Packager now freezes a non-ship-ready draft `10-handoff.md` with
+one complete local PR body between the canonical markers. The Lead runs
+`firm-seal-qa-evidence --run <exact-run-dir>` before either opposite-provider wrapper. The seal binds
+the exact final primary bytes, privacy result, producer identities, ledger prefix, acyclic self
+projection, and closed reviewer suffix grammar. Present, declared, or required partial seal state
+blocks; only genuinely markerless historical runs retain manifest v3 compatibility.
 
 - Claude-primary run: call `firm-gpt-qa`; it writes `08-qa-verdict.gpt.json`.
 - Codex-primary run: call `firm-claude-qa`; it writes `08-qa-verdict.claude.json`.
