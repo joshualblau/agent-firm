@@ -208,8 +208,10 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   local codex_command claude_command
   codex_command=codex; claude_command=claude
   local control="" broker_pid="" authority_manifest="" authority_digest="" authority_invocation="" candidate_path="" candidate_project="" candidate_authority=""
-  local guardian_token="" guardian_pid="" guardian_root="" guardian_marker="" guardian_sequence=0 seatbelt_profile="" real_common=""
-  local -a guardian_prefix=( "$BOUNDED" ) seatbelt_prefix=( /usr/bin/env )
+  local guardian_token="" guardian_pid="" guardian_root="" guardian_marker="" guardian_sequence=0 guardian_roles="" seatbelt_profile="" real_common=""
+  # Bash 3.2 with `set -u` rejects an expansion of an empty array.  Keep the ordinary provider-child
+  # prefix nonempty; the golden replaces it with the authenticated guardian registration gate.
+  local -a guardian_prefix=( /usr/bin/env ) seatbelt_prefix=( /usr/bin/env )
   local shell_env="${ZDOTDIR:-${HOME:-/tmp}}" shell_bash_env="${BASH_ENV:-}" shell_sh_env="${ENV:-}"
   [ -x "$CHECKER" ] || { echo "FAIL $name: missing executable firm-check-assertions at $CHECKER; provider phase not started" >&2; return 1; }
   command -v "$provider" >/dev/null 2>&1 || { echo "SKIP $name: '$provider' not found"; return 4; }
@@ -225,7 +227,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     guardian_pid="$(printf '%s\n' "$guardian_ready" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')" || return 1
     guardian_marker="$(printf '%s\n' "$guardian_ready" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["failure_marker"])')" || return 1
     authority_invocation="$(printf '%s\n' "$guardian_ready" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')" || return 1
-    trap 'guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; exit 1; }' EXIT HUP INT TERM
+    trap 'guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --expected-roles "$guardian_roles" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; exit 1; }' EXIT HUP INT TERM
   else
     scratch="$(mktemp -d "${TMPDIR:-/tmp}/firm-eval-${name}.XXXXXX")"
     chmod 700 "$scratch" || return 1
@@ -285,7 +287,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
       --guardian-token "$guardian_token" --guardian-failure-marker "$guardian_marker" --invocation "$authority_invocation" \
       --scratch "$scratch" --fixture "$d/fixture" --manifest "$authority_manifest" --shims "$control/shims" \
       --request-root "$out/authority-requests" --response-root "$control/responses")" || {
-        guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; trap - EXIT HUP INT TERM; return 1; }; trap - EXIT HUP INT TERM; return 1; }
+        guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --expected-roles "$guardian_roles" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; trap - EXIT HUP INT TERM; return 1; }; trap - EXIT HUP INT TERM; return 1; }
     authority_digest="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["manifest_digest"])')" || return 1
     shell_env="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["shell_env"])')" || return 1
     candidate_project="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["project_root"])')" || return 1
@@ -297,7 +299,8 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     shell_bash_env="$shell_env/.bash-env"; shell_sh_env="$shell_env/.sh-env"
     candidate_path="$control/shims:/usr/bin:/bin:/usr/sbin:/sbin"
     guardian_sequence=$((guardian_sequence+1))
-    "$EVAL_AUTHORITY" guardian-exec --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" -- \
+    guardian_roles="broker"
+    "$EVAL_AUTHORITY" guardian-exec --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --role broker -- \
       "$EVAL_AUTHORITY" serve --manifest "$authority_manifest" --digest "$authority_digest" \
       --invocation "$authority_invocation" --request-root "$out/authority-requests" \
       --response-root "$control/responses" --receipts "$control/receipts.jsonl" &
@@ -311,11 +314,11 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     [ "$authority_ready" -eq 1 ] || {
       kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true
       guardian_sequence=$((guardian_sequence+1))
-      "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" --action cleanup >/dev/null || {
+      "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --expected-roles "$guardian_roles" --action cleanup >/dev/null || {
         echo "FAIL $name: guardian cleanup BLOCK after broker startup failure" >&2; trap - EXIT HUP INT TERM; return 1; }
       trap - EXIT HUP INT TERM; echo "FAIL $name: candidate authority did not start" >&2; return 1
     }
-    trap 'kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; exit 1; }' EXIT HUP INT TERM
+    trap 'kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --expected-roles "$guardian_roles" --action cleanup >/dev/null || { echo "firm-run-evals: guardian cleanup BLOCK" >&2; exit 1; }' EXIT HUP INT TERM
   else
     provider_executable="$(command -v "$provider" 2>/dev/null || true)"
   fi
@@ -323,11 +326,13 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   if [ "$name" = final-evidence-seal ]; then
     "$EVAL_AUTHORITY" seatbelt-probe --manifest "$authority_manifest" --digest "$authority_digest" \
       --invocation "$authority_invocation" > "$control/seatbelt-prelaunch.json" || {
-        guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" --action cleanup >/dev/null; trap - EXIT HUP INT TERM; return 1; }
+        guardian_sequence=$((guardian_sequence+1)); "$EVAL_AUTHORITY" guardian-command --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --expected-roles "$guardian_roles" --action cleanup >/dev/null; trap - EXIT HUP INT TERM; return 1; }
     chmod 600 "$control/seatbelt-prelaunch.json" || return 1
     guardian_sequence=$((guardian_sequence+1))
-    guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --sequence "$guardian_sequence" -- "$BOUNDED" )
+    guardian_roles="broker,provider"
+    guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec --control "$control" --token "$guardian_token" --invocation "$authority_invocation" --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --role provider -- )
     seatbelt_prefix=( /usr/bin/sandbox-exec -D "REAL_COMMON=$real_common" -f "$seatbelt_profile" /usr/bin/env )
+    seatbelt_prefix=( "${guardian_prefix[@]}" "${seatbelt_prefix[@]}" )
   fi
 
   echo "==> $name: driving the $provider-primary firm headlessly (bounded posture) in $scratch"
@@ -335,7 +340,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
   # AskUserQuestion / merge / push are deliberately NOT allow-listed, so the firm cannot autonomously
   # pass the final human gate in -p mode — that's how final_gate_pending is provable.
   if [ "$provider" = claude ]; then
-    "${guardian_prefix[@]}" --phase eval --provider claude --timeout "$eval_timeout" \
+    "$BOUNDED" --phase eval --provider claude --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --generation 1 --output "$out/result.json" --result "$out/supervision.json" --cwd "$scratch" -- \
       "${seatbelt_prefix[@]}" PATH="${candidate_path:-$PATH}" \
@@ -384,7 +389,7 @@ Execution envelope: this eval permits one provider attempt, no retries, and at m
     # So moving `-a never` in front of `exec` only buys rc 0; it does not set an approval policy.
     # `codex exec --help` lists no --ask-for-approval at all; `-c approval_policy="never"` is how
     # exec takes it, and it is the same form firm-reviewer-common sends to the real judge.
-    "${guardian_prefix[@]}" --phase eval --provider codex --timeout "$eval_timeout" \
+    "$BOUNDED" --phase eval --provider codex --timeout "$eval_timeout" \
       --grace "${FIRM_EVAL_KILL_GRACE:-2}" --max-output "${FIRM_EVAL_MAX_OUTPUT:-1048576}" \
       --max-turns "$eval_max_turns" --generation 1 --output "$out/result.json" \
       --result "$out/supervision.json" --cwd "$scratch" -- \
@@ -445,7 +450,8 @@ PY
     if [ -n "$authority_manifest" ]; then
       guardian_sequence=$((guardian_sequence+1))
       "$EVAL_AUTHORITY" cleanup --manifest "$authority_manifest" --digest "$authority_digest" \
-        --invocation "$authority_invocation" --control "$control" --token "$guardian_token" --sequence "$guardian_sequence" >/dev/null || {
+        --invocation "$authority_invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
+        --sequence "$guardian_sequence" --expected-roles "$guardian_roles" >/dev/null || {
           echo "  (guardian cleanup BLOCK; marker: $guardian_marker)" >&2; trap - EXIT HUP INT TERM; return 1; }
     fi
     control=""; authority_manifest=""
@@ -542,7 +548,8 @@ PY
   if [ -n "$authority_manifest" ]; then
     guardian_sequence=$((guardian_sequence+1))
     "$EVAL_AUTHORITY" cleanup --manifest "$authority_manifest" --digest "$authority_digest" \
-      --invocation "$authority_invocation" --control "$control" --token "$guardian_token" --sequence "$guardian_sequence" >/dev/null || checker_rc=1
+      --invocation "$authority_invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
+      --sequence "$guardian_sequence" --expected-roles "$guardian_roles" >/dev/null || checker_rc=1
     control=""; authority_manifest=""
     trap - EXIT HUP INT TERM
   fi

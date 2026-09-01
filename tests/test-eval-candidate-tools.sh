@@ -90,6 +90,94 @@ PY
   fi
 done
 
+t_case "guardian cleanup uses authenticated request/ACK while launcher liveness remains open"
+g_ready="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+g_control="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+g_root="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+g_token="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+g_invocation="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+g_pid="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+g_marker="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["failure_marker"])')"
+t_track "$g_root"; t_track "$g_marker"
+assert_ok "malformed unauthenticated frame receives NACK without advancing state" t_python - "$g_control/guardian.sock" "$g_token" <<'PY'
+import hashlib,hmac,json,socket,sys
+path,token=sys.argv[1:]
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(path); s.sendall(b'{broken-json\n'); s.shutdown(socket.SHUT_WR)
+raw=b''
+while True:
+    part=s.recv(65536)
+    if not part: break
+    raw+=part
+d=json.loads(raw); auth=d.pop('auth')
+canonical=lambda value: json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True)
+assert d['status']=='NACK'
+assert hmac.compare_digest(auth,hmac.new(bytes.fromhex(token),canonical(d).encode('ascii'),hashlib.sha256).hexdigest())
+PY
+g_ack="$($AUTH guardian-command --control "$g_control" --token "$g_token" --invocation "$g_invocation" \
+  --guardian-pid "$g_pid" --sequence 1 --expected-roles '' --action cleanup)"
+assert_ok "terminal receipt is authenticated, bound, absent, and emitted before launcher exit" t_python - "$g_ack" "$g_token" "$$" <<'PY'
+import hashlib,hmac,json,os,sys
+d=json.loads(sys.argv[1]); auth=d.pop('auth')
+canonical=lambda value: json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True)
+assert d['status']=='TERMINAL_OK' and d['kind']=='terminal' and d['absent'] is True
+assert d['deletion']=={'absent':True,'method':'parent_fd_relative','removed':True}
+assert hmac.compare_digest(auth,hmac.new(bytes.fromhex(sys.argv[2]),canonical(d).encode('ascii'),hashlib.sha256).hexdigest())
+os.kill(int(sys.argv[3]),0)
+PY
+assert_no_file "terminal success leaves no reusable guardian root" "$g_root"
+assert_no_file "terminal success never emits a BLOCK marker" "$g_marker"
+
+t_case "authenticated skipped sequence is terminal BLOCK and cannot delete twice"
+g_ready="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+g_control="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+g_root="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+g_token="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+g_invocation="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+g_pid="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+g_marker="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["failure_marker"])')"
+t_track "$g_root"; t_track "$g_marker"
+assert_rc "skipped cleanup sequence is rejected" 2 "$AUTH" guardian-command --control "$g_control" --token "$g_token" \
+  --invocation "$g_invocation" --guardian-pid "$g_pid" --sequence 2 --expected-roles '' --action cleanup
+count=0; while [ "$count" -lt 200 ] && [ ! -f "$g_marker" ]; do sleep 0.01; count=$((count+1)); done
+assert_file "protocol fault emits the single visible BLOCK marker" "$g_marker"
+assert_no_file "protocol-fault disposal removes only the pinned root" "$g_root"
+assert_rc "retry after terminal uncertainty cannot recreate or delete again" 2 "$AUTH" guardian-command \
+  --control "$g_control" --token "$g_token" --invocation "$g_invocation" --guardian-pid "$g_pid" \
+  --sequence 1 --expected-roles '' --action cleanup
+rm -f "$g_marker"
+
+t_case "duplicate authenticated provider registration is replay-blocking and quiesces its group"
+g_ready="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+g_control="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+g_root="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+g_token="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+g_invocation="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+g_pid="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+g_marker="$(printf '%s\n' "$g_ready" | t_python -c 'import json,sys; print(json.load(sys.stdin)["failure_marker"])')"
+g_child="$(mktemp "${TMPDIR:-/tmp}/guardian-provider-pid.XXXXXX")"; t_track "$g_child"; t_track "$g_root"; t_track "$g_marker"
+"$BIN/firm-bounded-exec" --phase guardian-replay --provider test --timeout 20 --grace 1 -- \
+  "$AUTH" guardian-exec --control "$g_control" --token "$g_token" --invocation "$g_invocation" \
+    --guardian-pid "$g_pid" --sequence 1 --role provider -- /bin/sh -c 'printf "%s\n" "$$" > "$1"; sleep 20' sh "$g_child" &
+g_bounded=$!
+count=0; while [ "$count" -lt 200 ] && [ ! -s "$g_child" ]; do sleep 0.01; count=$((count+1)); done
+assert_file "provider starts only after registration ACK" "$g_child"
+g_child_pid="$(sed -n '1p' "$g_child")"
+assert_rc "duplicate provider role cannot register or advance state" 2 "$AUTH" guardian-command \
+  --control "$g_control" --token "$g_token" --invocation "$g_invocation" --guardian-pid "$g_pid" \
+  --sequence 2 --action register --role provider --pid "$g_child_pid" --pgid "$g_child_pid"
+wait "$g_bounded" 2>/dev/null || true
+assert_ok "duplicate-registration BLOCK quiesces the authenticated process group" sh -c "! kill -0 '$g_child_pid' 2>/dev/null"
+count=0; while [ "$count" -lt 200 ] && [ ! -f "$g_marker" ]; do sleep 0.01; count=$((count+1)); done
+assert_file "replay fault remains visibly blocking" "$g_marker"
+if [ -e "$g_root" ]; then
+  assert_output "unprovable group absence prevents deletion and is recorded, never treated as success" \
+    "cannot prove registered group absent" cat "$g_marker"
+  assert_eq "blocking residue remains private and cannot be mistaken for a fresh capsule" 700 "$(stat -f %Lp "$g_root")"
+else
+  assert_no_file "replay fault disposes the pinned root after proven group absence" "$g_root"
+fi
+rm -f "$g_marker"
+
 t_case "clean exact candidate gets one-use execution and P2-consumption receipts"
 if [ -n "$(git -C "$FIRM_ROOT" status --porcelain --untracked-files=all)" ]; then
   t_skip "live capsule dynamic" "candidate checkout is dirty; prepare correctly refuses an ambiguous candidate"
@@ -123,7 +211,8 @@ else
   assert_ok "exact Seatbelt wrapper denies canonical and alias real-common reads/writes" \
     "$AUTH" seatbelt-probe --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation"
   guardian_sequence=1
-  "$AUTH" guardian-exec --control "$control" --token "$guardian_token" --invocation "$invocation" --sequence "$guardian_sequence" -- \
+  "$AUTH" guardian-exec --control "$control" --token "$guardian_token" --invocation "$invocation" \
+    --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --role broker -- \
     "$AUTH" serve --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation" \
     --request-root "$scratch/.eval-out/authority-requests" --response-root "$control/responses" \
     --receipts "$control/receipts.jsonl" &
@@ -191,10 +280,12 @@ else
     assert_ok "normal Git linked worktree cleanup stays contained" git -C "$project" worktree remove "$linked"
     chmod 755 "$scratch"
     assert_rc "cleanup refuses ambiguous capsule mode" 2 "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
-      --invocation "$invocation" --control "$control" --token "$guardian_token" --sequence 2
+      --invocation "$invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
+      --sequence 2 --expected-roles broker
     chmod 700 "$scratch"
     assert_ok "guardian removes complete capsule" "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
-      --invocation "$invocation" --control "$control" --token "$guardian_token" --sequence 2
+      --invocation "$invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
+      --sequence 2 --expected-roles broker
     assert_no_file "capsule leaves no reusable residue" "$guardian_root"
   else
     kill "$broker" 2>/dev/null || true; wait "$broker" 2>/dev/null || true

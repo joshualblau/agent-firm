@@ -84,10 +84,16 @@
     },
     "guardian": {
       "type": "object", "additionalProperties": false,
-      "required": ["pid", "root", "root_identity", "control", "token_sha256", "failure_marker"],
+      "required": ["protocol_version", "candidate_commit", "pid", "root", "root_identity", "root_binding", "control", "socket", "socket_identity", "token_sha256", "failure_marker"],
       "properties": {
+        "protocol_version": {"const": 2},
+        "candidate_commit": {"const": "a57a8d0b4754ed92b74c023c340aab3154845abb"},
         "pid": {"type": "integer", "minimum": 1}, "root": {"type": "string", "minLength": 1},
-        "root_identity": {"$ref": "#/$defs/identity"}, "control": {"type": "string", "minLength": 1},
+        "root_identity": {"$ref": "#/$defs/identity"},
+        "root_binding": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "control": {"type": "string", "minLength": 1},
+        "socket": {"type": "string", "minLength": 1},
+        "socket_identity": {"$ref": "#/$defs/identity"},
         "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "failure_marker": {"type": "string", "minLength": 1}
       }

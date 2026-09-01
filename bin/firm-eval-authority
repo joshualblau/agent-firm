@@ -21,7 +21,9 @@ HEX64 = set("0123456789abcdef")
 GIT = str(Path(shutil.which("git") or "/usr/bin/git").resolve())
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 PROFILE_SOURCE = b'''(version 1)\n(allow default)\n(deny file-read* file-write* (subpath (param "REAL_COMMON")))\n'''
-GUARDIAN_COMMAND_RE = re.compile(r"[0-9]{8}\\.json")
+GUARDIAN_PROTOCOL_VERSION = 2
+GUARDIAN_SOCKET_NAME = "guardian.sock"
+GUARDIAN_STABLE_IDENTITY = ("dev", "ino", "uid", "mode")
 TEST_BARRIER_PHASES = {"manifest_read", "dispatch_commit", "use_exec", "cleanup_commit"}
 SAFE_GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -140,17 +142,90 @@ def owned_directory(path, mode=0o700):
 def guardian_auth(token, record):
     return hmac.new(bytes.fromhex(token),canonical(record).encode("ascii"),hashlib.sha256).hexdigest()
 
-def write_failure_marker(marker, invocation, root, reason):
-    value={"schema_version":1,"status":"BLOCK","invocation":invocation,"root":str(root),
-           "reason":str(reason)[:1000],"guardian_pid":os.getpid(),"monotonic_ns":time.monotonic_ns()}
+def guardian_signed(token, unsigned):
+    value=dict(unsigned); value["auth"]=guardian_auth(token,unsigned)
+    return value
+
+def guardian_root_binding(root_id):
+    if not isinstance(root_id,dict) or any(not isinstance(root_id.get(key),int) for key in GUARDIAN_STABLE_IDENTITY):
+        return ""
+    stable={key:root_id[key] for key in GUARDIAN_STABLE_IDENTITY}
+    return digest_bytes(canonical(stable).encode("ascii"))
+
+def guardian_registration_digest(registrations):
+    rows=[{"sequence":item["sequence"],"role":item["role"],"pid":item["pid"],
+           "pgid":item["pgid"],"nonce":item["nonce"],"request_sha256":item["request_sha256"]}
+          for item in sorted(registrations,key=lambda item:item["sequence"])]
+    return digest_bytes(canonical(rows).encode("ascii"))
+
+def guardian_write_all(fd, raw):
+    view=memoryview(raw)
+    while view:
+        count=os.write(fd,view)
+        if count<=0: raise RuntimeError("guardian short write")
+        view=view[count:]
+
+def guardian_recv_frame(connection, timeout):
+    connection.settimeout(timeout); raw=b""
+    while True:
+        part=connection.recv(min(65536,MAX_MESSAGE+1-len(raw)))
+        if not part: break
+        raw+=part
+        if len(raw)>MAX_MESSAGE: raise RuntimeError("guardian oversized frame")
+    if not raw.endswith(b"\n") or raw.count(b"\n")!=1:
+        raise RuntimeError("guardian partial or extra frame")
+    try: value=json.loads(raw[:-1].decode("ascii"))
+    except Exception: raise RuntimeError("guardian malformed frame")
+    if not isinstance(value,dict): raise RuntimeError("guardian frame shape")
+    return value
+
+def guardian_send_frame(connection, token, unsigned):
+    value=guardian_signed(token,unsigned)
     raw=(canonical(value)+"\n").encode("ascii")
-    path=Path(marker)
+    if len(raw)>MAX_MESSAGE: raise RuntimeError("guardian response too large")
+    connection.sendall(raw); connection.shutdown(socket.SHUT_WR)
+
+def guardian_verify_response(token, response):
+    if not isinstance(response,dict): fail("guardian response shape")
+    value=dict(response); auth=value.pop("auth",None)
+    if not isinstance(auth,str) or not hmac.compare_digest(auth,guardian_auth(token,value)):
+        fail("guardian response authentication")
+    return value,auth
+
+def guardian_client_request(control, token, unsigned, timeout=10):
+    if not re.fullmatch(r"[0-9a-f]{64}",token): fail("guardian token")
+    socket_path=Path(control)/GUARDIAN_SOCKET_NAME
+    owned_directory(Path(control)); socket_st=os.lstat(str(socket_path))
+    if (not stat.S_ISSOCK(socket_st.st_mode) or socket_st.st_uid!=os.getuid()
+            or stat.S_IMODE(socket_st.st_mode)!=0o600):
+        fail("guardian socket identity")
+    request=guardian_signed(token,unsigned)
+    raw=(canonical(request)+"\n").encode("ascii")
+    if len(raw)>MAX_MESSAGE: fail("guardian request too large")
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
     try:
-        fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
-    except FileExistsError:
-        path=path.with_name(path.name+"."+secrets.token_hex(4))
-        fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
-    try: os.write(fd,raw); os.fsync(fd)
+        connection.settimeout(timeout); connection.connect(str(socket_path))
+        connection.sendall(raw); connection.shutdown(socket.SHUT_WR)
+        response=guardian_recv_frame(connection,timeout)
+    except (OSError,RuntimeError) as exc:
+        fail("guardian request failed: %s"%exc)
+    finally: connection.close()
+    value,auth=guardian_verify_response(token,response)
+    value["auth"]=auth
+    return value
+
+def write_failure_marker(parent_fd, marker_name, token, invocation, root, root_binding,
+                         reason, request=None):
+    value={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"status":"BLOCK",
+           "invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,"root":str(root),
+           "root_binding":root_binding,"reason":str(reason)[:1000],"guardian_pid":os.getpid(),
+           "request_sha256":request.get("request_sha256") if request else None,
+           "request_sequence":request.get("sequence") if request else None,
+           "monotonic_ns":time.monotonic_ns()}
+    raw=(canonical(guardian_signed(token,value))+"\n").encode("ascii")
+    fd=os.open(marker_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600,
+               dir_fd=parent_fd)
+    try: guardian_write_all(fd,raw); os.fsync(fd)
     finally: os.close(fd)
 
 def remove_owned_tree_fd(fd):
@@ -228,77 +303,238 @@ def test_barrier(doc,phase,observed):
     elif any(value is not None for value in supplied.values()):
         fail("production invocation rejects test barrier")
 
-def terminate_groups(groups):
-    for pgid in sorted(set(groups)):
-        try: os.killpg(pgid,signal.SIGTERM)
-        except ProcessLookupError: pass
+def guardian_group_alive(pgid):
+    try: os.killpg(pgid,0); return True
+    except ProcessLookupError: return False
+    except PermissionError: raise RuntimeError("cannot prove registered group absent")
+
+def terminate_groups(registrations):
+    observations=[]
+    for item in registrations:
+        pid=item["pid"]; pgid=item["pgid"]
+        try:
+            if os.getpgid(pid)!=pgid or os.getsid(pid)!=pid:
+                raise RuntimeError("registered process identity drift")
+        except ProcessLookupError:
+            pass
+    groups=sorted(set(item["pgid"] for item in registrations))
+    for pgid in groups:
+        try: os.killpg(pgid,signal.SIGTERM); outcome="sent"
+        except ProcessLookupError: outcome="absent"
         except PermissionError: raise RuntimeError("cannot signal registered group")
+        observations.append({"signal":"TERM","pgid":pgid,"outcome":outcome})
+    deadline=time.monotonic()+2
+    alive=[]
+    while time.monotonic()<deadline:
+        alive=[pgid for pgid in groups if guardian_group_alive(pgid)]
+        if not alive: break
+        time.sleep(0.02)
+    for pgid in alive:
+        try: os.killpg(pgid,signal.SIGKILL); outcome="sent"
+        except ProcessLookupError: outcome="absent"
+        except PermissionError: raise RuntimeError("cannot kill registered group")
+        observations.append({"signal":"KILL","pgid":pgid,"outcome":outcome})
     deadline=time.monotonic()+2
     while time.monotonic()<deadline:
-        alive=[]
-        for pgid in groups:
-            try: os.killpg(pgid,0); alive.append(pgid)
-            except ProcessLookupError: pass
-        if not alive: return
+        alive=[pgid for pgid in groups if guardian_group_alive(pgid)]
+        if not alive: break
         time.sleep(0.02)
-    for pgid in sorted(set(groups)):
-        try: os.killpg(pgid,signal.SIGKILL)
-        except ProcessLookupError: pass
+    if alive: raise RuntimeError("registered group did not quiesce")
+    for pgid in groups:
+        observations.append({"signal":"PROBE","pgid":pgid,"outcome":"absent"})
+    return observations
+
+def guardian_same_identity(current, expected):
+    return all(current[key]==expected[key] for key in GUARDIAN_STABLE_IDENTITY)
+
+def guardian_delete_root(parent_fd, root, root_fd, root_id, control_fd, socket_path,
+                         socket_id, listener, barrier):
+    if listener is not None: listener.close()
+    path_id=identity(os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False))
+    if (not guardian_same_identity(path_id,root_id)
+            or not guardian_same_identity(identity(os.fstat(root_fd)),root_id)):
+        raise RuntimeError("guardian root identity drift")
+    socket_st=os.stat(GUARDIAN_SOCKET_NAME,dir_fd=control_fd,follow_symlinks=False)
+    if (not stat.S_ISSOCK(socket_st.st_mode)
+            or not guardian_same_identity(identity(socket_st),socket_id)):
+        raise RuntimeError("guardian socket identity drift")
+    os.unlink(GUARDIAN_SOCKET_NAME,dir_fd=control_fd)
+    raw_test_barrier(barrier,"cleanup_commit",root_id)
+    path_id=identity(os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False))
+    if not guardian_same_identity(path_id,root_id): raise RuntimeError("guardian cleanup race")
+    remove_owned_tree_fd(root_fd)
+    os.close(control_fd); control_fd=None
+    os.close(root_fd); root_fd=None
+    os.rmdir(root.name,dir_fd=parent_fd)
+    try: os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False)
+    except FileNotFoundError: return {"removed":True,"absent":True,"method":"parent_fd_relative"},root_fd,control_fd
+    raise RuntimeError("guardian cleanup residue")
 
 def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
-    root=None; root_fd=None
+    root=None; root_fd=None; parent_fd=None; control_fd=None; listener=None; cleanup_connection=None
+    registrations=[]; sequence=0; accepted=None; state="BOOTSTRAP"; quiescence=None; root_binding=None
+    marker_name="firm-eval-block-"+invocation+".json"
     try:
+        parent_path=Path(parent); parent_fd=os.open(str(parent_path),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+        try: os.stat(marker_name,dir_fd=parent_fd,follow_symlinks=False); raise RuntimeError("guardian failure marker collision")
+        except FileNotFoundError: pass
         root=Path(tempfile.mkdtemp(prefix="firm-eval-"+invocation[:12]+".",dir=parent)).resolve()
-        capsule=root/"capsule"; control=root/"control"; commands=control/"commands"
-        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700); commands.mkdir(mode=0o700)
+        capsule=root/"capsule"; control=root/"control"; socket_path=control/GUARDIAN_SOCKET_NAME
+        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700)
         root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
-        root_id=identity(os.fstat(root_fd)); marker=str(Path(parent)/("firm-eval-block-"+invocation+".json"))
-        unsigned={"schema_version":1,"status":"ready","invocation":invocation,"guardian_pid":os.getpid(),
+        control_fd=os.open("control",os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0),dir_fd=root_fd)
+        root_id=identity(os.fstat(root_fd)); root_binding=guardian_root_binding(root_id)
+        listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(str(socket_path)); os.chmod(str(socket_path),0o600)
+        listener.listen(8); listener.settimeout(0.05)
+        socket_id=identity(os.lstat(str(socket_path)))
+        if not stat.S_ISSOCK(os.lstat(str(socket_path)).st_mode): raise RuntimeError("guardian socket type")
+        marker=str(parent_path/marker_name)
+        unsigned={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"status":"ready",
+                  "invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,"guardian_pid":os.getpid(),
                   "launcher_pid":launcher_pid,"root":str(root),"capsule":str(capsule),"control":str(control),
-                  "root_identity":root_id,"failure_marker":marker,"token_sha256":digest_bytes(bytes.fromhex(token))}
-        unsigned["auth"]=guardian_auth(token,unsigned)
-        interrupted=[False]
-        def request_cleanup(*_): interrupted[0]=True
+                  "socket":str(socket_path),"socket_identity":socket_id,"root_identity":root_id,
+                  "root_binding":root_binding,"failure_marker":marker,
+                  "token_sha256":digest_bytes(bytes.fromhex(token))}
+        ready=guardian_signed(token,unsigned)
+        guardian_write_all(ready_fd,(canonical(ready)+"\n").encode("ascii")); os.close(ready_fd); ready_fd=None
+        state="ACCEPTING"; interrupted=[None]
+        def request_cleanup(signum,*_): interrupted[0]="guardian signal %d"%signum
         for signum in (signal.SIGHUP,signal.SIGINT,signal.SIGTERM): signal.signal(signum,request_cleanup)
-        os.write(ready_fd,(canonical(unsigned)+"\n").encode("ascii")); os.close(ready_fd)
-        seen=set(); groups=[]; cleanup=False; sequence=0
-        while not cleanup:
-            if interrupted[0]: cleanup=True
+        while accepted is None:
+            if interrupted[0]: raise RuntimeError(interrupted[0])
             try: os.kill(launcher_pid,0)
-            except ProcessLookupError: cleanup=True
-            if not cleanup:
-                for name in sorted(os.listdir(str(commands))):
-                    if not GUARDIAN_COMMAND_RE.fullmatch(name) or name in seen: continue
-                    raw,_=read_bytes(commands/name,MAX_MESSAGE); record=json.loads(raw.decode("ascii"))
-                    auth=record.pop("auth",None)
-                    if auth!=guardian_auth(token,record) or record.get("invocation")!=invocation:
-                        raise RuntimeError("guardian command authentication")
-                    if record.get("sequence")!=sequence+1: raise RuntimeError("guardian command sequence")
-                    sequence+=1; seen.add(name)
-                    if record.get("action")=="register" and exact_keys(record,{"schema_version","sequence","action","invocation","pid","pgid"}):
-                        if record["pid"]<=0 or record["pgid"]<=0: raise RuntimeError("guardian registration")
-                        os.kill(record["pid"],0); groups.append(record["pgid"])
-                    elif record.get("action")=="cleanup" and exact_keys(record,{"schema_version","sequence","action","invocation"}):
-                        cleanup=True
-                    else: raise RuntimeError("guardian command shape")
-            if not cleanup: time.sleep(0.01)
-        terminate_groups(groups)
-        path_st=os.lstat(str(root))
-        stable=("dev","ino","uid","mode")
-        if (any(identity(path_st)[key]!=root_id[key] for key in stable)
-                or any(identity(os.fstat(root_fd))[key]!=root_id[key] for key in stable)):
-            raise RuntimeError("guardian root identity drift")
-        raw_test_barrier(barrier,"cleanup_commit",root_id)
-        if any(identity(os.lstat(str(root)))[key]!=root_id[key] for key in stable): raise RuntimeError("guardian cleanup race")
-        remove_owned_tree_fd(root_fd); os.close(root_fd); root_fd=None
-        os.rmdir(str(root))
-        if root.exists() or root.is_symlink(): raise RuntimeError("guardian cleanup residue")
+            except ProcessLookupError: raise RuntimeError("launcher liveness EOF")
+            try: connection,_=listener.accept()
+            except socket.timeout: continue
+            try:
+                try: request=guardian_recv_frame(connection,2)
+                except Exception:
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"NACK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"reason":"unauthenticated or malformed frame"})
+                    continue
+                unsigned_request=dict(request); auth=unsigned_request.pop("auth",None)
+                authenticated=isinstance(auth,str) and hmac.compare_digest(auth,guardian_auth(token,unsigned_request))
+                if not authenticated:
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"NACK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"reason":"authentication failed"})
+                    continue
+                common={"schema_version","protocol_version","kind","invocation","candidate_commit","sequence",
+                        "nonce","guardian_pid","root_binding"}
+                if (request.get("schema_version")!=1 or request.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+                        or request.get("invocation")!=invocation or request.get("candidate_commit")!=PAYLOAD_COMMIT
+                        or request.get("guardian_pid")!=os.getpid() or request.get("root_binding")!=root_binding
+                        or not re.fullmatch(r"[0-9a-f]{64}",str(request.get("nonce","")))):
+                    raise RuntimeError("authenticated guardian binding fault")
+                kind=request.get("kind")
+                if kind=="status":
+                    if not exact_keys(request,common|{"auth"}) or request["sequence"]!=sequence+1:
+                        raise RuntimeError("guardian status sequence or shape")
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"STATE","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"next_sequence":sequence+1,
+                        "request_nonce":request["nonce"],"root_binding":root_binding,
+                        "registration_digest":guardian_registration_digest(registrations),
+                        "registered_roles":sorted(item["role"] for item in registrations)})
+                elif kind=="register":
+                    keys=common|{"role","pid","pgid","auth"}
+                    if not exact_keys(request,keys) or request["sequence"]!=sequence+1:
+                        raise RuntimeError("guardian registration sequence or shape")
+                    role=request.get("role"); pid=request.get("pid"); pgid=request.get("pgid")
+                    if role not in ("broker","provider") or not isinstance(pid,int) or pid<=0 or pid!=pgid:
+                        raise RuntimeError("guardian registration identity")
+                    if role in {item["role"] for item in registrations} or request["nonce"] in {item["nonce"] for item in registrations}:
+                        raise RuntimeError("guardian registration replay")
+                    try:
+                        if os.getpgid(pid)!=pgid or os.getsid(pid)!=pid: raise RuntimeError("guardian registration session")
+                        os.kill(pid,0)
+                    except ProcessLookupError: raise RuntimeError("guardian registration process absent")
+                    request_sha=digest_bytes(canonical(unsigned_request).encode("ascii")); sequence+=1
+                    registration={"sequence":sequence,"role":role,"pid":pid,"pgid":pgid,
+                                  "nonce":request["nonce"],"request_sha256":request_sha}
+                    registrations.append(registration)
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"REGISTERED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "role":role,"pid":pid,"pgid":pgid,"root_binding":root_binding,
+                        "request_sha256":request_sha,"registration_digest":guardian_registration_digest(registrations)})
+                elif kind=="cleanup":
+                    keys=common|{"registration_digest","expected_roles","auth"}
+                    roles=request.get("expected_roles")
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or not isinstance(roles,list) or roles!=sorted(set(roles))
+                            or any(role not in ("broker","provider") for role in roles)
+                            or roles!=sorted(item["role"] for item in registrations)
+                            or request.get("registration_digest")!=guardian_registration_digest(registrations)):
+                        raise RuntimeError("guardian cleanup sequence, registration, or shape")
+                    sequence+=1; state="CLEANUP_ACCEPTED"
+                    accepted={"sequence":sequence,"nonce":request["nonce"],
+                              "request_sha256":digest_bytes(canonical(unsigned_request).encode("ascii")),
+                              "registration_digest":request["registration_digest"]}
+                    cleanup_connection=connection; connection=None
+                    listener.close(); listener=None
+                else: raise RuntimeError("guardian request kind")
+            except BaseException as exc:
+                if connection is not None:
+                    try: guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"TERMINAL_BLOCK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":"TERMINAL_BLOCK","reason":str(exc)[:1000]})
+                    except Exception: pass
+                raise
+            finally:
+                if connection is not None: connection.close()
+        state="QUIESCING"; quiescence=terminate_groups(registrations)
+        quiescence_digest=digest_bytes(canonical(quiescence).encode("ascii"))
+        state="DELETING"
+        deletion,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
+                                                         socket_path,socket_id,listener,barrier)
+        listener=None; state="PROVING_ABSENT"
+        terminal={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"kind":"terminal",
+                  "status":"TERMINAL_OK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                  "guardian_pid":os.getpid(),"terminal_sequence":sequence+1,"request_sequence":accepted["sequence"],
+                  "request_nonce":accepted["nonce"],"request_sha256":accepted["request_sha256"],
+                  "root_identity":root_id,"root_binding":root_binding,
+                  "registration_digest":accepted["registration_digest"],"quiescence_digest":quiescence_digest,
+                  "deletion":deletion,"absent":True}
+        state="TERMINAL_OK"; guardian_send_frame(cleanup_connection,token,terminal); cleanup_connection.close(); cleanup_connection=None
     except BaseException as exc:
+        state="TERMINAL_BLOCK"
+        failure_reason="%s: %s"%(type(exc).__name__,exc)
+        if listener is not None:
+            try: listener.close()
+            except Exception: pass
+            listener=None
+        if cleanup_connection is not None:
+            try: guardian_send_frame(cleanup_connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                "status":"TERMINAL_BLOCK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                "guardian_pid":os.getpid(),"state":state,"reason":str(exc)[:1000],
+                "request_sequence":accepted.get("sequence") if accepted else None,
+                "request_sha256":accepted.get("request_sha256") if accepted else None})
+            except Exception: pass
+        # A fault before cleanup acceptance can never become success, but the guardian still owns
+        # lifecycle cleanup.  Quiesce every authenticated group and remove only the still-pinned
+        # root.  If quiescence or identity proof fails, retain the root and make that failure loud.
+        if accepted is None and root_fd is not None and control_fd is not None:
+            try:
+                quiescence=terminate_groups(registrations)
+                _,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
+                                                           socket_path,socket_id,None,barrier)
+            except Exception as cleanup_exc:
+                failure_reason+="; abnormal cleanup failed: %s: %s"%(type(cleanup_exc).__name__,cleanup_exc)
         try:
-            if root is not None:
-                marker=str(Path(parent)/("firm-eval-block-"+invocation+".json"))
-                write_failure_marker(marker,invocation,root,"%s: %s"%(type(exc).__name__,exc))
-        finally: os._exit(1)
+            if parent_fd is not None and root is not None:
+                write_failure_marker(parent_fd,marker_name,token,invocation,root,root_binding or "0"*64,
+                                     failure_reason,accepted)
+        except Exception: pass
+        for descriptor in (ready_fd,):
+            if descriptor is not None:
+                try: os.close(descriptor)
+                except OSError: pass
+        if cleanup_connection is not None:
+            try: cleanup_connection.close()
+            except Exception: pass
+        os._exit(1)
     os._exit(0)
 
 def guardian_start(ns):
@@ -334,35 +570,96 @@ def guardian_start(ns):
     left.close()
     try: receipt=json.loads(data.decode("ascii")); auth=receipt.pop("auth")
     except Exception: fail("guardian readiness")
-    if auth!=guardian_auth(token,receipt) or receipt.get("guardian_pid")!=pid or receipt.get("status")!="ready": fail("guardian readiness binding")
+    if (not hmac.compare_digest(auth,guardian_auth(token,receipt)) or receipt.get("guardian_pid")!=pid
+            or receipt.get("status")!="ready" or receipt.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or receipt.get("candidate_commit")!=PAYLOAD_COMMIT): fail("guardian readiness binding")
     receipt["auth"]=auth; receipt["token"]=token; receipt["test_barrier"]=barrier
     print(canonical(receipt))
 
-def guardian_write_command(control,token,invocation,sequence,record):
-    commands=Path(control)/"commands"; owned_directory(commands)
-    unsigned={"schema_version":1,"sequence":sequence,"invocation":invocation,**record}
-    unsigned["auth"]=guardian_auth(token,unsigned)
-    put_file(commands/("%08d.json"%sequence),(canonical(unsigned)+"\n").encode("ascii"),0o600)
+def guardian_request_base(control, invocation, sequence, guardian_pid, nonce=None):
+    try: root_id=identity(os.lstat(str(Path(control).parent)))
+    except OSError: fail("guardian root unavailable")
+    return {"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"invocation":invocation,
+            "candidate_commit":PAYLOAD_COMMIT,"sequence":sequence,"nonce":nonce or secrets.token_hex(32),
+            "guardian_pid":guardian_pid,"root_binding":guardian_root_binding(root_id)}
 
 def guardian_command(ns):
-    if not re.fullmatch(r"[0-9a-f]{64}",ns.token): fail("guardian token")
-    record={"action":ns.action}
+    base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid,ns.nonce)
     if ns.action=="register":
-        if ns.pid is None or ns.pgid is None: fail("guardian registration")
-        record.update({"pid":ns.pid,"pgid":ns.pgid})
-    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,record)
-    if ns.action=="cleanup":
-        root=Path(ns.control).parent; marker=Path("/private/tmp")/("firm-eval-block-"+ns.invocation+".json")
-        deadline=time.monotonic()+60
-        while time.monotonic()<deadline and root.exists() and not marker.exists(): time.sleep(0.01)
-        if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
-        if root.exists() or root.is_symlink(): fail("guardian cleanup timeout")
-        print(canonical({"schema_version":1,"status":"cleanup_complete","invocation":ns.invocation,"root":str(root)}))
+        if ns.pid is None or ns.pgid is None or ns.role is None: fail("guardian registration")
+        base.update({"kind":"register","role":ns.role,"pid":ns.pid,"pgid":ns.pgid})
+        response=guardian_client_request(ns.control,ns.token,base)
+        if response.get("status")!="REGISTERED": fail("guardian registration NACK")
+        print(canonical(response)); return
+    status_base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid)
+    status_base["kind"]="status"
+    status=guardian_client_request(ns.control,ns.token,status_base)
+    status_value,_=guardian_verify_response(ns.token,status)
+    expected_status={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid",
+                     "state","next_sequence","request_nonce","root_binding","registration_digest","registered_roles"}
+    roles=sorted(set(filter(None,(ns.expected_roles or "").split(","))))
+    if (not exact_keys(status_value,expected_status) or status_value.get("status")!="STATE"
+            or status_value.get("next_sequence")!=ns.sequence or status_value.get("request_nonce")!=status_base["nonce"]
+            or status_value.get("schema_version")!=1 or status_value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or status_value.get("invocation")!=ns.invocation or status_value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or status_value.get("guardian_pid")!=ns.guardian_pid or status_value.get("root_binding")!=base["root_binding"]
+            or not isinstance(status_value.get("registered_roles"),list)
+            or status_value["registered_roles"]!=sorted(set(status_value["registered_roles"]))
+            or any(role not in ("broker","provider") for role in status_value["registered_roles"])
+            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("registration_digest","")))):
+        fail("guardian status binding")
+    base.update({"kind":"cleanup","registration_digest":status_value["registration_digest"],
+                 "expected_roles":roles})
+    terminal=guardian_client_request(ns.control,ns.token,base,10)
+    terminal_value,_=guardian_verify_response(ns.token,terminal)
+    required={"schema_version","protocol_version","kind","status","invocation","candidate_commit","guardian_pid",
+              "terminal_sequence","request_sequence","request_nonce","request_sha256","root_identity","root_binding",
+              "registration_digest","quiescence_digest","deletion","absent"}
+    request_unsigned=dict(base); request_sha=digest_bytes(canonical(request_unsigned).encode("ascii"))
+    if (not exact_keys(terminal_value,required) or terminal_value.get("kind")!="terminal"
+            or terminal_value.get("schema_version")!=1 or terminal_value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or terminal_value.get("status")!="TERMINAL_OK" or terminal_value.get("invocation")!=ns.invocation
+            or terminal_value.get("candidate_commit")!=PAYLOAD_COMMIT or terminal_value.get("guardian_pid")!=ns.guardian_pid
+            or terminal_value.get("terminal_sequence")!=ns.sequence+1
+            or terminal_value.get("request_sequence")!=ns.sequence or terminal_value.get("request_nonce")!=base["nonce"]
+            or terminal_value.get("request_sha256")!=request_sha or terminal_value.get("root_binding")!=base["root_binding"]
+            or guardian_root_binding(terminal_value.get("root_identity",{}))!=base["root_binding"]
+            or terminal_value.get("registration_digest")!=status_value["registration_digest"]
+            or not re.fullmatch(r"[0-9a-f]{64}",str(terminal_value.get("quiescence_digest","")))
+            or terminal_value.get("absent") is not True
+            or terminal_value.get("deletion")!={"removed":True,"absent":True,"method":"parent_fd_relative"}):
+        fail("guardian terminal receipt binding")
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        try: os.kill(ns.guardian_pid,0)
+        except ProcessLookupError: break
+        time.sleep(0.01)
+    else: fail("guardian terminal exit timeout")
+    marker=Path("/private/tmp")/("firm-eval-block-"+ns.invocation+".json")
+    if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
+    print(canonical(terminal))
 
 def guardian_exec(ns, rest):
     if not rest: fail("guardian exec argv")
-    os.setsid(); pid=os.getpid(); pgid=os.getpgrp()
-    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,{"action":"register","pid":pid,"pgid":pgid})
+    pid=os.getpid(); pgid=os.getpgrp()
+    if (pid!=pgid or os.getsid(pid)!=pid) and ns.role=="broker":
+        os.setsid(); pid=os.getpid(); pgid=os.getpgrp()
+    if pid!=pgid or os.getsid(pid)!=pid: fail("guardian exec requires bounded child session leader")
+    base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid,ns.nonce)
+    base.update({"kind":"register","role":ns.role,"pid":pid,"pgid":pgid})
+    response=guardian_client_request(ns.control,ns.token,base)
+    value,_=guardian_verify_response(ns.token,response)
+    required={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid","sequence",
+              "nonce","role","pid","pgid","root_binding","request_sha256","registration_digest"}
+    request_sha=digest_bytes(canonical(base).encode("ascii"))
+    if (not exact_keys(value,required) or value.get("status")!="REGISTERED" or value.get("sequence")!=ns.sequence
+            or value.get("schema_version")!=1 or value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or value.get("invocation")!=ns.invocation or value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or value.get("guardian_pid")!=ns.guardian_pid
+            or value.get("nonce")!=base["nonce"] or value.get("role")!=ns.role or value.get("pid")!=pid
+            or value.get("pgid")!=pgid or value.get("request_sha256")!=request_sha
+            or value.get("root_binding")!=base["root_binding"]):
+        fail("guardian registration ACK binding")
     os.execv(rest[0],rest)
 
 def external_file_record(path, maximum=64*1024*1024):
@@ -719,14 +1016,16 @@ def load_manifest(path):
                 or barrier["phase"] not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{64}",barrier["token"])): fail("test barrier manifest")
     elif barrier!={"enabled":False}: fail("test barrier manifest")
     guardian=doc["guardian"]
-    if (not exact_keys(guardian,{"pid","root","root_identity","control","token_sha256","failure_marker"})
+    if (not exact_keys(guardian,{"protocol_version","candidate_commit","pid","root","root_identity","root_binding",
+                                "control","socket","socket_identity","token_sha256","failure_marker"})
+            or guardian["protocol_version"]!=GUARDIAN_PROTOCOL_VERSION or guardian["candidate_commit"]!=PAYLOAD_COMMIT
             or guardian["pid"]<=0 or Path(guardian["root"]).resolve()!=Path(doc["scratch_root"]).parent
             or Path(guardian["control"]).resolve()!=Path(path).resolve().parent
+            or Path(guardian["socket"])!=Path(guardian["control"])/GUARDIAN_SOCKET_NAME
+            or guardian["root_binding"]!=guardian_root_binding(guardian["root_identity"])
             or not re.fullmatch(r"[0-9a-f]{64}",guardian["token_sha256"])): fail("guardian manifest")
     try: os.kill(guardian["pid"],0)
-    except ProcessLookupError:
-        write_failure_marker(guardian["failure_marker"],doc["invocation"],guardian["root"],"guardian dead")
-        fail("guardian dead")
+    except ProcessLookupError: fail("guardian dead")
     return doc, raw
 
 def prepare(ns):
@@ -776,8 +1075,13 @@ def prepare(ns):
     runner_raw,runner_st=read_bytes(SELF.parent/"firm-run-evals")
     runner={"name":"firm-run-evals","path":str(SELF.parent/"firm-run-evals"),"sha256":digest_bytes(runner_raw)}
     runner.update(identity(runner_st))
-    guardian={"pid":ns.guardian_pid,"root":str(guardian_root),"root_identity":identity(root_st),
-              "control":str(control),"token_sha256":digest_bytes(bytes.fromhex(ns.guardian_token)),
+    guardian_socket=control/GUARDIAN_SOCKET_NAME; socket_st=os.lstat(str(guardian_socket))
+    if not stat.S_ISSOCK(socket_st.st_mode): fail("guardian socket")
+    guardian={"protocol_version":GUARDIAN_PROTOCOL_VERSION,"candidate_commit":PAYLOAD_COMMIT,
+              "pid":ns.guardian_pid,"root":str(guardian_root),"root_identity":identity(root_st),
+              "root_binding":guardian_root_binding(identity(root_st)),"control":str(control),
+              "socket":str(guardian_socket),"socket_identity":identity(socket_st),
+              "token_sha256":digest_bytes(bytes.fromhex(ns.guardian_token)),
               "failure_marker":ns.guardian_failure_marker}
     seatbelt=prepare_seatbelt(Path(capsule["real_common"]),scratch,control,ns.provider_executable)
     doc = {"schema_version":3,"purpose":"disposable_git_candidate_eval","invocation":invocation,
@@ -960,20 +1264,16 @@ def cleanup(ns):
     if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("cleanup digest")
     validate_capsule(doc,final=True); validate_seatbelt(doc,post=True)
     if (doc["guardian"]["control"]!=str(Path(ns.control).resolve())
-            or doc["guardian"]["token_sha256"]!=digest_bytes(bytes.fromhex(ns.token))): fail("cleanup guardian binding")
-    guardian_write_command(ns.control,ns.token,ns.invocation,ns.sequence,{"action":"cleanup"})
-    root=Path(doc["guardian"]["root"]); marker=Path(doc["guardian"]["failure_marker"])
-    deadline=time.monotonic()+60
-    while time.monotonic()<deadline and root.exists() and not marker.exists(): time.sleep(0.01)
-    if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
-    if root.exists() or root.is_symlink(): fail("guardian cleanup timeout")
-    print(canonical({"schema_version":1,"status":"cleanup_complete","invocation":ns.invocation,"root":str(root)}))
+            or doc["guardian"]["token_sha256"]!=digest_bytes(bytes.fromhex(ns.token))
+            or doc["guardian"]["pid"]!=ns.guardian_pid): fail("cleanup guardian binding")
+    ns.action="cleanup"; ns.nonce=None
+    guardian_command(ns)
 
 def main():
     p=argparse.ArgumentParser(add_help=False); sub=p.add_subparsers(dest="command",required=True)
     q=sub.add_parser("guardian-start"); q.add_argument("--parent",required=True); q.add_argument("--launcher-pid",type=int,required=True); q.add_argument("--invocation"); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
-    q=sub.add_parser("guardian-command"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--action",choices=("register","cleanup"),required=True); q.add_argument("--pid",type=int); q.add_argument("--pgid",type=int)
-    q=sub.add_parser("guardian-exec"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--sequence",type=int,required=True)
+    q=sub.add_parser("guardian-command"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--action",choices=("register","cleanup"),required=True); q.add_argument("--role",choices=("broker","provider")); q.add_argument("--pid",type=int); q.add_argument("--pgid",type=int); q.add_argument("--nonce"); q.add_argument("--expected-roles",default="")
+    q=sub.add_parser("guardian-exec"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--role",choices=("broker","provider"),required=True); q.add_argument("--nonce")
     q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--provider-executable",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--guardian-root",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--guardian-token",required=True); q.add_argument("--guardian-failure-marker",required=True); q.add_argument("--invocation",required=True); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
     q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
     q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)
@@ -981,7 +1281,7 @@ def main():
     q=sub.add_parser("verify"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--receipts",required=True)
     q=sub.add_parser("seatbelt-probe"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--post",action="store_true")
     q=sub.add_parser("test-barrier-probe"); q.add_argument("--root",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--candidate",required=True); q.add_argument("--phase",required=True); q.add_argument("--target",required=True)
-    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--sequence",type=int,required=True)
+    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--expected-roles",default="")
     ns,rest=p.parse_known_args(ARGV)
     if ns.command=="guardian-start": guardian_start(ns)
     elif ns.command=="guardian-command": guardian_command(ns)

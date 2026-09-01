@@ -32,12 +32,25 @@ allocation=raw.index('local out="$scratch/.eval-out"')
 prepare=raw.index('authority_prepare="$($EVAL_AUTHORITY prepare')
 assert start < allocation < prepare
 PY
-assert_eq "runner contains exactly one provider-neutral sandbox-exec construction" 1 \
+assert_eq "runner contains exactly one shared sandbox-exec construction" 1 \
   "$(rg -c 'seatbelt_prefix=\( /usr/bin/sandbox-exec' "$RUN")"
 assert_eq "the same Seatbelt prefix reaches both provider argv shapes" 2 \
   "$(rg -c '"\$\{seatbelt_prefix\[@\]\}" PATH=' "$RUN")"
-assert_output "bounded supervisor remains outside Seatbelt" \
-  'guardian_prefix=( "$EVAL_AUTHORITY" guardian-exec' cat "$RUN"
+assert_output "authenticated registration gate is inserted inside the bounded child and before Seatbelt" \
+  'seatbelt_prefix=( "${guardian_prefix[@]}" "${seatbelt_prefix[@]}" )' cat "$RUN"
+assert_ok "both golden orientations put bounded supervision before registration and Seatbelt" t_python - "$RUN" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+needle='"$BOUNDED" --phase eval --provider '
+cursor=0
+for _ in range(2):
+    launch=raw.index(needle,cursor)
+    gate=raw.index('"${seatbelt_prefix[@]}" PATH=',launch)
+    assert launch < gate
+    cursor=gate+1
+assert raw.count(needle)==2
+assert '--role provider --' in raw and '--role broker --' in raw
+PY
 assert_eq "runner has no recursive control/capsule deletion fallback" 0 \
   "$(rg -c 'rm -rf .*\$control|rm -rf .*\$scratch' "$RUN" || printf '0\n')"
 assert_ok "all four load-bearing concurrent barriers are wired" t_python - "$BIN/firm-eval-authority" <<'PY'
