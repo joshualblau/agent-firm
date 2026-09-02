@@ -1144,15 +1144,19 @@ for origin,item in entries.items():
     # transform MATCHES THE FILE'S ACTUAL SHAPE, so a structured file silently falling back to the
     # textual path -- the regression that would reintroduce the corruption -- now fails here. The
     # old assertion could not have caught that, because it demanded the buggy value.
+    # Mirrors parsed_json_shape()'s ORDER, which is load-bearing: JSONL is tried first so a
+    # one-record ledger keeps its single line instead of being pretty-printed by json_bytes()
+    # (indent=2) into a file that is still valid JSON and no longer valid JSONL.
     parsed=None
-    try:
-        json.loads(raw.decode("utf-8")); parsed="redacted_json"
-    except Exception:
-        lines=[l for l in raw.decode("utf-8","replace").splitlines() if l.strip()]
-        if lines:
-            try:
-                [json.loads(l) for l in lines]; parsed="redacted_jsonl"
-            except Exception: parsed=None
+    lines=[l for l in raw.decode("utf-8","replace").splitlines() if l.strip()]
+    if lines:
+        try:
+            [json.loads(l) for l in lines]; parsed="redacted_jsonl"
+        except Exception: parsed=None
+    if parsed is None:
+        try:
+            json.loads(raw.decode("utf-8")); parsed="redacted_json"
+        except Exception: parsed=None
     assert item["transform"]==(parsed or "redacted_utf8"), (origin,item["transform"],parsed)
 PY
 t_python - "$RUN/07-review-findings.yaml" <<'PY'

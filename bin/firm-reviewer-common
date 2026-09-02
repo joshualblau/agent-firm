@@ -1391,23 +1391,31 @@ except Exception as exc:
         """Return ('json'|'jsonl', parsed) if raw is structured, else (None, None).
 
         Keyed on what the file IS, not on its name or the run that produced it.
+
+        JSONL IS TRIED FIRST, AND THE ORDER IS LOAD-BEARING. A single-record run.jsonl is also a
+        valid JSON document, so a JSON-first test classifies it `json` -- and json_bytes() writes
+        with indent=2, which would rewrite that one line as multi-line pretty JSON. The file would
+        still be valid JSON and would no longer be valid JSONL, so a consumer reading it line by
+        line breaks. The invariant below could not catch it either: the pretty copy still parses as
+        `json`, which is the shape that was recorded, so shape-to-shape comparison passes while the
+        line structure is destroyed. Trying JSONL first keeps line structure whenever line structure
+        exists, and a pretty-printed document still falls through correctly because its lines do not
+        parse individually. Caught by tests/test-judge-input-integrity.sh before shipping.
         """
         try:
             text = raw.decode("utf-8", "strict")
         except UnicodeDecodeError:
             return None, None
-        stripped = text.strip()
-        if not stripped:
+        if not text.strip():
             return None, None
+        lines = [line for line in text.splitlines() if line.strip()]
+        if lines:
+            try:
+                return "jsonl", [json.loads(line) for line in lines]
+            except Exception:
+                pass
         try:
             return "json", json.loads(text)
-        except Exception:
-            pass
-        lines = [line for line in text.splitlines() if line.strip()]
-        if not lines:
-            return None, None
-        try:
-            return "jsonl", [json.loads(line) for line in lines]
         except Exception:
             return None, None
 

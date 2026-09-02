@@ -5,7 +5,7 @@ reviewed for generalizability, approved by the human, versioned, and guarded by 
 
 - **Proposed by run:** `20260902T064517Z-link-audit-tool`
 - **Date (UTC):** 2026-09-02
-- **Status:** proposed
+- **Status:** proposed (implemented on `fix/judge-input-redaction-corrupts-json`, awaiting human decision)
 
 ## Motivation
 
@@ -119,7 +119,12 @@ approximate — the structural fix and the invariant do not depend on getting th
 
 ## Golden eval to guard it
 
-- Eval: `agent-firm/evals/judge-input-integrity/`
+- Eval: `agent-firm/evals/judge-input-integrity/` — **added**, with the deterministic property check
+  in `tests/test-judge-input-integrity.sh` (auto-discovered by `tests/run-tests.sh`) and the fixture
+  guard `fixture/test/judge-input-integrity.sh` delegating to it, matching the pattern
+  `judge-credential-boundary` uses.
+- **The guard was verified to BITE**, not merely to pass: with the pre-fix wrapper stashed back in,
+  `sh test/judge-input-integrity.sh` exits 1. A guard never seen to fail proves nothing.
 - What it asserts:
   1. A ledger line containing `\n@pytest.hookimpl(...)` — the exact observed trigger — survives
      redaction as parseable JSON.
@@ -129,7 +134,33 @@ approximate — the structural fix and the invariant do not depend on getting th
   4. The post-redaction invariant **bites**: a deliberately corrupting substitution injected into
      the transform causes `stop(...)`, not a silent hand-off. Without this case the eval would pass
      on a fix that merely avoided today's regex.
-- [ ] Golden evals pass (`firm-run-evals`) — attach the run output.
+- [x] `firm-run-evals --structural judge-input-integrity` — `ok judge-input-integrity (9 assertions)`.
+      Structural mode is parse/shape only and is explicitly NOT a behavioural pass; a real
+      `firm-run-evals --provider <p> judge-input-integrity` needs provider login and spend, and has
+      NOT been run. Recorded as unproven rather than claimed.
+- [x] Deterministic checks: `tests/test-judge-input-integrity.sh` 4 passed / 0 failed.
+- [x] Regression: `test-provider-reviewers` 320/0, `test-reviewer-hermeticity` 18/0,
+      `test-reviewer-capability-contract` 18/0, `test-reviewer-credential-contract` 54/0,
+      `test-reviewer-readiness-contract` 22/0.
+- [ ] NOTE: `test-provider-launch-sites` has 2 failures that are **pre-existing and unrelated** —
+      verified identical with this change stashed. They are the firm's staleness guard firing
+      correctly: the `--max-turns` measurement for `claude --help` was taken against CLI 2.1.234
+      while 2.1.258 is installed. Separate defect, separate fix.
+
+## What the eval caught in this change before it shipped
+
+Both were found by the guard, not by review, which is the case for writing it alongside the fix:
+
+1. **A silent disclosure regression.** Structure splits `key: value` in half and the textual rules
+   are `key[:=]value` shaped, so parsing `{"password": "hunter2"}` yields two strings that match
+   nothing individually. Naive structural redaction stopped redacting exactly the pairs the firm
+   most cares about. Fixed by redacting a secret-NAMED key's whole value — which is strictly
+   stronger than the textual rule, whose `[^\s,;]+` stopped at the first space.
+2. **A JSON/JSONL ordering bug.** `parsed_json_shape()` originally tried whole-document JSON first.
+   A one-record `run.jsonl` is *also* a valid JSON document, so it was classified `json` and
+   re-serialised by `json_bytes()` at `indent=2` — still valid JSON, no longer valid JSONL. The
+   shape-to-shape invariant could not catch it, because the pretty copy parses as the shape that was
+   recorded. JSONL is now tried first, and both the ordering and its reason are pinned by the eval.
 
 ## Evidence
 

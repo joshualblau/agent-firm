@@ -1,0 +1,30 @@
+name: judge-input-integrity
+description: >-
+  Guards the 2026-09-02 defect, where bin/firm-reviewer-common validated run.jsonl as well-formed
+  JSONL immediately before snapshotting it, then wrote the judge's copy through a TEXTUAL redact()
+  and never re-read its own output. A ledger record carrying Python source put `\n` in a JSON string
+  as two literal characters, so the email substitution matched `n@pytest.hookimpl` -- a Python
+  decorator after a newline read as an address -- consumed the escape's second character, and left a
+  dangling backslash. The cross-provider judge (attempt gpt-c2-a0003, run
+  20260902T064517Z-link-audit-tool) reported run.jsonl malformed at lines 116/128/462/573/574/647/865,
+  was correct, and correctly refused to approve on evidence it could not validate, while the run's
+  real ledger was intact at 1538 records and nothing on the primary side saw anything wrong. The eval
+  drives a normal lifecycle and then runs checks the defect could not have satisfied: the observed
+  decorator trigger surviving redaction, a realistic multi-record ledger surviving, secrets still
+  redacted in values, nested lists AND keys (structure splits `key: value` in half, and a naive
+  structural fix silently stops redacting the pairs the firm most cares about -- the first cut
+  regressed exactly there), the fail-closed post-redaction invariant both biting on a corrupting
+  transform and NOT firing on a clean one, and the structural path actually being present so a fix
+  that merely tightened the regex fails.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/slugify.js
+  - file_exists: test/slugify.test.js
+  - test_passes: node --test
+  - test_passes: sh test/judge-input-integrity.sh
+  - traceability_passes: true
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true
