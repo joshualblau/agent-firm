@@ -31,4 +31,4 @@
 
 - **Integrator must own** (shared state / migrations / ports / fixtures):
 - **Sequential-only** (same-file or ordered):
-- **Needs a Fable 5 deep pass?** yes/no — why:
+- **Needs a Fable 5.1 deep pass?** yes/no — why:
