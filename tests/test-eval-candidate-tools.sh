@@ -773,6 +773,8 @@ assert_ok "clean capsule fixture compiles to the managed runtime's native Mach-O
 chmod 700 "$clean_native_provider"
 assert_ok "clean capsule fixture receives an explicit ad-hoc signature without a private identity" \
   /usr/bin/codesign --force --sign - "$clean_native_provider"
+assert_ok "clean capsule fixture carries a local xattr into the produced manifest" \
+  /usr/bin/xattr -w com.agentfirm.schema schema-capsule "$clean_native_provider"
 if [ -n "$(git -C "$FIRM_ROOT" status --porcelain --untracked-files=all)" ]; then
   t_skip "live capsule dynamic" "candidate checkout is dirty; prepare correctly refuses an ambiguous candidate"
 else
@@ -791,6 +793,65 @@ else
     --scratch "$scratch" --fixture "$FIRM_ROOT/agent-firm/evals/final-evidence-seal/fixture" \
     --manifest "$control/manifest.json" --shims "$control/shims" \
     --request-root "$scratch/.eval-out/authority-requests" --response-root "$control/responses")"
+  assert_ok "the real produced authority manifest satisfies only the closed canonical schema" \
+    t_python - "$SCHEMA" "$control/manifest.json" <<'PY'
+import copy,json,sys
+from jsonschema import Draft202012Validator
+
+schema=json.load(open(sys.argv[1],encoding="utf-8"))
+manifest=json.load(open(sys.argv[2],encoding="utf-8"))
+validator=Draft202012Validator(schema)
+validator.validate(manifest)
+assert manifest["guardian"]["protocol_version"]==3
+assert manifest["provider_capsule"]["schema_version"]==1
+assert manifest["provider_capsule"]["guardian"]["capsule"]["schema_version"]==1
+assert manifest["provider_capsule"]["xattrs"]
+
+def value_at(value,path):
+    for part in path: value=value[part]
+    return value
+
+def object_paths(value,path=()):
+    if isinstance(value,dict):
+        yield path
+        for key,item in value.items(): yield from object_paths(item,path+(key,))
+    elif isinstance(value,list):
+        for index,item in enumerate(value): yield from object_paths(item,path+(index,))
+
+# Every field emitted anywhere in the new capsule tree is required, and every object boundary is
+# closed. These mutations use the real producer output rather than a hand-maintained fixture.
+capsule=manifest["provider_capsule"]
+paths=list(object_paths(capsule))
+field_count=0
+for path in paths:
+    original=value_at(capsule,path)
+    for key in original:
+        candidate=copy.deepcopy(manifest)
+        value_at(candidate["provider_capsule"],path).pop(key)
+        assert not validator.is_valid(candidate),("missing",path,key)
+        field_count+=1
+    candidate=copy.deepcopy(manifest)
+    value_at(candidate["provider_capsule"],path)["unexpected_schema_field"]=True
+    assert not validator.is_valid(candidate),("extra",path)
+assert field_count>=100 and len(paths)>=25,(field_count,len(paths))
+
+candidate=copy.deepcopy(manifest); candidate.pop("provider_capsule")
+assert not validator.is_valid(candidate)
+for path in (("schema_version",),("guardian","capsule","schema_version")):
+    candidate=copy.deepcopy(manifest)
+    target=value_at(candidate["provider_capsule"],path[:-1]); target[path[-1]]+=1
+    assert not validator.is_valid(candidate),("version",path)
+candidate=copy.deepcopy(manifest); candidate["guardian"]["protocol_version"]=2
+assert not validator.is_valid(candidate)
+
+for phase in ("capsule_copy","capsule_preexec"):
+    candidate=copy.deepcopy(manifest)
+    candidate["test_barrier"]={"enabled":True,"root":manifest["guardian"]["control"],
+        "token":"0"*64,"phase":phase,"invocation":manifest["invocation"]}
+    validator.validate(candidate)
+    candidate["test_barrier"]["phase"]=phase+"_unexpected"
+    assert not validator.is_valid(candidate),phase
+PY
   digest="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["manifest_digest"])')"
   project="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["project_root"])')"
   authority_bin="$(printf '%s\n' "$prepared" | t_python -c 'import json,sys; print(json.load(sys.stdin)["authority_bin"])')"

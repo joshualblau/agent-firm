@@ -4,7 +4,7 @@
   "title": "Disposable-Git candidate-bound eval execution authority",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "harness_root", "harness_commit", "harness_tree", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools", "capsule", "guardian", "seatbelt", "test_barrier"],
+  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "harness_root", "harness_commit", "harness_tree", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools", "capsule", "guardian", "seatbelt", "provider_capsule", "test_barrier"],
   "properties": {
     "schema_version": {"const": 3},
     "purpose": {"const": "disposable_git_candidate_eval"},
@@ -31,6 +31,7 @@
     "capsule": {"$ref": "#/$defs/capsule"},
     "guardian": {"$ref": "#/$defs/guardian"},
     "seatbelt": {"$ref": "#/$defs/seatbelt"},
+    "provider_capsule": {"$ref": "#/$defs/providerCapsule"},
     "test_barrier": {"$ref": "#/$defs/testBarrier"}
   },
   "$defs": {
@@ -86,7 +87,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["protocol_version", "candidate_commit", "pid", "root", "root_identity", "root_binding", "control", "socket", "socket_identity", "token_sha256", "failure_marker"],
       "properties": {
-        "protocol_version": {"const": 2},
+        "protocol_version": {"const": 3},
         "candidate_commit": {"const": "a57a8d0b4754ed92b74c023c340aab3154845abb"},
         "pid": {"type": "integer", "minimum": 1}, "root": {"type": "string", "minLength": 1},
         "root_identity": {"$ref": "#/$defs/identity"},
@@ -148,13 +149,212 @@
                         "bytes": {"type": "integer", "minimum": 1, "maximum": 197220928}}}
       ]
     },
+    "streamDigest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "sha256"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 262144},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "codesignCommand": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv", "cwd", "exit_code", "start_utc", "end_utc", "start_monotonic_ns", "end_monotonic_ns", "duration_ns", "stdout", "stderr"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "cwd": {"const": "/"},
+        "exit_code": {"type": "integer", "minimum": 0},
+        "start_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+        "end_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "stdout": {"$ref": "#/$defs/streamDigest"},
+        "stderr": {"$ref": "#/$defs/streamDigest"}
+      }
+    },
+    "codesignRecord": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "display_result"],
+          "properties": {
+            "state": {"const": "unsigned"},
+            "display_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "identifier", "team_identifier", "cdhash", "designated_requirement", "codedirectory_flags", "display_result", "strict_verify_result"],
+          "properties": {
+            "state": {"const": "adhoc_signed"},
+            "identifier": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "team_identifier": {"type": "null"},
+            "cdhash": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "designated_requirement": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "codedirectory_flags": {"type": "integer", "minimum": 0},
+            "display_result": {"$ref": "#/$defs/codesignCommand"},
+            "strict_verify_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "identifier", "team_identifier", "cdhash", "designated_requirement", "codedirectory_flags", "display_result", "strict_verify_result"],
+          "properties": {
+            "state": {"const": "team_signed"},
+            "identifier": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "team_identifier": {"type": "string", "pattern": "^[A-Z0-9]{10}$"},
+            "cdhash": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "designated_requirement": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "codedirectory_flags": {"type": "integer", "minimum": 0},
+            "display_result": {"$ref": "#/$defs/codesignCommand"},
+            "strict_verify_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        }
+      ]
+    },
+    "codesignSet": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "copy", "mounted"],
+      "properties": {
+        "source": {"$ref": "#/$defs/codesignRecord"},
+        "copy": {"$ref": "#/$defs/codesignRecord"},
+        "mounted": {"$ref": "#/$defs/codesignRecord"}
+      }
+    },
+    "macho": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "native_architecture", "architectures", "magic"],
+      "properties": {
+        "format": {"enum": ["thin32", "thin64", "fat32", "fat64"]},
+        "native_architecture": {"enum": ["arm64", "x86_64"]},
+        "architectures": {
+          "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?:arm64|x86_64|unsupported-[0-9a-f]{8})$"}
+        },
+        "magic": {"type": "string", "pattern": "^[0-9a-f]{8}$"}
+      }
+    },
+    "xattr": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "name_bytes", "bytes", "sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "name_bytes": {"type": "integer", "minimum": 1, "maximum": 255},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 1048576},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "copyTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_monotonic_ns", "end_monotonic_ns", "duration_ns", "bytes", "chunk_bytes", "timeout_ns"],
+      "properties": {
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "bytes": {"type": "integer", "minimum": 1},
+        "chunk_bytes": {"const": 1048576},
+        "timeout_ns": {"const": 10000000000}
+      }
+    },
+    "guardianCommandTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_monotonic_ns", "end_monotonic_ns", "duration_ns", "exit_code", "argv_sha256", "stdout_sha256", "stderr_sha256"],
+      "properties": {
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "exit_code": {"const": 0},
+        "argv_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "mountAttachment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "device_identifier", "mountpoint", "filesystem", "bus_protocol", "volume_uuid", "readonly", "options", "disk_info_timing", "attach_timing"],
+      "properties": {
+        "device": {"type": "string", "pattern": "^/dev/disk[0-9]+(?:s[0-9]+)?$"},
+        "device_identifier": {"type": "string", "pattern": "^disk[0-9]+(?:s[0-9]+)?$"},
+        "mountpoint": {"type": "string", "minLength": 1},
+        "filesystem": {"const": "hfs"},
+        "bus_protocol": {"const": "Disk Image"},
+        "volume_uuid": {"type": "string", "minLength": 1},
+        "readonly": {"const": true},
+        "options": {
+          "type": "array", "minItems": 5, "uniqueItems": true, "items": {"type": "string", "minLength": 1},
+          "allOf": [
+            {"contains": {"const": "local"}}, {"contains": {"const": "nodev"}},
+            {"contains": {"const": "nosuid"}}, {"contains": {"const": "read-only"}},
+            {"contains": {"const": "nobrowse"}}
+          ]
+        },
+        "disk_info_timing": {"$ref": "#/$defs/guardianCommandTiming"},
+        "attach_timing": {"$ref": "#/$defs/guardianCommandTiming"}
+      }
+    },
+    "detachReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "mountpoint", "absent", "detach_timing"],
+      "properties": {
+        "device": {"type": "string", "pattern": "^/dev/disk[0-9]+(?:s[0-9]+)?$"},
+        "mountpoint": {"type": "string", "minLength": 1},
+        "absent": {"const": true},
+        "detach_timing": {"$ref": "#/$defs/guardianCommandTiming"}
+      }
+    },
+    "providerCapsuleGuardianState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "state", "provider", "source_bytes", "requested_image_bytes", "maximum_image_bytes", "root", "mountpoint_backing", "image", "attachment", "create_timing", "rw_detach"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "state": {"const": "RO_ATTACHED"},
+        "provider": {"enum": ["claude", "codex"]},
+        "source_bytes": {"type": "integer", "minimum": 1},
+        "requested_image_bytes": {"type": "integer", "minimum": 1},
+        "maximum_image_bytes": {"type": "integer", "minimum": 1},
+        "root": {"type": "string", "minLength": 1},
+        "mountpoint_backing": {"$ref": "#/$defs/identity"},
+        "image": {"$ref": "#/$defs/externalFile"},
+        "attachment": {"$ref": "#/$defs/mountAttachment"},
+        "create_timing": {"$ref": "#/$defs/guardianCommandTiming"},
+        "rw_detach": {"$ref": "#/$defs/detachReceipt"}
+      }
+    },
+    "providerCapsuleGuardian": {
+      "type": "object", "additionalProperties": false,
+      "required": ["create_sequence", "seal_sequence", "create_digest", "sealed_digest", "capsule"],
+      "properties": {
+        "create_sequence": {"const": 1},
+        "seal_sequence": {"const": 2},
+        "create_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sealed_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "capsule": {"$ref": "#/$defs/providerCapsuleGuardianState"}
+      }
+    },
+    "providerCapsule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "provider", "source", "macho", "xattrs", "copy", "mounted", "signing", "copy_timing", "guardian"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "provider": {"enum": ["claude", "codex"]},
+        "source": {"$ref": "#/$defs/providerExecutable"},
+        "macho": {"$ref": "#/$defs/macho"},
+        "xattrs": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/xattr"}},
+        "copy": {"$ref": "#/$defs/externalFile"},
+        "mounted": {"$ref": "#/$defs/providerExecutable"},
+        "signing": {"$ref": "#/$defs/codesignSet"},
+        "copy_timing": {"$ref": "#/$defs/copyTiming"},
+        "guardian": {"$ref": "#/$defs/providerCapsuleGuardian"}
+      }
+    },
     "testBarrier": {
       "oneOf": [
         {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"const": false}}},
         {"type": "object", "additionalProperties": false, "required": ["enabled", "root", "token", "phase", "invocation"],
          "properties": {"enabled": {"const": true}, "root": {"type": "string", "minLength": 1},
            "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit", "provider_stream", "provider_preexec"]},
+           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit", "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"]},
            "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"}}}
       ]
     },
