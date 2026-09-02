@@ -80,6 +80,14 @@ SEAL_PUBLISH_FIELDS = COMMON_FIELDS | {
     "sha", "generation", "seal_path", "seal_sha256", "seal_bytes",
     "projection_sha256", "prefix_sha256", "prefix_bytes", "prefix_records", "artifacts",
 }
+EVIDENCE_CURRENT_FIELDS = COMMON_FIELDS | {
+    "sha", "generation", "path", "sha256", "bytes", "stage", "role",
+    "role_start_event_id",
+}
+EVIDENCE_LEGACY_FIELDS = COMMON_FIELDS | {
+    "sha", "generation", "path", "sha256", "bytes",
+}
+MAX_EVIDENCE_ARTIFACT = 64 * 1024 * 1024
 # OBSERVATION SHAPES — the closed key sets this writer admits from an out-of-band observer (the
 # PreToolUse hooks). Each is matched EXACTLY: an extra key or a missing one is not a lenient
 # near-miss, it is a record from the `else` branch of classify_record, which then demands run_id and
@@ -437,13 +445,53 @@ def validate_seal_publish_record(record, ledger_run_id):
             raise LedgerError("invalid evidence seal artifact identity")
 
 
-def classify_record(record, ledger_run_id):
+def validate_evidence_record(record, ledger_run_id, context):
+    mode = context.get("mode") if isinstance(context, dict) else "invalid"
+    expected = EVIDENCE_LEGACY_FIELDS if mode == "legacy" else EVIDENCE_CURRENT_FIELDS
+    if not exact_keys(record, expected) or record.get("event") != "evidence_produced":
+        raise LedgerError("invalid evidence publication fields")
+    validate_common_record(record, ledger_run_id)
+    if not re.fullmatch(r"[0-9a-f]{40}", str(record.get("sha", ""))):
+        raise LedgerError("invalid evidence candidate")
+    if not re.fullmatch(r"[1-9][0-9]*", str(record.get("generation", ""))):
+        raise LedgerError("invalid evidence generation")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
+        raise LedgerError("invalid evidence digest")
+    if not re.fullmatch(r"0|[1-9][0-9]*", str(record.get("bytes", ""))):
+        raise LedgerError("invalid evidence byte count")
+    try:
+        validate_relative_path(record.get("path"))
+    except ValidationError as exc:
+        raise LedgerError("invalid evidence path") from exc
+    if mode == "legacy":
+        return
+    if mode != "current" or context.get("candidate_sha") is None:
+        raise LedgerError("current evidence identity unavailable")
+    if (record["sha"] != context["candidate_sha"]
+            or record["generation"] != context["generation"]):
+        raise LedgerError("stale evidence target")
+    stage = record["stage"]
+    role = record["role"]
+    if (not printable(stage, 256)
+            or any(not SAFE_STAGE_PART.fullmatch(part) for part in stage.split("/"))):
+        raise LedgerError("invalid evidence stage")
+    if not isinstance(role, str) or not SAFE_ROLE.fullmatch(role):
+        raise LedgerError("invalid evidence role")
+    if (not isinstance(record["role_start_event_id"], str)
+            or not SAFE_EVENT_ID.fullmatch(record["role_start_event_id"])):
+        raise LedgerError("invalid evidence role start")
+
+
+def classify_record(record, ledger_run_id, evidence_context=None):
     if not isinstance(record, dict):
         raise LedgerError("ledger line is not an object")
     families = []
     if record.get("event") == "evidence_seal_published":
         validate_seal_publish_record(record, ledger_run_id)
         families.append("evidence_seal_published")
+    elif record.get("event") == "evidence_produced":
+        validate_evidence_record(record, ledger_run_id, evidence_context)
+        families.append("evidence_produced")
     elif NATIVE_ONLY_FIELDS & set(record):
         validate_native_record(record, ledger_run_id)
         families.append("native_role_start")
@@ -503,10 +551,13 @@ def classify_ledger_file(argv):
     if not raw or len(raw) > MAX_LEDGER_LINE * 4 or not raw.endswith(b"\n") or b"\n\n" in raw:
         raise SystemExit(1)
     seen = set()
+    bound = None
     try:
+        bound = bind_run(path.parents[3], path.parent)
+        context = evidence_context_for_run(bound)
         for line in raw.splitlines():
             record = parse_json_unique(line.decode("utf-8", "strict"))
-            family = classify_record(record, argv[1])
+            family = classify_record(record, argv[1], context)
             if family not in ("shell_observation", "merge_observation", "merge_permit_observation"):
                 event_id = record["event_id"]
                 if event_id in seen:
@@ -515,6 +566,9 @@ def classify_ledger_file(argv):
     except (UnicodeError, ValueError, json.JSONDecodeError, KeyError, LedgerError, ValidationError) as exc:
         print(f"classifier: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)
+    finally:
+        if bound is not None:
+            bound.close()
     print(f"valid:{len(raw)}:{hashlib.sha256(raw).hexdigest()}")
     raise SystemExit(0)
 
@@ -754,6 +808,241 @@ def validate_relative_path(value, prefix=None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part):
             raise ValidationError("unsafe relative path component")
     return parts
+
+
+def relative_exists(run, relative):
+    parts = validate_relative_path(relative)
+    opened = []
+    current = run.run_fd
+    try:
+        run.prove()
+        for part in parts[:-1]:
+            try:
+                current = os.open(part, directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                return False
+            opened.append(current)
+        try:
+            os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    except OSError as exc:
+        raise ValidationError("unsafe evidence state path") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def open_stable_relative(run, relative, maximum, modes, label):
+    parts = validate_relative_path(relative)
+    chain = []
+    fd = None
+    try:
+        run.prove()
+        current = os.dup(run.run_fd)
+        chain.append((current, object_identity(os.fstat(current))))
+        for part in parts[:-1]:
+            current = os.open(part, directory_flags(), dir_fd=current)
+            st = os.fstat(current)
+            if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+                    or stat.S_IMODE(st.st_mode) & 0o022):
+                raise ValidationError(f"unsafe {label} directory")
+            chain.append((current, object_identity(st)))
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=current)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) not in modes
+                or before.st_size > maximum):
+            raise ValidationError(f"unsafe {label}")
+        identity = stat_identity(before)
+        chunks = []
+        total = 0
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise ValidationError(f"oversized {label}")
+            chunks.append(chunk)
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if stat_identity(after) != identity or total != identity[5]:
+            raise ValidationError(f"drifting {label}")
+        value = {
+            "fd": fd, "identity": identity, "chain": tuple(chain), "raw": b"".join(chunks),
+            "bytes": total, "sha256": digest.hexdigest(), "path": relative, "label": label,
+        }
+        fd = None
+        chain = []
+        return value
+    except (OSError, ValidationError) as exc:
+        raise ValidationError(f"cannot read {label}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        for item, _ in reversed(chain):
+            os.close(item)
+
+
+def close_stable_relative(value):
+    if not value:
+        return
+    try:
+        os.close(value["fd"])
+    except OSError:
+        pass
+    for fd, _ in reversed(value["chain"]):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def prove_stable_relative(run, value):
+    parts = validate_relative_path(value["path"])
+    opened = []
+    try:
+        run.prove()
+        for fd, expected in value["chain"]:
+            if object_identity(os.fstat(fd)) != expected:
+                raise ValidationError(f"{value['label']} directory drift")
+        current = run.run_fd
+        for index, part in enumerate(parts[:-1], 1):
+            current = os.open(part, directory_flags(), dir_fd=current)
+            opened.append(current)
+            if object_identity(os.fstat(current)) != value["chain"][index][1]:
+                raise ValidationError(f"{value['label']} path drift")
+        live = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=current)
+        try:
+            if stat_identity(os.fstat(live)) != value["identity"]:
+                raise ValidationError(f"{value['label']} identity drift")
+        finally:
+            os.close(live)
+        count, digest = descriptor_digest(value["fd"], "append")
+        if count != value["bytes"] or digest.hexdigest() != value["sha256"]:
+            raise ValidationError(f"{value['label']} bytes drift")
+    except OSError as exc:
+        raise ValidationError(f"{value['label']} path changed") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def parse_stable_json(value, label):
+    try:
+        parsed = parse_json_unique(value["raw"].decode("utf-8", "strict"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"malformed {label}") from exc
+    return parsed
+
+
+def evidence_context_for_run(run):
+    current_metadata = None
+    candidate = None
+    try:
+        metadata_present = relative_exists(run, "run-metadata.json")
+        candidate_present = relative_exists(run, "09-test-evidence/qa-candidate.json")
+        final_present = relative_exists(run, "09-test-evidence/final-evidence")
+    except ValidationError:
+        return {"mode": "invalid", "candidate_sha": None, "generation": None}
+    if metadata_present:
+        value = None
+        try:
+            value = open_stable_relative(
+                run, "run-metadata.json", MAX_JSON_OPERAND, {0o600, 0o644}, "run metadata"
+            )
+            current_metadata = parse_stable_json(value, "run metadata")
+            required = {
+                "schema_version", "run_id", "track", "primary_provider", "repository_root",
+                "git_common_dir", "accepted_base_sha", "historical", "approval_eligible",
+            }
+            if (not exact_keys(current_metadata, required)
+                    or current_metadata.get("schema_version") != 2
+                    or current_metadata.get("run_id") != run.name
+                    or current_metadata.get("track") not in ("fast_path", "full_track")
+                    or current_metadata.get("primary_provider") not in ("claude", "codex")
+                    or current_metadata.get("historical") is not False
+                    or not isinstance(current_metadata.get("approval_eligible"), bool)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{40}", str(current_metadata.get("accepted_base_sha", ""))
+                    )
+                    or os.path.realpath(str(current_metadata.get("repository_root", "")))
+                    != os.path.realpath(run.repo)):
+                current_metadata = None
+        except ValidationError:
+            current_metadata = None
+        finally:
+            close_stable_relative(value)
+    if candidate_present:
+        value = None
+        try:
+            value = open_stable_relative(
+                run, "09-test-evidence/qa-candidate.json", MAX_JSON_OPERAND,
+                {0o400, 0o600, 0o644}, "candidate metadata",
+            )
+            candidate = parse_stable_json(value, "candidate metadata")
+            generation = candidate.get("generation") if isinstance(candidate, dict) else None
+            if (not isinstance(candidate, dict) or candidate.get("run_id") != run.name
+                    or not re.fullmatch(r"[0-9a-f]{40}", str(candidate.get("candidate_sha", "")))
+                    or isinstance(generation, bool) or not isinstance(generation, int)
+                    or generation < 1 or current_metadata is None
+                    or candidate.get("base_sha") != current_metadata.get("accepted_base_sha")
+                    or candidate.get("source_ref_sha") != candidate.get("candidate_sha")
+                    or os.path.realpath(str(candidate.get("repository_root", "")))
+                    != os.path.realpath(run.repo)
+                    or os.path.realpath(str(candidate.get("git_common_dir", "")))
+                    != os.path.realpath(str(current_metadata.get("git_common_dir", "")))):
+                candidate = None
+        except ValidationError:
+            candidate = None
+        finally:
+            close_stable_relative(value)
+
+    ledger_value = None
+    first = None
+    seal_signal = False
+    ledger_valid = True
+    try:
+        ledger_value = open_stable_relative(
+            run, "run.jsonl", MAX_LEDGER_LINE * 4, {0o600}, "ledger"
+        )
+        raw = ledger_value["raw"]
+        if not raw or not raw.endswith(b"\n"):
+            ledger_valid = False
+        else:
+            rows = []
+            for line in raw.splitlines():
+                row = parse_json_unique(line.decode("utf-8", "strict"))
+                if not isinstance(row, dict):
+                    raise ValueError("non-object ledger row")
+                rows.append(row)
+            first = rows[0] if rows else None
+            seal_signal = any(
+                row.get("event") in ("evidence_seal_required", "evidence_seal_published")
+                or "evidence_seal_protocol" in row for row in rows
+            )
+    except (ValidationError, UnicodeError, ValueError, json.JSONDecodeError):
+        ledger_valid = False
+    finally:
+        close_stable_relative(ledger_value)
+
+    if metadata_present or candidate_present or final_present or seal_signal:
+        if current_metadata is None:
+            return {"mode": "invalid", "candidate_sha": None, "generation": None}
+        if candidate is None:
+            return {"mode": "current", "candidate_sha": None, "generation": None}
+        return {
+            "mode": "current", "candidate_sha": candidate["candidate_sha"],
+            "generation": str(candidate["generation"]),
+        }
+    if (ledger_valid and isinstance(first, dict) and first.get("event") == "run_started"
+            and first.get("run_id") == run.name and "primary_provider" not in first
+            and "evidence_seal_protocol" not in first):
+        return {"mode": "legacy", "candidate_sha": None, "generation": None}
+    return {"mode": "invalid", "candidate_sha": None, "generation": None}
 
 
 def open_contract(run, relative, failpoint):
@@ -1946,16 +2235,18 @@ def ledger_records(fd, copy_fd=None):
         raise LedgerError("incomplete ledger line")
 
 
-def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=()):
+def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=(), evidence_context=None):
     event_ids = set()
     activation_ids = set()
     wanted = set(wanted_event_ids)
     matches = {}
     count = 0
     for record in ledger_records(fd, copy_fd):
-        family = classify_record(record, ledger_run_id)
+        family = classify_record(record, ledger_run_id, evidence_context)
         count += 1
-        if family not in ("ordinary", "native_role_start", "evidence_seal_published"):
+        if family not in (
+            "ordinary", "native_role_start", "evidence_produced", "evidence_seal_published"
+        ):
             continue
         event_id = record["event_id"]
         if event_id in event_ids:
@@ -1976,6 +2267,86 @@ def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=()):
     }
 
 
+def validate_evidence_role_window(run, record, context):
+    fd, _ = open_ledger(run)
+    if fd is None:
+        raise LedgerError("missing evidence role ledger")
+    try:
+        scan_ledger(fd, run.name, evidence_context=context)
+        os.lseek(fd, 0, os.SEEK_SET)
+        records = list(ledger_records(fd))
+    finally:
+        os.close(fd)
+    start_id = record["role_start_event_id"]
+    starts = [item for item in records if item.get("event_id") == start_id]
+    if len(starts) != 1:
+        raise LedgerError("evidence role start is not unique")
+    start = starts[0]
+    if (classify_record(start, run.name, context) != "native_role_start"
+            or start.get("stage") != record["stage"] or start.get("role") != record["role"]):
+        raise LedgerError("evidence role start mismatch")
+    completions = [
+        item for item in records
+        if item.get("role_start_event_id") == start_id
+        and str(item.get("event", "")).endswith("_completed")
+    ]
+    if completions:
+        raise LedgerError("evidence role window is closed")
+    duplicates = [
+        item for item in records
+        if item.get("event") == "evidence_produced" and item.get("path") == record["path"]
+        and item.get("sha") == record["sha"] and item.get("generation") == record["generation"]
+    ]
+    if duplicates:
+        raise LedgerError("duplicate evidence artifact publication")
+    try:
+        if parse_ts(record["ts"]) < parse_ts(start["ts"]):
+            raise LedgerError("evidence timestamp precedes role start")
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("invalid evidence role timestamp") from exc
+
+
+def prepare_evidence_publication(run, record, context):
+    validate_evidence_record(record, run.name, context)
+    identity_values = []
+    artifact = None
+    try:
+        if context["mode"] == "current":
+            identity_values.append(open_stable_relative(
+                run, "run-metadata.json", MAX_JSON_OPERAND, {0o600, 0o644}, "run metadata"
+            ))
+            identity_values.append(open_stable_relative(
+                run, "09-test-evidence/qa-candidate.json", MAX_JSON_OPERAND,
+                {0o400, 0o600, 0o644}, "candidate metadata",
+            ))
+        artifact = open_stable_relative(
+            run, record["path"], MAX_EVIDENCE_ARTIFACT,
+            {0o400, 0o600, 0o644}, "evidence artifact",
+        )
+        if (artifact["bytes"] != int(record["bytes"])
+                or artifact["sha256"] != record["sha256"]):
+            raise ValidationError("evidence artifact identity mismatch")
+
+        def check():
+            live = evidence_context_for_run(run)
+            if live != context:
+                raise ValidationError("evidence target state changed")
+            validate_evidence_record(record, run.name, live)
+            for value in identity_values:
+                prove_stable_relative(run, value)
+            prove_stable_relative(run, artifact)
+            if live["mode"] == "current":
+                validate_evidence_role_window(run, record, live)
+
+        check()
+        return artifact, identity_values, check
+    except (ValidationError, LedgerError, CommitError):
+        close_stable_relative(artifact)
+        for value in identity_values:
+            close_stable_relative(value)
+        raise
+
+
 def validate_authorities(items, start_time):
     projections = []
     descriptors = []
@@ -1984,7 +2355,10 @@ def validate_authorities(items, start_time):
         if fd is None:
             role_fail(11, "AUTHORITY_INVALID", source_id)
         try:
-            scan = scan_ledger(fd, source_id, wanted_event_ids=(event_id,))
+            scan = scan_ledger(
+                fd, source_id, wanted_event_ids=(event_id,),
+                evidence_context=evidence_context_for_run(source_run),
+            )
         except DuplicateEvent as exc:
             os.close(fd)
             if str(exc) == event_id:
@@ -2144,7 +2518,10 @@ def atomic_commit(
             old_length, old_digest = descriptor_digest(old_fd, "append")
         scan = {"event_ids": set(), "activation_ids": set()}
         if old_fd is not None:
-            scan = scan_ledger(old_fd, run.name, copy_fd=temp_fd)
+            scan = scan_ledger(
+                old_fd, run.name, copy_fd=temp_fd,
+                evidence_context=evidence_context_for_run(run),
+            )
         if event_id in scan["event_ids"]:
             raise DuplicateEvent("duplicate event id")
         if role_key is not None and (run.name, role_key[0], role_key[1]) in scan["activation_ids"]:
@@ -2247,7 +2624,10 @@ def atomic_commit(
             raise CommitError("proof")
         try:
             prove_exact_append(proof_fd, old_length, old_digest, payload)
-            proven_scan = scan_ledger(proof_fd, run.name, wanted_event_ids=(event_id,))
+            proven_scan = scan_ledger(
+                proof_fd, run.name, wanted_event_ids=(event_id,),
+                evidence_context=evidence_context_for_run(run),
+            )
             ledger_barrier(run, "after_result_scan")
             prove_live_ledger_identity(run, proof_fd, proof_identity)
             prove_exact_append(proof_fd, old_length, old_digest, payload)
@@ -2353,11 +2733,26 @@ def ordinary_main(argv):
             ordinary_fail(strict, f"unsafe field value: {key}")
         record[key] = value
     record["run_id"] = run.name
+    evidence_artifact = None
+    evidence_identity_values = []
+    evidence_check = None
+    if event == "evidence_produced":
+        try:
+            context = evidence_context_for_run(run)
+            evidence_artifact, evidence_identity_values, evidence_check = prepare_evidence_publication(
+                run, record, context
+            )
+        except (ValidationError, LedgerError, CommitError):
+            run.close()
+            ordinary_fail(strict, "invalid evidence publication")
     held = []
     try:
         held = acquire_locks(run, [])
         ledger_barrier(run, "after_lock")
-        atomic_commit(run, record, event_id, lock_check=lambda: prove_locks(held))
+        atomic_commit(
+            run, record, event_id, lock_check=lambda: prove_locks(held),
+            precommit_check=evidence_check,
+        )
         result = event_id if print_event_id else None
         ledger_barrier(run, "after_result_construction")
     except DuplicateEvent:
@@ -2367,6 +2762,9 @@ def ordinary_main(argv):
     finally:
         for _, fd, _ in reversed(held):
             os.close(fd)
+        close_stable_relative(evidence_artifact)
+        for value in evidence_identity_values:
+            close_stable_relative(value)
         run.close()
     if result is not None:
         print(result)
@@ -2439,7 +2837,7 @@ def seal_publish_main(argv):
             role_fail(14, "LEDGER_INVALID_OR_LOCK_FAILED", run.name)
         try:
             length, digest = descriptor_digest(fd, "append")
-            scan = scan_ledger(fd, run.name)
+            scan = scan_ledger(fd, run.name, evidence_context=evidence_context_for_run(run))
         finally:
             os.close(fd)
         if (str(length) != record["prefix_bytes"] or digest.hexdigest() != record["prefix_sha256"]

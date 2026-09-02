@@ -19,19 +19,31 @@ PY
 ( cd "$repo" && "$QAC" >/dev/null )
 printf 'proof\n' > "$run/09-test-evidence/proof.log"
 printf 'round\n' > "$run/09-test-evidence/round.log"
+mkdir -p "$run/role-contracts"
+printf '%s\n' '# final QA fixture evidence producer' > "$run/role-contracts/Q-01-qa-tester.md"
+chmod 644 "$run/role-contracts/Q-01-qa-tester.md"
+run_event="$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["event_id"])' "$run/run.jsonl")"
+run_sha="$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["base_sha"])' "$run/run.jsonl")"
+authority="$(t_python -c 'import json,sys; rid=sys.argv[1]; print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":sys.argv[2],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":sys.argv[3]}}}],separators=(",",":")))' "$run_id" "$run_event" "$run_sha")"
+activation="$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)"
+producer_start="$("$BIN/firm-ledger-log" --run "$run" --strict --role-start \
+  --stage test/Q-01 --role qa-tester --contract role-contracts/Q-01-qa-tester.md \
+  --event qa_started --authority-json "$authority" --agent /root/final_qa_fixture \
+  --activation-json "$activation" | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')"
 ledger_baseline="$(mktemp "${TMPDIR:-/tmp}/firm-final-qa-ledger.XXXXXX")"; t_track "$ledger_baseline"
 cp "$run/run.jsonl" "$ledger_baseline"
 
 reset_case() { # primary provider
   cp "$ledger_baseline" "$run/run.jsonl"
   chmod 600 "$run/run.jsonl"
-  t_python - "$run" "$1" <<'PY'
+  t_python - "$run" "$1" "$producer_start" <<'PY'
 import hashlib,json,os,secrets,shutil,sys,yaml
-run,primary=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+run,primary,producer_start=sys.argv[1:]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 def event_ref(path,event="evidence_produced"):
  raw=open(run+"/"+path,"rb").read(); eid="evt-fixture-"+secrets.token_hex(8)
  item={"ts":"2026-08-10T00:00:00Z","event":event,"event_id":eid,"run_id":os.path.basename(run),
-       "sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+       "sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
+       "stage":"test/Q-01","role":"qa-tester","role_start_event_id":producer_start}
  with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(item,separators=(",",":"))+"\n")
  return {"path":path,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":event}}
 secondary="gpt" if primary=="claude" else "claude"
@@ -94,14 +106,14 @@ PY
 }
 
 set_disposition() { # kind low|high blocked-attempt fresh-attempt-or-empty
-  t_python - "$run" "$1" "$2" "$3" "${4:-}" <<'PY'
+  t_python - "$run" "$1" "$2" "$3" "${4:-}" "$producer_start" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
-run,kind,risk,blocked_id,fresh_id=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
+run,kind,risk,blocked_id,fresh_id,producer_start=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
 def ref(path,event_id=None,event="evidence_produced",provider=None,attempt_id=None):
  raw=open(run+"/"+path,"rb").read()
  if event_id is None:
   event_id="evt-evidence-"+secrets.token_hex(8)
-  record={"ts":"2026-08-10T00:00:00Z","event":event,"event_id":event_id,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+  record={"ts":"2026-08-10T00:00:00Z","event":event,"event_id":event_id,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),"stage":"test/Q-01","role":"qa-tester","role_start_event_id":producer_start}
   with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(record,separators=(",",":"))+"\n")
  producer={"event_id":event_id,"event":event}
  if provider: producer.update({"provider":provider,"generation":gen,"attempt_id":attempt_id})
@@ -123,12 +135,12 @@ PY
 }
 
 set_mixed_human_dispositions() {
-  t_python - "$run" <<'PY'
+  t_python - "$run" "$producer_start" <<'PY'
 import hashlib,json,os,secrets,sys,yaml
-run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
+run,producer_start=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p)); sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
 def ref(path):
  raw=open(run+"/"+path,"rb").read(); eid="evt-mixed-"+secrets.token_hex(8)
- event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw))}
+ event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":path,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),"stage":"test/Q-01","role":"qa-tester","role_start_event_id":producer_start}
  with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
  return {"path":path,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":"evidence_produced"}}
 common={"primary_position":"positive evidence-based contrary reading","positive_dissent":True,

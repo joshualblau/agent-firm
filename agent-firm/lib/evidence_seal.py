@@ -35,6 +35,10 @@ HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 EVENT_ID = re.compile(r"evt-[A-Za-z0-9._:-]{1,128}\Z")
 SAFE_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ALLOWED_FILE_MODES = {0o400, 0o600, 0o644}
+CURRENT_PRODUCER_FIELDS = {
+    "ts", "event", "event_id", "run_id", "sha", "generation", "path", "sha256",
+    "bytes", "stage", "role", "role_start_event_id",
+}
 SCHEMAS = Path(__file__).resolve().parent.parent / "schemas"
 RFC3339_UTC = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
@@ -512,7 +516,23 @@ def _scan(raw, relative, privacy):
 
 
 def _producer(records, path, raw, sha, generation, required):
-    matches = [item for item in records if item.get("event") == "evidence_produced" and item.get("path") == path]
+    publications = [item for item in records if item.get("event") == "evidence_produced"]
+    for item in publications:
+        try:
+            _safe_relative(item.get("path"))
+        except (SealError, UnicodeError, AttributeError) as exc:
+            raise SealError("PRODUCER_SHAPE", "non-canonical evidence path") from exc
+        if (set(item) != CURRENT_PRODUCER_FIELDS
+                or EVENT_ID.fullmatch(str(item.get("event_id", ""))) is None
+                or EVENT_ID.fullmatch(str(item.get("role_start_event_id", ""))) is None
+                or HEX40.fullmatch(str(item.get("sha", ""))) is None
+                or HEX64.fullmatch(str(item.get("sha256", ""))) is None
+                or re.fullmatch(r"[1-9][0-9]*", str(item.get("generation", ""))) is None
+                or re.fullmatch(r"0|[1-9][0-9]*", str(item.get("bytes", ""))) is None
+                or not isinstance(item.get("stage"), str) or not item["stage"]
+                or not isinstance(item.get("role"), str) or not item["role"]):
+            raise SealError("PRODUCER_SHAPE", str(item.get("path", "evidence"))[:160])
+    matches = [item for item in publications if item["path"] == path]
     if not matches:
         if required:
             raise SealError("PRODUCER_MISSING", path)
@@ -521,7 +541,7 @@ def _producer(records, path, raw, sha, generation, required):
         raise SealError("PRODUCER_DUPLICATE", path)
     event = matches[0]
     if (event.get("sha256") != sha256(raw) or str(event.get("bytes")) != str(len(raw)) or
-            event.get("sha", event.get("candidate_sha")) != sha or str(event.get("generation")) != str(generation)):
+            event.get("sha") != sha or str(event.get("generation")) != str(generation)):
         raise SealError("PRODUCER_STALE", path)
     start_id = event.get("role_start_event_id")
     if not isinstance(start_id, str) or EVENT_ID.fullmatch(start_id) is None:
