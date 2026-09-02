@@ -9,7 +9,7 @@ tiers:
     role: "The ceiling — slowest and quota-heaviest."
     used_for: "Escalate TO it only for the hardest/novel design work, or a genuinely hard specialist."
     never: "Not the Lead. Keep the security_privacy review lens OFF Fable — its safety classifiers can refuse security-adjacent work."
-    claude: {model: fable, display: "Fable 5", effort: max}
+    claude: {model: fable, display: "Fable 5.1", effort: max}
     codex: {model: gpt-5.6-sol, display: "GPT-5.6 sol", effort: ultra}
 
   heavyweight:
