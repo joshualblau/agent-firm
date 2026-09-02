@@ -767,6 +767,12 @@ fi
 rm -f "$g_marker"
 
 t_case "clean exact candidate gets one-use execution and P2-consumption receipts"
+clean_native_provider="$provider_root/clean-native-provider"
+assert_ok "clean capsule fixture compiles to the managed runtime's native Mach-O architecture" \
+  /usr/bin/xcrun cc -arch "$native_arch" -Os -o "$clean_native_provider" "$native_source"
+chmod 700 "$clean_native_provider"
+assert_ok "clean capsule fixture receives an explicit ad-hoc signature without a private identity" \
+  /usr/bin/codesign --force --sign - "$clean_native_provider"
 if [ -n "$(git -C "$FIRM_ROOT" status --porcelain --untracked-files=all)" ]; then
   t_skip "live capsule dynamic" "candidate checkout is dirty; prepare correctly refuses an ambiguous candidate"
 else
@@ -780,7 +786,7 @@ else
   invocation="$(printf '%s\n' "$guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
   mkdir -p "$scratch/.eval-out"
   prepared="$($AUTH prepare --root "$FIRM_ROOT" --eval final-evidence-seal --provider codex \
-    --provider-executable "$provider_small" --guardian-root "$guardian_root" --guardian-pid "$guardian_pid" \
+    --provider-executable "$clean_native_provider" --guardian-root "$guardian_root" --guardian-pid "$guardian_pid" \
     --guardian-token "$guardian_token" --guardian-failure-marker "$guardian_marker" --invocation "$invocation" \
     --scratch "$scratch" --fixture "$FIRM_ROOT/agent-firm/evals/final-evidence-seal/fixture" \
     --manifest "$control/manifest.json" --shims "$control/shims" \
@@ -798,7 +804,7 @@ else
     "$(git -C "$project" rev-parse refs/firm-eval/candidate)"
   assert_ok "exact Seatbelt wrapper denies canonical and alias real-common reads/writes" \
     "$AUTH" seatbelt-probe --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation"
-  guardian_sequence=1
+  guardian_sequence=3
   "$AUTH" guardian-exec --control "$control" --token "$guardian_token" --invocation "$invocation" \
     --guardian-pid "$guardian_pid" --sequence "$guardian_sequence" --role broker -- \
     "$AUTH" serve --manifest "$control/manifest.json" --digest "$digest" --invocation "$invocation" \
@@ -869,11 +875,11 @@ else
     chmod 755 "$scratch"
     assert_rc "cleanup refuses ambiguous capsule mode" 2 "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
       --invocation "$invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
-      --sequence 2 --expected-roles broker
+      --sequence 4 --expected-roles broker
     chmod 700 "$scratch"
     assert_ok "guardian removes complete capsule" "$AUTH" cleanup --manifest "$control/manifest.json" --digest "$digest" \
       --invocation "$invocation" --control "$control" --token "$guardian_token" --guardian-pid "$guardian_pid" \
-      --sequence 2 --expected-roles broker
+      --sequence 4 --expected-roles broker
     assert_no_file "capsule leaves no reusable residue" "$guardian_root"
   else
     kill "$broker" 2>/dev/null || true; wait "$broker" 2>/dev/null || true
