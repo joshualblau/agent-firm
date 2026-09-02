@@ -43,6 +43,12 @@ SCHEMAS = Path(__file__).resolve().parent.parent / "schemas"
 RFC3339_UTC = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
 )
+OPERATOR_HOME_FIELDS = {
+    "run-metadata.json": frozenset(("repository_root", "git_common_dir")),
+    "09-test-evidence/qa-candidate.json": frozenset(
+        ("repository_root", "git_common_dir", "checkout_path")
+    ),
+}
 
 
 class SealError(Exception):
@@ -440,7 +446,7 @@ def _validate_command_result(value, expected_artifact, run):
 def _privacy_patterns(policy):
     if not isinstance(policy, dict) or set(policy) != {"schema_version", "version", "categories", "allow_rules"}:
         raise SealError("PRIVACY_POLICY", "policy shape is invalid")
-    if policy["schema_version"] != 1 or policy["version"] != 1 or not isinstance(policy["categories"], list):
+    if policy["schema_version"] != 1 or policy["version"] != 2 or not isinstance(policy["categories"], list):
         raise SealError("PRIVACY_POLICY", "policy version/categories are invalid")
     patterns = []
     for item in policy["categories"]:
@@ -455,16 +461,118 @@ def _privacy_patterns(policy):
             raise SealError("PRIVACY_POLICY", "category regex is invalid") from exc
     rules = []
     category_ids = {item[0] for item in patterns}
+    structured_rules = 0
+    base_fields = {"id", "pattern_id", "pattern", "surfaces"}
+    structured_fields = base_fields | {"selectors", "value_binding", "unescaped_json_string"}
     for item in policy["allow_rules"]:
-        if not isinstance(item, dict) or set(item) != {"id", "pattern_id", "pattern", "surfaces"}:
+        if not isinstance(item, dict) or set(item) not in (base_fields, structured_fields):
             raise SealError("PRIVACY_POLICY", "allow rule shape is invalid")
         if item["pattern_id"] not in category_ids or not isinstance(item["surfaces"], list) or not item["surfaces"]:
             raise SealError("PRIVACY_POLICY", "allow rule target/surfaces are invalid")
+        if len(item["surfaces"]) != len(set(item["surfaces"])):
+            raise SealError("PRIVACY_POLICY", "allow rule surfaces are duplicated")
         try:
-            rules.append((item["id"], item["pattern_id"], re.compile(item["pattern"]), tuple(item["surfaces"])))
+            rule = {
+                "id": item["id"], "pattern_id": item["pattern_id"],
+                "pattern": re.compile(item["pattern"]), "surfaces": tuple(item["surfaces"]),
+                "selectors": None,
+            }
         except (TypeError, re.error) as exc:
             raise SealError("PRIVACY_POLICY", "allow regex is invalid") from exc
+        if set(item) == structured_fields:
+            structured_rules += 1
+            selectors = item.get("selectors")
+            if (item.get("id") != "declared_operator_home_identity"
+                    or item.get("pattern_id") != "operator_home"
+                    or item.get("surfaces") != ["declared_metadata"]
+                    or item.get("value_binding") != "proven_canonical_identity"
+                    or item.get("unescaped_json_string") is not True
+                    or not isinstance(selectors, list)):
+                raise SealError("PRIVACY_POLICY", "operator-home rule boundary is invalid")
+            compiled_selectors = {}
+            for selector in selectors:
+                if (not isinstance(selector, dict) or set(selector) != {"path", "fields"}
+                        or not isinstance(selector.get("path"), str)
+                        or not isinstance(selector.get("fields"), list)
+                        or not selector["fields"]
+                        or len(selector["fields"]) != len(set(selector["fields"]))
+                        or selector["path"] in compiled_selectors):
+                    raise SealError("PRIVACY_POLICY", "operator-home selectors are invalid")
+                compiled_selectors[selector["path"]] = frozenset(selector["fields"])
+            if compiled_selectors != OPERATOR_HOME_FIELDS:
+                raise SealError("PRIVACY_POLICY", "operator-home selectors exceed the approved fields")
+            rule["selectors"] = frozenset(
+                (path, field) for path, fields in compiled_selectors.items() for field in fields
+            )
+        elif item["pattern_id"] == "operator_home":
+            raise SealError("PRIVACY_POLICY", "operator-home allowance requires exact selectors")
+        rules.append(rule)
+    if structured_rules != 1:
+        raise SealError("PRIVACY_POLICY", "exactly one operator-home rule is required")
     return patterns, rules
+
+
+def _top_level_json_string_fields(raw):
+    """Return exact raw spans for unique top-level JSON string fields, or no fields."""
+    try:
+        text = raw.decode("utf-8", "strict")
+        parsed = parse_json_unique(raw, "privacy metadata")
+        if not isinstance(parsed, dict):
+            return {}
+        decoder = json.JSONDecoder()
+        length = len(text)
+
+        def whitespace(offset):
+            while offset < length and text[offset] in " \t\r\n":
+                offset += 1
+            return offset
+
+        offset = whitespace(0)
+        if offset >= length or text[offset] != "{":
+            return {}
+        offset = whitespace(offset + 1)
+        fields = {}
+        if offset < length and text[offset] == "}":
+            return fields if whitespace(offset + 1) == length else {}
+        while offset < length:
+            key_start = offset
+            key, key_end = decoder.raw_decode(text, key_start)
+            if not isinstance(key, str) or text[key_start] != '"':
+                return {}
+            offset = whitespace(key_end)
+            if offset >= length or text[offset] != ":":
+                return {}
+            value_start = whitespace(offset + 1)
+            value, value_end = decoder.raw_decode(text, value_start)
+            if (isinstance(value, str) and text[value_start] == '"'
+                    and value_end > value_start and text[value_end - 1] == '"'):
+                fields[key] = {
+                    "value": value,
+                    "content_start": value_start + 1,
+                    "content_end": value_end - 1,
+                    "unescaped": "\\" not in text[value_start + 1:value_end - 1],
+                }
+            offset = whitespace(value_end)
+            if offset < length and text[offset] == ",":
+                offset = whitespace(offset + 1)
+                continue
+            if offset < length and text[offset] == "}":
+                return fields if whitespace(offset + 1) == length else {}
+            return {}
+    except (SealError, UnicodeError, ValueError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def _canonical_operator_home(value):
+    prefix = "/" + "Users" + "/"
+    suffix = value[len(prefix):] if isinstance(value, str) and value.startswith(prefix) else ""
+    operator, separator, remainder = suffix.partition("/")
+    return bool(
+        separator and remainder and re.fullmatch(r"[A-Za-z0-9._-]+", operator)
+        and os.path.isabs(value) and os.path.normpath(value) == value
+        and os.path.realpath(value) == value
+    )
 
 
 def _surface_class(relative):
@@ -489,23 +597,58 @@ def _surface_class(relative):
     return "run_artifact"
 
 
-def _scan(raw, relative, privacy):
+def _scan(raw, relative, privacy, identity_bindings=None):
     patterns, rules = privacy
     text = raw.decode("utf-8", "replace")
     matches = []
     allowances = []
     surface = _surface_class(relative)
+    identity_bindings = identity_bindings or {}
+    string_fields = None
     for pattern_id, pattern, surfaces in patterns:
         # Deny categories apply to every final-byte surface. The declared surface set is
         # policy inventory; only an exact allow rule may narrow a match on a named surface.
         for match in pattern.finditer(text):
             token = match.group(0).encode("utf-8", "replace")
-            allowed = next((rule_id for rule_id, target_id, allow_pattern, allow_surfaces in rules
-                            if target_id == pattern_id and surface in allow_surfaces
-                            and allow_pattern.fullmatch(match.group(0))), None)
+            allowed = None
+            for rule in rules:
+                if (rule["pattern_id"] != pattern_id or surface not in rule["surfaces"]
+                        or rule["pattern"].fullmatch(match.group(0)) is None):
+                    continue
+                if rule["selectors"] is None:
+                    allowed = {
+                        "rule_id": rule["id"],
+                        "offset": len(text[:match.start()].encode("utf-8")),
+                        "token_sha256": sha256(token),
+                    }
+                    break
+                if string_fields is None:
+                    string_fields = _top_level_json_string_fields(raw)
+                for field, descriptor in string_fields.items():
+                    if ((relative, field) not in rule["selectors"]
+                            or descriptor["unescaped"] is not True
+                            or not (descriptor["content_start"] <= match.start()
+                                    and match.end() <= descriptor["content_end"])):
+                        continue
+                    value = descriptor["value"]
+                    expected = identity_bindings.get((relative, field))
+                    if (not isinstance(expected, str) or value != expected
+                            or not _canonical_operator_home(value)):
+                        continue
+                    allowed = {
+                        "rule_id": rule["id"],
+                        "offset": len(text[:match.start()].encode("utf-8")),
+                        "token_sha256": sha256(token),
+                        "artifact_path": relative,
+                        "surface_class": surface,
+                        "json_field": field,
+                        "value_sha256": sha256(value.encode("utf-8")),
+                    }
+                    break
+                if allowed is not None:
+                    break
             if allowed is not None:
-                allowances.append({"rule_id": allowed, "offset": len(text[:match.start()].encode("utf-8")),
-                                   "token_sha256": sha256(token)})
+                allowances.append(allowed)
                 continue
             matches.append({"pattern_id": pattern_id, "offset": len(text[:match.start()].encode("utf-8")),
                             "token_sha256": sha256(token)})
@@ -575,7 +718,7 @@ def _producer(records, path, raw, sha, generation, required):
 
 
 def _identity(run):
-    run = Path(os.path.abspath(run))
+    run = Path(os.path.realpath(os.path.abspath(run)))
     if not SAFE_RUN.fullmatch(run.name) or run.parent.name != "runs" or run.parent.parent.name != ".agent-firm":
         raise SealError("RUN_INVALID", "run is not <repo>/.agent-firm/runs/<safe-id>")
     repo = run.parent.parent.parent
@@ -584,9 +727,17 @@ def _identity(run):
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise SealError("RUN_INVALID", str(component))
     top = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-                                  stderr=subprocess.DEVNULL, text=True).strip()
-    if os.path.realpath(top) != os.path.realpath(repo):
+                                  stderr=subprocess.DEVNULL, text=True, timeout=10).strip()
+    canonical_repo = os.path.realpath(repo)
+    if top != canonical_repo:
         raise SealError("RUN_IDENTITY", "repository root mismatch")
+    common = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+        stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).strip()
+    if not os.path.isabs(common):
+        common = os.path.join(str(repo), common)
+    canonical_common = os.path.realpath(common)
     metadata_raw, _, _ = _safe_read(run, "run-metadata.json")
     candidate_raw, _, _ = _safe_read(run, "09-test-evidence/qa-candidate.json")
     metadata = parse_json_unique(metadata_raw, "run metadata")
@@ -597,13 +748,77 @@ def _identity(run):
             not isinstance(sha, str) or not HEX40.fullmatch(sha) or
             isinstance(generation, bool) or not isinstance(generation, int) or generation < 1 or
             candidate.get("base_sha") != metadata.get("accepted_base_sha") or
-            os.path.realpath(str(metadata.get("repository_root", ""))) != os.path.realpath(repo) or
-            os.path.realpath(str(candidate.get("repository_root", ""))) != os.path.realpath(repo)):
+            metadata.get("repository_root") != canonical_repo or
+            candidate.get("repository_root") != canonical_repo or
+            metadata.get("git_common_dir") != canonical_common or
+            candidate.get("git_common_dir") != canonical_common):
         raise SealError("RUN_IDENTITY", "metadata/candidate identity mismatch")
+    checkout = candidate.get("checkout_path")
+    expected_checkout = os.path.join(canonical_repo, ".agent-firm", "qa-checkout", run.name)
+    if checkout != expected_checkout or os.path.realpath(str(checkout)) != expected_checkout:
+        raise SealError("RUN_IDENTITY", "QA checkout identity is noncanonical")
+    for component in (repo / ".agent-firm" / "qa-checkout", Path(expected_checkout)):
+        try:
+            info = os.lstat(component)
+        except OSError as exc:
+            raise SealError("RUN_IDENTITY", "QA checkout identity is missing") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise SealError("RUN_IDENTITY", "QA checkout identity is unsafe")
+    checkout_top = subprocess.check_output(
+        ["git", "-C", expected_checkout, "rev-parse", "--show-toplevel"],
+        stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).strip()
+    checkout_sha = subprocess.check_output(
+        ["git", "-C", expected_checkout, "rev-parse", "HEAD"],
+        stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).strip()
+    checkout_common = subprocess.check_output(
+        ["git", "-C", expected_checkout, "rev-parse", "--git-common-dir"],
+        stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).strip()
+    if not os.path.isabs(checkout_common):
+        checkout_common = os.path.join(expected_checkout, checkout_common)
+    if (checkout_top != expected_checkout or checkout_sha != sha
+            or os.path.realpath(checkout_common) != canonical_common):
+        raise SealError("RUN_IDENTITY", "QA checkout repository identity mismatch")
     primary = metadata.get("primary_provider")
     if primary not in ("claude", "codex"):
         raise SealError("RUN_IDENTITY", "primary provider invalid")
     return run, repo, metadata, candidate
+
+
+def _operator_home_identity_bindings(metadata, candidate):
+    return {
+        ("run-metadata.json", "repository_root"): metadata["repository_root"],
+        ("run-metadata.json", "git_common_dir"): metadata["git_common_dir"],
+        ("09-test-evidence/qa-candidate.json", "repository_root"): candidate["repository_root"],
+        ("09-test-evidence/qa-candidate.json", "git_common_dir"): candidate["git_common_dir"],
+        ("09-test-evidence/qa-candidate.json", "checkout_path"): candidate["checkout_path"],
+    }
+
+
+def _privacy_command_argv(cli_argv, run, cwd):
+    if not cli_argv:
+        raise SealError("COMMAND_EVIDENCE", "privacy command argv is empty")
+    projected = [Path(cli_argv[0]).name]
+    run_relative = f".agent-firm/runs/{run.name}"
+    index = 1
+    while index < len(cli_argv):
+        item = cli_argv[index]
+        if item == "--run" and index + 1 < len(cli_argv):
+            target = cli_argv[index + 1]
+            absolute = target if os.path.isabs(target) else os.path.join(cwd, target)
+            projected.extend((item, run_relative if os.path.realpath(absolute) == str(run) else target))
+            index += 2
+            continue
+        if item.startswith("--run="):
+            target = item[len("--run="):]
+            absolute = target if os.path.isabs(target) else os.path.join(cwd, target)
+            if os.path.realpath(absolute) == str(run):
+                item = "--run=" + run_relative
+        projected.append(item)
+        index += 1
+    return projected
 
 
 def seal_state(run):
@@ -636,6 +851,7 @@ def _create_seal_in_place(run_path, policy_path, cli_argv, cwd):
     privacy_started = datetime.datetime.now(datetime.timezone.utc)
     privacy_started_ns = time.monotonic_ns()
     run, repo, metadata, candidate = _identity(run_path)
+    identity_bindings = _operator_home_identity_bindings(metadata, candidate)
     state = seal_state(run)
     if not state["required"]:
         raise SealError("LEGACY_NOT_OPTED_IN", "use --opt-in-legacy")
@@ -758,7 +974,7 @@ def _create_seal_in_place(run_path, policy_path, cli_argv, cwd):
     scanned = []
     for entry in entries:
         raw, _, _ = build_read(entry["path"])
-        scanned.append(_scan(raw, entry["path"], patterns))
+        scanned.append(_scan(raw, entry["path"], patterns, identity_bindings))
     ledger_scan = _scan(state["ledger_raw"], "run.jsonl#prefix", patterns)
     scanned.append(ledger_scan)
     privacy_rel = bundle_rel + "/privacy.json"
@@ -766,7 +982,11 @@ def _create_seal_in_place(run_path, policy_path, cli_argv, cwd):
     privacy = {
         "schema_version": 1, "protocol": PROTOCOL,
         "command": {
-            "argv": list(cli_argv), "cwd": os.path.realpath(cwd),
+            "argv": _privacy_command_argv(cli_argv, run, cwd),
+            "argv_projection": "logical_tool_and_run_relative/v1",
+            "cwd": "." if os.path.realpath(cwd) == os.path.realpath(repo) else os.path.realpath(cwd),
+            "cwd_projection": ("repository_relative/v1" if os.path.realpath(cwd) == os.path.realpath(repo)
+                               else "canonical_absolute/v1"),
             "started_at": _format_rfc3339_ms(privacy_started),
             "finished_at": _format_rfc3339_ms(privacy_command_finished),
             "duration_ms": int((privacy_command_finished - privacy_started).total_seconds() * 1000),
@@ -1032,6 +1252,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
 
 def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None):
     run, repo, metadata, candidate = _identity(run_path)
+    identity_bindings = _operator_home_identity_bindings(metadata, candidate)
     state = seal_state(run)
     if not state["required"]:
         return {"schema_version": 1, "state": "legacy_unsealed", "manifest_version": 3,
@@ -1100,7 +1321,7 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
     for entry in entries:
         if entry["kind"] != "ledger_prefix":
             raw, _, _ = _safe_read(run, entry["path"])
-            _scan(raw, entry["path"], patterns)
+            _scan(raw, entry["path"], patterns, identity_bindings)
     prefix_bytes = seal["ledger"]["prefix"]["bytes"]
     current_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
     if current_raw[:prefix_bytes] != state["ledger_raw"][:prefix_bytes] or sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:

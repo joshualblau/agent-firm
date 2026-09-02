@@ -12,9 +12,58 @@
   },
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "command": {"type": "object", "additionalProperties": false, "required": ["argv", "cwd", "started_at", "finished_at", "duration_ms", "exit_code", "result"], "properties": {"argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 4096}}, "cwd": {"type": "string", "minLength": 1, "maxLength": 4096}, "started_at": {"type": "string", "format": "date-time"}, "finished_at": {"type": "string", "format": "date-time"}, "duration_ms": {"type": "integer", "minimum": 0}, "exit_code": {"const": 0}, "result": {"const": "pass"}}},
+    "command": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv", "argv_projection", "cwd", "cwd_projection", "started_at", "finished_at", "duration_ms", "exit_code", "result"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
+        "argv_projection": {"const": "logical_tool_and_run_relative/v1"},
+        "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "cwd_projection": {"enum": ["repository_relative/v1", "canonical_absolute/v1"]},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "exit_code": {"const": 0},
+        "result": {"const": "pass"}
+      }
+    },
     "policy": {"type": "object", "additionalProperties": false, "required": ["path", "bytes", "sha256"], "properties": {"path": {"const": "agent-firm/policy/evidence-privacy.yaml"}, "bytes": {"type": "integer", "minimum": 1}, "sha256": {"$ref": "#/$defs/digest"}}},
-    "allowance": {"type": "object", "additionalProperties": false, "required": ["rule_id", "offset", "token_sha256"], "properties": {"rule_id": {"type": "string", "minLength": 1, "maxLength": 64}, "offset": {"type": "integer", "minimum": 0}, "token_sha256": {"$ref": "#/$defs/digest"}}},
+    "allowance": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["rule_id", "offset", "token_sha256"],
+          "properties": {
+            "rule_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            "offset": {"type": "integer", "minimum": 0},
+            "token_sha256": {"$ref": "#/$defs/digest"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["rule_id", "offset", "token_sha256", "artifact_path", "surface_class", "json_field", "value_sha256"],
+          "properties": {
+            "rule_id": {"const": "declared_operator_home_identity"},
+            "offset": {"type": "integer", "minimum": 0},
+            "token_sha256": {"$ref": "#/$defs/digest"},
+            "artifact_path": {"enum": ["run-metadata.json", "09-test-evidence/qa-candidate.json"]},
+            "surface_class": {"const": "declared_metadata"},
+            "json_field": {"enum": ["repository_root", "git_common_dir", "checkout_path"]},
+            "value_sha256": {"$ref": "#/$defs/digest"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"artifact_path": {"const": "run-metadata.json"}}, "required": ["artifact_path"]},
+              "then": {"properties": {"json_field": {"enum": ["repository_root", "git_common_dir"]}}}
+            },
+            {
+              "if": {"properties": {"artifact_path": {"const": "09-test-evidence/qa-candidate.json"}}, "required": ["artifact_path"]},
+              "then": {"properties": {"json_field": {"enum": ["repository_root", "git_common_dir", "checkout_path"]}}}
+            }
+          ]
+        }
+      ]
+    },
     "scan": {"type": "object", "additionalProperties": false, "required": ["path", "surface_class", "bytes", "sha256", "matches", "allowances"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 512}, "surface_class": {"enum": ["handoff", "pr_body", "primary_verdict", "traceability", "ledger_prefix", "source_diff", "declared_metadata", "test_evidence", "summary", "run_artifact"]}, "bytes": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/digest"}, "matches": {"type": "array", "maxItems": 0}, "allowances": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/allowance"}}}}
   }
 }
