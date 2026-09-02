@@ -228,7 +228,7 @@ for provider in claude codex; do
   reset_fixture
   if [ "$provider" = claude ]; then action=claude:marketplace-add; else action=codex:marketplace-add; fi
   STUB_NO_WRITE_ACTION="$action" assert_rc "$provider zero marketplace post-state blocks" 1 run_boot
-  for wrong in 10.8.0 0.8.0-rc.1; do
+  for wrong in 10.9.0 0.9.0-rc.1; do
     reset_fixture; seed_exact
     if [ "$provider" = claude ]; then
       write_plugin_state claude "$wrong"
@@ -254,10 +254,10 @@ python3 - "$CACHE_ROOT" <<'PY'
 import json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 for provider,rel in [('claude','.claude-plugin/plugin.json'),('codex','.codex-plugin/plugin.json')]:
- p=root/rel; d=json.loads(p.read_text()); d['version']=f"0.8.0+{provider}.fresh"; p.write_text(json.dumps(d,indent=2)+"\n")
+ p=root/rel; d=json.loads(p.read_text()); d['version']=f"0.9.0+{provider}.fresh"; p.write_text(json.dumps(d,indent=2)+"\n")
 PY
-CACHE_CLAUDE_VERSION=0.8.0+claude.fresh
-CACHE_CODEX_VERSION=0.8.0+codex.fresh
+CACHE_CLAUDE_VERSION=0.9.0+claude.fresh
+CACHE_CODEX_VERSION=0.9.0+codex.fresh
 run_cache_boot() {
   env PATH="$STUB:/usr/bin:/bin" STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$CACHE_ROOT" \
     STUB_CLAUDE_VERSION="$CACHE_CLAUDE_VERSION" STUB_CODEX_VERSION="$CACHE_CODEX_VERSION" \
@@ -271,9 +271,9 @@ for provider in claude codex; do
   write_plugin_state claude "$CACHE_CLAUDE_VERSION"
   write_plugin_state codex "$CACHE_CODEX_VERSION"
   if [ "$provider" = claude ]; then
-    write_plugin_state claude 0.8.0; action=claude:plugin-update
+    write_plugin_state claude 0.9.0; action=claude:plugin-update
   else
-    write_plugin_state codex 0.8.0; action=codex:plugin-add
+    write_plugin_state codex 0.9.0; action=codex:plugin-add
   fi
   # Same CR-03 precondition: without bin/firm-python this root died on its source line, so `rc 1`
   # was satisfied by a bootstrap that never reached the version check it is named for.

@@ -9,7 +9,7 @@ model's self-reported confidence.
 |---|---|---|
 | **Requirements** | spec + acceptance criteria + open questions | scope ambiguous, user impact unclear, or a non-obvious product choice |
 | **Architecture** | options (A/B/C) + recommendation + risks + rollback | irreversible design, data migration, new dependency, or a security-sensitive path |
-| **External action** | the exact proposed command/API call + its reversibility | any write outside the local repo, PR/issue creation, deploy, or production access |
+| **External action** | the exact proposed command/API call + its reversibility | any write outside the local repo except an explicit topic-branch push or PR create/edit; issue creation, deploy, or production access still gate |
 | **Risky change** | diff + tests + rollback plan | auth, payments, data deletion, migrations, permissions, or crypto/forensics actions |
 | **Final** | QA verdict + handoff + known risks | **always** — nothing is "done" until you sign off |
 
@@ -57,6 +57,9 @@ The Lead decides the track at intake and records it in `00-intake.md`.
 
 The same rule binds `firm-integrate`: integration runs on `integration/*` branches only, and refuses
 any other target. Merging to the default branch is a **human gate**, never a script's decision.
+Directly pushing, force-pushing, or deleting the remote default branch is prohibited; publish the
+topic branch and open a PR instead. Topic-branch push and PR create/edit do not require a separate
+External-action gate because they are the reviewable delivery path, not the merge decision.
 
 ## Cross-provider second-voice QA policy
 

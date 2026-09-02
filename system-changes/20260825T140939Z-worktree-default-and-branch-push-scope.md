@@ -3,7 +3,8 @@
 A change to the **firm itself** (not a project deliverable).
 
 - **Proposed by run:** operator instruction, 2026-08-25, during the PR #6 reconciliation
-- **Status:** proposed — awaiting decision
+- **Status:** approved for implementation by the repository owner on 2026-09-02; implemented in
+  Agent Firm 0.9.0 on a dedicated topic branch, pending review and merge
 - **Scope:** the operator asked for this as the behaviour for **all projects**, not only this
   repository. That means two artifacts: this firm-scoped change, and a user-level default. See
   "Two homes" below.
@@ -111,3 +112,21 @@ non-firm repositories, rather than duplicating its text.
 
 `firm-run-evals` before and after. Note the eval fixture's own `firm-new-run` behaviour is sensitive
 to `init.defaultBranch`, fixed in this repo during the engagement — re-run rather than assume.
+
+## Implementation record
+
+- The canonical policy distinguishes topic-branch publication from direct default-branch writes.
+- `firm-merge-guard` resolves the remote-advertised symbolic `HEAD` with bounded
+  `git ls-remote --symref` and every explicit push destination before permitting a topic push. It
+  does not trust the locally mutable `refs/remotes/<remote>/HEAD` cache. Default writes/deletes are
+  prohibited even for allow-listed identities; multiple, unsupported, or ambiguous push shapes fail
+  closed so remote discovery cannot overrun the hook timeout.
+- Both provider adapters require dedicated worktrees for repository-writing roles while preserving
+  the central run-artifact namespace.
+- The release is versioned as 0.9.0 so a cachebuster alone cannot masquerade as policy adoption.
+- PR create/edit is ordinary delivery work; PR merge and direct default-branch mutation remain human
+  decisions.
+- This branch changes the Agent Firm repository/plugin only. The separate user-level
+  `~/.claude/settings.json` still contains a broad `Bash(gh:*)` ask that shadows its specific PR
+  allows under Claude Code's Deny → Ask → Allow precedence; reconciling that user-level file is an
+  explicitly disclosed follow-up, not an unrecorded side effect of plugin installation.

@@ -94,7 +94,11 @@ failure: block
 Use the existing Claude subagents as provider adapters; their bodies load the same shared role
 contracts used by Codex. Claude primary QA writes `08-qa-verdict.json`, then calls `firm-gpt-qa`.
 The Lead must run `firm-validate-verdict`, `firm-traceability-check`, `firm-qa-clean-check`, and
-`firm-final-qa-check` before packaging. Never merge, push, deploy, publish, or manufacture approval.
+`firm-final-qa-check` before packaging. Before a delegated role writes repository files, create its
+dedicated `firm-new-worktree`; keep canonical run artifacts in the central run directory. Commit in
+the task worktree, push only an explicit non-default branch, and open or update its PR. Never directly
+modify the remote default branch, merge, deploy, release, or manufacture approval.
+The remote default branch is never a direct publication target for the agent.
 Both provider CLIs and adapters are mandatory. A trusted exit-3 secondary is unavailable, never an
 approval; retain its target-run attempt/event, complete traceability, and surface the blocking or
 waiver requirement at Final.

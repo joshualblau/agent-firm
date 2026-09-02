@@ -99,10 +99,13 @@ role-to-tier/model authority.
 2. Every approval needs proving evidence; self-reported confidence is not evidence.
 3. Use `fast_path` for small low-risk changes and `full_track` otherwise.
 4. Respect `firm-policy execution-budget`; a breach is a stop condition, never a reason to thrash.
-5. Use worktrees for parallel edits and an `integration/*` branch for synthesis.
+5. Every delegated role that can write repository files runs in its own worktree. Canonical run
+   artifacts remain in the central run directory; read-only roles may use a detached checkout.
+   Use an `integration/*` branch for synthesis.
 6. Improve the firm only through the reviewed system-change process.
-7. Never merge to the default branch, push, deploy, publish, spend, sign, or perform another
-   irreversible/external action without its human gate.
+7. Commit inside the task worktree, push only an explicit topic branch, and open or update its PR as
+   ordinary delivery work. Never directly write, force-write, or delete the remote default branch.
+   Merge, deploy, release, spend, sign, and other irreversible actions retain their human gates.
 
 ## Lifecycle and durable artifacts
 
@@ -122,6 +125,20 @@ role-to-tier/model authority.
 Fast path collapses planning, integration, and panel overhead only when risk and dependency shape
 permit it. It never waives clean QA, cross-provider disposition, traceability, merge authority, or
 the Final gate.
+
+## Default delivery path
+
+1. Before any delegated role writes repository files, create its dedicated `firm-new-worktree`.
+   Keep user-owned and other-run worktrees untouched.
+2. Integrate and verify the candidate locally, commit the accepted change, push its explicit non-default branch,
+   and open or update a pull request whose body is the delivery record.
+3. Stop at the human Final/merge gate. After a verified human merge, delete the merged topic branch
+   locally and remotely and remove its clean worktree. This cleanup authority never extends to the
+   default branch or to an unmerged topic branch.
+
+Run artifacts are coordination state, not application source: they stay in the canonical run
+directory so role starts, QA identity, traceability, and packaging all bind one namespace even when a
+role's working directory is an isolated worktree.
 
 Each integration cycle publishes through `firm-integration-summary`; it never reuses the legacy
 singleton path. `integration-summaries/index.json` is append-only by stage and binds every summary's

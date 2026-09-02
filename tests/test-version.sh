@@ -39,8 +39,8 @@ for bad in '01.2.3' '1.02.3' '1.2.03' '1.2' '1.2.3-' '1.2.3-alpha..1' '1.2.3-01'
   R="$(mk_version_root)"; printf '%s\n' "$bad" > "$R/VERSION"
   assert_rc "canonical rejects malformed SemVer: $bad" 2 "$R/bin/firm-version" --check
 done
-for bad in '0.8.0+claude.' '0.8.0+claude..x' '0.8.0+claude' '0.8.0+codex.x' \
-           '0.8.0+claude.x+again' '0.8.0+claude.x_y'; do
+for bad in '0.9.0+claude.' '0.9.0+claude..x' '0.9.0+claude' '0.9.0+codex.x' \
+           '0.9.0+claude.x+again' '0.9.0+claude.x_y'; do
   R="$(mk_version_root)"; set_manifest_version "$R/.claude-plugin/plugin.json" "$bad"
   assert_rc "Claude manifest rejects malformed/wrong cache version: $bad" 2 "$R/bin/firm-version" --check
 done
@@ -72,9 +72,9 @@ assert_output "Claude gets its exact cachebuster" '"version": "1.2.3-rc.1+claude
 assert_output "Codex gets its exact cachebuster" '"version": "1.2.3-rc.1+codex.cache.007-alpha"' cat "$R/.codex-plugin/plugin.json"
 assert_eq "canonical stays at the release base" "1.2.3-rc.1" "$(tr -d '\n' < "$R/VERSION")"
 assert_ok "unrelated Claude manifest bytes survive the targeted version replacement" python3 -c \
-  "a='''$before_claude'''; b=open('$R/.claude-plugin/plugin.json').read(); assert a.replace('0.8.0','TOKEN') == b.replace('1.2.3-rc.1+claude.cache.007-alpha','TOKEN').rstrip('\\n')"
+  "a='''$before_claude'''; b=open('$R/.claude-plugin/plugin.json').read(); assert a.replace('0.9.0','TOKEN') == b.replace('1.2.3-rc.1+claude.cache.007-alpha','TOKEN').rstrip('\\n')"
 assert_ok "unrelated Codex manifest bytes survive the targeted version replacement" python3 -c \
-  "a='''$before_codex'''; b=open('$R/.codex-plugin/plugin.json').read(); assert a.replace('0.8.0','TOKEN') == b.replace('1.2.3-rc.1+codex.cache.007-alpha','TOKEN').rstrip('\\n')"
+  "a='''$before_codex'''; b=open('$R/.codex-plugin/plugin.json').read(); assert a.replace('0.9.0','TOKEN') == b.replace('1.2.3-rc.1+codex.cache.007-alpha','TOKEN').rstrip('\\n')"
 
 t_case "preflight failures write nothing"
 for target in version claude codex; do

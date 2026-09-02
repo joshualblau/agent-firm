@@ -17,7 +17,8 @@
 #
 # THE TWO SOURCES FAIL DIFFERENTLY, WHICH IS WHY BOTH ARE REQUIRED
 #   · `gh` proves control of a GitHub token. It is NOT the identity an SSH `git push` authenticates
-#     as, and it needs the network.
+#     as, and it needs the network. Topic-branch pushes do not consult this identity file; they are
+#     admitted only by destination proof.
 #   · `git config user.email` is offline and is what lands in the commit, but it is a plain string
 #     any user can set to anything.
 #   Neither is a credential check. Together they are a consistency check on the operator's own
@@ -28,8 +29,9 @@
 #   script, delete the hook entry from .claude/settings.json, set `git config user.email` to a
 #   listed value, or just run git in a terminal outside the AI tool. It is NOT a security boundary,
 #   NOT branch protection, and it CANNOT provide a "required PR review" — only GitHub can do that
-#   (see docs/BRANCH-PROTECTION-RUNBOOK.md). Its actual, narrower scope: preventing an AI agent
-#   from performing an unauthorised merge or push. Rated honestly in docs/ENFORCEMENT.md.
+#   (see docs/BRANCH-PROTECTION-RUNBOOK.md). Its actual, narrower scope: authorising local merges
+#   and non-branch remote writes after the separate push-destination policy has excluded direct
+#   default-branch writes. Rated honestly in docs/ENFORCEMENT.md.
 #
 # STRICTNESS — this file fails CLOSED
 #   Missing, unreadable, unparseable, empty, or carrying a key the script does not read  =>
