@@ -6,7 +6,8 @@ while [ -L "$__src" ]; do __dir="$(cd -P "$(dirname "$__src")" && pwd)"; __src="
 __self="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$__self/firm-python"
 exec "${FIRM_PYTHON_ARGV[@]}" - "$__src" "$@" <<'PY'
-import argparse, errno, hashlib, hmac, json, os, re, secrets, shlex, shutil, signal, socket, stat, subprocess, sys, tempfile, time
+import argparse, ctypes, errno, hashlib, hmac, json, os, platform, plistlib, re, secrets, selectors, shlex, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
 from pathlib import Path
 
 SELF = Path(sys.argv[1]).resolve()
@@ -20,15 +21,28 @@ MAX_MESSAGE = 256 * 1024
 HEX64 = set("0123456789abcdef")
 GIT = str(Path(shutil.which("git") or "/usr/bin/git").resolve())
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+HDIUTIL = Path("/usr/bin/hdiutil")
+DISKUTIL = Path("/usr/sbin/diskutil")
+CODESIGN = Path("/usr/bin/codesign")
+MOUNT = Path("/sbin/mount")
 PROFILE_SOURCE = b'''(version 1)\n(allow default)\n(deny file-read* file-write* (subpath (param "REAL_COMMON")))\n'''
-GUARDIAN_PROTOCOL_VERSION = 2
+GUARDIAN_PROTOCOL_VERSION = 3
 GUARDIAN_SOCKET_NAME = "guardian.sock"
 GUARDIAN_STABLE_IDENTITY = ("dev", "ino", "uid", "mode")
 TEST_BARRIER_PHASES = {"manifest_read", "dispatch_commit", "use_exec", "cleanup_commit",
-                       "provider_stream", "provider_preexec"}
+                       "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"}
 PROVIDER_EXECUTABLE_MAX_BYTES = {"codex": 247464144, "claude": 197220928}
 PROVIDER_EXECUTABLE_CHUNK_BYTES = 1024 * 1024
 PROVIDER_EXECUTABLE_TIMEOUT_NS = 10_000_000_000
+PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS = 30
+PROVIDER_CAPSULE_METADATA_MAX_COUNT = 64
+PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES = 255
+PROVIDER_CAPSULE_METADATA_MAX_VALUE_BYTES = 1024 * 1024
+PROVIDER_CAPSULE_METADATA_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES = 32 * 1024 * 1024
+CODESIGN_RESULT_MAX_BYTES = 256 * 1024
+CODESIGN_IDENTIFIER_MAX_BYTES = 1024
+CODESIGN_REQUIREMENT_MAX_BYTES = 16 * 1024
 PROVIDER_EXECUTABLE_FIELDS = {"provider", "maximum_bytes", "chunk_bytes", "timeout_ns", "path",
                               "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"}
 SAFE_GIT_ENV = {
@@ -144,6 +158,140 @@ def owned_directory(path, mode=0o700):
             or stat.S_IMODE(st.st_mode)!=mode):
         fail("unsafe owned directory")
     return st
+
+def provider_capsule_image_size(provider, source_bytes):
+    maximum=PROVIDER_EXECUTABLE_MAX_BYTES.get(provider)
+    if maximum is None or not isinstance(source_bytes,int) or source_bytes<1 or source_bytes>maximum:
+        raise RuntimeError("provider capsule size policy")
+    quantum=1024*1024
+    requested=((source_bytes+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES+quantum-1)//quantum)*quantum
+    maximum_image=((maximum+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES+quantum-1)//quantum)*quantum
+    if requested>maximum_image: raise RuntimeError("provider capsule image cap")
+    return requested,maximum_image
+
+def guardian_run(argv, timeout=PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS):
+    started=time.monotonic_ns()
+    try:
+        done=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            close_fds=True,timeout=timeout,
+                            env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+    except (OSError,subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("provider capsule command unavailable: %s"%type(exc).__name__)
+    finished=time.monotonic_ns()
+    if done.returncode!=0:
+        message=done.stderr.decode("utf-8","replace").strip().replace("\n"," ")[:500]
+        raise RuntimeError("provider capsule command failed rc=%d: %s"%(done.returncode,message))
+    return done.stdout,{"start_monotonic_ns":started,"end_monotonic_ns":finished,
+                        "duration_ns":finished-started,"exit_code":done.returncode,
+                        "argv_sha256":digest_bytes(canonical(argv).encode("ascii")),
+                        "stdout_sha256":digest_bytes(done.stdout),"stderr_sha256":digest_bytes(done.stderr)}
+
+def guardian_mount_line(mountpoint):
+    raw,_=guardian_run([str(MOUNT)])
+    prefix=None
+    suffix=" on "+mountpoint+" ("
+    rows=[]
+    for line in raw.decode("utf-8","strict").splitlines():
+        if suffix in line and line.endswith(")"):
+            device,options=line.split(suffix,1); rows.append((device,options[:-1]))
+    if len(rows)!=1: raise RuntimeError("provider capsule mount identity")
+    device,raw_options=rows[0]
+    options=sorted(item.strip() for item in raw_options.split(",") if item.strip())
+    return device,options
+
+def guardian_mount_record(device, mountpoint, readonly):
+    observed_device,options=guardian_mount_line(mountpoint)
+    if observed_device!=device or ("read-only" in options)!=readonly or "nobrowse" not in options:
+        raise RuntimeError("provider capsule mount flags")
+    if readonly and not {"local","nodev","nosuid","read-only","nobrowse"}.issubset(set(options)):
+        raise RuntimeError("provider capsule read-only flags")
+    raw,timing=guardian_run([str(DISKUTIL),"info","-plist",device])
+    try: info=plistlib.loads(raw)
+    except Exception: raise RuntimeError("provider capsule disk info")
+    identifier=device.removeprefix("/dev/")
+    if (not isinstance(info,dict) or info.get("MountPoint")!=mountpoint
+            or info.get("DeviceIdentifier")!=identifier or info.get("FilesystemType")!="hfs"
+            or info.get("BusProtocol")!="Disk Image"
+            or not isinstance(info.get("VolumeUUID"),str) or not info["VolumeUUID"]):
+        raise RuntimeError("provider capsule disk identity")
+    return {"device":device,"device_identifier":identifier,"mountpoint":mountpoint,
+            "filesystem":"hfs","bus_protocol":"Disk Image","volume_uuid":info["VolumeUUID"],
+            "readonly":readonly,"options":options,"disk_info_timing":timing}
+
+def guardian_attach(image, mountpoint, readonly):
+    argv=[str(HDIUTIL),"attach","-kernel","-readonly" if readonly else "-readwrite",
+          "-nobrowse","-owners","on","-mountpoint",mountpoint,"-plist",image]
+    raw,timing=guardian_run(argv)
+    try: result=plistlib.loads(raw)
+    except Exception: raise RuntimeError("provider capsule attach result")
+    entities=result.get("system-entities") if isinstance(result,dict) else None
+    mounted=[] if not isinstance(entities,list) else [item for item in entities
+        if isinstance(item,dict) and item.get("mount-point")==mountpoint and isinstance(item.get("dev-entry"),str)]
+    if len(mounted)!=1: raise RuntimeError("provider capsule attach ambiguity")
+    device=mounted[0]["dev-entry"]
+    if not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)?",device):
+        raise RuntimeError("provider capsule device identity")
+    record=guardian_mount_record(device,mountpoint,readonly)
+    record["attach_timing"]=timing
+    return record
+
+def guardian_reprove_attachment(expected):
+    observed=guardian_mount_record(expected["device"],expected["mountpoint"],expected["readonly"])
+    observed["attach_timing"]=expected["attach_timing"]
+    observed["disk_info_timing"]=expected["disk_info_timing"]
+    if observed!=expected: raise RuntimeError("provider capsule attachment drift")
+
+def guardian_detach_attachment(expected):
+    guardian_reprove_attachment(expected)
+    _,timing=guardian_run([str(HDIUTIL),"detach",expected["device"]])
+    try: guardian_mount_line(expected["mountpoint"])
+    except RuntimeError:
+        return {"device":expected["device"],"mountpoint":expected["mountpoint"],"absent":True,
+                "detach_timing":timing}
+    raise RuntimeError("provider capsule detach residue")
+
+def guardian_hash_fd(fd, maximum):
+    before=os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size<1 or before.st_size>maximum:
+        raise RuntimeError("provider capsule image identity")
+    digest=hashlib.sha256(); total=0; deadline=time.monotonic_ns()+PROVIDER_EXECUTABLE_TIMEOUT_NS
+    while total<before.st_size:
+        if time.monotonic_ns()>=deadline: raise RuntimeError("provider capsule image hash timeout")
+        part=os.pread(fd,min(PROVIDER_EXECUTABLE_CHUNK_BYTES,before.st_size-total),total)
+        if not part: raise RuntimeError("provider capsule image short read")
+        digest.update(part); total+=len(part)
+    after=os.fstat(fd)
+    if provider_stat_stability(before)!=provider_stat_stability(after):
+        raise RuntimeError("provider capsule image drift")
+    return {**identity(before),"sha256":digest.hexdigest()}
+
+def guardian_capsule_public(state):
+    if state is None: return {"state":"ABSENT"}
+    return {key:value for key,value in state.items() if not key.startswith("_")}
+
+def guardian_capsule_digest(state):
+    return digest_bytes(canonical(guardian_capsule_public(state)).encode("ascii"))
+
+def guardian_capsule_close(state):
+    if state is None: return
+    for key in ("_mount_fd","_image_fd"):
+        descriptor=state.pop(key,None)
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+
+def guardian_capsule_detach(state):
+    if state is None: return {"state":"ABSENT","absent":True}
+    attachment=state.get("attachment")
+    if state.get("_mount_fd") is not None:
+        os.close(state.pop("_mount_fd"))
+    if state.get("state") not in ("RW_ATTACHED","RO_ATTACHED") or not isinstance(attachment,dict):
+        raise RuntimeError("provider capsule cleanup state")
+    receipt=guardian_detach_attachment(attachment)
+    state["state"]="DETACHED"; state["detach"]=receipt; state.pop("attachment",None)
+    descriptor=state.pop("_image_fd",None)
+    if descriptor is not None: os.close(descriptor)
+    return receipt
 
 def guardian_auth(token, record):
     return hmac.new(bytes.fromhex(token),canonical(record).encode("ascii"),hashlib.sha256).hexdigest()
@@ -360,11 +508,12 @@ def guardian_delete_root(parent_fd, root, root_fd, root_id, control_fd, socket_p
     if (not guardian_same_identity(path_id,root_id)
             or not guardian_same_identity(identity(os.fstat(root_fd)),root_id)):
         raise RuntimeError("guardian root identity drift")
-    socket_st=os.stat(GUARDIAN_SOCKET_NAME,dir_fd=control_fd,follow_symlinks=False)
-    if (not stat.S_ISSOCK(socket_st.st_mode)
-            or not guardian_same_identity(identity(socket_st),socket_id)):
-        raise RuntimeError("guardian socket identity drift")
-    os.unlink(GUARDIAN_SOCKET_NAME,dir_fd=control_fd)
+    if socket_id is not None:
+        socket_st=os.stat(GUARDIAN_SOCKET_NAME,dir_fd=control_fd,follow_symlinks=False)
+        if (not stat.S_ISSOCK(socket_st.st_mode)
+                or not guardian_same_identity(identity(socket_st),socket_id)):
+            raise RuntimeError("guardian socket identity drift")
+        os.unlink(GUARDIAN_SOCKET_NAME,dir_fd=control_fd)
     raw_test_barrier(barrier,"cleanup_commit",root_id)
     path_id=identity(os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False))
     if not guardian_same_identity(path_id,root_id): raise RuntimeError("guardian cleanup race")
@@ -379,18 +528,23 @@ def guardian_delete_root(parent_fd, root, root_fd, root_id, control_fd, socket_p
 def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
     root=None; root_fd=None; parent_fd=None; control_fd=None; listener=None; cleanup_connection=None
     registrations=[]; sequence=0; accepted=None; state="BOOTSTRAP"; quiescence=None; root_binding=None
+    capsule_state=None; capsule_detach=None; socket_id=None; socket_path=None
     marker_name="firm-eval-block-"+invocation+".json"
     try:
         parent_path=Path(parent); parent_fd=os.open(str(parent_path),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
         try: os.stat(marker_name,dir_fd=parent_fd,follow_symlinks=False); raise RuntimeError("guardian failure marker collision")
         except FileNotFoundError: pass
-        root=Path(tempfile.mkdtemp(prefix="firm-eval-"+invocation[:12]+".",dir=parent)).resolve()
-        capsule=root/"capsule"; control=root/"control"; socket_path=control/GUARDIAN_SOCKET_NAME
-        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700)
+        state="BOOTSTRAP_ROOT"; root=Path(tempfile.mkdtemp(prefix="firm-eval-"+invocation[:12]+".",dir=parent)).resolve()
+        capsule=root/"capsule"; control=root/"control"; provider_capsule=root/"provider-capsule"
+        socket_path=control/GUARDIAN_SOCKET_NAME
+        state="BOOTSTRAP_DIRECTORIES"
+        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700); provider_capsule.mkdir(mode=0o700)
+        (provider_capsule/"mount").mkdir(mode=0o700)
+        state="BOOTSTRAP_DESCRIPTORS"
         root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
         control_fd=os.open("control",os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0),dir_fd=root_fd)
         root_id=identity(os.fstat(root_fd)); root_binding=guardian_root_binding(root_id)
-        listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(str(socket_path)); os.chmod(str(socket_path),0o600)
+        state="BOOTSTRAP_SOCKET"; listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(str(socket_path)); os.chmod(str(socket_path),0o600)
         listener.listen(8); listener.settimeout(0.05)
         socket_id=identity(os.lstat(str(socket_path)))
         if not stat.S_ISSOCK(os.lstat(str(socket_path)).st_mode): raise RuntimeError("guardian socket type")
@@ -398,6 +552,7 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
         unsigned={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"status":"ready",
                   "invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,"guardian_pid":os.getpid(),
                   "launcher_pid":launcher_pid,"root":str(root),"capsule":str(capsule),"control":str(control),
+                  "provider_capsule":str(provider_capsule),
                   "socket":str(socket_path),"socket_identity":socket_id,"root_identity":root_id,
                   "root_binding":root_binding,"failure_marker":marker,
                   "token_sha256":digest_bytes(bytes.fromhex(token))}
@@ -442,7 +597,66 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
                         "guardian_pid":os.getpid(),"state":state,"next_sequence":sequence+1,
                         "request_nonce":request["nonce"],"root_binding":root_binding,
                         "registration_digest":guardian_registration_digest(registrations),
-                        "registered_roles":sorted(item["role"] for item in registrations)})
+                        "registered_roles":sorted(item["role"] for item in registrations),
+                        "capsule_state":guardian_capsule_public(capsule_state).get("state"),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
+                elif kind=="capsule_create":
+                    keys=common|{"provider","source_bytes","auth"}
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or capsule_state is not None):
+                        raise RuntimeError("provider capsule create sequence or shape")
+                    requested,maximum_image=provider_capsule_image_size(request.get("provider"),request.get("source_bytes"))
+                    image_path=provider_capsule/"provider.dmg"; mountpoint=provider_capsule/"mount"
+                    if image_path.exists() or any(os.scandir(str(mountpoint))):
+                        raise RuntimeError("provider capsule create collision")
+                    backing=identity(os.lstat(str(mountpoint)))
+                    # hdiutil's `b` suffix denotes 512-byte blocks, not bytes.  Every policy value
+                    # is MiB-aligned, so pass a closed MiB count and verify the resulting byte size.
+                    create_argv=[str(HDIUTIL),"create","-size",str(requested//(1024*1024))+"m","-fs","HFS+",
+                                 "-volname","FIRM_CAPSULE","-uid",str(os.getuid()),"-gid",str(os.getgid()),
+                                 "-mode","0700","-layout","NONE","-type","UDIF","-plist",str(image_path)]
+                    _,create_timing=guardian_run(create_argv)
+                    image_fd=os.open(str(image_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+                    image_st=os.fstat(image_fd)
+                    if (not stat.S_ISREG(image_st.st_mode) or image_st.st_uid!=os.getuid()
+                            or image_st.st_nlink!=1 or image_st.st_size>maximum_image):
+                        os.close(image_fd); raise RuntimeError("provider capsule image creation identity")
+                    attachment=guardian_attach(str(image_path),str(mountpoint),False)
+                    capsule_state={"schema_version":1,"state":"RW_ATTACHED","provider":request["provider"],
+                                   "source_bytes":request["source_bytes"],"requested_image_bytes":requested,
+                                   "maximum_image_bytes":maximum_image,"root":str(provider_capsule),
+                                   "mountpoint_backing":backing,"image":{"path":str(image_path),**identity(image_st)},
+                                   "attachment":attachment,"create_timing":create_timing,"_image_fd":image_fd}
+                    capsule_state["_mount_fd"]=os.open(str(mountpoint),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+                    sequence+=1
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"CAPSULE_RW_ATTACHED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "root_binding":root_binding,"capsule":guardian_capsule_public(capsule_state),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
+                elif kind=="capsule_seal":
+                    keys=common|{"capsule_digest","auth"}
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or capsule_state is None or capsule_state.get("state")!="RW_ATTACHED"
+                            or request.get("capsule_digest")!=guardian_capsule_digest(capsule_state)):
+                        raise RuntimeError("provider capsule seal sequence or shape")
+                    if capsule_state.get("_mount_fd") is not None:
+                        os.close(capsule_state.pop("_mount_fd"))
+                    rw_detach=guardian_detach_attachment(capsule_state["attachment"])
+                    image_path=Path(capsule_state["image"]["path"])
+                    os.chmod(str(image_path),0o400); os.fsync(capsule_state["_image_fd"])
+                    image=guardian_hash_fd(capsule_state["_image_fd"],capsule_state["maximum_image_bytes"])
+                    if image["mode"]!=0o400: raise RuntimeError("provider capsule sealed image mode")
+                    ro_attachment=guardian_attach(str(image_path),capsule_state["attachment"]["mountpoint"],True)
+                    capsule_state.update({"state":"RO_ATTACHED","image":{"path":str(image_path),**image},
+                                          "rw_detach":rw_detach,"attachment":ro_attachment})
+                    capsule_state["_mount_fd"]=os.open(ro_attachment["mountpoint"],os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+                    sequence+=1
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"CAPSULE_RO_ATTACHED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "root_binding":root_binding,"capsule":guardian_capsule_public(capsule_state),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
                 elif kind=="register":
                     keys=common|{"role","pid","pgid","auth"}
                     if not exact_keys(request,keys) or request["sequence"]!=sequence+1:
@@ -466,18 +680,21 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
                         "role":role,"pid":pid,"pgid":pgid,"root_binding":root_binding,
                         "request_sha256":request_sha,"registration_digest":guardian_registration_digest(registrations)})
                 elif kind=="cleanup":
-                    keys=common|{"registration_digest","expected_roles","auth"}
+                    keys=common|{"registration_digest","expected_roles","capsule_state","capsule_digest","auth"}
                     roles=request.get("expected_roles")
                     if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
                             or not isinstance(roles,list) or roles!=sorted(set(roles))
                             or any(role not in ("broker","provider") for role in roles)
                             or roles!=sorted(item["role"] for item in registrations)
-                            or request.get("registration_digest")!=guardian_registration_digest(registrations)):
+                            or request.get("registration_digest")!=guardian_registration_digest(registrations)
+                            or request.get("capsule_state")!=guardian_capsule_public(capsule_state).get("state")
+                            or request.get("capsule_digest")!=guardian_capsule_digest(capsule_state)):
                         raise RuntimeError("guardian cleanup sequence, registration, or shape")
                     sequence+=1; state="CLEANUP_ACCEPTED"
                     accepted={"sequence":sequence,"nonce":request["nonce"],
                               "request_sha256":digest_bytes(canonical(unsigned_request).encode("ascii")),
-                              "registration_digest":request["registration_digest"]}
+                              "registration_digest":request["registration_digest"],
+                              "capsule_digest":request["capsule_digest"]}
                     cleanup_connection=connection; connection=None
                     listener.close(); listener=None
                 else: raise RuntimeError("guardian request kind")
@@ -492,6 +709,7 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
                 if connection is not None: connection.close()
         state="QUIESCING"; quiescence=terminate_groups(registrations)
         quiescence_digest=digest_bytes(canonical(quiescence).encode("ascii"))
+        state="DETACHING_CAPSULE"; capsule_detach=guardian_capsule_detach(capsule_state)
         state="DELETING"
         deletion,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
                                                          socket_path,socket_id,listener,barrier)
@@ -502,11 +720,12 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
                   "request_nonce":accepted["nonce"],"request_sha256":accepted["request_sha256"],
                   "root_identity":root_id,"root_binding":root_binding,
                   "registration_digest":accepted["registration_digest"],"quiescence_digest":quiescence_digest,
+                  "capsule_digest":accepted["capsule_digest"],"capsule_detach":capsule_detach,
                   "deletion":deletion,"absent":True}
         state="TERMINAL_OK"; guardian_send_frame(cleanup_connection,token,terminal); cleanup_connection.close(); cleanup_connection=None
     except BaseException as exc:
-        state="TERMINAL_BLOCK"
-        failure_reason="%s: %s"%(type(exc).__name__,exc)
+        failed_state=state; state="TERMINAL_BLOCK"
+        failure_reason="%s: %s: %s"%(failed_state,type(exc).__name__,exc)
         if listener is not None:
             try: listener.close()
             except Exception: pass
@@ -524,10 +743,12 @@ def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
         if accepted is None and root_fd is not None and control_fd is not None:
             try:
                 quiescence=terminate_groups(registrations)
+                capsule_detach=guardian_capsule_detach(capsule_state)
                 _,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
                                                            socket_path,socket_id,None,barrier)
             except Exception as cleanup_exc:
                 failure_reason+="; abnormal cleanup failed: %s: %s"%(type(cleanup_exc).__name__,cleanup_exc)
+        guardian_capsule_close(capsule_state)
         try:
             if parent_fd is not None and root is not None:
                 write_failure_marker(parent_fd,marker_name,token,invocation,root,root_binding or "0"*64,
@@ -589,6 +810,27 @@ def guardian_request_base(control, invocation, sequence, guardian_pid, nonce=Non
             "candidate_commit":PAYLOAD_COMMIT,"sequence":sequence,"nonce":nonce or secrets.token_hex(32),
             "guardian_pid":guardian_pid,"root_binding":guardian_root_binding(root_id)}
 
+def guardian_capsule_request(control, token, invocation, guardian_pid, sequence, action,
+                             provider=None, source_bytes=None, capsule_digest=None):
+    base=guardian_request_base(str(control),invocation,sequence,guardian_pid)
+    base["kind"]=action
+    if action=="capsule_create": base.update({"provider":provider,"source_bytes":source_bytes})
+    elif action=="capsule_seal": base["capsule_digest"]=capsule_digest
+    else: fail("guardian capsule action")
+    response=guardian_client_request(str(control),token,base,PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS+5)
+    value,_=guardian_verify_response(token,response)
+    required={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid",
+              "sequence","nonce","root_binding","capsule","capsule_digest"}
+    expected_status="CAPSULE_RW_ATTACHED" if action=="capsule_create" else "CAPSULE_RO_ATTACHED"
+    if (not exact_keys(value,required) or value.get("schema_version")!=1
+            or value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION or value.get("status")!=expected_status
+            or value.get("invocation")!=invocation or value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or value.get("guardian_pid")!=guardian_pid or value.get("sequence")!=sequence
+            or value.get("nonce")!=base["nonce"] or value.get("root_binding")!=base["root_binding"]
+            or value.get("capsule_digest")!=digest_bytes(canonical(value.get("capsule")).encode("ascii"))):
+        fail("guardian capsule ACK binding")
+    return value
+
 def guardian_command(ns):
     base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid,ns.nonce)
     if ns.action=="register":
@@ -602,7 +844,8 @@ def guardian_command(ns):
     status=guardian_client_request(ns.control,ns.token,status_base)
     status_value,_=guardian_verify_response(ns.token,status)
     expected_status={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid",
-                     "state","next_sequence","request_nonce","root_binding","registration_digest","registered_roles"}
+                     "state","next_sequence","request_nonce","root_binding","registration_digest","registered_roles",
+                     "capsule_state","capsule_digest"}
     roles=sorted(set(filter(None,(ns.expected_roles or "").split(","))))
     if (not exact_keys(status_value,expected_status) or status_value.get("status")!="STATE"
             or status_value.get("next_sequence")!=ns.sequence or status_value.get("request_nonce")!=status_base["nonce"]
@@ -612,15 +855,18 @@ def guardian_command(ns):
             or not isinstance(status_value.get("registered_roles"),list)
             or status_value["registered_roles"]!=sorted(set(status_value["registered_roles"]))
             or any(role not in ("broker","provider") for role in status_value["registered_roles"])
-            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("registration_digest","")))):
+            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("registration_digest","")))
+            or status_value.get("capsule_state") not in ("ABSENT","RW_ATTACHED","RO_ATTACHED")
+            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("capsule_digest","")))):
         fail("guardian status binding")
     base.update({"kind":"cleanup","registration_digest":status_value["registration_digest"],
-                 "expected_roles":roles})
+                 "expected_roles":roles,"capsule_state":status_value["capsule_state"],
+                 "capsule_digest":status_value["capsule_digest"]})
     terminal=guardian_client_request(ns.control,ns.token,base,10)
     terminal_value,_=guardian_verify_response(ns.token,terminal)
     required={"schema_version","protocol_version","kind","status","invocation","candidate_commit","guardian_pid",
               "terminal_sequence","request_sequence","request_nonce","request_sha256","root_identity","root_binding",
-              "registration_digest","quiescence_digest","deletion","absent"}
+              "registration_digest","quiescence_digest","capsule_digest","capsule_detach","deletion","absent"}
     request_unsigned=dict(base); request_sha=digest_bytes(canonical(request_unsigned).encode("ascii"))
     if (not exact_keys(terminal_value,required) or terminal_value.get("kind")!="terminal"
             or terminal_value.get("schema_version")!=1 or terminal_value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
@@ -631,6 +877,9 @@ def guardian_command(ns):
             or terminal_value.get("request_sha256")!=request_sha or terminal_value.get("root_binding")!=base["root_binding"]
             or guardian_root_binding(terminal_value.get("root_identity",{}))!=base["root_binding"]
             or terminal_value.get("registration_digest")!=status_value["registration_digest"]
+            or terminal_value.get("capsule_digest")!=status_value["capsule_digest"]
+            or not isinstance(terminal_value.get("capsule_detach"),dict)
+            or terminal_value["capsule_detach"].get("absent") is not True
             or not re.fullmatch(r"[0-9a-f]{64}",str(terminal_value.get("quiescence_digest","")))
             or terminal_value.get("absent") is not True
             or terminal_value.get("deletion")!={"removed":True,"absent":True,"method":"parent_fd_relative"}):
@@ -733,6 +982,358 @@ def provider_read(fd, amount, deadline_ns):
     if time.monotonic_ns()>=deadline_ns: fail("provider executable stream timeout")
     return part
 
+def provider_native_architecture():
+    value=platform.machine().lower()
+    aliases={"amd64":"x86_64","x86_64":"x86_64","arm64":"arm64","aarch64":"arm64"}
+    result=aliases.get(value)
+    if result is None: fail("provider capsule native architecture")
+    return result
+
+def provider_macho_record(fd, size):
+    if sys.platform!="darwin": fail("provider capsule unsupported host")
+    raw=os.pread(fd,min(size,4096),0)
+    if len(raw)<8: fail("provider executable is not native Mach-O")
+    magic=raw[:4]; native=provider_native_architecture()
+    cpu_names={0x01000007:"x86_64",0x0100000c:"arm64"}
+    thin={b"\xce\xfa\xed\xfe":("little","thin32"),b"\xcf\xfa\xed\xfe":("little","thin64"),
+          b"\xfe\xed\xfa\xce":("big","thin32"),b"\xfe\xed\xfa\xcf":("big","thin64")}
+    fat={b"\xca\xfe\xba\xbe":("big",20,"fat32"),b"\xbe\xba\xfe\xca":("little",20,"fat32"),
+         b"\xca\xfe\xba\xbf":("big",32,"fat64"),b"\xbf\xba\xfe\xca":("little",32,"fat64")}
+    if magic in thin:
+        endian,kind=thin[magic]; cputype=int.from_bytes(raw[4:8],endian,signed=False)
+        architecture=cpu_names.get(cputype)
+        if architecture!=native: fail("provider executable has no native Mach-O slice")
+        return {"format":kind,"native_architecture":native,"architectures":[architecture],"magic":magic.hex()}
+    if magic in fat:
+        endian,width,kind=fat[magic]; count=int.from_bytes(raw[4:8],endian,signed=False)
+        if count<1 or count>16 or len(raw)<8+count*width: fail("provider executable Mach-O header")
+        architectures=[]
+        for index in range(count):
+            offset=8+index*width; cputype=int.from_bytes(raw[offset:offset+4],endian,signed=False)
+            architecture=cpu_names.get(cputype,"unsupported-%08x"%cputype)
+            if architecture in architectures: fail("provider executable duplicate Mach-O slice")
+            architectures.append(architecture)
+        if native not in architectures: fail("provider executable has no native Mach-O slice")
+        return {"format":kind,"native_architecture":native,"architectures":architectures,"magic":magic.hex()}
+    fail("provider executable is not native Mach-O")
+
+def provider_xattrs(fd):
+    if sys.platform!="darwin": fail("provider capsule xattr unsupported")
+    libc=ctypes.CDLL(None,use_errno=True)
+    flist=getattr(libc,"flistxattr",None); fget=getattr(libc,"fgetxattr",None)
+    if flist is None or fget is None: fail("provider capsule xattr unavailable")
+    size=flist(fd,None,0,0)
+    if size<0: fail("provider capsule xattr list")
+    if size>PROVIDER_CAPSULE_METADATA_MAX_COUNT*(PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES+1):
+        fail("provider capsule xattr names cap")
+    names_raw=b""
+    if size:
+        buffer=ctypes.create_string_buffer(size); observed=flist(fd,buffer,size,0)
+        if observed!=size: fail("provider capsule xattr list drift")
+        names_raw=buffer.raw[:size]
+    names=[item for item in names_raw.split(b"\0") if item]
+    if len(names)>PROVIDER_CAPSULE_METADATA_MAX_COUNT or len(names)!=len(set(names)):
+        fail("provider capsule xattr count")
+    values={}; records=[]; total=0
+    for raw_name in sorted(names):
+        if len(raw_name)>PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES:
+            fail("provider capsule xattr name cap")
+        try: name=raw_name.decode("utf-8","strict")
+        except UnicodeDecodeError: fail("provider capsule xattr name encoding")
+        length=fget(fd,raw_name,None,0,0,0)
+        if length<0 or length>PROVIDER_CAPSULE_METADATA_MAX_VALUE_BYTES:
+            fail("provider capsule xattr value cap")
+        value=b""
+        if length:
+            buffer=ctypes.create_string_buffer(length); observed=fget(fd,raw_name,buffer,length,0,0)
+            if observed!=length: fail("provider capsule xattr value drift")
+            value=buffer.raw[:length]
+        total+=len(raw_name)+len(value)
+        if total>PROVIDER_CAPSULE_METADATA_MAX_TOTAL_BYTES: fail("provider capsule xattr aggregate cap")
+        values[raw_name]=value
+        records.append({"name":name,"name_bytes":len(raw_name),"bytes":len(value),"sha256":digest_bytes(value)})
+    return records,values
+
+def provider_set_xattrs(fd, values):
+    libc=ctypes.CDLL(None,use_errno=True); fset=getattr(libc,"fsetxattr",None)
+    if fset is None: fail("provider capsule xattr unavailable")
+    for name,value in sorted(values.items()):
+        buffer=ctypes.create_string_buffer(value,len(value)) if value else None
+        pointer=ctypes.cast(buffer,ctypes.c_void_p) if buffer is not None else None
+        if fset(fd,name,pointer,len(value),0,0)!=0: fail("provider capsule xattr copy")
+
+def provider_copy_to_capsule(source_fd, expected, destination, barrier):
+    source_before=os.fstat(source_fd); stable=provider_stat_stability(source_before)
+    if source_before.st_uid!=os.geteuid(): fail("provider capsule cannot preserve source owner")
+    macho=provider_macho_record(source_fd,source_before.st_size)
+    xattrs,xattr_values=provider_xattrs(source_fd)
+    flags=os.O_RDWR|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0)
+    destination_fd=os.open(str(destination),flags,0o600)
+    started=time.monotonic_ns(); digest=hashlib.sha256(); total=0
+    try:
+        os.lseek(source_fd,0,os.SEEK_SET); deadline=started+PROVIDER_EXECUTABLE_TIMEOUT_NS
+        while total<source_before.st_size:
+            amount=min(PROVIDER_EXECUTABLE_CHUNK_BYTES,source_before.st_size-total)
+            part=provider_read(source_fd,amount,deadline)
+            if len(part)!=amount: fail("provider capsule source short read")
+            view=memoryview(part)
+            while view:
+                count=os.write(destination_fd,view)
+                if count<=0: fail("provider capsule copy short write")
+                view=view[count:]
+            digest.update(part); total+=len(part)
+            if total==len(part): raw_test_barrier(barrier,"capsule_copy",{"source":expected,"copied":total})
+        if provider_read(source_fd,1,deadline): fail("provider capsule source overrun")
+        provider_set_xattrs(destination_fd,xattr_values)
+        os.fchmod(destination_fd,expected["mode"]); os.fsync(destination_fd)
+        destination_after=os.fstat(destination_fd); source_after=os.fstat(source_fd)
+        if (provider_stat_stability(source_after)!=stable or digest.hexdigest()!=expected["sha256"]
+                or total!=expected["bytes"]): fail("provider capsule source drift")
+        validate_provider_stat(destination_after,expected["maximum_bytes"])
+        if (destination_after.st_uid!=expected["uid"] or stat.S_IMODE(destination_after.st_mode)!=expected["mode"]
+                or destination_after.st_nlink!=1): fail("provider capsule copy metadata")
+        copied_xattrs,_=provider_xattrs(destination_fd)
+        if copied_xattrs!=xattrs: fail("provider capsule copied xattr mismatch")
+        finished=time.monotonic_ns()
+        copy={"path":str(destination),**identity(destination_after),"sha256":digest.hexdigest()}
+        timing={"start_monotonic_ns":started,"end_monotonic_ns":finished,"duration_ns":finished-started,
+                "bytes":total,"chunk_bytes":PROVIDER_EXECUTABLE_CHUNK_BYTES,
+                "timeout_ns":PROVIDER_EXECUTABLE_TIMEOUT_NS}
+        return copy,macho,xattrs,timing
+    finally: os.close(destination_fd)
+
+def reprove_provider_source_descriptor(source_fd, expected):
+    before=os.fstat(source_fd); validate_provider_stat(before,expected["maximum_bytes"])
+    named_before=os.lstat(expected["path"]); validate_provider_stat(named_before,expected["maximum_bytes"])
+    required={key:expected[key] for key in ("dev","ino","uid","mode","nlink","bytes")}
+    if identity(before)!=required or identity(named_before)!=required:
+        fail("provider capsule source path descriptor drift")
+    digest=hashlib.sha256(); total=0; deadline=time.monotonic_ns()+PROVIDER_EXECUTABLE_TIMEOUT_NS
+    os.lseek(source_fd,0,os.SEEK_SET)
+    while total<before.st_size:
+        amount=min(PROVIDER_EXECUTABLE_CHUNK_BYTES,before.st_size-total)
+        part=provider_read(source_fd,amount,deadline)
+        if len(part)!=amount: fail("provider capsule source short read")
+        digest.update(part); total+=len(part)
+    if provider_read(source_fd,1,deadline): fail("provider capsule source overrun")
+    after=os.fstat(source_fd); named_after=os.lstat(expected["path"])
+    if (identity(after)!=required or identity(named_after)!=required or digest.hexdigest()!=expected["sha256"]
+            or provider_stat_stability(after)!=provider_stat_stability(before)):
+        fail("provider capsule source path descriptor drift")
+
+def codesign_utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z")
+
+def codesign_stream_text(raw, label):
+    if not isinstance(raw,bytes) or len(raw)>CODESIGN_RESULT_MAX_BYTES:
+        fail("provider capsule codesign "+label+" cap")
+    if any(byte<0x20 and byte!=0x0a or byte==0x7f for byte in raw):
+        fail("provider capsule codesign "+label+" control data")
+    if raw and (not raw.endswith(b"\n") or b"\r" in raw):
+        fail("provider capsule codesign "+label+" line endings")
+    try: text=raw.decode("utf-8","strict")
+    except UnicodeDecodeError: fail("provider capsule codesign "+label+" encoding")
+    return [] if not text else text[:-1].split("\n")
+
+def codesign_command(argv):
+    if (not isinstance(argv,list) or not argv or argv[0]!=str(CODESIGN)
+            or str(CODESIGN)!="/usr/bin/codesign" or os.path.realpath(str(CODESIGN))!=str(CODESIGN)):
+        fail("provider capsule codesign canonical tool")
+    try:
+        tool_st=os.lstat(str(CODESIGN))
+        if (not stat.S_ISREG(tool_st.st_mode) or not tool_st.st_mode&stat.S_IXUSR
+                or tool_st.st_uid not in (0,os.geteuid()) or stat.S_IMODE(tool_st.st_mode)&0o022):
+            fail("provider capsule codesign canonical tool")
+    except OSError: fail("provider capsule codesign unavailable")
+    started_utc=codesign_utc_now(); started=time.monotonic_ns(); process=None
+    captured={"stdout":bytearray(),"stderr":bytearray()}; selector=selectors.DefaultSelector()
+    try:
+        process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                 close_fds=True,cwd="/",env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+        for name,stream in (("stdout",process.stdout),("stderr",process.stderr)):
+            os.set_blocking(stream.fileno(),False); selector.register(stream,selectors.EVENT_READ,name)
+        deadline=started+10_000_000_000
+        while selector.get_map():
+            remaining=deadline-time.monotonic_ns()
+            if remaining<=0: fail("provider capsule codesign timeout")
+            for key,_ in selector.select(min(remaining/1_000_000_000,0.1)):
+                try: part=os.read(key.fileobj.fileno(),65536)
+                except BlockingIOError: continue
+                except OSError: fail("provider capsule codesign stream read")
+                if not part:
+                    selector.unregister(key.fileobj); key.fileobj.close(); continue
+                target=captured[key.data]
+                target.extend(part)
+                if len(target)>CODESIGN_RESULT_MAX_BYTES:
+                    fail("provider capsule codesign "+key.data+" cap")
+        remaining=deadline-time.monotonic_ns()
+        if remaining<=0: fail("provider capsule codesign timeout")
+        try: exit_code=process.wait(timeout=remaining/1_000_000_000)
+        except subprocess.TimeoutExpired: fail("provider capsule codesign timeout")
+    except OSError: fail("provider capsule codesign unavailable")
+    finally:
+        selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            try: process.wait(timeout=1)
+            except Exception: pass
+    finished=time.monotonic_ns(); finished_utc=codesign_utc_now()
+    if not isinstance(exit_code,int) or exit_code<0: fail("provider capsule codesign signal")
+    stdout=bytes(captured["stdout"]); stderr=bytes(captured["stderr"])
+    codesign_stream_text(stdout,"stdout"); codesign_stream_text(stderr,"stderr")
+    result={"argv":argv,"cwd":"/","exit_code":exit_code,"start_utc":started_utc,"end_utc":finished_utc,
+            "start_monotonic_ns":started,"end_monotonic_ns":finished,"duration_ns":finished-started,
+            "stdout":{"bytes":len(stdout),"sha256":digest_bytes(stdout)},
+            "stderr":{"bytes":len(stderr),"sha256":digest_bytes(stderr)}}
+    return stdout,stderr,result
+
+def codesign_single(lines, prefix, required=True):
+    values=[line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(values)!=(1 if required else 0): fail("provider capsule signing identity")
+    return values[0] if required else None
+
+def codesign_bounded_value(value, maximum, label):
+    if (not isinstance(value,str) or not value or value!=value.strip()
+            or len(value.encode("utf-8"))>maximum):
+        fail("provider capsule "+label)
+    return value
+
+def codesign_classify_display(path, exit_code, stdout, stderr):
+    raw_path=str(path); stdout_lines=codesign_stream_text(stdout,"stdout")
+    stderr_lines=codesign_stream_text(stderr,"stderr")
+    unsigned_stderr=(raw_path+": code object is not signed at all\n").encode("utf-8")
+    if exit_code!=0:
+        if exit_code<0 or stdout!=b"" or stderr!=unsigned_stderr:
+            fail("provider capsule signing ambiguity")
+        return {"state":"unsigned"}
+    if stdout==b"" or stderr==b"": fail("provider capsule signing identity")
+    forbidden_stdout=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=")
+    if any(any(marker in line for marker in forbidden_stdout) for line in stdout_lines):
+        fail("provider capsule signing stream ambiguity")
+    if any("designated => " in line for line in stderr_lines):
+        fail("provider capsule signing stream ambiguity")
+    recognized_stderr=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=")
+    for line in stderr_lines:
+        if any(marker in line for marker in recognized_stderr) and not line.startswith(recognized_stderr):
+            fail("provider capsule signing stream ambiguity")
+    identifier=codesign_single(stderr_lines,"Identifier=")
+    team=codesign_single(stderr_lines,"TeamIdentifier=")
+    cdhash=codesign_single(stderr_lines,"CDHash=")
+    codedirectory=[line for line in stderr_lines if line.startswith("CodeDirectory ")]
+    if len(codedirectory)!=1 or codedirectory[0].count("flags=")!=1:
+        fail("provider capsule signing flags")
+    flag_match=re.search(r"(?:^| )flags=0x([0-9a-f]+)\(([^()]*)\)(?: |$)",codedirectory[0])
+    if flag_match is None: fail("provider capsule signing flags")
+    flags=int(flag_match.group(1),16); token_text=flag_match.group(2)
+    if token_text=="none":
+        if flags!=0: fail("provider capsule signing flags")
+        flag_tokens=set()
+    else:
+        if not re.fullmatch(r"[a-z0-9-]+(?:,[a-z0-9-]+)*",token_text):
+            fail("provider capsule signing flags")
+        tokens=token_text.split(",")
+        if len(tokens)!=len(set(tokens)): fail("provider capsule signing flags")
+        flag_tokens=set(tokens)
+    signatures=[line[len("Signature="):] for line in stderr_lines if line.startswith("Signature=")]
+    adhoc_evidence=(bool(flags&0x2),"adhoc" in flag_tokens,signatures==["adhoc"])
+    has_any_adhoc=any(adhoc_evidence) or bool(signatures)
+    has_all_adhoc=all(adhoc_evidence)
+    if team=="not set":
+        if not has_all_adhoc: fail("provider capsule signing ambiguity")
+        state="adhoc_signed"; team_identifier=None; requirement_prefix="# designated => "
+    else:
+        if not re.fullmatch(r"[A-Z0-9]{10}",team) or has_any_adhoc:
+            fail("provider capsule signing ambiguity")
+        state="team_signed"; team_identifier=team; requirement_prefix="designated => "
+    if has_any_adhoc and not has_all_adhoc: fail("provider capsule signing ambiguity")
+    if len(stdout_lines)!=1 or not stdout_lines[0].startswith(requirement_prefix):
+        fail("provider capsule designated requirement")
+    requirement=codesign_bounded_value(stdout_lines[0][len(requirement_prefix):],
+                                       CODESIGN_REQUIREMENT_MAX_BYTES,"designated requirement")
+    identifier=codesign_bounded_value(identifier,CODESIGN_IDENTIFIER_MAX_BYTES,"signing identifier")
+    if not re.fullmatch(r"[0-9a-f]{40}",cdhash): fail("provider capsule signing CDHash")
+    return {"state":state,"identifier":identifier,"team_identifier":team_identifier,"cdhash":cdhash,
+            "designated_requirement":requirement,"codedirectory_flags":flags}
+
+def codesign_result_schema(value, expected_argv):
+    keys={"argv","cwd","exit_code","start_utc","end_utc","start_monotonic_ns","end_monotonic_ns",
+          "duration_ns","stdout","stderr"}
+    if (not isinstance(value,dict) or not exact_keys(value,keys) or value["argv"]!=expected_argv
+            or value["cwd"]!="/" or type(value["exit_code"]) is not int or value["exit_code"]<0
+            or type(value["start_monotonic_ns"]) is not int or type(value["end_monotonic_ns"]) is not int
+            or value["end_monotonic_ns"]<value["start_monotonic_ns"]
+            or value["duration_ns"]!=value["end_monotonic_ns"]-value["start_monotonic_ns"]):
+        fail("provider capsule codesign result schema")
+    utc_pattern=r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z"
+    if (not re.fullmatch(utc_pattern,str(value["start_utc"]))
+            or not re.fullmatch(utc_pattern,str(value["end_utc"]))):
+        fail("provider capsule codesign result time")
+    try:
+        start=datetime.fromisoformat(value["start_utc"].replace("Z","+00:00"))
+        end=datetime.fromisoformat(value["end_utc"].replace("Z","+00:00"))
+    except ValueError: fail("provider capsule codesign result time")
+    if start.tzinfo!=timezone.utc or end.tzinfo!=timezone.utc or end<start:
+        fail("provider capsule codesign result time")
+    for name in ("stdout","stderr"):
+        stream=value[name]
+        if (not isinstance(stream,dict) or not exact_keys(stream,{"bytes","sha256"})
+                or type(stream["bytes"]) is not int or not 0<=stream["bytes"]<=CODESIGN_RESULT_MAX_BYTES
+                or not re.fullmatch(r"[0-9a-f]{64}",str(stream["sha256"]))):
+            fail("provider capsule codesign result stream")
+
+def codesign_record_from_observations(path, display, strict_verify=None):
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    if (not isinstance(display,tuple) or len(display)!=3): fail("provider capsule codesign display result")
+    stdout,stderr,display_result=display; codesign_result_schema(display_result,display_argv)
+    if (display_result["stdout"]!={"bytes":len(stdout),"sha256":digest_bytes(stdout)}
+            or display_result["stderr"]!={"bytes":len(stderr),"sha256":digest_bytes(stderr)}):
+        fail("provider capsule codesign display binding")
+    fields=codesign_classify_display(path,display_result["exit_code"],stdout,stderr)
+    if fields["state"]=="unsigned":
+        if strict_verify is not None: fail("provider capsule unsigned verification")
+        return {**fields,"display_result":display_result}
+    if not isinstance(strict_verify,tuple) or len(strict_verify)!=3:
+        fail("provider capsule strict code signature")
+    verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+    verify_stdout,verify_stderr,verify_result=strict_verify
+    codesign_result_schema(verify_result,verify_argv)
+    if (display_result["end_monotonic_ns"]>verify_result["start_monotonic_ns"]
+            or display_result["end_utc"]>verify_result["start_utc"]):
+        fail("provider capsule codesign command order")
+    if (verify_result["stdout"]!={"bytes":len(verify_stdout),"sha256":digest_bytes(verify_stdout)}
+            or verify_result["stderr"]!={"bytes":len(verify_stderr),"sha256":digest_bytes(verify_stderr)}):
+        fail("provider capsule codesign verify binding")
+    codesign_stream_text(verify_stdout,"verify stdout"); verify_lines=codesign_stream_text(verify_stderr,"verify stderr")
+    recognized=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=","designated => ")
+    if verify_result["exit_code"]!=0 or any(any(marker in line for marker in recognized) for line in verify_lines):
+        fail("provider capsule strict code signature")
+    return {**fields,"display_result":display_result,"strict_verify_result":verify_result}
+
+def codesign_record(path):
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    display=codesign_command(display_argv)
+    if display[2]["exit_code"]!=0:
+        return codesign_record_from_observations(path,display)
+    verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+    return codesign_record_from_observations(path,display,codesign_command(verify_argv))
+
+def codesign_stable_identity(value):
+    fields=("state",) if value.get("state")=="unsigned" else (
+        "state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags")
+    return {name:value[name] for name in fields}
+
+def codesign_reproof_identity(value):
+    result=codesign_stable_identity(value)
+    for name in ("display_result","strict_verify_result"):
+        if name in value:
+            command=value[name]
+            result[name]={key:command[key] for key in ("argv","cwd","exit_code","stdout","stderr")}
+    return result
+
+def validate_codesign_reproof(expected, observed):
+    if codesign_reproof_identity(observed)!=codesign_reproof_identity(expected):
+        fail("provider capsule signing reproof drift")
+
 def provider_executable_record(provider, canonical_path, barrier=None, retain_descriptor=False):
     maximum=PROVIDER_EXECUTABLE_MAX_BYTES.get(provider)
     if maximum is None: fail("provider executable policy")
@@ -791,12 +1392,197 @@ def reprove_provider_executable(expected, barrier=None, retain_descriptor=False)
         return fd
     if result!=expected: fail("provider executable manifest mismatch")
 
+def provider_capsule_attachment_schema(value):
+    keys={"device","device_identifier","mountpoint","filesystem","bus_protocol","volume_uuid",
+          "readonly","options","disk_info_timing","attach_timing"}
+    if not isinstance(value,dict) or not exact_keys(value,keys): fail("provider capsule attachment schema")
+    for name in ("disk_info_timing","attach_timing"):
+        timing=value[name]
+        required={"start_monotonic_ns","end_monotonic_ns","duration_ns","exit_code","argv_sha256",
+                  "stdout_sha256","stderr_sha256"}
+        if (not isinstance(timing,dict) or not exact_keys(timing,required)
+                or timing["duration_ns"]!=timing["end_monotonic_ns"]-timing["start_monotonic_ns"]
+                or timing["duration_ns"]<0 or timing["exit_code"]!=0): fail("provider capsule timing schema")
+
+def provider_capsule_guardian_schema(value):
+    required={"create_sequence","seal_sequence","create_digest","sealed_digest","capsule"}
+    if not isinstance(value,dict) or not exact_keys(value,required): fail("provider capsule guardian schema")
+    capsule=value["capsule"]
+    keys={"schema_version","state","provider","source_bytes","requested_image_bytes","maximum_image_bytes",
+          "root","mountpoint_backing","image","attachment","create_timing","rw_detach"}
+    if (not isinstance(capsule,dict) or not exact_keys(capsule,keys) or capsule.get("schema_version")!=1
+            or capsule.get("state")!="RO_ATTACHED" or value["create_sequence"]!=1 or value["seal_sequence"]!=2
+            or value["sealed_digest"]!=digest_bytes(canonical(capsule).encode("ascii"))):
+        fail("provider capsule guardian state")
+    provider_capsule_attachment_schema(capsule["attachment"])
+    image=capsule["image"]
+    if not isinstance(image,dict) or not exact_keys(image,{"path","dev","ino","uid","mode","nlink","bytes","sha256"}):
+        fail("provider capsule image schema")
+    detach=capsule["rw_detach"]
+    if (not isinstance(detach,dict) or not exact_keys(detach,{"device","mountpoint","absent","detach_timing"})
+            or detach.get("absent") is not True): fail("provider capsule detach schema")
+
+def codesign_record_schema(value, path):
+    unsigned={"state","display_result"}
+    signed={"state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags",
+            "display_result","strict_verify_result"}
+    if not isinstance(value,dict): fail("provider capsule signing schema")
+    state=value.get("state")
+    if state=="unsigned":
+        if not exact_keys(value,unsigned): fail("provider capsule signing schema")
+    elif state in ("adhoc_signed","team_signed"):
+        if (not exact_keys(value,signed) or not isinstance(value["identifier"],str) or not value["identifier"]
+                or value["identifier"]!=value["identifier"].strip()
+                or len(value["identifier"].encode("utf-8"))>CODESIGN_IDENTIFIER_MAX_BYTES
+                or not re.fullmatch(r"[0-9a-f]{40}",str(value["cdhash"]))
+                or not isinstance(value["designated_requirement"],str) or not value["designated_requirement"]
+                or value["designated_requirement"]!=value["designated_requirement"].strip()
+                or len(value["designated_requirement"].encode("utf-8"))>CODESIGN_REQUIREMENT_MAX_BYTES
+                or type(value["codedirectory_flags"]) is not int or value["codedirectory_flags"]<0):
+            fail("provider capsule signing schema")
+        if state=="adhoc_signed":
+            if value["team_identifier"] is not None or not value["codedirectory_flags"]&0x2:
+                fail("provider capsule signing schema")
+        elif (not re.fullmatch(r"[A-Z0-9]{10}",str(value["team_identifier"]))
+                or value["codedirectory_flags"]&0x2):
+            fail("provider capsule signing schema")
+    else: fail("provider capsule signing schema")
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    codesign_result_schema(value["display_result"],display_argv)
+    if (state=="unsigned")!=(value["display_result"]["exit_code"]!=0):
+        fail("provider capsule signing display relationship")
+    if state!="unsigned":
+        verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+        codesign_result_schema(value["strict_verify_result"],verify_argv)
+        if value["strict_verify_result"]["exit_code"]!=0:
+            fail("provider capsule strict code signature")
+        if (value["display_result"]["end_monotonic_ns"]>value["strict_verify_result"]["start_monotonic_ns"]
+                or value["display_result"]["end_utc"]>value["strict_verify_result"]["start_utc"]):
+            fail("provider capsule codesign command order")
+
+def provider_capsule_schema(value):
+    keys={"schema_version","provider","source","macho","xattrs","copy","mounted","signing","copy_timing","guardian"}
+    if not isinstance(value,dict) or not exact_keys(value,keys) or value.get("schema_version")!=1:
+        fail("provider capsule schema")
+    if not isinstance(value["source"],dict) or not exact_keys(value["source"],PROVIDER_EXECUTABLE_FIELDS):
+        fail("provider capsule source schema")
+    copy_keys={"path","dev","ino","uid","mode","nlink","bytes","sha256"}
+    if not isinstance(value["copy"],dict) or not exact_keys(value["copy"],copy_keys):
+        fail("provider capsule copy schema")
+    if not isinstance(value["mounted"],dict) or not exact_keys(value["mounted"],PROVIDER_EXECUTABLE_FIELDS):
+        fail("provider capsule mounted schema")
+    macho=value["macho"]
+    if (not isinstance(macho,dict) or not exact_keys(macho,{"format","native_architecture","architectures","magic"})
+            or macho["native_architecture"] not in macho["architectures"]): fail("provider capsule Mach-O schema")
+    if not isinstance(value["xattrs"],list) or len(value["xattrs"])>PROVIDER_CAPSULE_METADATA_MAX_COUNT:
+        fail("provider capsule xattr schema")
+    names=[]
+    for item in value["xattrs"]:
+        if (not isinstance(item,dict) or not exact_keys(item,{"name","name_bytes","bytes","sha256"})
+                or not isinstance(item["name"],str) or not re.fullmatch(r"[0-9a-f]{64}",str(item["sha256"]))):
+            fail("provider capsule xattr schema")
+        names.append(item["name"])
+    if names!=sorted(set(names)): fail("provider capsule xattr order")
+    timing=value["copy_timing"]
+    if (not isinstance(timing,dict) or not exact_keys(timing,{"start_monotonic_ns","end_monotonic_ns","duration_ns",
+            "bytes","chunk_bytes","timeout_ns"}) or timing["duration_ns"]!=timing["end_monotonic_ns"]-timing["start_monotonic_ns"]):
+        fail("provider capsule copy timing")
+    signing=value["signing"]
+    if not isinstance(signing,dict) or not exact_keys(signing,{"source","copy","mounted"}):
+        fail("provider capsule signing schema")
+    for name,path in (("source",value["source"]["path"]),("copy",value["copy"]["path"]),
+                      ("mounted",value["mounted"]["path"])):
+        codesign_record_schema(signing[name],path)
+    identities=[codesign_stable_identity(signing[name]) for name in ("source","copy","mounted")]
+    if identities[1:]!=identities[:-1]: fail("provider capsule signing identity mismatch")
+    provider_capsule_guardian_schema(value["guardian"])
+
+def build_provider_capsule(provider, source_path, control, guardian_pid, guardian_token, invocation, barrier):
+    source,source_fd=provider_executable_record(provider,source_path,barrier,retain_descriptor=True)
+    try:
+        source_stable=provider_stat_stability(os.fstat(source_fd))
+        reprove_provider_source_descriptor(source_fd,source)
+        source_signing=codesign_record(Path(source["path"]))
+        reprove_provider_source_descriptor(source_fd,source)
+        created=guardian_capsule_request(control,guardian_token,invocation,guardian_pid,1,"capsule_create",
+                                         provider=provider,source_bytes=source["bytes"])
+        rw=created["capsule"]
+        if (rw.get("state")!="RW_ATTACHED" or rw.get("provider")!=provider
+                or rw.get("source_bytes")!=source["bytes"]): fail("provider capsule create receipt")
+        destination=Path(rw["attachment"]["mountpoint"])/"provider"
+        copy,macho,xattrs,copy_timing=provider_copy_to_capsule(source_fd,source,destination,barrier)
+        copy_signing=codesign_record(destination)
+        observed_copy=provider_executable_record(provider,str(destination))
+        if any(copy[key]!=observed_copy[key] for key in ("path","dev","ino","uid","mode","nlink","bytes","sha256")):
+            fail("provider capsule copy signing drift")
+        reprove_provider_source_descriptor(source_fd,source)
+        after_xattrs,_=provider_xattrs(source_fd)
+        if provider_stat_stability(os.fstat(source_fd))!=source_stable or after_xattrs!=xattrs:
+            fail("provider capsule source mutation")
+        sealed=guardian_capsule_request(control,guardian_token,invocation,guardian_pid,2,"capsule_seal",
+                                        capsule_digest=created["capsule_digest"])
+        final=sealed["capsule"]; mounted_path=Path(final["attachment"]["mountpoint"])/"provider"
+        mounted=provider_executable_record(provider,str(mounted_path),barrier)
+        mounted_fd=os.open(str(mounted_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+        try: mounted_xattrs,_=provider_xattrs(mounted_fd)
+        finally: os.close(mounted_fd)
+        if (mounted_xattrs!=xattrs or any(source[key]!=copy[key] or source[key]!=mounted[key]
+                for key in ("uid","mode","nlink","bytes","sha256"))):
+            fail("provider capsule source-copy-mounted mismatch")
+        mounted_signing=codesign_record(mounted_path)
+        signing={"source":source_signing,"copy":copy_signing,"mounted":mounted_signing}
+        identities=[codesign_stable_identity(signing[name]) for name in ("source","copy","mounted")]
+        if identities[1:]!=identities[:-1]: fail("provider capsule signing identity mismatch")
+        result={"schema_version":1,"provider":provider,"source":source,"macho":macho,"xattrs":xattrs,
+                "copy":copy,"mounted":mounted,"signing":signing,"copy_timing":copy_timing,
+                "guardian":{"create_sequence":1,"seal_sequence":2,"create_digest":created["capsule_digest"],
+                            "sealed_digest":sealed["capsule_digest"],"capsule":final}}
+        provider_capsule_schema(result)
+        return result
+    finally: os.close(source_fd)
+
+def validate_provider_capsule(doc, dynamic=True):
+    capsule=doc["provider_capsule"]; provider_capsule_schema(capsule)
+    source=capsule["source"]; copy=capsule["copy"]; mounted=capsule["mounted"]
+    if capsule["provider"]!=doc["provider"] or source["provider"]!=doc["provider"] or mounted["provider"]!=doc["provider"]:
+        fail("provider capsule provider binding")
+    guardian=capsule["guardian"]["capsule"]; root=Path(doc["guardian"]["root"])/"provider-capsule"
+    mounted_path=root/"mount"/"provider"
+    if (Path(guardian["root"])!=root or Path(guardian["image"]["path"])!=root/"provider.dmg"
+            or Path(guardian["attachment"]["mountpoint"])!=root/"mount"
+            or Path(copy["path"])!=mounted_path or Path(mounted["path"])!=mounted_path):
+        fail("provider capsule path binding")
+    if any(source[key]!=copy[key] or source[key]!=mounted[key] for key in ("uid","mode","nlink","bytes","sha256")):
+        fail("provider capsule byte binding")
+    if not dynamic: return
+    try: guardian_reprove_attachment(guardian["attachment"])
+    except RuntimeError as exc: fail(str(exc))
+    image_st=os.lstat(guardian["image"]["path"])
+    if identity(image_st)!={key:guardian["image"][key] for key in ("dev","ino","uid","mode","nlink","bytes")}:
+        fail("provider capsule image drift")
+    observed=provider_executable_record(doc["provider"],mounted["path"],doc["test_barrier"])
+    if observed!=mounted: fail("provider capsule mounted executable drift")
+    descriptor=os.open(mounted["path"],os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try: observed_xattrs,_=provider_xattrs(descriptor)
+    finally: os.close(descriptor)
+    current_signing=codesign_record(Path(mounted["path"]))
+    if observed_xattrs!=capsule["xattrs"]: fail("provider capsule metadata drift")
+    validate_codesign_reproof(capsule["signing"]["mounted"],current_signing)
+
 def provider_exec(ns, rest):
     if not rest: fail("provider exec argv")
     doc,raw=load_manifest(ns.manifest)
     if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation:
         fail("provider exec manifest binding")
-    seatbelt=doc["seatbelt"]; expected=seatbelt["provider"]
+    seatbelt=doc["seatbelt"]; expected=doc["provider_capsule"]["mounted"]
+    if ns.terminal:
+        if len(rest)<2 or rest[0]!=doc["provider_capsule"]["source"]["path"] or rest[1]!=expected["path"]:
+            fail("provider terminal argv")
+        validate_provider_capsule(doc)
+        raw_test_barrier(doc["test_barrier"],"capsule_preexec",{"mounted":expected,"logical_argv0":rest[0]})
+        validate_provider_capsule(doc)
+        argv=[os.fsencode(rest[0])]+[os.fsencode(value) for value in rest[2:]]
+        os.execve(os.fsencode(expected["path"]),argv,os.environb.copy())
     prefix=seatbelt["supervisor_argv_prefix"]
     if rest[:len(prefix)]!=prefix or len(rest)<=len(prefix) or rest[len(prefix)]!="/usr/bin/env":
         fail("provider exec supervisor argv")
@@ -805,9 +1591,11 @@ def provider_exec(ns, rest):
     while cursor<len(rest) and assignment.fullmatch(rest[cursor]): cursor+=1
     if cursor>=len(rest) or rest[cursor]!=expected.get("path"):
         fail("provider exec executable argv")
-    fd=reprove_provider_executable(expected,doc["test_barrier"],retain_descriptor=True)
-    try: os.execve(rest[0],rest,os.environ.copy())
-    finally: os.close(fd)
+    validate_provider_capsule(doc)
+    terminal=[str(SELF),"provider-exec","--manifest",ns.manifest,"--digest",ns.digest,
+              "--invocation",ns.invocation,"--terminal","--",doc["provider_capsule"]["source"]["path"]]
+    rewritten=rest[:cursor]+terminal+rest[cursor:]
+    os.execve(os.fsencode(rewritten[0]),[os.fsencode(value) for value in rewritten],os.environb.copy())
 
 def find_probe_file(real_common):
     for current,dirs,files in os.walk(str(real_common),topdown=True,followlinks=False):
@@ -854,10 +1642,13 @@ raise SystemExit(0 if all(ok.values()) else 3)
     return {"result":result,"stdout_sha256":digest_bytes(done.stdout),"profile_sha256":seatbelt["profile"]["sha256"],
             "wrapper_sha256":seatbelt["wrapper"]["sha256"],"monotonic_ns":time.monotonic_ns()}
 
-def prepare_seatbelt(real_common, capsule_root, control, provider, provider_executable, barrier=None):
+def prepare_seatbelt(real_common, capsule_root, control, provider, provider_executable,
+                     guardian_pid, guardian_token, invocation, barrier=None):
     if sys.platform!="darwin" or not SANDBOX_EXEC.exists(): fail("Seatbelt unsupported")
     wrapper=external_file_record(SANDBOX_EXEC)
-    provider_record=provider_executable_record(provider,provider_executable,barrier)
+    provider_capsule=build_provider_capsule(provider,provider_executable,control,guardian_pid,
+                                            guardian_token,invocation,barrier)
+    provider_record=provider_capsule["source"]
     profile=control/"provider.sb"; put_file(profile,PROFILE_SOURCE,0o400)
     alias=control/"real-common-alias"; os.symlink(str(real_common),str(alias))
     sentinel=control/"seatbelt-capsule-sentinel"; put_file(sentinel,b"seatbelt-capsule-ok\n",0o600)
@@ -867,12 +1658,13 @@ def prepare_seatbelt(real_common, capsule_root, control, provider, provider_exec
               "alias":str(alias),"probe_file":str(probe),"probe_file_identity":{"path":str(probe),**path_record(probe)},
               "capsule_sentinel":str(sentinel),"supervisor_argv_prefix":[str(SANDBOX_EXEC),"-D","REAL_COMMON="+str(real_common),"-f",str(profile)]}
     seatbelt["prepare_probe"]=run_seatbelt_probe(seatbelt,{})
-    return seatbelt
+    return seatbelt,provider_capsule
 
 def validate_seatbelt(doc, post=False):
     seatbelt=doc["seatbelt"]
     if external_file_record(Path(seatbelt["wrapper"]["path"]))!=seatbelt["wrapper"]: fail("Seatbelt wrapper drift")
-    reprove_provider_executable(seatbelt["provider"],doc["test_barrier"])
+    if seatbelt["provider"]!=doc["provider_capsule"]["source"]: fail("Seatbelt provider binding")
+    validate_provider_capsule(doc)
     profile={"path":seatbelt["profile"]["path"],**path_record(Path(seatbelt["profile"]["path"]))}
     if profile!=seatbelt["profile"] or Path(seatbelt["profile"]["path"]).read_bytes()!=PROFILE_SOURCE: fail("Seatbelt profile drift")
     real=Path(seatbelt["real_common"])
@@ -1118,7 +1910,7 @@ def load_manifest(path):
             "harness_commit","harness_tree","candidate_root","candidate_commit","candidate_tree",
             "patch_base","patch_commit","patch_bytes","patch_sha256","scratch_root","scratch_dev",
             "scratch_ino","request_root","response_root","runner","tools","capsule","guardian",
-            "seatbelt","test_barrier"}
+            "seatbelt","provider_capsule","test_barrier"}
     if not exact_keys(doc, keys) or doc["schema_version"] != 3 or doc["purpose"] != "disposable_git_candidate_eval":
         fail("manifest schema")
     root = Path(doc["candidate_root"])
@@ -1143,6 +1935,7 @@ def load_manifest(path):
         if (not exact_keys(barrier,required) or barrier["enabled"] is not True or barrier["invocation"]!=doc["invocation"]
                 or barrier["phase"] not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{64}",barrier["token"])): fail("test barrier manifest")
     elif barrier!={"enabled":False}: fail("test barrier manifest")
+    provider_capsule_schema(doc["provider_capsule"])
     guardian=doc["guardian"]
     if (not exact_keys(guardian,{"protocol_version","candidate_commit","pid","root","root_identity","root_binding",
                                 "control","socket","socket_identity","token_sha256","failure_marker"})
@@ -1211,8 +2004,8 @@ def prepare(ns):
               "socket":str(guardian_socket),"socket_identity":identity(socket_st),
               "token_sha256":digest_bytes(bytes.fromhex(ns.guardian_token)),
               "failure_marker":ns.guardian_failure_marker}
-    seatbelt=prepare_seatbelt(Path(capsule["real_common"]),scratch,control,ns.provider,
-                              ns.provider_executable,test_barrier_doc)
+    seatbelt,provider_capsule=prepare_seatbelt(Path(capsule["real_common"]),scratch,control,ns.provider,
+                              ns.provider_executable,ns.guardian_pid,ns.guardian_token,invocation,test_barrier_doc)
     doc = {"schema_version":3,"purpose":"disposable_git_candidate_eval","invocation":invocation,
            "eval":ns.eval,"provider":ns.provider,"harness_root":str(root),"harness_commit":head,
            "harness_tree":tree,"candidate_root":str(candidate_root),
@@ -1221,6 +2014,7 @@ def prepare(ns):
            "scratch_root":str(scratch),"scratch_dev":scratch_st.st_dev,"scratch_ino":scratch_st.st_ino,
            "request_root":str(request_root),"response_root":str(response_root),
            "runner":runner,"tools":tools,"capsule":capsule,"guardian":guardian,"seatbelt":seatbelt,
+           "provider_capsule":provider_capsule,
            "test_barrier":test_barrier_doc}
     raw = (canonical(doc) + "\n").encode("ascii")
     if manifest.resolve().parent!=control: fail("manifest control root")
@@ -1260,7 +2054,8 @@ def prepare(ns):
                      "shell_env":str(shell_env),"project_root":str(candidate_root),"capsule_root":str(scratch),
                      "authority_bin":str(candidate_root/"bin"/"firm-eval-authority"),
                      "seatbelt_profile":seatbelt["profile"]["path"],"real_common":seatbelt["real_common"],
-                     "provider_executable":seatbelt["provider"]["path"],
+                     "provider_executable":provider_capsule["mounted"]["path"],
+                     "provider_logical_argv0":provider_capsule["source"]["path"],"guardian_sequence":2,
                      "guardian_pid":ns.guardian_pid,"guardian_root":str(guardian_root)}))
 
 def send_message(request_root, response_root, request):
@@ -1403,7 +2198,7 @@ def main():
     q=sub.add_parser("guardian-start"); q.add_argument("--parent",required=True); q.add_argument("--launcher-pid",type=int,required=True); q.add_argument("--invocation"); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
     q=sub.add_parser("guardian-command"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--action",choices=("register","cleanup"),required=True); q.add_argument("--role",choices=("broker","provider")); q.add_argument("--pid",type=int); q.add_argument("--pgid",type=int); q.add_argument("--nonce"); q.add_argument("--expected-roles",default="")
     q=sub.add_parser("guardian-exec"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--role",choices=("broker","provider"),required=True); q.add_argument("--nonce")
-    q=sub.add_parser("provider-exec"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True)
+    q=sub.add_parser("provider-exec"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--terminal",action="store_true")
     q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--provider-executable",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--guardian-root",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--guardian-token",required=True); q.add_argument("--guardian-failure-marker",required=True); q.add_argument("--invocation",required=True); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
     q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
     q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)

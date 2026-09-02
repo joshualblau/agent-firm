@@ -296,6 +296,7 @@ run_one() { # $1 = eval dir ; $2 = name -> checker rc (0 pass)
     seatbelt_profile="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["seatbelt_profile"])')" || return 1
     real_common="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["real_common"])')" || return 1
     provider_executable="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; print(json.load(sys.stdin)["provider_executable"])')" || return 1
+    guardian_sequence="$(printf '%s\n' "$authority_prepare" | firm_python -c 'import json,sys; value=json.load(sys.stdin)["guardian_sequence"]; assert value==2; print(value)')" || return 1
     [ "$provider" = codex ] && codex_command="$provider_executable" || claude_command="$provider_executable"
     shell_bash_env="$shell_env/.bash-env"; shell_sh_env="$shell_env/.sh-env"
     candidate_path="$control/shims:/usr/bin:/bin:/usr/sbin:/sbin"

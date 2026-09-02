@@ -53,6 +53,80 @@ if action=="record":
         maximum=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         value["maximum_rss_bytes"]=maximum if sys.platform=="darwin" else maximum*1024
     emit(value)
+elif action=="capsule-build":
+    provider,path,control,token,invocation,pid=args[:6]
+    emit(scope["build_provider_capsule"](provider,path,Path(control),int(pid),token,invocation,{"enabled":False}))
+elif action=="signing-record":
+    emit(scope["codesign_record"](Path(args[0])))
+elif action=="signing-observation":
+    state,mutation=args[:2]; path=Path("/private/tmp/provider-fixture")
+    cdhash="1"*40
+    if state=="unsigned":
+        display_stdout=b""; display_stderr=(str(path)+": code object is not signed at all\n").encode(); display_exit=1
+    elif state=="adhoc_signed":
+        display_stdout=("# designated => cdhash H\\\"%s\\\"\n"%cdhash).encode()
+        display_stderr=("Executable=%s\nIdentifier=fixture-adhoc\nCodeDirectory v=20400 size=259 flags=0x2(adhoc) hashes=2+2 location=embedded\nCDHash=%s\nSignature=adhoc\nTeamIdentifier=not set\n"%(path,cdhash)).encode()
+        display_exit=0
+    elif state=="team_signed":
+        display_stdout=b'designated => identifier "fixture-team" and anchor apple generic\n'
+        display_stderr=("Executable=%s\nIdentifier=fixture-team\nCodeDirectory v=20500 size=259 flags=0x10000(runtime) hashes=2+2 location=embedded\nCDHash=%s\nSignature size=4096\nTeamIdentifier=ABC1234XYZ\n"%(path,cdhash)).encode()
+        display_exit=0
+    else: raise SystemExit("unknown signing state")
+    verify_stdout=b""; verify_stderr=(str(path)+": valid on disk\n"+str(path)+": satisfies its Designated Requirement\n").encode(); verify_exit=0
+    if mutation=="none": pass
+    elif mutation=="missing-identifier": display_stderr=display_stderr.replace(b"Identifier=fixture-adhoc\n",b"").replace(b"Identifier=fixture-team\n",b"")
+    elif mutation=="duplicate-team": display_stderr+=b"TeamIdentifier=ABC1234XYZ\n"
+    elif mutation=="mixed-team-adhoc": display_stderr=display_stderr.replace(b"TeamIdentifier=not set",b"TeamIdentifier=ABC1234XYZ")
+    elif mutation=="bad-hash": display_stderr=display_stderr.replace(cdhash.encode(),b"A"*40)
+    elif mutation=="bad-requirement": display_stdout=display_stdout.replace(b"# designated => ",b"designated => ") if state=="adhoc_signed" else display_stdout.replace(b"designated => ",b"# designated => ")
+    elif mutation=="missing-adhoc-signature": display_stderr=display_stderr.replace(b"Signature=adhoc\n",b"")
+    elif mutation=="signed-no-team-no-adhoc": display_stderr=display_stderr.replace(b"TeamIdentifier=ABC1234XYZ",b"TeamIdentifier=not set")
+    elif mutation=="wrong-unsigned-path": display_stderr=b"/private/tmp/other: code object is not signed at all\n"
+    elif mutation=="unsigned-extra-output": display_stdout=b"unexpected\n"
+    elif mutation=="control-output": display_stderr+=b"bad\x00value\n"
+    elif mutation=="unterminated-output": display_stderr=display_stderr.rstrip(b"\n")
+    elif mutation=="verify-failure": verify_exit=1
+    elif mutation=="verify-identity-output": verify_stderr+=b"Identifier=forbidden\n"
+    elif mutation=="verify-order": pass
+    elif mutation=="display-digest-drift": pass
+    else: raise SystemExit("unknown signing mutation")
+    def observation(kind,stdout,stderr,exit_code):
+        argv=[str(scope["CODESIGN"])]
+        argv+=(['--display','--requirements','-','--verbose=4',str(path)] if kind=="display" else ['--verify','--strict','--verbose=4',str(path)])
+        start_ns,end_ns=(1,2) if kind=="display" else (3,4)
+        start_utc,end_utc=(("2026-09-02T00:00:00.000000Z","2026-09-02T00:00:00.000001Z") if kind=="display" else
+                           ("2026-09-02T00:00:00.000002Z","2026-09-02T00:00:00.000003Z"))
+        result={"argv":argv,"cwd":"/","exit_code":exit_code,"start_utc":start_utc,
+                "end_utc":end_utc,"start_monotonic_ns":start_ns,"end_monotonic_ns":end_ns,"duration_ns":1,
+                "stdout":{"bytes":len(stdout),"sha256":scope["digest_bytes"](stdout)},
+                "stderr":{"bytes":len(stderr),"sha256":scope["digest_bytes"](stderr)}}
+        return stdout,stderr,result
+    display=observation("display",display_stdout,display_stderr,display_exit)
+    if mutation=="display-digest-drift": display[2]["stderr"]["sha256"]="0"*64
+    verify=None if state=="unsigned" else observation("verify",verify_stdout,verify_stderr,verify_exit)
+    if mutation=="verify-order":
+        verify[2].update(start_utc="2026-09-02T00:00:00.000000Z",end_utc="2026-09-02T00:00:00.000001Z",
+                         start_monotonic_ns=1,end_monotonic_ns=2)
+    emit(scope["codesign_record_from_observations"](path,display,verify))
+elif action=="signing-reproof":
+    expected=json.loads(args[0]); observed=json.loads(args[0]); mutation=args[1]
+    if mutation=="identity": observed["identifier"]+="-drift"
+    elif mutation=="team-appearance": observed["team_identifier"]="ABC1234XYZ"
+    elif mutation=="display-output": observed["display_result"]["stdout"]["sha256"]="0"*64
+    elif mutation=="verify-output": observed["strict_verify_result"]["stderr"]["sha256"]="0"*64
+    elif mutation=="none": pass
+    else: raise SystemExit("unknown signing reproof mutation")
+    scope["validate_codesign_reproof"](expected,observed)
+elif action=="capsule-schema-mutate":
+    capsule=json.loads(args[0]); mutation=args[1]; signing=capsule["signing"]
+    if mutation=="state": signing["copy"]["state"]="team_signed"
+    elif mutation=="identity": signing["mounted"]["identifier"]+="-drift"
+    elif mutation=="team-appearance": signing["copy"]["team_identifier"]="ABC1234XYZ"
+    elif mutation=="hash": signing["source"]["cdhash"]="0"*40
+    elif mutation=="verify-failure": signing["mounted"]["strict_verify_result"]["exit_code"]=1
+    elif mutation=="extra": signing["copy"]["extra"]=True
+    else: raise SystemExit("unknown capsule schema mutation")
+    scope["provider_capsule_schema"](capsule)
 elif action=="external":
     emit(scope["external_file_record"](Path(args[0])))
 elif action=="instrument":
@@ -139,10 +213,19 @@ elif action=="exec":
     expected=record(provider,path)
     if mutation=="digest": expected["sha256"]="0"*64
     doc={"invocation":"a"*48,"test_barrier":{"enabled":False},
+         "provider_capsule":{"source":expected,"mounted":expected},
          "seatbelt":{"provider":expected,"supervisor_argv_prefix":[wrapper,"-D","REAL_COMMON=/private/absent","-f",profile]}}
     manifest_raw=b"authenticated-manifest\n"
     scope["load_manifest"]=lambda _:(doc,manifest_raw)
-    ns=types.SimpleNamespace(manifest="ignored",digest=scope["digest_bytes"](manifest_raw),invocation=doc["invocation"])
+    def validate(candidate):
+        if record(provider,path)!=candidate["provider_capsule"]["mounted"]:
+            scope["fail"]("provider capsule mounted executable drift")
+    scope["validate_provider_capsule"]=validate
+    def execve(executable,argv,environment):
+        if mutation=="clean": Path(marker).touch()
+        raise SystemExit(0)
+    scope["os"].execve=execve
+    ns=types.SimpleNamespace(manifest="ignored",digest=scope["digest_bytes"](manifest_raw),invocation=doc["invocation"],terminal=False)
     executable=path if mutation!="argv" else wrapper
     scope["provider_exec"](ns,[wrapper,"-D","REAL_COMMON=/private/absent","-f",profile,
                                     "/usr/bin/env","PROVIDER_MARKER="+marker,executable])
@@ -263,6 +346,213 @@ assert_no_file "digest failure launches no provider stub" "$provider_marker"
 assert_rc "alternate executable argv blocks before the provider marker" 2 \
   provider_harness exec argv codex "$provider_stub" "$wrapper_stub" "$profile_stub" "$provider_marker"
 assert_no_file "argv failure launches no provider stub" "$provider_marker"
+
+t_case "closed codesign parsing distinguishes unsigned, ad-hoc, and team identities"
+for signing_state in unsigned adhoc_signed team_signed; do
+  signing_record="$(provider_harness signing-observation "$signing_state" none)"
+  assert_ok "$signing_state has only its closed state-applicable fields" t_python - "$signing_record" "$signing_state" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); state=sys.argv[2]
+assert d["state"]==state
+if state=="unsigned":
+    assert set(d)=={"state","display_result"}
+    assert d["display_result"]["exit_code"]!=0
+else:
+    assert set(d)=={"state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags","display_result","strict_verify_result"}
+    assert len(d["cdhash"])==40 and d["strict_verify_result"]["exit_code"]==0
+    assert (d["team_identifier"] is None and d["codedirectory_flags"]&2) if state=="adhoc_signed" else (len(d["team_identifier"])==10 and not d["codedirectory_flags"]&2)
+for command in [d["display_result"]]+([] if state=="unsigned" else [d["strict_verify_result"]]):
+    assert command["cwd"]=="/" and command["duration_ns"]==command["end_monotonic_ns"]-command["start_monotonic_ns"]
+    assert set(command["stdout"])==set(command["stderr"])=={"bytes","sha256"}
+PY
+done
+for signing_case in \
+  "adhoc_signed missing-identifier" \
+  "adhoc_signed duplicate-team" \
+  "adhoc_signed mixed-team-adhoc" \
+  "adhoc_signed bad-hash" \
+  "adhoc_signed bad-requirement" \
+  "adhoc_signed missing-adhoc-signature" \
+  "adhoc_signed control-output" \
+  "adhoc_signed unterminated-output" \
+  "adhoc_signed verify-failure" \
+  "adhoc_signed verify-identity-output" \
+  "adhoc_signed verify-order" \
+  "adhoc_signed display-digest-drift" \
+  "team_signed signed-no-team-no-adhoc" \
+  "team_signed bad-hash" \
+  "team_signed bad-requirement" \
+  "unsigned wrong-unsigned-path" \
+  "unsigned unsigned-extra-output"; do
+  set -- $signing_case
+  assert_rc "$1 $2 is rejected before provider launch" 2 provider_harness signing-observation "$1" "$2"
+  assert_no_file "$1 $2 leaves the provider marker absent" "$provider_marker"
+done
+
+t_case "guardian-owned native Mach-O capsule is byte-exact, kernel-read-only, and exactly detached"
+native_source="$provider_root/native-provider.c"
+native_provider="$provider_root/native-provider"
+cat > "$native_source" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+  const char *nonce = getenv("CAPSULE_NONCE");
+  if (argc != 2 || nonce == NULL) return 19;
+  printf("%s\n%s\n%s\n", argv[0], argv[1], nonce);
+  return 0;
+}
+C
+native_arch="$(t_python -c 'import platform; print(platform.machine())')"
+assert_ok "local fixture compiles to a native Mach-O" /usr/bin/xcrun cc -arch "$native_arch" -Os -o "$native_provider" "$native_source"
+chmod 700 "$native_provider"
+assert_ok "local fixture receives an explicit ad-hoc signature without a private identity" \
+  /usr/bin/codesign --force --sign - "$native_provider"
+/usr/bin/xattr -w com.agentfirm.fixture readonly-capsule "$native_provider"
+native_signing="$(provider_harness signing-record "$native_provider")"
+assert_ok "native ad-hoc fixture has exact identity and explicit absent TeamIdentifier" \
+  t_python - "$native_signing" <<'PY'
+import json,re,sys
+d=json.loads(sys.argv[1])
+assert d["state"]=="adhoc_signed" and d["team_identifier"] is None and d["codedirectory_flags"]&2
+assert d["identifier"] and re.fullmatch(r"[0-9a-f]{40}",d["cdhash"]) and d["designated_requirement"]
+assert d["strict_verify_result"]["exit_code"]==0
+PY
+for signing_drift in identity team-appearance display-output verify-output; do
+  assert_rc "mounted $signing_drift drift is rejected by dynamic reproof" 2 \
+    provider_harness signing-reproof "$native_signing" "$signing_drift"
+  assert_no_file "mounted $signing_drift drift leaves no provider marker" "$provider_marker"
+done
+unsigned_provider="$provider_root/native-provider-unsigned"
+cp "$native_provider" "$unsigned_provider"; chmod 700 "$unsigned_provider"
+assert_ok "local unsigned fixture has its signature removed without another identity" \
+  /usr/bin/codesign --remove-signature "$unsigned_provider"
+unsigned_signing="$(provider_harness signing-record "$unsigned_provider")"
+assert_ok "native unsigned fixture exposes no signed identity or verify fields" t_python - "$unsigned_signing" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); assert d["state"]=="unsigned" and set(d)=={"state","display_result"}
+PY
+capsule_guardian="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+capsule_control="$(printf '%s\n' "$capsule_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+capsule_root="$(printf '%s\n' "$capsule_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+capsule_token="$(printf '%s\n' "$capsule_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+capsule_pid="$(printf '%s\n' "$capsule_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+capsule_invocation="$(printf '%s\n' "$capsule_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+capsule_record="$(provider_harness capsule-build codex "$native_provider" "$capsule_control" "$capsule_token" "$capsule_invocation" "$capsule_pid")"
+capsule_mounted="$(printf '%s\n' "$capsule_record" | t_python -c 'import json,sys; print(json.load(sys.stdin)["mounted"]["path"])')"
+for signing_manifest_mutation in state identity team-appearance hash verify-failure extra; do
+  assert_rc "manifest signing $signing_manifest_mutation mutation fails the closed capsule schema" 2 \
+    provider_harness capsule-schema-mutate "$capsule_record" "$signing_manifest_mutation"
+  assert_no_file "manifest signing $signing_manifest_mutation mutation leaves no provider marker" "$provider_marker"
+done
+assert_ok "manifest binds source, descriptor-copy, and mounted bytes plus native slice/xattr/signing" \
+  t_python - "$capsule_record" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+assert d["macho"]["native_architecture"] in d["macho"]["architectures"]
+assert d["guardian"]["capsule"]["state"]=="RO_ATTACHED"
+assert d["guardian"]["capsule"]["attachment"]["readonly"] is True
+assert "read-only" in d["guardian"]["capsule"]["attachment"]["options"]
+assert "nobrowse" in d["guardian"]["capsule"]["attachment"]["options"]
+assert [x["name"] for x in d["xattrs"]]==["com.agentfirm.fixture"]
+for key in ("uid","mode","nlink","bytes","sha256"):
+    assert d["source"][key]==d["copy"][key]==d["mounted"][key],key
+assert set(d["signing"])=={"source","copy","mounted"}
+identities=[]
+for name in ("source","copy","mounted"):
+    signed=d["signing"][name]
+    assert signed["state"]=="adhoc_signed" and signed["team_identifier"] is None and signed["codedirectory_flags"]&2
+    assert signed["display_result"]["argv"][-1]==d[name]["path"]
+    assert signed["strict_verify_result"]["argv"][-1]==d[name]["path"]
+    identities.append(tuple(signed[key] for key in ("state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags")))
+assert identities[0]==identities[1]==identities[2]
+PY
+assert_ok "mounted native fixture executes only its original nonce" env CAPSULE_NONCE=original-fixture-nonce \
+  "$capsule_mounted" unchanged-argument
+assert_ok "overwrite/truncate/rename/unlink/create are denied with EROFS" t_python - "$capsule_mounted" <<'PY'
+import errno,os,sys
+path=sys.argv[1]; root=os.path.dirname(path)
+operations=(
+    lambda:os.open(path,os.O_WRONLY),
+    lambda:os.truncate(path,0),
+    lambda:os.rename(path,path+".other"),
+    lambda:os.unlink(path),
+    lambda:os.open(os.path.join(root,"replacement"),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o700),
+)
+for operation in operations:
+    try: operation()
+    except OSError as exc: assert exc.errno==errno.EROFS,(exc.errno,exc)
+    else: raise AssertionError("read-only mutation unexpectedly succeeded")
+PY
+printf 'mutated source after capsule seal\n' > "$native_provider"
+assert_output "source-path mutation cannot change mounted output" original-fixture-nonce \
+  env CAPSULE_NONCE=original-fixture-nonce "$capsule_mounted" unchanged-argument
+assert_ok "guardian exact-detaches and removes the complete provider capsule after quiescence" \
+  "$AUTH" guardian-command --control "$capsule_control" --token "$capsule_token" \
+    --invocation "$capsule_invocation" --guardian-pid "$capsule_pid" --sequence 3 \
+    --expected-roles '' --action cleanup
+assert_no_file "guardian cleanup leaves no image, mount, descriptor, or root residue" "$capsule_root"
+
+unsigned_guardian="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+unsigned_control="$(printf '%s\n' "$unsigned_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+unsigned_root="$(printf '%s\n' "$unsigned_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+unsigned_token="$(printf '%s\n' "$unsigned_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+unsigned_pid="$(printf '%s\n' "$unsigned_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+unsigned_invocation="$(printf '%s\n' "$unsigned_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+unsigned_capsule="$(provider_harness capsule-build codex "$unsigned_provider" "$unsigned_control" "$unsigned_token" "$unsigned_invocation" "$unsigned_pid")"
+assert_ok "unsigned state remains identical across source, writable copy, and read-only mount" \
+  t_python - "$unsigned_capsule" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); records=d["signing"]
+assert [records[name]["state"] for name in ("source","copy","mounted")]==["unsigned"]*3
+assert all(set(records[name])=={"state","display_result"} for name in records)
+PY
+assert_ok "unsigned capsule cleanup removes every image and mount" \
+  "$AUTH" guardian-command --control "$unsigned_control" --token "$unsigned_token" \
+    --invocation "$unsigned_invocation" --guardian-pid "$unsigned_pid" --sequence 3 \
+    --expected-roles '' --action cleanup
+assert_no_file "unsigned capsule leaves no reusable residue" "$unsigned_root"
+
+team_fixture=''
+team_fixture_index=0
+for candidate in \
+  '/Applications/Visual Studio Code.app/Contents/MacOS/Code' \
+  '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT' \
+  '/Applications/Mersive Solstice.app/Contents/MacOS/SolsticeClient' \
+  "$HOME/.local/bin/claude"; do
+  [ -f "$candidate" ] || continue
+  team_fixture_index=$((team_fixture_index+1))
+  candidate_copy="$provider_root/team-fixture-$team_fixture_index"
+  cp "$candidate" "$candidate_copy"; chmod 700 "$candidate_copy"
+  if candidate_record="$(provider_harness signing-record "$candidate_copy" 2>/dev/null)" \
+      && printf '%s\n' "$candidate_record" | t_python -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin)["state"]=="team_signed" else 1)'; then
+    team_fixture="$candidate_copy"; break
+  fi
+  rm -f "$candidate_copy"
+done
+if [ -n "$team_fixture" ]; then
+  team_guardian="$($AUTH guardian-start --parent /private/tmp --launcher-pid $$)"
+  team_control="$(printf '%s\n' "$team_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["control"])')"
+  team_root="$(printf '%s\n' "$team_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+  team_token="$(printf '%s\n' "$team_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+  team_pid="$(printf '%s\n' "$team_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["guardian_pid"])')"
+  team_invocation="$(printf '%s\n' "$team_guardian" | t_python -c 'import json,sys; print(json.load(sys.stdin)["invocation"])')"
+  team_capsule="$(provider_harness capsule-build codex "$team_fixture" "$team_control" "$team_token" "$team_invocation" "$team_pid")"
+  assert_ok "available installed team signature and TeamIdentifier survive all three surfaces" t_python - "$team_capsule" <<'PY'
+import json,re,sys
+r=json.loads(sys.argv[1])["signing"]; values=[]
+for name in ("source","copy","mounted"):
+    d=r[name]; assert d["state"]=="team_signed" and re.fullmatch(r"[A-Z0-9]{10}",d["team_identifier"])
+    values.append(tuple(d[k] for k in ("identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags")))
+assert values[0]==values[1]==values[2]
+PY
+  assert_ok "team-signed capsule cleanup removes every image and mount" \
+    "$AUTH" guardian-command --control "$team_control" --token "$team_token" \
+      --invocation "$team_invocation" --guardian-pid "$team_pid" --sequence 3 \
+      --expected-roles '' --action cleanup
+  assert_no_file "team-signed capsule leaves no reusable residue" "$team_root"
+else
+  t_skip "team-signed source/copy/mount fixture" "no installed local team-signed native fixture passes canonical strict verification"
+fi
 
 t_case "synchronized provider streaming and pre-exec mutations fail before launch"
 for specification in \
