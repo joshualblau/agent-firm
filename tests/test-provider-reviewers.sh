@@ -1133,7 +1133,27 @@ for origin,item in entries.items():
     raw=open(os.path.join(run,origin),"rb").read()
     assert item["source_sha256"]==hashlib.sha256(raw).hexdigest() and item["source_bytes"]==len(raw)
     assert item["source_mode"]==format(os.lstat(os.path.join(run,origin)).st_mode & 0o777,"04o")
-    assert item["transform"]=="redacted_utf8"
+    # CHANGED 2026-09-02 with the judge-input redaction fix. This line used to assert
+    # `transform == "redacted_utf8"` for every entry, which is no longer true and SHOULD no longer
+    # be true: textual substitution corrupts JSON (a `@decorator` after a newline was matched as an
+    # email and ate the `\n` escape's second character, handing the judge a run.jsonl the wrapper
+    # had itself just certified as well-formed). Structured inputs are now parsed, redacted by
+    # value, and re-serialised, and the manifest says which transform ran.
+    #
+    # The replacement is STRICTLY STRONGER than the blanket equality it replaces: it asserts the
+    # transform MATCHES THE FILE'S ACTUAL SHAPE, so a structured file silently falling back to the
+    # textual path -- the regression that would reintroduce the corruption -- now fails here. The
+    # old assertion could not have caught that, because it demanded the buggy value.
+    parsed=None
+    try:
+        json.loads(raw.decode("utf-8")); parsed="redacted_json"
+    except Exception:
+        lines=[l for l in raw.decode("utf-8","replace").splitlines() if l.strip()]
+        if lines:
+            try:
+                [json.loads(l) for l in lines]; parsed="redacted_jsonl"
+            except Exception: parsed=None
+    assert item["transform"]==(parsed or "redacted_utf8"), (origin,item["transform"],parsed)
 PY
 t_python - "$RUN/07-review-findings.yaml" <<'PY'
 import sys,yaml

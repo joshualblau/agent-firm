@@ -1314,18 +1314,102 @@ except Exception as exc:
             data = b"SYMLINK TARGET (inert evidence only):\n" + data + b"\n"
         atomic_write(destination, data, 0o500 if mode == "100755" else 0o400)
 
+    REDACTIONS = [
+        (r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]+", r"\1=[REDACTED]"),
+        (r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|device[_ -]?code|login[_ -]?code|account[_ -]?id|request[_ -]?id)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]"),
+        (r"(?i)https?://[^\s]*(?:login|device|oauth|authorize)[^\s]*", "[REDACTED_URL]"),
+        (r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b", "[REDACTED_TOKEN]"),
+        (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[REDACTED_ACCOUNT]")
+    ]
+
+    def redact_text(value):
+        for pattern, replacement in REDACTIONS:
+            value = re.sub(pattern, replacement, value)
+        return value
+
     def redact(raw):
-        text = raw.decode("utf-8", "replace")
-        substitutions = [
-            (r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]+", r"\1=[REDACTED]"),
-            (r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|device[_ -]?code|login[_ -]?code|account[_ -]?id|request[_ -]?id)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]"),
-            (r"(?i)https?://[^\s]*(?:login|device|oauth|authorize)[^\s]*", "[REDACTED_URL]"),
-            (r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b", "[REDACTED_TOKEN]"),
-            (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[REDACTED_ACCOUNT]")
-        ]
-        for pattern, replacement in substitutions:
-            text = re.sub(pattern, replacement, text)
-        return text
+        return redact_text(raw.decode("utf-8", "replace"))
+
+    # TEXTUAL REDACTION CANNOT BE APPLIED TO JSON, AND THE FIRM LEARNED THIS FROM A JUDGE.
+    #
+    # Measured 2026-09-02, run 20260902T064517Z-link-audit-tool, attempt gpt-c2-a0003: the judge
+    # BLOCKED with `obj-controlled-evidence-integrity`, reporting run.jsonl malformed at lines 116,
+    # 128, 462, 573, 574, 647 and 865. The run's actual ledger was intact -- 1538 records, 0
+    # malformed, verified independently by the Lead and by primary QA. Only the judge's COPY was
+    # broken, and this transform broke it.
+    #
+    # A ledger line records a shell command, so Python source arrives as a JSON string in which
+    # `\n` is TWO LITERAL CHARACTERS. Given `...None\n\n\n@pytest.hookimpl(wrapper=True)...` the
+    # email pattern matches `n@pytest.hookimpl` -- local part `n`, domain `pytest.hookimpl` -- where
+    # that `n` is the escape's second character. Substituting eats it and leaves a dangling
+    # backslash:
+    #     before:  ledger.current_nodeid = None\n\n\n@pytest.hookimpl(wrapper=True)
+    #     after:   ledger.current_nodeid = None\n\n\[REDACTED_ACCOUNT](wrapper=True)
+    # A PYTHON DECORATOR AFTER A NEWLINE IS READ AS AN EMAIL ADDRESS. Attribution by applying each
+    # substitution alone: #1-#4 give 0 malformed lines, #5 gives all 7.
+    #
+    # Widening or tightening the pattern is NOT the fix and was considered and rejected: requiring a
+    # two-character local part fixes `n@` and misses `\t` plus a one-letter local part. These rules
+    # are a denylist and will always be approximate. Parse, redact the strings, re-serialise -- then
+    # syntax is preserved by construction rather than by the denylist happening to behave.
+    # THE TEXTUAL RULES ARE `key[:=]value` SHAPED, AND STRUCTURE SPLITS THAT PAIR IN HALF.
+    #
+    # Caught by this change's own eval before it shipped, which is the only reason it is not a
+    # silent disclosure regression: parsing {"password": "hunter2"} yields the key "password" and
+    # the value "hunter2" as SEPARATE strings. Redacting each alone, neither matches -- the key has
+    # no `=value` after it, and the value is just an opaque token. Textual redaction caught this
+    # pair; naive structural redaction does not. Structure must therefore reproduce the pairing
+    # semantics explicitly, by name.
+    #
+    # Done this way it is STRICTLY STRONGER than the text rule it replaces, not merely equivalent:
+    # the textual pattern stops the value at whitespace/comma/semicolon (`[^\s,;]+`), so a secret
+    # containing a space survived it. Keying on the field name redacts the whole value whatever is
+    # in it.
+    SECRET_KEY_NAMES = re.compile(
+        r"(?i)^\s*(authorization|proxy-authorization|cookie|set-cookie|api[_-]?key|"
+        r"access[_-]?token|refresh[_-]?token|token|secret|password|device[_ -]?code|"
+        r"login[_ -]?code|account[_ -]?id|request[_ -]?id)\s*$")
+
+    def redact_json_document(document):
+        if isinstance(document, dict):
+            redacted = {}
+            for key, value in document.items():
+                # Keys are redacted too: a secret can be a key as easily as a value.
+                new_key = redact_text(key) if isinstance(key, str) else key
+                if isinstance(key, str) and SECRET_KEY_NAMES.match(key):
+                    redacted[new_key] = "[REDACTED]"
+                else:
+                    redacted[new_key] = redact_json_document(value)
+            return redacted
+        if isinstance(document, list):
+            return [redact_json_document(item) for item in document]
+        if isinstance(document, str):
+            return redact_text(document)
+        return document
+
+    def parsed_json_shape(raw):
+        """Return ('json'|'jsonl', parsed) if raw is structured, else (None, None).
+
+        Keyed on what the file IS, not on its name or the run that produced it.
+        """
+        try:
+            text = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return None, None
+        stripped = text.strip()
+        if not stripped:
+            return None, None
+        try:
+            return "json", json.loads(text)
+        except Exception:
+            pass
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None, None
+        try:
+            return "jsonl", [json.loads(line) for line in lines]
+        except Exception:
+            return None, None
 
     copied = 0
     manifest_entries = []
@@ -1364,7 +1448,37 @@ except Exception as exc:
         copied += len(raw)
         if copied > 8 * 1024 * 1024:
             stop("bounded evidence snapshot exceeds 8 MiB; curate current evidence before review", 1)
-        controlled = redact(raw).encode("utf-8") if transform == "redacted_utf8" else raw
+        if transform == "redacted_utf8":
+            shape, parsed = parsed_json_shape(raw)
+            if shape == "json":
+                controlled = json_bytes(redact_json_document(parsed))
+                transform = "redacted_json"
+            elif shape == "jsonl":
+                controlled = ("\n".join(
+                    json.dumps(redact_json_document(record), separators=(",", ":"), sort_keys=True)
+                    for record in parsed) + "\n").encode("utf-8")
+                transform = "redacted_jsonl"
+            else:
+                controlled = redact(raw).encode("utf-8")
+            # THE INVARIANT, AND THE PART THAT GENERALISES BEYOND THE BUG THAT PROMPTED IT.
+            #
+            # This wrapper ALREADY validated run.jsonl as well-formed JSONL immediately before
+            # snapshotting it ("target ledger is malformed before judge snapshot"), then wrote a
+            # copy that was not, and never re-read its own output. The judge was handed evidence
+            # the firm had explicitly vouched for, found it corrupt, and correctly refused to
+            # approve on unvalidatable input -- while nothing on the primary side saw anything
+            # wrong. A corrupting transform is indistinguishable from a working one until a judge
+            # trips over it, so the transform is now required to prove it did not corrupt.
+            #
+            # Stated over "source parsed / copy must parse", not over any pattern, file or run:
+            # it therefore also covers the text path and file shapes nobody has considered yet.
+            if shape is not None:
+                after_shape, _ = parsed_json_shape(controlled)
+                if after_shape != shape:
+                    stop(f"redaction corrupted structured judge input: {origin} "
+                         f"(source parsed as {shape}, controlled copy did not)", 1)
+        else:
+            controlled = raw
         destination = run_snapshot / "files" / origin
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         atomic_write(destination, controlled, 0o400)
