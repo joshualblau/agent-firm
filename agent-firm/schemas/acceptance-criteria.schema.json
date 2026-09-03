@@ -2,29 +2,100 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-firm/schemas/acceptance-criteria.schema.json",
   "title": "Acceptance criteria",
-  "description": "Structured contract produced by Intake. QA checks coverage against this. Lightweight for fast-path tasks, full for substantial work.",
+  "description": "Structured contract produced by Intake. QA checks coverage against this. Lightweight for fast-path tasks, full for substantial work. For a greenfield build delivered as MULTIPLE bounded runs, this file is the criteria for THIS RUN's phase, and `phase` + `engagement_criteria` name the phase and point at the engagement-wide master it was drawn from. firm-traceability-check validates the QA verdict's coverage and the traceability matrix in BOTH directions against this file, so a run whose file carries the whole engagement's criteria while the run delivers one phase cannot pass -- and will not discover that until the Final gate.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["task_slug", "track", "criteria", "explicitly_out_of_scope", "test_evidence_required"],
+  "required": [
+    "task_slug",
+    "track",
+    "criteria",
+    "explicitly_out_of_scope",
+    "test_evidence_required"
+  ],
   "properties": {
-    "task_slug": { "type": "string" },
-    "track": { "type": "string", "enum": ["fast_path", "full_track"] },
+    "task_slug": {
+      "type": "string"
+    },
+    "track": {
+      "type": "string",
+      "enum": [
+        "fast_path",
+        "full_track"
+      ]
+    },
     "criteria": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "type", "statement", "verification"],
+        "required": [
+          "id",
+          "type",
+          "statement",
+          "verification"
+        ],
         "properties": {
-          "id": { "type": "string", "description": "e.g. AC-001" },
-          "type": { "type": "string", "enum": ["functional", "non_functional", "compatibility", "security_privacy", "observability", "performance", "accessibility", "data_migration", "rollback"] },
-          "statement": { "type": "string", "description": "testable 'given/when/then' or clear assertion" },
-          "verification": { "type": "string", "enum": ["automated_test", "manual_check", "review_only"] }
+          "id": {
+            "type": "string",
+            "description": "e.g. AC-001"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "functional",
+              "non_functional",
+              "compatibility",
+              "security_privacy",
+              "observability",
+              "performance",
+              "accessibility",
+              "data_migration",
+              "rollback"
+            ]
+          },
+          "statement": {
+            "type": "string",
+            "description": "testable 'given/when/then' or clear assertion"
+          },
+          "verification": {
+            "type": "string",
+            "enum": [
+              "automated_test",
+              "manual_check",
+              "review_only"
+            ]
+          }
         }
       }
     },
-    "explicitly_out_of_scope": { "type": "array", "items": { "type": "string" } },
-    "test_evidence_required": { "type": "array", "items": { "type": "string" }, "description": "which test types must show evidence, e.g. ['unit','integration']" }
+    "explicitly_out_of_scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "test_evidence_required": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "which test types must show evidence, e.g. ['unit','integration']"
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1,
+      "description": "OPTIONAL. The phase this run delivers, when a greenfield build is decomposed into multiple bounded runs (see the greenfield_build profile in agent-firm/policy/execution-budget.yaml and the Architect's run-phasing plan). Present means `criteria` below is the PHASE's subset, not the engagement's whole set. Absent means this run delivers everything in `criteria`."
+    },
+    "engagement_criteria": {
+      "type": "string",
+      "minLength": 1,
+      "description": "OPTIONAL, and REQUIRED IN PRACTICE whenever `phase` is set: the run-relative path to the engagement-wide criteria file this phase was drawn from, preserved verbatim so nothing is silently dropped. Conventionally 01-acceptance-criteria.engagement.yaml. A reader must be able to see the criteria this run did NOT take on, and which later phase owns them."
+    }
+  },
+  "dependentRequired": {
+    "phase": [
+      "engagement_criteria"
+    ]
   }
 }

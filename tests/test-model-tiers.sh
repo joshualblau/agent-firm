@@ -12,7 +12,7 @@ import json, pathlib, subprocess, sys, yaml
 resolve, policy_path = sys.argv[1:]
 policy = yaml.safe_load(pathlib.Path(policy_path).read_text())
 cells = {
-    "ceiling": {"claude": ("fable", "Fable 5", "max"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "ultra")},
+    "ceiling": {"claude": ("fable", "Fable 5.1", "max"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "ultra")},
     "heavyweight": {"claude": ("opus", "Opus 5", "xhigh"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "xhigh")},
     "workhorse": {"claude": ("sonnet", "Sonnet 5", "high"), "codex": ("gpt-5.6-terra", "GPT-5.6 terra", "high")},
     "fast": {"claude": ("haiku", "Haiku 4.5", "low"), "codex": ("gpt-5.6-terra", "GPT-5.6 terra", "low")},
@@ -97,7 +97,7 @@ import copy, pathlib, subprocess, sys, yaml
 resolve, policy_path, workspace = sys.argv[1:]
 base = yaml.safe_load(pathlib.Path(policy_path).read_text())
 cells = {
-    "ceiling": {"claude": ("fable", "Fable 5", "max"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "ultra")},
+    "ceiling": {"claude": ("fable", "Fable 5.1", "max"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "ultra")},
     "heavyweight": {"claude": ("opus", "Opus 5", "xhigh"), "codex": ("gpt-5.6-sol", "GPT-5.6 sol", "xhigh")},
     "workhorse": {"claude": ("sonnet", "Sonnet 5", "high"), "codex": ("gpt-5.6-terra", "GPT-5.6 terra", "high")},
     "fast": {"claude": ("haiku", "Haiku 4.5", "low"), "codex": ("gpt-5.6-terra", "GPT-5.6 terra", "low")},

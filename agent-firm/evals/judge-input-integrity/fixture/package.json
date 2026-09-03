@@ -1,0 +1,9 @@
+{
+  "name": "judge-input-integrity-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Golden-eval fixture: empty starting point; the firm adds slugify()+test and must leave the evidence handed to the cross-provider judge PARSEABLE — structured inputs redacted structurally, secrets still redacted including in keys, and a fail-closed invariant that a copy must parse whenever its source did (see test/judge-input-integrity.sh).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

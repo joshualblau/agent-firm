@@ -50,7 +50,7 @@ gates (with a well-formed approval payload), and gates on schema-valid QA eviden
 
 Runtime selection is fail-closed and inspectable. `firm-model-resolve --provider <claude|codex>
 --role <role>` returns the exact tier, model, display, and effort; tier and legacy-alias selectors are
-also supported. The canonical cells are: ceiling = Fable 5 (`fable`, `max`) / GPT-5.6 sol
+also supported. The canonical cells are: ceiling = Fable 5.1 (`fable`, `max`) / GPT-5.6 sol
 (`gpt-5.6-sol`, `ultra`); heavyweight = Opus 5 (`opus`, `xhigh`) / GPT-5.6 sol
 (`gpt-5.6-sol`, `xhigh`); workhorse = Sonnet 5 (`sonnet`, `high`) / GPT-5.6 terra
 (`gpt-5.6-terra`, `high`); fast = Haiku 4.5 (`haiku`, `low`) / GPT-5.6 terra

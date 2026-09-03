@@ -128,9 +128,23 @@ measured() { # <name> <expected substring> <registry-json> [mutation]...
 T_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-measurements.XXXXXX")"; t_track "$T_REGISTRY"
 # The control fixture has to name the version that is INSTALLED, or it fails the staleness rule
 # instead of proving the seam works -- which is what it did after this branch was written against
-# claude 2.1.238 and landed on a host running 2.1.234. Re-measured 2026-08-25; the record in
-# tests/provider-launch-scan.py was re-taken at the same time and for the same reason.
-VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.234","date":"2026-08-25","argv":["claude","--max-turns","3","-p","x"],"rc":1,"observed":"rc 1 from unrecognized_model, not from an unknown option"}}]'
+# claude 2.1.238 and landed on a host running 2.1.234, and AGAIN on 2.1.258.
+#
+# DERIVED, NOT HARDCODED, as of 2026-09-03. A literal version here is stale the moment the CLI
+# updates, so this control failed on every upgrade and each failure had to be diagnosed as "the
+# fixture, not the seam" before it could be fixed by hand. That is a standing tax for no signal:
+# this case's job is to prove a WELL-FORMED CURRENT measurement passes, and "current" is a property
+# of the host, not a constant. The deliberately-stale version still appears below, hardcoded to a
+# version that cannot be installed, because THAT case's job is the opposite.
+#
+# The measurement's substance (that --max-turns is accepted and undocumented) is re-measured and
+# recorded in tests/provider-launch-scan.py; this fixture only exercises the seam's shape.
+T_CLI_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')"
+if [ -z "$T_CLI_VERSION" ]; then
+  echo "test-provider-launch-sites: claude --version produced nothing; CANNOT CHECK the seam control" >&2
+  exit 1
+fi
+VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"'"$T_CLI_VERSION"'","date":"2026-09-03","argv":["claude","--max-turns","3","-p","x"],"rc":1,"observed":"rc 1 from unrecognized_model, not from an unknown option"}}]'
 
 # Control: the real, well-formed measurement still passes through the seam, so the cases below fail
 # for their own reason and not because the seam breaks everything.

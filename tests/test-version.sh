@@ -58,6 +58,20 @@ t_case "successful three-target release and local-refresh transactions"
 R="$(mk_version_root)"
 before_claude="$(cat "$R/.claude-plugin/plugin.json")"
 before_codex="$(cat "$R/.codex-plugin/plugin.json")"
+# DERIVED, NOT HARDCODED, as of 2026-09-03. The two "unrelated manifest bytes survive" assertions
+# below neutralise the version before comparing, and they used to spell the pre-release version as
+# the literal '0.8.0'. That is the repo's CURRENT version, so both assertions failed the moment
+# VERSION moved -- they were testing the version number, not the property (that a targeted
+# replacement leaves every other byte alone).
+#
+# It also mis-diagnoses: reverting the manifests to their committed state makes the literal match
+# again, so the failure looks like it belongs to whatever else is uncommitted. It was attributed to
+# a local-refresh cachebuster on exactly that evidence before being tracked here.
+#
+# Same defect class as the `--max-turns` measurement fixture in tests/test-provider-launch-sites.sh:
+# a constant standing in for a property of the host.
+base_version="$(tr -d '\n' < "$R/VERSION")"
+[ -n "$base_version" ] || { echo "test-version: fixture VERSION is empty; CANNOT CHECK" >&2; exit 1; }
 mode_v="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$R/VERSION")"
 mode_c="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$R/.claude-plugin/plugin.json")"
 assert_ok "release replaces all three targets" "$R/bin/firm-version" --release 1.2.3-rc.1
@@ -72,9 +86,9 @@ assert_output "Claude gets its exact cachebuster" '"version": "1.2.3-rc.1+claude
 assert_output "Codex gets its exact cachebuster" '"version": "1.2.3-rc.1+codex.cache.007-alpha"' cat "$R/.codex-plugin/plugin.json"
 assert_eq "canonical stays at the release base" "1.2.3-rc.1" "$(tr -d '\n' < "$R/VERSION")"
 assert_ok "unrelated Claude manifest bytes survive the targeted version replacement" python3 -c \
-  "a='''$before_claude'''; b=open('$R/.claude-plugin/plugin.json').read(); assert a.replace('0.8.0','TOKEN') == b.replace('1.2.3-rc.1+claude.cache.007-alpha','TOKEN').rstrip('\\n')"
+  "a='''$before_claude'''; b=open('$R/.claude-plugin/plugin.json').read(); assert a.replace('$base_version','TOKEN') == b.replace('1.2.3-rc.1+claude.cache.007-alpha','TOKEN').rstrip('\\n')"
 assert_ok "unrelated Codex manifest bytes survive the targeted version replacement" python3 -c \
-  "a='''$before_codex'''; b=open('$R/.codex-plugin/plugin.json').read(); assert a.replace('0.8.0','TOKEN') == b.replace('1.2.3-rc.1+codex.cache.007-alpha','TOKEN').rstrip('\\n')"
+  "a='''$before_codex'''; b=open('$R/.codex-plugin/plugin.json').read(); assert a.replace('$base_version','TOKEN') == b.replace('1.2.3-rc.1+codex.cache.007-alpha','TOKEN').rstrip('\\n')"
 
 t_case "preflight failures write nothing"
 for target in version claude codex; do

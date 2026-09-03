@@ -44,3 +44,33 @@ stop_conditions:
 
 # Note: "cost is not the constraint" (max subscriptions) but unbounded loops, rate-limit throttling,
 # and human review-load ARE. Caps protect those, not the bill.
+
+# WHAT max_subagents_total COUNTS, AND WHY IT MATTERS THAT IT IS SPAWNS.
+#
+# It counts agents STARTED, not messages sent. RESUMING an agent that already ran -- handing its
+# own defect back to the author who wrote it -- does not consume a slot.
+#
+# This is not a loophole to route around the cap; it is what the cap was already measuring. The cap
+# exists to bound review load, context fragmentation, and rate-limit exposure, and a resumption adds
+# none of them: no new role, no new context to brief, no fourth opinion for a human to reconcile. It
+# is also the BETTER outcome on correctness. The author holds the context, remembers what they
+# rejected and why, and can be told "you closed this on trust; verify it" -- which is how the
+# strongest findings in run 20260902T064517Z-link-audit-tool were produced, including a reviewer
+# re-attacking its own fix and finding a second defect in it.
+#
+# MEASURED, and the reason this is written down. On that run the Recruiter spent the roster to
+# exactly 12 of 12 and flagged the zero slack as risk R-1 before Build started. The risk then
+# materialised in full: the review panel returned changes_requested, and closing it took three fix
+# cycles, two re-integrations, a re-issued QA verdict and a second judge run. Every one was absorbed
+# by resumption. Had each needed a fresh agent the run would have hit a hard stop mid-flight and
+# escalated to the human -- not because the work was unbounded, but because the budget would have
+# been counting the wrong thing.
+#
+# So a roster AT the cap is viable, and the Recruiter may plan one deliberately -- but only with the
+# fix path named. See agent-firm/contracts/roles/recruiter.md.
+#
+# WHAT THIS DOES NOT LICENSE. Resumption is not free: it spends turns, tokens and wall clock, and
+# max_turns_per_agent still binds each resumed agent. An agent resumed indefinitely is an unbounded
+# loop wearing a different hat, and the stop conditions above apply to it unchanged. If a fix cycle
+# needs a role nobody on the roster holds, that is a NEW agent and a real budget decision -- resuming
+# an ill-suited agent to dodge the count is worse than asking.
