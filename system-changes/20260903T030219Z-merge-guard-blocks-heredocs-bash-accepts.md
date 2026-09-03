@@ -5,7 +5,8 @@ reviewed for generalizability, approved by the human, versioned, and guarded by 
 
 - **Proposed by run:** `20260902T064517Z-link-audit-tool`
 - **Date (UTC):** 2026-09-03
-- **Status:** proposed — **NOT implemented; this one needs a decision before code**
+- **Status:** **PARTIALLY ACCEPTED 2026-09-03.** Option C (comment + message) is landed. The
+  extraction fix is **DEFERRED, not rejected** — see Human decision.
 
 ## Motivation
 
@@ -162,5 +163,19 @@ making unverified — and I made two unverified claims in this very document bef
 
 ## Human decision
 
-- [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
-- [ ] **which option:** EXTRACT (heredoc bodies, keeping today's shell-segment rule) / C only (landed)
+- [x] **Decided by the operator on 2026-09-03 (UTC): land option C only; DEFER the extraction.**
+- **Reason given:** do not introduce potential new failure points into a security control without
+  need. The tokeniser refusal is a workflow tax, not a correctness or safety defect — the guard
+  fails closed, and the workaround (write the file with a file-writing tool) is available and now
+  named in the message itself.
+- **Status of the extraction: DEFERRED, not rejected.** Pick it up if the cost changes — the
+  signals to watch are (a) the refusal starting to block work with no workaround, (b) an operator
+  routinely running commands outside the guarded path to get around it, which would be worse than
+  the tax, or (c) any other change to this file opening the tokeniser anyway, at which point the
+  marginal risk is much lower.
+- **What a future implementer inherits, already done:** the root cause is measured and written down,
+  the false premise is corrected in the source, the scope rule is confirmed correct by probe (bodies
+  are scanned iff a segment of the introducing line is a shell), the two must-nots are stated, and
+  the eval is specified in full above. The remaining work is the extraction itself and its tests.
+- **What is NOT deferred:** nothing about today's behaviour changed, so there is no window opened by
+  waiting. The guard refuses exactly what it refused before.

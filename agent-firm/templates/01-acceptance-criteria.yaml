@@ -5,6 +5,29 @@
 # criterion's threshold.
 task_slug:
 track: full_track            # fast_path | full_track
+
+# PHASE SCOPING — omit both keys unless this run delivers ONE PHASE of a multi-run build.
+#
+# firm-traceability-check validates the QA verdict's coverage and the traceability matrix in BOTH
+# directions against THIS file. So if a greenfield build is decomposed into bounded runs (see the
+# greenfield_build profile in agent-firm/policy/execution-budget.yaml) and this file still carries
+# the whole engagement's criteria, the run cannot pass -- and will not find out until the
+# FINAL GATE, after every stage has already run against the wrong set.
+#
+# Measured on run 20260902T064517Z-link-audit-tool: Intake wrote 66 engagement-wide criteria and
+# flagged at the time that binding ids to runs was the Architect's call. The Architect then
+# decomposed into six phases, each its own run -- and nobody narrowed this file. The mismatch
+# surfaced at the Final gate, with the alternative being 50 waive_uncovered records for work nobody
+# had claimed to start, which would have misrepresented "not yet begun" as "waived".
+#
+# When set, `criteria` below is THIS PHASE's subset and `engagement_criteria` points at the
+# engagement-wide master, preserved verbatim so nothing is silently dropped. The schema REQUIRES
+# engagement_criteria whenever phase is present: a scoped file that does not say what it was scoped
+# FROM is indistinguishable from a run that quietly narrowed its own acceptance criteria.
+#
+# phase: 1a
+# engagement_criteria: 01-acceptance-criteria.engagement.yaml
+
 criteria:
   - id: AC-001
     type: functional         # functional|non_functional|compatibility|security_privacy|observability|performance|accessibility|data_migration|rollback
