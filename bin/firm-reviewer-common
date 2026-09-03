@@ -2456,7 +2456,33 @@ except Exception as exc:
         stop("provider wrote the controlled candidate snapshot; BLOCK", 1)
     if result.get("status") in ("timeout", "turn_limit"):
         finalize_attempt("timeout", 1, "reviewer_timeout", {"phase":"judge"}, diagnostic=str(diagnostic_path.relative_to(run)))
-        stop("main judge timed out; post-start output cannot downgrade this BLOCK", 1)
+        # CARRY THE MEASUREMENT TO THE OPERATOR, NOT JUST TO THE SOURCE.
+        #
+        # The default is documented ~1650 lines up as sitting BELOW real cost for a substantial
+        # candidate, with a measurement showing 300 s failing twice and 900 s completing in 352 s.
+        # That comment is correct and useless at the moment it matters: it is not on the path anyone
+        # walks when a judge times out. Measured 2026-09-02 on run 20260902T064517Z-link-audit-tool,
+        # the SAME two-timeouts-then-raise sequence was reproduced from scratch -- the operator spent
+        # two full judge runs rediscovering a fact the firm already knew and had written down.
+        #
+        # So the stop() states the bound in force, the prior measurement, and the exact knob. It
+        # deliberately does NOT raise the default: 300 s stays a spend decision with an owner, which
+        # is why the number was left low in the first place. What changes is that the decision is now
+        # informed on the first failure instead of the third.
+        stop(
+            f"main judge timed out after {judge_timeout} s; post-start output cannot downgrade "
+            f"this BLOCK.\n"
+            f"  This is a classified BLOCK, not a verdict: the judge produced no answer, so nothing "
+            f"here says the candidate is sound.\n"
+            f"  MEASURED PRIOR: the {judge_timeout} s default sits BELOW real cost for a substantial "
+            f"candidate. On 2026-08-23 a real candidate timed out twice at 300 s and then completed "
+            f"in 352 s with the bound raised; on 2026-09-02 the same sequence recurred.\n"
+            f"  If this candidate is large (many files, many evidence artifacts), re-run with a "
+            f"higher bound, up to the 900 s ceiling:\n"
+            f"      firm-{provider}-qa --judge-timeout 900 --run <run-dir>\n"
+            f"  Raising it is a SPEND decision and is deliberately not automatic. A judge that "
+            f"cannot finish is still a judge that failed.",
+            1)
     if rc != 0:
         finalize_attempt("block", 1, "reviewer_block", {"phase":"judge"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("main judge failed; post-start auth/model text remains BLOCKING", 1)
