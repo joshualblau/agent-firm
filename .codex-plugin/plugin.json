@@ -1,6 +1,6 @@
 {
   "name": "agent-firm",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A dual-provider AI engineering firm with GPT staff, Claude review, shared evidence gates, worktree isolation, and guarded integration.",
   "author": {
     "name": "Josh Blau"

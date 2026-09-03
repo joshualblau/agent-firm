@@ -250,14 +250,26 @@ cp "$FIRM_ROOT/.claude-plugin/plugin.json" "$CACHE_ROOT/.claude-plugin/plugin.js
 cp "$FIRM_ROOT/.codex-plugin/plugin.json" "$CACHE_ROOT/.codex-plugin/plugin.json"
 cp "$FIRM_ROOT/.claude-plugin/marketplace.json" "$CACHE_ROOT/.claude-plugin/marketplace.json"
 cp "$FIRM_ROOT/.agents/plugins/marketplace.json" "$CACHE_ROOT/.agents/plugins/marketplace.json"
-python3 - "$CACHE_ROOT" <<'PY'
+# DERIVED, NOT HARDCODED, as of 2026-09-03. These fixtures spelled the source version as the
+# literal 0.8.0. That is the repo's CURRENT version, so the moment VERSION moved the cache root no
+# longer matched its own source and bootstrap failed at "source version/manifest validation" --
+# EARLIER than the post-mutation check these cases are named for, which is precisely the failure
+# mode the CR-03 precondition above exists to catch. The cases were testing the version number
+# instead of the property.
+#
+# Third occurrence of this defect class in the suite, alongside the `--max-turns` measurement
+# fixture in tests/test-provider-launch-sites.sh and the manifest-bytes assertions in
+# tests/test-version.sh. A constant standing in for a property of the repo.
+CACHE_BASE_VERSION="$(tr -d '\n' < "$FIRM_ROOT/VERSION")"
+[ -n "$CACHE_BASE_VERSION" ] || { echo "test-bootstrap-dual: VERSION is empty; CANNOT CHECK" >&2; exit 1; }
+python3 - "$CACHE_ROOT" "$CACHE_BASE_VERSION" <<'PY'
 import json,pathlib,sys
-root=pathlib.Path(sys.argv[1])
+root=pathlib.Path(sys.argv[1]); base=sys.argv[2]
 for provider,rel in [('claude','.claude-plugin/plugin.json'),('codex','.codex-plugin/plugin.json')]:
- p=root/rel; d=json.loads(p.read_text()); d['version']=f"0.8.0+{provider}.fresh"; p.write_text(json.dumps(d,indent=2)+"\n")
+ p=root/rel; d=json.loads(p.read_text()); d['version']=f"{base}+{provider}.fresh"; p.write_text(json.dumps(d,indent=2)+"\n")
 PY
-CACHE_CLAUDE_VERSION=0.8.0+claude.fresh
-CACHE_CODEX_VERSION=0.8.0+codex.fresh
+CACHE_CLAUDE_VERSION="$CACHE_BASE_VERSION+claude.fresh"
+CACHE_CODEX_VERSION="$CACHE_BASE_VERSION+codex.fresh"
 run_cache_boot() {
   env PATH="$STUB:/usr/bin:/bin" STUB_LOG="$LOG" STUB_STATE="$STATE" STUB_ROOT="$CACHE_ROOT" \
     STUB_CLAUDE_VERSION="$CACHE_CLAUDE_VERSION" STUB_CODEX_VERSION="$CACHE_CODEX_VERSION" \
@@ -271,9 +283,9 @@ for provider in claude codex; do
   write_plugin_state claude "$CACHE_CLAUDE_VERSION"
   write_plugin_state codex "$CACHE_CODEX_VERSION"
   if [ "$provider" = claude ]; then
-    write_plugin_state claude 0.8.0; action=claude:plugin-update
+    write_plugin_state claude "$CACHE_BASE_VERSION"; action=claude:plugin-update
   else
-    write_plugin_state codex 0.8.0; action=codex:plugin-add
+    write_plugin_state codex "$CACHE_BASE_VERSION"; action=codex:plugin-add
   fi
   # Same CR-03 precondition: without bin/firm-python this root died on its source line, so `rc 1`
   # was satisfied by a bootstrap that never reached the version check it is named for.

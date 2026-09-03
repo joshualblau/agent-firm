@@ -5,7 +5,8 @@ reviewed for generalizability, approved by the human, versioned, and guarded by 
 
 - **Proposed by run:** `20260902T064517Z-link-audit-tool`
 - **Date (UTC):** 2026-09-02
-- **Status:** proposed (implemented on `fix/judge-input-redaction-corrupts-json`, awaiting human decision)
+- **Status:** **APPROVED 2026-09-03** by the operator. Implemented and green on
+  `fix/judge-input-redaction-corrupts-json`.
 
 ## Motivation
 
@@ -176,4 +177,10 @@ Both were found by the guard, not by review, which is the case for writing it al
 
 ## Human decision
 
-- [ ] approved by ____ on ____ (UTC)   |   [ ] rejected — reason:
+- [x] **APPROVED by the operator on 2026-09-03 (UTC).**
+- Scope of the approval: the structural redaction, the fail-closed post-redaction invariant, the
+  manifest transform vocabulary, and the golden eval guarding them.
+- Still recorded as unproven, and not covered by this approval: the BEHAVIOURAL eval run.
+  `firm-run-evals --structural judge-input-integrity` passes, but structural mode is parse/shape
+  only and is explicitly not a behavioural pass; a real `--provider` run needs login and spend and
+  has not been made.
