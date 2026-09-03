@@ -1052,8 +1052,41 @@ def segments(line):
     try:
         toks = list(lex)
     except ValueError as e:
-        # Unbalanced quote: a real shell would fail too, but we must not guess. Fail closed.
-        raise Cannot("could not tokenise the command line (%s)" % e)
+        # FAILING CLOSED IS RIGHT. THE REASON PREVIOUSLY GIVEN FOR IT WAS NOT.
+        #
+        # This said "a real shell would fail too, but we must not guess." The first half is false,
+        # and being false is why the cost went unexamined. Bash runs this without complaint:
+        #
+        #     cat > f <<'EOF'
+        #     the tool cannot know the server's setting
+        #     EOF
+        #
+        # shlex has no concept of a heredoc, so it sees one apostrophe and reports "No closing
+        # quotation". The line is well-formed shell; only the tokeniser thinks otherwise. Measured
+        # on run 20260902T064517Z-link-audit-tool: five legitimate commands refused this way in one
+        # engagement -- writing a .gitignore, a README, a Python probe -- each rerouted through a
+        # file-writing tool. On 2026-09-03 the guard also refused the probe written to characterise
+        # the bug.
+        #
+        # We still cannot proceed: an untokenisable line cannot be classified, and guessing at a
+        # security boundary is worse than refusing. So the behaviour is unchanged and deliberate.
+        # What changes is that the message now names the likely cause and a way forward, because
+        # "could not be parsed to a decision" tells the operator nothing actionable.
+        #
+        # The real fix -- extracting heredoc bodies before tokenising -- is a change to how a
+        # security control reads its input and is NOT made here. Note that today a BALANCED heredoc
+        # body is tokenised into the command stream and therefore already scanned as commands, so
+        # any extraction must keep scanning bodies that feed a shell. Options and their costs:
+        # system-changes/20260903T030219Z-merge-guard-blocks-heredocs-bash-accepts.md
+        raise Cannot(
+            "could not tokenise the command line (%s).\n"
+            "  If this command contains a heredoc, that is the likely cause: a quote or apostrophe\n"
+            "  inside the heredoc BODY is well-formed shell, but the tokeniser reads it as an\n"
+            "  unbalanced quote and cannot classify the line. The refusal is deliberate -- an\n"
+            "  unclassifiable line is never assumed safe -- but it is not a claim that your command\n"
+            "  is wrong.\n"
+            "  Ways forward: write the file with a file-writing tool instead of a heredoc, avoid the\n"
+            "  quote in the body, or run the command yourself in a terminal." % e)
     segs, cur, here = [], [], []
     i, n = 0, len(toks)
     while i < n:
