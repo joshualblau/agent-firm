@@ -67,7 +67,13 @@ allowed:
 
   - gh_login: younglionsolutions
     git_emails:
+      - younglionsolutions@gmail.com
       - younglionsolutions@youngs-mbp.lan
     note: >-
-      Collaborator with push access; the account `gh` is currently authenticated as. Observed in
-      history as "Young Lion Solutions <younglionsolutions@youngs-mbp.lan>".
+      Collaborator with push access; the account `gh` is currently authenticated as. The .lan
+      address is observed in history as "Young Lion Solutions
+      <younglionsolutions@youngs-mbp.lan>". The gmail address is NOT observed in this repo's
+      history: it was asserted directly by the human operator on 2026-09-02 as the address backing
+      the `younglionsolutions` GitHub account and the intended device-wide git default. It is
+      listed on operator assertion, not on observation — the distinction is recorded because the
+      PROVENANCE note above otherwise claims every value here was observed.
