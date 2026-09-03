@@ -192,7 +192,7 @@ elif action=="reprove":
     scope["reprove_provider_executable"](expected)
 elif action=="barrier":
     provider,path,root,token,phase,invocation=args[:6]
-    emit(record(provider,path,{"enabled":True,"root":root,"token":token,"phase":phase,"invocation":invocation}))
+    emit(record(provider,path,scope["test_barrier_config"](root,token,phase,invocation)))
 elif action=="descriptor-swap":
     provider,path,replacement=args[:3]
     def swap(_config,phase,observed):
@@ -846,8 +846,15 @@ assert not validator.is_valid(candidate)
 
 for phase in ("capsule_copy","capsule_preexec"):
     candidate=copy.deepcopy(manifest)
-    candidate["test_barrier"]={"enabled":True,"root":manifest["guardian"]["control"],
-        "token":"0"*64,"phase":phase,"invocation":manifest["invocation"]}
+    import hashlib,os
+    root=manifest["guardian"]["control"]; st=os.lstat(root)
+    root_identity={"dev":st.st_dev,"ino":st.st_ino,"uid":st.st_uid,"mode":st.st_mode&0o7777}
+    encoded=json.dumps(root_identity,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode("ascii")
+    token="0"*64
+    candidate["test_barrier"]={"enabled":True,"protocol_version":2,"root":root,
+        "root_identity":root_identity,"root_binding":hashlib.sha256(encoded).hexdigest(),
+        "token":token,"token_sha256":hashlib.sha256(bytes.fromhex(token)).hexdigest(),
+        "phase":phase,"invocation":manifest["invocation"]}
     validator.validate(candidate)
     candidate["test_barrier"]["phase"]=phase+"_unexpected"
     assert not validator.is_valid(candidate),phase
