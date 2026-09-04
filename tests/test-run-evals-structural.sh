@@ -76,8 +76,55 @@ for phase in ("manifest_read","dispatch_commit","use_exec","cleanup_commit","pro
     assert ('"%s"'%phase) in raw
 assert "shutil.rmtree" not in raw
 PY
+assert_ok "capsule_preexec is authenticated and occurs only after final validation before pathname exec" \
+  t_python - "$BIN/firm-eval-authority" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+start=raw.index("def provider_exec(ns, rest):")
+terminal=raw.index("if ns.terminal:",start)
+validate=raw.index("validate_provider_capsule(doc)",terminal)
+barrier=raw.index('test_barrier(doc,"capsule_preexec"',validate)
+# The window the attacks target is opened BETWEEN two validations, and the second one must be
+# after the barrier: a barrier placed after the last validation would let a landed mutation be
+# carried into execve unobserved, which is the defect this ordering assertion exists to pin.
+revalidate=raw.index("validate_provider_capsule(doc)",barrier)
+execute=raw.index('os.execve(os.fsencode(expected["path"]),argv,provider_env)',revalidate)
+assert terminal < validate < barrier < revalidate < execute
+# A refused pathname exec is a stated BLOCK, never an unhandled traceback.
+assert 'fail("provider terminal exec")' in raw[execute:execute+400]
+# The provider must not inherit the barrier's environment channel.
+strip=raw.index('provider_env.pop(name,None)',barrier)
+assert barrier < strip < execute
+body=raw[raw.index("def capsule_preexec_barrier",0):raw.index("def raw_test_barrier",0)]
+for binding in ("root_binding","token_sha256","invocation","wrapper_pid","capsule_digest","mounted","logical_argv"):
+    assert binding in body
+for state in ("READY","MUTATED","RESUME","RELEASE","CONSUMED"):
+    assert ('"%s"'%state) in body
+assert "test_barrier_put" in body and "test_barrier_read" in body
+assert "def test_barrier_signed" in raw and "hmac.compare_digest" in raw
+# Every wait in the barrier is a deadline loop, and the one-use publication is O_EXCL.
+assert "while True" not in body and "test_barrier_wait" in body
+wait=raw[raw.index("def test_barrier_wait"):raw.index("def capsule_preexec_barrier")]
+assert "TEST_BARRIER_TIMEOUT_SECONDS" in wait and "time.monotonic()<deadline" in wait
+assert "os.O_EXCL" in raw[raw.index("def put_file"):raw.index("def path_record")]
+# Neither the manifest nor the state filenames may publish the barrier token itself.
+assert 'root/(token_id+".capsule_preexec")' in body
+PY
+assert_ok "the actual-chain suite names every authorized attack and uses no live provider" \
+  t_python - "$FIRM_ROOT/tests/test-eval-capsule-attacks.sh" <<'PY'
+import sys
+raw=open(sys.argv[1],encoding="utf-8").read()
+for axis in ("mounted_overwrite","mounted_truncate","mounted_rename","mounted_unlink",
+             "mounted_replacement","original_path_mutation","original_inode_mutation",
+             "sibling_source_fd_close_reuse","detach","remount","shadow","release_to_exec_loop"):
+    assert axis in raw
+for link in ("guardian-exec","provider-exec","/usr/bin/sandbox-exec","/usr/bin/env","os.execve"):
+    assert link in raw
+assert "codex exec" not in raw and "claude -p" not in raw and "firm-run-evals" not in raw
+PY
 assert_ok "focused suites contain no live final-evidence-seal provider invocation" \
-  t_python - "$FIRM_ROOT/tests/test-eval-candidate-tools.sh" "$FIRM_ROOT/tests/test-run-evals-structural.sh" <<'PY'
+  t_python - "$FIRM_ROOT/tests/test-eval-candidate-tools.sh" "$FIRM_ROOT/tests/test-run-evals-structural.sh" \
+    "$FIRM_ROOT/tests/test-eval-capsule-attacks.sh" <<'PY'
 import re,sys
 provider_names="co"+"dex|cl"+"aude"
 pattern=re.compile(r"firm-run-evals.*--provider (?:"+provider_names+r").*final-evidence-seal")

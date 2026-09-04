@@ -31,6 +31,8 @@ GUARDIAN_SOCKET_NAME = "guardian.sock"
 GUARDIAN_STABLE_IDENTITY = ("dev", "ino", "uid", "mode")
 TEST_BARRIER_PHASES = {"manifest_read", "dispatch_commit", "use_exec", "cleanup_commit",
                        "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"}
+TEST_BARRIER_PROTOCOL_VERSION = 2
+TEST_BARRIER_TIMEOUT_SECONDS = 10
 PROVIDER_EXECUTABLE_MAX_BYTES = {"codex": 247464144, "claude": 197220928}
 PROVIDER_EXECUTABLE_CHUNK_BYTES = 1024 * 1024
 PROVIDER_EXECUTABLE_TIMEOUT_NS = 10_000_000_000
@@ -306,6 +308,43 @@ def guardian_root_binding(root_id):
     stable={key:root_id[key] for key in GUARDIAN_STABLE_IDENTITY}
     return digest_bytes(canonical(stable).encode("ascii"))
 
+def test_barrier_config(root, token, phase, invocation):
+    root=Path(root).resolve(); root_st=owned_directory(root)
+    if (not re.fullmatch(r"[0-9a-f]{64}",str(token)) or phase not in TEST_BARRIER_PHASES
+            or not re.fullmatch(r"[0-9a-f]{48}",str(invocation))):
+        fail("test barrier binding")
+    root_identity={key:identity(root_st)[key] for key in GUARDIAN_STABLE_IDENTITY}
+    return {"enabled":True,"protocol_version":TEST_BARRIER_PROTOCOL_VERSION,"root":str(root),
+            "root_identity":root_identity,"root_binding":guardian_root_binding(root_identity),
+            "token":token,"token_sha256":digest_bytes(bytes.fromhex(token)),
+            "phase":phase,"invocation":invocation}
+
+def validate_test_barrier_config(config):
+    required={"enabled","protocol_version","root","root_identity","root_binding","token",
+              "token_sha256","phase","invocation"}
+    if (not isinstance(config,dict) or not exact_keys(config,required) or config.get("enabled") is not True
+            or config.get("protocol_version")!=TEST_BARRIER_PROTOCOL_VERSION
+            or not re.fullmatch(r"[0-9a-f]{64}",str(config.get("token","")))
+            or config.get("token_sha256")!=digest_bytes(bytes.fromhex(config["token"]))
+            or config.get("phase") not in TEST_BARRIER_PHASES
+            or not re.fullmatch(r"[0-9a-f]{48}",str(config.get("invocation","")))):
+        fail("test barrier config")
+    root=Path(config["root"])
+    if not root.is_absolute() or root.resolve()!=root: fail("test barrier root")
+    root_st=owned_directory(root)
+    current={key:identity(root_st)[key] for key in GUARDIAN_STABLE_IDENTITY}
+    if current!=config.get("root_identity") or guardian_root_binding(current)!=config.get("root_binding"):
+        fail("test barrier root identity")
+    return root
+
+def reprove_test_barrier_root(config,root_fd):
+    try:
+        descriptor={key:identity(os.fstat(root_fd))[key] for key in GUARDIAN_STABLE_IDENTITY}
+        named={key:identity(os.lstat(config["root"]))[key] for key in GUARDIAN_STABLE_IDENTITY}
+    except OSError: fail("test barrier root unavailable")
+    if descriptor!=config["root_identity"] or named!=descriptor:
+        fail("test barrier root drift")
+
 def guardian_registration_digest(registrations):
     rows=[{"sequence":item["sequence"],"role":item["role"],"pid":item["pid"],
            "pgid":item["pgid"],"nonce":item["nonce"],"request_sha256":item["request_sha256"]}
@@ -398,9 +437,167 @@ def remove_owned_tree_fd(fd):
             os.unlink(entry.name,dir_fd=fd)
         else: raise RuntimeError("special cleanup entry")
 
+def test_barrier_signed(token, unsigned):
+    value=dict(unsigned); value["auth"]=guardian_auth(token,unsigned)
+    return value
+
+def test_barrier_put(path, token, unsigned):
+    # O_EXCL is the one-use property: each state of the machine may be published exactly once, so a
+    # second wrapper sharing the root, or a replay of an earlier run, collides here instead of
+    # silently overwriting a state another reader has already bound itself to.  The collision is a
+    # stated BLOCK rather than an unhandled FileExistsError, because an unhandled traceback out of a
+    # pre-exec guard is exactly the ambiguous outcome this barrier exists to remove.
+    try: put_file(path,(canonical(test_barrier_signed(token,unsigned))+"\n").encode("ascii"),0o600)
+    except OSError: fail("test barrier exclusive state publication")
+
+def test_barrier_names(root):
+    try:
+        with os.scandir(str(root)) as entries: return {entry.name for entry in entries}
+    except OSError: fail("test barrier root enumeration")
+
+def test_barrier_read(path, token, label):
+    try: raw,st=read_bytes(path,MAX_MESSAGE)
+    except (OSError,SystemExit): fail("test barrier "+label+" state")
+    if stat.S_IMODE(st.st_mode)!=0o600: fail("test barrier "+label+" mode")
+    try: value=json.loads(raw.decode("ascii"))
+    except Exception: fail("test barrier "+label+" JSON")
+    if raw!=(canonical(value)+"\n").encode("ascii") or not isinstance(value,dict):
+        fail("test barrier "+label+" canonical state")
+    unsigned=dict(value); auth=unsigned.pop("auth",None)
+    if not isinstance(auth,str) or not hmac.compare_digest(auth,guardian_auth(token,unsigned)):
+        fail("test barrier "+label+" authentication")
+    return value,unsigned,digest_bytes(raw)
+
+def test_barrier_wait(path, label):
+    deadline=time.monotonic()+TEST_BARRIER_TIMEOUT_SECONDS
+    while time.monotonic()<deadline:
+        try:
+            os.lstat(str(path)); return
+        except FileNotFoundError: time.sleep(0.005)
+        except OSError: fail("test barrier "+label+" state")
+    fail("test barrier "+label+" timeout")
+
+def capsule_preexec_barrier(config, observed):
+    # The exclusive, authenticated, one-use state machine that opens the check-then-use window for a
+    # synchronized mutator, and refuses to open it at all unless every binding below holds.
+    #
+    # READY -> MUTATED -> RESUME -> RELEASE -> CONSUMED.  The wrapper publishes READY, RESUME and
+    # CONSUMED; the mutator publishes MUTATED and RELEASE.  Each record is HMAC-authenticated under
+    # the barrier token, canonically encoded, and chained to the digest of the record before it, so
+    # the sequence cannot be reordered, spliced, or partially replayed.
+    #
+    # WHAT IS BOUND, and why each one is load-bearing:
+    #   root/root_identity/root_binding  the owned 0700 directory this run was given, proven by
+    #                                    descriptor AND by name before every state transition, so a
+    #                                    swapped or remounted barrier root is caught mid-protocol.
+    #   token/token_sha256               a random per-run secret.  State FILENAMES use the digest,
+    #                                    never the token, so the secret is not published by listing.
+    #   invocation                       the run.  A record minted for another run does not verify.
+    #   phase                            this exact phase; a record for another phase is foreign.
+    #   wrapper_pid                      the live pre-exec process.  A record naming another process
+    #                                    (`wrong_process`) is refused even when correctly signed.
+    #   capsule_digest                   the sealed capsule.  A record from another capsule
+    #                                    (`cross_capsule`) is refused.
+    #   mounted/logical_argv             the exact executable identity and argv about to be used.
+    #
+    # BOUNDED BY CONSTRUCTION: there is no unbounded wait anywhere.  Both waits are
+    # TEST_BARRIER_TIMEOUT_SECONDS deadline loops (test_barrier_wait), the state machine is a fixed
+    # five-step sequence with no retry, and every enumeration reads one directory once.  An absent,
+    # late, or never-arriving counterparty therefore ends as a timeout BLOCK, not a hang.
+    #
+    # PRODUCTION REACHABILITY: none.  test_barrier() only routes here when the manifest carries an
+    # enabled barrier AND the four environment variables match it exactly; a production manifest
+    # carries {"enabled": false} and prepare() refuses to build one while any of those variables is
+    # set at all.  The provider never inherits them (provider_exec strips them before execve).
+    root=validate_test_barrier_config(config); token=config["token"]
+    if config["phase"]!="capsule_preexec": return
+    if (not isinstance(observed,dict)
+            or not exact_keys(observed,{"capsule_digest","mounted","logical_argv"})
+            or not re.fullmatch(r"[0-9a-f]{64}",str(observed.get("capsule_digest","")))
+            or not isinstance(observed.get("mounted"),dict)
+            or not isinstance(observed.get("logical_argv"),list) or not observed["logical_argv"]
+            or any(not isinstance(value,str) or "\0" in value for value in observed["logical_argv"])):
+        fail("capsule preexec barrier observation")
+    try: root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    except OSError: fail("capsule preexec barrier root")
+    reprove_test_barrier_root(config,root_fd)
+    # The root must be EMPTY on entry.  This is what makes "early" and "replayed" state detectable:
+    # a RELEASE or CONSUMED record planted before the wrapper ever arrives cannot be mistaken for
+    # one this run produced, because this run refuses to start on a root that already holds state.
+    if test_barrier_names(root): os.close(root_fd); fail("capsule preexec barrier pre-existing state")
+    token_id=config["token_sha256"]
+    prefix=root/(token_id+".capsule_preexec")
+    paths={name:Path(str(prefix)+"."+name) for name in ("ready","mutated","resume","release","consumed")}
+    wrapper_pid=os.getpid()
+    try:
+        if os.getpgid(wrapper_pid)<=0: raise ProcessLookupError
+        os.kill(wrapper_pid,0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier wrapper not live")
+    common={"schema_version":1,"protocol_version":TEST_BARRIER_PROTOCOL_VERSION,
+            "phase":"capsule_preexec","token_sha256":token_id,"invocation":config["invocation"],
+            "barrier_root":str(root),"barrier_root_binding":config["root_binding"],
+            "wrapper_pid":wrapper_pid,"capsule_digest":observed["capsule_digest"],
+            "mounted":observed["mounted"],"logical_argv":observed["logical_argv"]}
+    enter_ns=time.monotonic_ns()
+    ready_unsigned={**common,"state":"READY","enter_monotonic_ns":enter_ns}
+    reprove_test_barrier_root(config,root_fd)
+    test_barrier_put(paths["ready"],token,ready_unsigned)
+    _,ready,ready_sha=test_barrier_read(paths["ready"],token,"ready")
+    if ready!=ready_unsigned: fail("capsule preexec barrier ready binding")
+    test_barrier_wait(paths["mutated"],"mutation")
+    reprove_test_barrier_root(config,root_fd)
+    _,mutation,mutation_sha=test_barrier_read(paths["mutated"],token,"mutation")
+    required=set(common)|{"state","enter_monotonic_ns","ready_sha256","mutator_pid",
+                          "mutate_monotonic_ns","changed"}
+    if (not exact_keys(mutation,required) or any(mutation.get(key)!=value for key,value in common.items())
+            or mutation.get("state")!="MUTATED" or mutation.get("enter_monotonic_ns")!=enter_ns
+            or mutation.get("ready_sha256")!=ready_sha
+            or not isinstance(mutation.get("mutator_pid"),int) or mutation["mutator_pid"]<=0
+            or not isinstance(mutation.get("mutate_monotonic_ns"),int)
+            or mutation["mutate_monotonic_ns"]<=enter_ns
+            or not isinstance(mutation.get("changed"),dict) or not mutation["changed"]):
+        fail("capsule preexec barrier mutation binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier mutator not live")
+    resume_ns=time.monotonic_ns()
+    resume_unsigned={**common,"state":"RESUME","enter_monotonic_ns":enter_ns,
+                     "ready_sha256":ready_sha,"mutator_pid":mutation["mutator_pid"],
+                     "mutation_sha256":mutation_sha,"resume_monotonic_ns":resume_ns}
+    reprove_test_barrier_root(config,root_fd); test_barrier_put(paths["resume"],token,resume_unsigned)
+    test_barrier_wait(paths["release"],"release")
+    reprove_test_barrier_root(config,root_fd)
+    _,release,release_sha=test_barrier_read(paths["release"],token,"release")
+    release_required=set(common)|{"state","enter_monotonic_ns","ready_sha256","mutator_pid",
+                                  "mutation_sha256","resume_sha256","release_monotonic_ns"}
+    resume_raw=(canonical(test_barrier_signed(token,resume_unsigned))+"\n").encode("ascii")
+    if (not exact_keys(release,release_required) or any(release.get(key)!=value for key,value in common.items())
+            or release.get("state")!="RELEASE" or release.get("enter_monotonic_ns")!=enter_ns
+            or release.get("ready_sha256")!=ready_sha or release.get("mutator_pid")!=mutation["mutator_pid"]
+            or release.get("mutation_sha256")!=mutation_sha
+            or release.get("resume_sha256")!=digest_bytes(resume_raw)
+            or not isinstance(release.get("release_monotonic_ns"),int)
+            or release["release_monotonic_ns"]<resume_ns):
+        fail("capsule preexec barrier release binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier release process")
+    # Before consuming, the root must hold EXACTLY the four states published so far and nothing
+    # else.  A duplicate or extra record means more than one counterparty wrote into this run's
+    # root, and the wrapper cannot tell which one the release it just verified belongs to — so it
+    # refuses rather than guess.  The same enumeration runs again after CONSUMED is published.
+    if test_barrier_names(root)!={paths[name].name for name in ("ready","mutated","resume","release")}:
+        os.close(root_fd); fail("capsule preexec barrier duplicate state")
+    consumed_unsigned={**common,"state":"CONSUMED","enter_monotonic_ns":enter_ns,
+                       "ready_sha256":ready_sha,"mutator_pid":mutation["mutator_pid"],
+                       "mutation_sha256":mutation_sha,"resume_sha256":digest_bytes(resume_raw),
+                       "release_sha256":release_sha,"consumed_monotonic_ns":time.monotonic_ns()}
+    reprove_test_barrier_root(config,root_fd); test_barrier_put(paths["consumed"],token,consumed_unsigned)
+    if test_barrier_names(root)!={path.name for path in paths.values()}:
+        os.close(root_fd); fail("capsule preexec barrier duplicate state")
+    reprove_test_barrier_root(config,root_fd); os.close(root_fd)
+
 def raw_test_barrier(config, phase, observed):
     if not config or not config.get("enabled") or config.get("phase")!=phase: return
-    root=Path(config["root"]); owned_directory(root)
+    root=validate_test_barrier_config(config)
     token=config["token"]
     if not re.fullmatch(r"[0-9a-f]{64}",token) or config.get("invocation") is None:
         fail("test barrier binding")
@@ -451,9 +648,11 @@ def test_barrier(doc,phase,observed):
               "invocation":os.environ.get("FIRM_EVAL_TEST_BARRIER_INVOCATION"),
               "phase":os.environ.get("FIRM_EVAL_TEST_BARRIER_PHASE")}
     if config.get("enabled"):
+        validate_test_barrier_config(config)
         expected={key:config[key] for key in supplied}
         if supplied!=expected: fail("test barrier environment binding")
-        raw_test_barrier(config,phase,observed)
+        if phase=="capsule_preexec": capsule_preexec_barrier(config,observed)
+        else: raw_test_barrier(config,phase,observed)
     elif any(value is not None for value in supplied.values()):
         fail("production invocation rejects test barrier")
 
@@ -776,9 +975,7 @@ def guardian_start(ns):
     barrier={"enabled":False}
     if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
         if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("guardian test barrier")
-        root=Path(ns.test_barrier_root).resolve(); owned_directory(root)
-        if not re.fullmatch(r"[0-9a-f]{64}",ns.test_barrier_token): fail("guardian test barrier token")
-        barrier={"enabled":True,"root":str(root),"token":ns.test_barrier_token,"phase":ns.test_barrier_phase,"invocation":invocation}
+        barrier=test_barrier_config(ns.test_barrier_root,ns.test_barrier_token,ns.test_barrier_phase,invocation)
     left,right=socket.socketpair(); pid=os.fork()
     if pid==0:
         left.close(); os.setsid()
@@ -1579,10 +1776,29 @@ def provider_exec(ns, rest):
         if len(rest)<2 or rest[0]!=doc["provider_capsule"]["source"]["path"] or rest[1]!=expected["path"]:
             fail("provider terminal argv")
         validate_provider_capsule(doc)
-        raw_test_barrier(doc["test_barrier"],"capsule_preexec",{"mounted":expected,"logical_argv0":rest[0]})
+        capsule=doc["provider_capsule"]
+        # The barrier releases a synchronized mutator INSIDE the check-then-use window.  It is a
+        # no-op in production (manifest test_barrier disabled and no barrier environment), and the
+        # revalidation below is deliberately kept AFTER it: an attack that lands between the two
+        # validations must be observed here rather than carried into execve.
+        test_barrier(doc,"capsule_preexec",{
+            "capsule_digest":capsule["guardian"]["sealed_digest"],
+            "mounted":expected,
+            "logical_argv":[rest[0]]+rest[2:],
+        })
         validate_provider_capsule(doc)
         argv=[os.fsencode(rest[0])]+[os.fsencode(value) for value in rest[2:]]
-        os.execve(os.fsencode(expected["path"]),argv,os.environb.copy())
+        provider_env=os.environb.copy()
+        # The barrier is the wrapper's own synchronization channel.  The provider never inherits it,
+        # so a provider process can neither observe nor forge barrier state.
+        for name in (b"FIRM_EVAL_TEST_BARRIER_ROOT",b"FIRM_EVAL_TEST_BARRIER_TOKEN",
+                     b"FIRM_EVAL_TEST_BARRIER_INVOCATION",b"FIRM_EVAL_TEST_BARRIER_PHASE"):
+            provider_env.pop(name,None)
+        # The residual path-exec window cannot be closed by revalidation (this platform's os.execve
+        # does not accept a descriptor), so a refused exec must still be a stated BLOCK, never an
+        # unhandled traceback that a caller could read as an ambiguous outcome.
+        try: os.execve(os.fsencode(expected["path"]),argv,provider_env)
+        except OSError: fail("provider terminal exec")
     prefix=seatbelt["supervisor_argv_prefix"]
     if rest[:len(prefix)]!=prefix or len(rest)<=len(prefix) or rest[len(prefix)]!="/usr/bin/env":
         fail("provider exec supervisor argv")
@@ -1691,7 +1907,7 @@ def test_barrier_probe(ns):
     if ns.phase not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{40}",ns.candidate): fail("test barrier probe scope")
     before_raw,before_st=read_bytes(target,MAX_MESSAGE)
     before={"candidate":ns.candidate,"identity":identity(before_st),"sha256":digest_bytes(before_raw)}
-    config={"enabled":True,"root":str(root),"token":ns.token,"phase":ns.phase,"invocation":ns.invocation}
+    config=test_barrier_config(root,ns.token,ns.phase,ns.invocation)
     raw_test_barrier(config,ns.phase,before)
     try: after_raw,after_st=read_bytes(target,MAX_MESSAGE)
     except BaseException: fail("concurrent "+ns.phase+" mutation detected")
@@ -1931,9 +2147,8 @@ def load_manifest(path):
     for tool in doc["tools"]: validate_tool(tool, root)
     barrier=doc["test_barrier"]
     if barrier.get("enabled"):
-        required={"enabled","root","token","phase","invocation"}
-        if (not exact_keys(barrier,required) or barrier["enabled"] is not True or barrier["invocation"]!=doc["invocation"]
-                or barrier["phase"] not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{64}",barrier["token"])): fail("test barrier manifest")
+        validate_test_barrier_config(barrier)
+        if barrier["invocation"]!=doc["invocation"]: fail("test barrier manifest")
     elif barrier!={"enabled":False}: fail("test barrier manifest")
     provider_capsule_schema(doc["provider_capsule"])
     guardian=doc["guardian"]
@@ -1966,14 +2181,12 @@ def prepare(ns):
     test_barrier_doc={"enabled":False}
     barrier_env=("FIRM_EVAL_TEST_BARRIER_ROOT","FIRM_EVAL_TEST_BARRIER_TOKEN",
                  "FIRM_EVAL_TEST_BARRIER_INVOCATION","FIRM_EVAL_TEST_BARRIER_PHASE")
-    if any(os.environ.get(key) is not None for key in barrier_env) and not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase):
+    if any(os.environ.get(key) is not None for key in barrier_env):
         fail("inherited test barrier environment")
     if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
         if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("test barrier arguments")
-        barrier_root=Path(ns.test_barrier_root).resolve(); owned_directory(barrier_root)
-        if not re.fullmatch(r"[0-9a-f]{64}",ns.test_barrier_token): fail("test barrier token")
-        test_barrier_doc={"enabled":True,"root":str(barrier_root),"token":ns.test_barrier_token,
-                          "phase":ns.test_barrier_phase,"invocation":invocation}
+        test_barrier_doc=test_barrier_config(ns.test_barrier_root,ns.test_barrier_token,
+                                             ns.test_barrier_phase,invocation)
     no_symlink_components(root); no_symlink_components(scratch)
     if git(root, "rev-parse", "--show-toplevel") != str(root): fail("repository root")
     if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty harness")

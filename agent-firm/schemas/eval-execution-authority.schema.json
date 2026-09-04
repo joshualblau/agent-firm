@@ -351,12 +351,25 @@
     "testBarrier": {
       "oneOf": [
         {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"const": false}}},
-        {"type": "object", "additionalProperties": false, "required": ["enabled", "root", "token", "phase", "invocation"],
-         "properties": {"enabled": {"const": true}, "root": {"type": "string", "minLength": 1},
+        {"type": "object", "additionalProperties": false,
+         "required": ["enabled", "protocol_version", "root", "root_identity", "root_binding", "token", "token_sha256", "phase", "invocation"],
+         "properties": {"enabled": {"const": true}, "protocol_version": {"const": 2},
+           "root": {"type": "string", "minLength": 1},
+           "root_identity": {"$ref": "#/$defs/testBarrierRootIdentity"},
+           "root_binding": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
            "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+           "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
            "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit", "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"]},
            "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"}}}
       ]
+    },
+    "testBarrierRootIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dev", "ino", "uid", "mode"],
+      "properties": {
+        "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0}, "mode": {"const": 448}
+      }
     },
     "protectedFile": {
       "type": "object", "additionalProperties": false,
