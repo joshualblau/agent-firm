@@ -31,6 +31,19 @@ for owner in bin/firm-doctor bin/firm-run-evals bin/firm-bootstrap; do
     sh -c "printf '%s' \"\$1\" | grep -q '$owner'" sh "$CLEAN"
 done
 
+# A FIXTURE THAT NAMES A PROVIDER IS NOT A FIXTURE THAT LAUNCHES ONE. tests/fixtures/ac007-mutation-
+# matrix.py passes "claude"/"codex" as an ORIENTATION LABEL and a list of SUB-CASE NAMES to a local
+# `record()` helper that writes a dict; it launches nothing, and test-run-evals-structural.sh asserts
+# separately that it cannot. The scanner read that shape as argv and reported an unaccounted launch
+# site, which is a guard crying wolf about its own test data. The anchor assertion below runs first
+# on purpose: without it, deleting or renaming the fixture would make the real assertion vacuous and
+# still green.
+FIXTURE="$REPO/tests/fixtures/ac007-mutation-matrix.py"
+assert_ok "the fixture whose data labels the scanner used to misread is still present and unchanged in shape" \
+  grep -q 'record("ac007_placeholder_argv", "claude", result, \["angle_bracket_placeholder_in_command_argv"\])' "$FIXTURE"
+assert_ok "a fixture that passes a provider name as DATA is not reported as a launch site" \
+  sh -c "! printf '%s' \"\$1\" | grep -q 'ac007-mutation-matrix.py'" sh "$CLEAN"
+
 # A mutant per defect actually found in the wild, plus one per rule that could be quietly relaxed.
 mutant() { # <name> <expected substring> <mutation>...
   local name="$1" expect="$2" out rc
@@ -89,6 +102,25 @@ mutant "a LAUNCH_OWNERS entry whose launch site no longer exists" \
   'the scan found no launch site in it' \
   'bin/firm-bootstrap:"claude":"clauded"' \
   'bin/firm-bootstrap:"codex":"codexed"'
+
+# THE PYTHON SIDE STILL BITES. Not matching a fixture's data labels is only correct if a REAL python
+# launch in the SAME file still fails, so these three mutants inject one into the very file the
+# scanner stopped flagging, plus one into the registered python owner. `login status` carries no
+# control at all, so it can only be recognised by codex's OWN published subcommand list -- which is
+# the half of the rule a "must contain a dash" shortcut would have thrown away.
+mutant "a control-free python launch (subcommand-led argv) in a fixture is still unaccounted" \
+  'not accounted for in LAUNCH_OWNERS' \
+  'tests/fixtures/ac007-mutation-matrix.py:families = {}:families = {}
+subprocess.run(launcher("codex", ["login", "status"]))'
+mutant "a python launch whose argv opens with a control is still unaccounted" \
+  'not accounted for in LAUNCH_OWNERS' \
+  'tests/fixtures/ac007-mutation-matrix.py:families = {}:families = {}
+subprocess.run(launcher("claude", ["-p", "unregistered python launch"]))'
+# COVERAGE is not SURFACE: prove the derived_python path still splits argv and checks each control
+# against its own help text, in the one file registered `derived_python`.
+mutant "a control a python launcher passes that its surface does not accept" \
+  'needs a measurement in UNDOCUMENTED_CONTROLS' \
+  'bin/firm-bootstrap:require("claude", "version", ["--version"]):require("claude", "version", ["--version", "--not-a-real-control"])'
 
 t_case "the scanner's own blind spots"
 # Two blind spots the review measured against the real scan: an argv built from an array made the

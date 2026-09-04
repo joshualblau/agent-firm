@@ -23,11 +23,14 @@ SCOPE, STATED SO IT IS NOT MISTAKEN FOR MORE
     untracked file is not something the firm ships — but it means "the scan is clean" is a statement
     about committed content, not about the machine it ran on.
   * python_launches() reads LITERAL argv lists only: it needs an ast.Call carrying a Constant
-    "codex"/"claude" together with an all-Constant list. `subprocess.run([exe] + declared["command"])`
-    is invisible to it. That is acceptable here only because the one file that builds argv that way,
-    bin/firm-reviewer-common, is registered `contract:` and covered by its own drift tests — it is
-    not a general capability, and a new python launcher that composes argv would need either literal
-    lists or its own declaration.
+    "codex"/"claude" together with an all-Constant list THAT OPENS THE WAY A PROVIDER ARGV OPENS —
+    with a control, or with one of that provider's own published subcommands. That last test is the
+    same one shell_launches applies to the word after a provider name, and it is there for the same
+    reason: a provider name sitting next to an arbitrary word is data, not a command.
+    `subprocess.run([exe] + declared["command"])` is invisible to it. That is acceptable here only
+    because the one file that builds argv that way, bin/firm-reviewer-common, is registered
+    `contract:` and covered by its own drift tests — it is not a general capability, and a new
+    python launcher that composes argv would need either literal lists or its own declaration.
 
 WHAT IT DOES NOT DO, DELIBERATELY
   * It never runs a provider CLI with anything but `--help`, and only on subcommand chains it has
@@ -355,6 +358,37 @@ def shell_launches(relative, text):
     return found
 
 
+def opens_provider_argv(provider, elements):
+    """Does this literal list begin the way that provider's OWN argv begins?
+
+    THE SAME TEST shell_launches ALREADY APPLIES, and for the same reason. A shell line only counts
+    as a launch when the word after the provider is a control, one of the provider's published
+    subcommands, or an expansion; `claude` standing next to an arbitrary word is prose, not a
+    command. The python side carried no such test, so ANY all-Constant list of strings travelling
+    beside a `"claude"`/`"codex"` Constant was read as argv — and
+    `record("ac007_placeholder_argv", "claude", result, ["angle_bracket_placeholder_in_command_argv"])`
+    in tests/fixtures/ac007-mutation-matrix.py matched it exactly: a provider ORIENTATION LABEL next
+    to a list of SUB-CASE NAMES, in a fixture that launches nothing and asserts it launches nothing.
+    Reporting that as an unaccounted launch site is the cry-wolf failure launch_argv() was written to
+    stop; here it buried the scan's one real finding under nine lines of noise.
+
+    WHY NOT DECIDE IT BY WHO IS CALLED. `record()` is a plain record builder, and the tempting rule
+    is "the callee must reach subprocess". bin/firm-bootstrap's `mutation()` is a plain record
+    builder too, and its records ARE executed later, from a list, by `call()`. That rule would
+    therefore drop a genuine launch descriptor. The shape of the argv travels with the data; the
+    identity of the helper that carries it does not.
+
+    THE BLIND SPOT THIS ACCEPTS, STATED. A launch whose first argv word is neither a control nor a
+    published subcommand — `claude "some prompt"` — is not recognised. That is the blind spot the
+    shell side has carried since it was written; this makes it the same on both sides rather than a
+    new one. It also means a missing provider CLI (no help text, so no subcommand list) narrows the
+    test to controls alone, which is why tests/test-provider-launch-sites.sh refuses to run at all
+    unless both CLIs are installed rather than reporting a thinner scan as a pass.
+    """
+    head = elements[0]
+    return head.startswith("-") or head in subcommands(provider, [])
+
+
 def python_launches(relative, text):
     """argv lists in a python file that travel with a provider name in the same call."""
     found = []
@@ -373,7 +407,10 @@ def python_launches(relative, text):
             if isinstance(argument, (ast.List, ast.Tuple)) and argument.elts and all(
                     isinstance(e, ast.Constant) and isinstance(e.value, str)
                     for e in argument.elts):
-                found.append((named[0], [e.value for e in argument.elts]))
+                elements = [e.value for e in argument.elts]
+                if not opens_provider_argv(named[0], elements):
+                    continue
+                found.append((named[0], elements))
     return found
 
 
