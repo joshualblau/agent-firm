@@ -402,6 +402,173 @@ try:
 finally:e.os.lstat=original
 PY
 
+mk_legacy_run() {
+  # A GENUINE historical legacy run: no run-metadata.json, no qa-candidate.json, no seal marker and
+  # no seal state -- the only shape whose legacy-shaped evidence rows stay valid. Everything else
+  # (present, partial, required, opted-in, unknown) is current state and must never fall back to it.
+  local _repo="$1" _id="legacy-evidence-run" _run _raw _digest _bytes
+  _run="$_repo/.agent-firm/runs/$_id"
+  mkdir -p "$_run"
+  _raw='legacy evidence artifact'
+  printf '%s\n' "$_raw" > "$_run/legacy-artifact.txt"
+  _digest="$(shasum -a 256 "$_run/legacy-artifact.txt" | awk '{print $1}')"
+  _bytes="$(wc -c < "$_run/legacy-artifact.txt" | tr -d ' ')"
+  {
+    printf '{"ts":"2024-01-01T00:00:00Z","event":"run_started","event_id":"evt-legacy-start","run_id":"%s"}\n' "$_id"
+    printf '{"ts":"2024-01-01T00:00:01Z","event":"evidence_produced","event_id":"evt-legacy-evidence","run_id":"%s","sha":"%s","generation":"1","path":"legacy-artifact.txt","sha256":"%s","bytes":"%s"}\n' \
+      "$_id" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$_digest" "$_bytes"
+  } > "$_run/run.jsonl"
+  chmod 600 "$_run/run.jsonl"
+  printf '%s' "$_run"
+}
+
+# AC-007/AC-010/AC-011/AC-012. Everything below is local-fixture-only: no provider is launched, no
+# credential is read, and both primary orientations are exercised through ordinary sealable runs.
+t_case "every AC-007 mutation family executes fail-closed and is proven by the closed golden manifest"
+if ! t_p2_row_supported; then
+  t_skip "AC-007 mutation matrix and golden manifest" "requires a supported P2 ledger write host"
+else
+  matrix_run="$(make_sealable_run claude | sed -n '2p')"
+  pre_run="$(make_sealable_run claude | sed -n '2p')"
+  published_fixture="$(make_sealable_run claude)"
+  published_repo="$(printf '%s\n' "$published_fixture" | sed -n '1p')"
+  published_run="$(printf '%s\n' "$published_fixture" | sed -n '2p')"
+  codex_run="$(make_sealable_run codex | sed -n '2p')"
+  legacy_run="$(mk_legacy_run "$published_repo")"
+  if [ -z "$matrix_run" ] || [ -z "$pre_run" ] || [ -z "$published_run" ] || [ -z "$codex_run" ]; then
+    _t_no "AC-007 matrix fixtures created" "one or more sealable fixtures failed"
+  else
+    _t_ok "AC-007 matrix fixtures created"
+    assert_ok "claude-primary fixture publishes one seal" seal_for_run "$published_run"
+    assert_ok "codex-primary fixture publishes one seal" seal_for_run "$codex_run"
+    matrix_authority="$(t_python -c 'import json,sys; rid=sys.argv[1]; print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":sys.argv[2],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":sys.argv[3]}}}],separators=(",",":")))' \
+      "$(basename "$matrix_run")" \
+      "$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["event_id"])' "$matrix_run/run.jsonl")" \
+      "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$matrix_run/09-test-evidence/qa-candidate.json")")"
+    matrix_activation="$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)"
+    matrix_start="$("$BIN/firm-ledger-log" --run "$matrix_run" --strict --role-start --stage test/M-01 \
+      --role qa-tester --contract role-contracts/Q-01-qa-tester.md --event qa_started \
+      --authority-json "$matrix_authority" --agent /root/mutation_matrix \
+      --activation-json "$matrix_activation" \
+      | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')"
+    if [ -z "$matrix_start" ]; then
+      _t_no "mutation-evidence role window opened" "role start produced no event id"
+    else
+      _t_ok "mutation-evidence role window opened"
+      matrix_out="$(t_python "$TESTS_DIR/fixtures/ac007-mutation-matrix.py" "$FIRM_ROOT" "$matrix_run" \
+        "$pre_run" "$published_run" "$codex_run" "$legacy_run" test/M-01 qa-tester "$matrix_start" 2>&1)"
+      matrix_rc=$?
+      if [ "$matrix_rc" -eq 0 ]; then
+        _t_ok "every AC-007 family raised its exact expected fail-closed category"
+      else
+        _t_no "every AC-007 family raised its exact expected fail-closed category" "$(_t_ctx "$matrix_out")"
+      fi
+      "$BIN/firm-ledger-log" --run "$matrix_run" --strict qa_completed stage=test/M-01 \
+        role=qa-tester "role_start_event_id=$matrix_start" >/dev/null
+      # Name the families the run actually proved. A count would pass a matrix that dropped one.
+      assert_eq "the published matrix names every required family exactly once" \
+        "ac007_both_provider_sealed ac007_evidence_tamper ac007_genuine_legacy_reviewable ac007_integration_index_duplicate ac007_integration_index_malformed ac007_opted_in_no_fallback ac007_partial_no_fallback ac007_placeholder_argv ac007_pr_marker_malformed ac007_privacy_category_misuse ac007_privacy_surface_misuse ac007_producer_window_defect ac007_seal_tamper ac007_synchronized_toctou ac007_unexpected_ledger_append" \
+        "$(t_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(" ".join(i["family"] for i in d["families"]))' \
+           "$matrix_run/09-test-evidence/mutation-evidence/ac007-manifest.json")"
+      assert_eq "each family records the exact category it observed" \
+        "ac007_both_provider_sealed=SEAL_IDENTITY ac007_evidence_tamper=ARTIFACT_STALE ac007_genuine_legacy_reviewable=NONE ac007_integration_index_duplicate=DUPLICATE_DECLARATION ac007_integration_index_malformed=INTEGRATION_INDEX ac007_opted_in_no_fallback=ARTIFACT_MISSING ac007_partial_no_fallback=MULTIPLE_SEALS ac007_placeholder_argv=COMMAND_EVIDENCE ac007_pr_marker_malformed=PR_MARKERS ac007_privacy_category_misuse=PRIVACY_MATCH ac007_privacy_surface_misuse=PRIVACY_MATCH ac007_producer_window_defect=PRODUCER_WINDOW ac007_seal_tamper=NONCANONICAL_JSON ac007_synchronized_toctou=ARTIFACT_MOVED ac007_unexpected_ledger_append=LEDGER_SUFFIX" \
+        "$(t_python -c '
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+manifest=json.load(open(root/"09-test-evidence/mutation-evidence/ac007-manifest.json"))
+out=[]
+for item in manifest["families"]:
+  record=json.load(open(root/item["path"]))
+  out.append(item["family"]+"="+record["observed_category"])
+print(" ".join(out))' "$matrix_run")"
+      assert_eq "only the genuine-legacy family records a success" "ac007_genuine_legacy_reviewable" \
+        "$(t_python -c '
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+manifest=json.load(open(root/"09-test-evidence/mutation-evidence/ac007-manifest.json"))
+print(" ".join(item["family"] for item in manifest["families"]
+               if json.load(open(root/item["path"]))["legacy_success"]))' "$matrix_run")"
+      assert_ok "library validator accepts the closed current-candidate manifest" \
+        t_python - "$FIRM_ROOT" "$matrix_run" <<'PY'
+import json,os,sys
+root,run=sys.argv[1:]
+sys.path.insert(0,os.path.join(root,"agent-firm","lib"))
+from evidence_seal import REQUIRED_MUTATION_FAMILIES,seal_state,validate_mutation_matrix
+candidate=json.load(open(os.path.join(run,"09-test-evidence","qa-candidate.json")))
+receipt=validate_mutation_matrix(run,candidate["candidate_sha"],candidate["generation"],
+                                 seal_state(run)["records"])
+assert set(receipt["families"])==set(REQUIRED_MUTATION_FAMILIES),sorted(receipt["families"])
+assert receipt["producer"]["event"]=="evidence_produced"
+assert {receipt["families"][name]["orientation"] for name in receipt["families"]} >= {"claude","both"}
+for name,proven in receipt["families"].items():
+  assert proven["cases"],name
+  assert proven["producer"]["event_id"].startswith("evt-"),name
+PY
+      matrix_repo="$(cd "$matrix_run/../../.." && pwd -P)"
+      matrix_assertions="$matrix_repo/ac007-golden-assertions.yaml"
+      printf 'assertions:\n  - mutation_matrix_proven: true\n' > "$matrix_assertions"
+      assert_rc "golden assertion passes on complete mutation evidence" 0 \
+        "$BIN/firm-check-assertions" "$matrix_assertions" "$matrix_repo"
+      assert_output "golden assertion names the proven candidate and generation" "15 AC-007 families proven" \
+        "$BIN/firm-check-assertions" "$matrix_assertions" "$matrix_repo"
+      matrix_inverted="$matrix_repo/ac007-golden-assertions-false.yaml"
+      printf 'assertions:\n  - mutation_matrix_proven: false\n' > "$matrix_inverted"
+      assert_rc "golden assertion refuses to be inverted into a negative" 1 \
+        "$BIN/firm-check-assertions" "$matrix_inverted" "$matrix_repo"
+      # Every evidence dimension, removed / duplicated / staled / mutated / mismatched / left
+      # unproduced / changed after publication. The semantic ones are re-published CONSISTENTLY, so
+      # the only defect is the claim itself -- a digest mismatch would prove nothing about them.
+      matrix_backup="$(mktemp -d "${TMPDIR:-/tmp}/firm-matrix-backup.XXXXXX")"; t_track "$matrix_backup"
+      cp -R "$matrix_run/09-test-evidence/mutation-evidence" "$matrix_backup/mutation-evidence"
+      cp "$matrix_run/run.jsonl" "$matrix_backup/run.jsonl"
+      for tamper in removed_family_evidence dropped_manifest_family extra_manifest_family \
+                    duplicated_manifest_family duplicated_producer_event \
+                    unproduced_family_evidence unproduced_manifest stale_manifest_digest \
+                    stale_manifest_bytes changed_after_publication producer_event_id_mismatch \
+                    mutable_family_evidence symlinked_family_evidence \
+                    noncanonical_family_evidence mismatched_candidate mismatched_generation \
+                    mismatched_record_candidate observed_category_drift seal_published \
+                    reusable_partial_generation ledger_prefix_drift provider_call_drift \
+                    nonlegacy_success legacy_family_not_reviewable single_orientation \
+                    empty_case_list extra_record_field; do
+        rm -rf "$matrix_run/09-test-evidence/mutation-evidence"
+        cp -R "$matrix_backup/mutation-evidence" "$matrix_run/09-test-evidence/mutation-evidence"
+        cp "$matrix_backup/run.jsonl" "$matrix_run/run.jsonl"
+        chmod 600 "$matrix_run/run.jsonl"
+        if ! t_python "$TESTS_DIR/fixtures/ac007-mutation-tamper.py" "$FIRM_ROOT" "$matrix_run" \
+             "$tamper" >/dev/null 2>&1; then
+          _t_no "$tamper is applied" "the tamper script failed"
+          continue
+        fi
+        t_python - "$FIRM_ROOT" "$matrix_run" >/dev/null 2>&1 <<'PY'
+import json,os,sys
+root,run=sys.argv[1:]
+sys.path.insert(0,os.path.join(root,"agent-firm","lib"))
+from evidence_seal import seal_state,validate_mutation_matrix
+candidate=json.load(open(os.path.join(run,"09-test-evidence","qa-candidate.json")))
+validate_mutation_matrix(run,candidate["candidate_sha"],candidate["generation"],
+                         seal_state(run)["records"])
+PY
+        library_rc=$?
+        "$BIN/firm-check-assertions" "$matrix_assertions" "$matrix_repo" >/dev/null 2>&1
+        golden_rc=$?
+        if [ "$library_rc" -ne 0 ] && [ "$golden_rc" -eq 1 ]; then
+          _t_ok "$tamper is refused by both the library and the golden assertion"
+        else
+          _t_no "$tamper is refused by both the library and the golden assertion" \
+            "library rc=$library_rc golden rc=$golden_rc"
+        fi
+      done
+      rm -rf "$matrix_run/09-test-evidence/mutation-evidence"
+      cp -R "$matrix_backup/mutation-evidence" "$matrix_run/09-test-evidence/mutation-evidence"
+      cp "$matrix_backup/run.jsonl" "$matrix_run/run.jsonl"
+      chmod 600 "$matrix_run/run.jsonl"
+      assert_rc "restored evidence passes the golden assertion again" 0 \
+        "$BIN/firm-check-assertions" "$matrix_assertions" "$matrix_repo"
+    fi
+  fi
+fi
+
 t_case "proven no-append publication failure removes the complete unpublished bundle"
 cleanup_fixture="$(make_sealable_run)"; cleanup_run="$(printf '%s\n' "$cleanup_fixture" | sed -n '2p')"
 if t_p2_row_supported; then

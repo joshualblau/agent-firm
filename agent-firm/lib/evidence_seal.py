@@ -50,6 +50,35 @@ OPERATOR_HOME_FIELDS = {
     ),
 }
 
+# ---------------------------------------------------------------------------------------------
+# AC-007 mutation matrix.  The preflight mutation families are a CLOSED set: the manifest must
+# carry every one of them exactly once, and it may carry nothing else.  An open set would let a
+# matrix that silently dropped a family still report "all declared families proven", which is the
+# aggregate-count proof AC-010 forbids.  Exactly one family -- the genuine-legacy one -- may record
+# a success; every other family must record an exact fail-closed category.
+# ---------------------------------------------------------------------------------------------
+MUTATION_EVIDENCE_DIR = "09-test-evidence/mutation-evidence"
+MUTATION_MANIFEST_PATH = MUTATION_EVIDENCE_DIR + "/ac007-manifest.json"
+MUTATION_LEGACY_FAMILY = "ac007_genuine_legacy_reviewable"
+MUTATION_ORIENTATIONS = ("claude", "codex")
+REQUIRED_MUTATION_FAMILIES = (
+    "ac007_opted_in_no_fallback",
+    "ac007_partial_no_fallback",
+    "ac007_both_provider_sealed",
+    "ac007_privacy_category_misuse",
+    "ac007_privacy_surface_misuse",
+    "ac007_placeholder_argv",
+    "ac007_unexpected_ledger_append",
+    "ac007_producer_window_defect",
+    "ac007_integration_index_duplicate",
+    "ac007_integration_index_malformed",
+    "ac007_pr_marker_malformed",
+    "ac007_seal_tamper",
+    "ac007_evidence_tamper",
+    "ac007_synchronized_toctou",
+    MUTATION_LEGACY_FAMILY,
+)
+
 
 class SealError(Exception):
     """A stable fail-closed protocol error."""
@@ -715,6 +744,93 @@ def _producer(records, path, raw, sha, generation, required):
             raise SealError("PRODUCER_WINDOW", f"{path}:back-stamped timestamp")
     return {"event_id": event["event_id"], "event": "evidence_produced",
             "role_start_event_id": start_id, "stage": event.get("stage"), "role": event.get("role")}
+
+
+def validate_mutation_matrix(run, sha, generation, records):
+    """Validate the closed AC-007 mutation-evidence manifest for the CURRENT candidate.
+
+    Every required family must be present exactly once, bound to this run/candidate/generation, and
+    backed by its own immutable AF-CJSON-1 evidence document whose exact no-follow bytes, lowercase
+    digest, byte count and single `evidence_produced` producer event all agree.  Each family record
+    must prove, for its own execution, that the expected fail-closed category was the observed one,
+    that no seal and no reusable partial generation were produced, that the tested ledger prefix
+    stayed byte-identical, and that the provider-call count did not move.  A missing, stale, mutable,
+    duplicated, mismatched, unproduced, or post-publication-changed dimension raises; there is no
+    aggregate count or prose that can substitute for any of it.
+    """
+    run = Path(run)
+    manifest_raw, _, _ = _safe_read(run, MUTATION_MANIFEST_PATH)
+    manifest = parse_canonical_json(manifest_raw, MUTATION_MANIFEST_PATH)
+    _schema_validate(manifest, "mutation-evidence.schema.json", MUTATION_MANIFEST_PATH)
+    if manifest.get("kind") != "mutation_matrix_manifest":
+        raise SealError("MUTATION_MANIFEST", "artifact is not the mutation matrix manifest")
+    if (manifest.get("run_id") != run.name or manifest.get("candidate_sha") != sha
+            or str(manifest.get("generation")) != str(generation)):
+        raise SealError("MUTATION_MANIFEST", "manifest is not bound to the current candidate")
+    entries = manifest["families"]
+    declared = [item["family"] for item in entries]
+    if len(declared) != len(set(declared)):
+        raise SealError("MUTATION_MANIFEST", "a family is declared more than once")
+    if set(declared) != set(REQUIRED_MUTATION_FAMILIES):
+        missing = sorted(set(REQUIRED_MUTATION_FAMILIES) - set(declared))
+        extra = sorted(set(declared) - set(REQUIRED_MUTATION_FAMILIES))
+        raise SealError("MUTATION_MANIFEST",
+                        f"family set is not the closed AC-007 set (missing={missing} extra={extra})")
+    manifest_producer = _producer(records, MUTATION_MANIFEST_PATH, manifest_raw, sha, generation, True)
+    covered = set()
+    proven = {}
+    for entry in entries:
+        family = entry["family"]
+        expected_path = f"{MUTATION_EVIDENCE_DIR}/{family}.json"
+        if entry["path"] != expected_path:
+            raise SealError("MUTATION_FAMILY", f"{family}:path is not the canonical family path")
+        raw, _, _ = _safe_read(run, entry["path"])
+        if entry["bytes"] != len(raw) or entry["sha256"] != sha256(raw):
+            raise SealError("MUTATION_EVIDENCE", f"{family}:manifest identity is stale")
+        record = parse_canonical_json(raw, entry["path"])
+        _schema_validate(record, "mutation-evidence.schema.json", entry["path"])
+        if record.get("kind") != "mutation_family_evidence":
+            raise SealError("MUTATION_EVIDENCE", f"{family}:artifact is not a family record")
+        if (record.get("family") != family or record.get("run_id") != run.name
+                or record.get("candidate_sha") != sha
+                or str(record.get("generation")) != str(generation)
+                or record.get("orientation") != entry["orientation"]
+                or record.get("expected_category") != entry["expected_category"]):
+            raise SealError("MUTATION_EVIDENCE", f"{family}:record identity does not match the manifest")
+        if record["observed_category"] != record["expected_category"]:
+            raise SealError("MUTATION_FAMILY",
+                            f"{family}:observed {record['observed_category']} != expected "
+                            f"{record['expected_category']}")
+        if record["seal_published"] or record["partial_generation_present"]:
+            raise SealError("MUTATION_FAMILY", f"{family}:left a seal or a reusable partial generation")
+        if record["ledger_prefix_before"] != record["ledger_prefix_after"]:
+            raise SealError("MUTATION_FAMILY", f"{family}:tested ledger prefix is not byte-identical")
+        if record["provider_calls_before"] != record["provider_calls_after"]:
+            raise SealError("MUTATION_FAMILY", f"{family}:provider-call count changed")
+        if record["legacy_success"]:
+            if family != MUTATION_LEGACY_FAMILY:
+                raise SealError("MUTATION_FAMILY", f"{family}:only the genuine-legacy family may succeed")
+            if record["expected_category"] != "NONE":
+                raise SealError("MUTATION_FAMILY", f"{family}:legacy success must declare NONE")
+        else:
+            if family == MUTATION_LEGACY_FAMILY:
+                raise SealError("MUTATION_FAMILY",
+                                f"{family}:genuine legacy reviewability was not retained")
+            if record["expected_category"] == "NONE":
+                raise SealError("MUTATION_FAMILY", f"{family}:a mutation must name a fail-closed category")
+        producer = _producer(records, entry["path"], raw, sha, generation, True)
+        if producer != entry["producer"]:
+            raise SealError("MUTATION_EVIDENCE", f"{family}:producer binding does not match the ledger")
+        covered.update(MUTATION_ORIENTATIONS if entry["orientation"] == "both" else (entry["orientation"],))
+        proven[family] = {"orientation": entry["orientation"], "category": record["observed_category"],
+                          "cases": list(record["cases"]), "producer": producer}
+    if covered != set(MUTATION_ORIENTATIONS):
+        raise SealError("MUTATION_MANIFEST",
+                        f"matrix does not cover both primary orientations (covered={sorted(covered)})")
+    return {"schema_version": 1, "path": MUTATION_MANIFEST_PATH, "run_id": run.name,
+            "candidate_sha": sha, "generation": generation,
+            "bytes": len(manifest_raw), "sha256": sha256(manifest_raw),
+            "producer": manifest_producer, "families": proven}
 
 
 def _identity(run):

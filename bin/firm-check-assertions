@@ -25,6 +25,9 @@
 #                                          envelope — see default_branch_status() below)
 #   qa_checkout_clean true               (delegates to firm-qa-clean-check; NOT read-only enforcement,
 #                                          only "no visible changes were left" — see that script's header)
+#   mutation_matrix_proven true          (AC-007: the CLOSED mutation-family matrix, each family bound
+#                                          to the current candidate by path/bytes/digest/producer —
+#                                          see mutation_matrix_proven() below)
 #
 # `--parse-only` accepts only the assertions file, validates this complete vocabulary plus non-empty
 # value domains, and exits before assertion helper definitions or dispatch. In particular,
@@ -254,6 +257,7 @@ KNOWN = {
     "traceability_passes": "boolean", "no_default_branch_merge": "boolean",
     "final_gate_pending": "boolean", "qa_checkout_clean": "boolean",
     "trusted_unavailability_chain": "boolean",
+    "mutation_matrix_proven": "boolean",
 }
 
 def value_error(index, key, message):
@@ -579,6 +583,287 @@ def trusted_unavailability_chain():
     except Exception as exc:
         return False, _one_line_ascii(f"{type(exc).__name__}: {exc}")
 
+MUTATION_EVIDENCE_DIR = "09-test-evidence/mutation-evidence"
+MUTATION_MANIFEST_PATH = MUTATION_EVIDENCE_DIR + "/ac007-manifest.json"
+MUTATION_LEGACY_FAMILY = "ac007_genuine_legacy_reviewable"
+MUTATION_ORIENTATIONS = ("claude", "codex")
+# The CLOSED AC-007 family set, restated here ON PURPOSE. This verb is the golden proof, so it must
+# be able to fail a run whose own library was edited to drop a family: if it imported the same
+# constant the evidence producer used, a one-line edit to that constant would silently shrink the
+# matrix AND the check of the matrix together, and the eval would still report green. Two
+# independent statements of the required set is the point -- when they diverge, the golden fails,
+# which is the correct direction to fail in.
+REQUIRED_MUTATION_FAMILIES = (
+    "ac007_opted_in_no_fallback", "ac007_partial_no_fallback", "ac007_both_provider_sealed",
+    "ac007_privacy_category_misuse", "ac007_privacy_surface_misuse", "ac007_placeholder_argv",
+    "ac007_unexpected_ledger_append", "ac007_producer_window_defect",
+    "ac007_integration_index_duplicate", "ac007_integration_index_malformed",
+    "ac007_pr_marker_malformed", "ac007_seal_tamper", "ac007_evidence_tamper",
+    "ac007_synchronized_toctou", MUTATION_LEGACY_FAMILY,
+)
+MUTATION_MANIFEST_FIELDS = {"schema_version", "kind", "criterion", "run_id", "candidate_sha",
+                            "generation", "families"}
+MUTATION_ENTRY_FIELDS = {"family", "orientation", "expected_category", "path", "bytes", "sha256",
+                         "producer"}
+MUTATION_RECORD_FIELDS = {"schema_version", "kind", "criterion", "family", "orientation", "run_id",
+                          "candidate_sha", "generation", "expected_category", "observed_category",
+                          "legacy_success", "seal_published", "partial_generation_present",
+                          "ledger_prefix_before", "ledger_prefix_after", "provider_calls_before",
+                          "provider_calls_after", "cases"}
+MUTATION_PRODUCER_FIELDS = {"event_id", "event", "stage", "role", "role_start_event_id"}
+LEDGER_PRODUCER_FIELDS = {"ts", "event", "event_id", "run_id", "sha", "generation", "path",
+                          "sha256", "bytes", "stage", "role", "role_start_event_id"}
+
+
+def mutation_matrix_proven():
+    """AC-007/AC-012: require immutable, current-candidate-bound evidence for EVERY mutation family.
+
+    A successful-path assertion set proves the happy path ran. It proves nothing about whether the
+    deterministic preflight mutation matrix ran, or whether it ran COMPLETELY -- and "the task
+    description says all families were covered" plus "N/N assertions passed" are exactly the two
+    non-proofs AC-010 rules out. So this verb reads the closed, schema-versioned manifest the run
+    published and re-derives every binding itself:
+
+      * the family id set must be EXACTLY the closed required set -- not a superset, not a subset,
+        no duplicates. A dropped family is an unrun mutation, the same way a dropped assertion is an
+        unrun check;
+      * the manifest and every family record must be immutable canonical JSON (sorted keys, no
+        whitespace, one terminal LF) read through a no-follow regular-file descriptor, so a symlink,
+        a directory, or a reformatted-in-place document is not readable as evidence;
+      * every family's declared bytes/sha256 must equal the artifact's ACTUAL bytes, and the run
+        ledger must carry EXACTLY ONE evidence_produced event for that path, itself carrying the
+        current candidate sha, generation, digest and byte count. Missing = unproduced; two = the
+        duplicate that makes "which one is current" unanswerable; a digest that no longer matches =
+        the artifact was changed after publication;
+      * every family must record the exact fail-closed CATEGORY it observed, equal to the one it
+        expected, with no seal published, no reusable partial generation left behind, a
+        byte-identical tested ledger prefix, and an unchanged provider-call count;
+      * exactly one family -- the genuine-legacy one -- may record a success, and it must be the
+        legacy family. Any other family claiming success, or the legacy family failing to retain
+        reviewability, is a fail-closed fallback that AC-011 forbids.
+
+    Returns (ok, detail). Any exception is a FAILURE, never a pass: a golden proof that cannot
+    evaluate its own evidence has not proven anything.
+    """
+    led = find_ledger()
+    if led is None:
+        return False, "no run ledger found"
+    led = os.path.realpath(led)
+    runs_root = os.path.realpath(os.path.join(repo, ".agent-firm", "runs"))
+    try:
+        inside_runs = os.path.commonpath((runs_root, led)) == runs_root
+    except ValueError:
+        inside_runs = False
+    if not inside_runs or led == runs_root:
+        return False, "run ledger is outside the scratch repository's runs root"
+    if not os.path.isdir(led) or os.path.islink(led):
+        return False, "run ledger is not a regular directory"
+    run_id = os.path.basename(led)
+
+    def raw(rel):
+        """Exact bytes of one run-relative REGULAR file, refusing every link on the way down."""
+        if not isinstance(rel, str) or not rel or os.path.isabs(rel) or "\\" in rel:
+            raise ValueError(f"unsafe relative path {rel!r}")
+        parts = rel.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"noncanonical relative path {rel!r}")
+        current = led
+        for part in parts:
+            current = os.path.join(current, part)
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                raise ValueError(f"path traverses a symlink: {rel}")
+        info = os.lstat(current)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(f"not an owned regular no-follow file: {rel}")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError(f"mutation evidence is group/other-writable (mutable): {rel}")
+        if info.st_size > 1024 * 1024:
+            raise ValueError(f"oversized evidence artifact: {rel}")
+        fd = os.open(current, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            return os.read(fd, 1024 * 1024 + 1)
+        finally:
+            os.close(fd)
+
+    def canonical(rel, payload):
+        """Parse AF-CJSON-1: unique keys, and re-encoding must reproduce the exact bytes."""
+        def unique(pairs):
+            out = {}
+            for key, value in pairs:
+                if key in out:
+                    raise ValueError(f"duplicate JSON key {key!r} in {rel}")
+                out[key] = value
+            return out
+        doc = json.loads(payload.decode("utf-8", "strict"), object_pairs_hook=unique)
+        if not isinstance(doc, dict):
+            raise ValueError(f"{rel} is not a JSON object")
+        expected = (json.dumps(doc, ensure_ascii=True, sort_keys=True,
+                               separators=(",", ":")) + "\n").encode()
+        if expected != payload:
+            raise ValueError(f"{rel} is not canonical immutable JSON")
+        return doc
+
+    try:
+        # run-metadata.json / qa-candidate.json are ordinary run identity documents, not protocol
+        # artifacts: they are read for identity only and are NOT held to AF-CJSON-1 canonical bytes.
+        metadata = json.loads(raw("run-metadata.json").decode("utf-8", "strict"))
+        candidate = json.loads(raw("09-test-evidence/qa-candidate.json").decode("utf-8", "strict"))
+        if not isinstance(metadata, dict) or not isinstance(candidate, dict):
+            raise ValueError("run identity documents are not objects")
+        sha = candidate.get("candidate_sha")
+        generation = candidate.get("generation")
+        if (metadata.get("run_id") != run_id or candidate.get("run_id") != run_id
+                or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or isinstance(generation, bool) or not isinstance(generation, int)
+                or generation < 1):
+            raise ValueError("current candidate identity is incomplete or invalid")
+        if metadata.get("primary_provider") not in MUTATION_ORIENTATIONS:
+            raise ValueError("run metadata declares no supported primary orientation")
+
+        events = []
+        for number, line in enumerate(raw("run.jsonl").decode("utf-8", "strict").splitlines(), 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError(f"ledger line {number} is not an object")
+            events.append(item)
+
+        def producer_for(rel, payload):
+            """The ONE current evidence_produced event for this artifact, or an explicit failure."""
+            matches = [e for e in events
+                       if e.get("event") == "evidence_produced" and e.get("path") == rel]
+            if not matches:
+                raise ValueError(f"no evidence_produced event published {rel} (unproduced)")
+            if len(matches) != 1:
+                raise ValueError(f"{len(matches)} duplicate evidence_produced events publish {rel}")
+            event = matches[0]
+            if set(event) != LEDGER_PRODUCER_FIELDS:
+                raise ValueError(f"producer event for {rel} is not the closed current shape")
+            if (event.get("run_id") != run_id or event.get("sha") != sha
+                    or str(event.get("generation")) != str(generation)):
+                raise ValueError(f"producer event for {rel} is not bound to the current candidate")
+            if (event.get("sha256") != hashlib.sha256(payload).hexdigest()
+                    or str(event.get("bytes")) != str(len(payload))):
+                raise ValueError(f"producer event for {rel} is stale: evidence changed after publication")
+            start_id = event.get("role_start_event_id")
+            starts = [e for e in events if e.get("event_id") == start_id
+                      and str(e.get("event", "")).endswith("_started")]
+            if len(starts) != 1:
+                raise ValueError(f"producer event for {rel} has no unique role-start window")
+            if (starts[0].get("stage") != event.get("stage")
+                    or starts[0].get("role") != event.get("role")):
+                raise ValueError(f"producer event for {rel} does not match its role window")
+            return {"event_id": event["event_id"], "event": "evidence_produced",
+                    "stage": event["stage"], "role": event["role"],
+                    "role_start_event_id": start_id}
+
+        manifest_raw = raw(MUTATION_MANIFEST_PATH)
+        manifest = canonical(MUTATION_MANIFEST_PATH, manifest_raw)
+        if set(manifest) != MUTATION_MANIFEST_FIELDS:
+            raise ValueError("manifest field set is not closed")
+        if (manifest.get("schema_version") != 1 or manifest.get("kind") != "mutation_matrix_manifest"
+                or manifest.get("criterion") != "AC-007"):
+            raise ValueError("manifest is not a schema-version-1 AC-007 mutation matrix")
+        if (manifest.get("run_id") != run_id or manifest.get("candidate_sha") != sha
+                or manifest.get("generation") != generation):
+            raise ValueError("manifest is not bound to the current candidate")
+        entries = manifest.get("families")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("manifest declares no families")
+        declared = [item.get("family") if isinstance(item, dict) else None for item in entries]
+        if len(declared) != len(set(declared)):
+            raise ValueError("a family is declared more than once")
+        if set(declared) != set(REQUIRED_MUTATION_FAMILIES):
+            missing = sorted(x for x in REQUIRED_MUTATION_FAMILIES if x not in set(declared))
+            extra = sorted(str(x) for x in set(declared) - set(REQUIRED_MUTATION_FAMILIES))
+            raise ValueError(f"family set is not the closed AC-007 set (missing={missing} extra={extra})")
+        manifest_producer = producer_for(MUTATION_MANIFEST_PATH, manifest_raw)
+        covered = set()
+        legacy_successes = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != MUTATION_ENTRY_FIELDS:
+                raise ValueError("a manifest entry field set is not closed")
+            family = entry["family"]
+            if entry["path"] != f"{MUTATION_EVIDENCE_DIR}/{family}.json":
+                raise ValueError(f"{family}: path is not the canonical family evidence path")
+            if entry["orientation"] not in ("claude", "codex", "both"):
+                raise ValueError(f"{family}: orientation is not a supported primary orientation")
+            payload = raw(entry["path"])
+            if (entry["bytes"] != len(payload)
+                    or entry["sha256"] != hashlib.sha256(payload).hexdigest()):
+                raise ValueError(f"{family}: manifest bytes/digest do not match the actual artifact")
+            record = canonical(entry["path"], payload)
+            if set(record) != MUTATION_RECORD_FIELDS:
+                raise ValueError(f"{family}: family record field set is not closed")
+            if (record.get("schema_version") != 1
+                    or record.get("kind") != "mutation_family_evidence"
+                    or record.get("criterion") != "AC-007"):
+                raise ValueError(f"{family}: record is not a schema-version-1 AC-007 family record")
+            if (record.get("family") != family or record.get("run_id") != run_id
+                    or record.get("candidate_sha") != sha
+                    or record.get("generation") != generation
+                    or record.get("orientation") != entry["orientation"]
+                    or record.get("expected_category") != entry["expected_category"]):
+                raise ValueError(f"{family}: record identity does not match the manifest entry")
+            observed = record.get("observed_category")
+            expected = record.get("expected_category")
+            if not isinstance(observed, str) or not re.fullmatch(r"NONE|[A-Z][A-Z0-9_]{1,63}", observed):
+                raise ValueError(f"{family}: observed category is not a fail-closed category")
+            if observed != expected:
+                raise ValueError(f"{family}: observed {observed} != expected {expected}")
+            for flag in ("legacy_success", "seal_published", "partial_generation_present"):
+                if not isinstance(record.get(flag), bool):
+                    raise ValueError(f"{family}: {flag} is not a boolean")
+            if record["seal_published"] or record["partial_generation_present"]:
+                raise ValueError(f"{family}: left a seal or a reusable partial generation")
+            before, after = record.get("ledger_prefix_before"), record.get("ledger_prefix_after")
+            for side in (before, after):
+                if (not isinstance(side, dict) or set(side) != {"bytes", "sha256"}
+                        or isinstance(side.get("bytes"), bool)
+                        or not isinstance(side.get("bytes"), int) or side["bytes"] < 1
+                        or not isinstance(side.get("sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", side["sha256"])):
+                    raise ValueError(f"{family}: a ledger prefix identity is malformed")
+            if before != after:
+                raise ValueError(f"{family}: tested ledger prefix is not byte-identical")
+            calls = (record.get("provider_calls_before"), record.get("provider_calls_after"))
+            if any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in calls):
+                raise ValueError(f"{family}: provider-call counts are not counts")
+            if calls[0] != calls[1]:
+                raise ValueError(f"{family}: provider-call count changed from {calls[0]} to {calls[1]}")
+            cases = record.get("cases")
+            if (not isinstance(cases, list) or not cases
+                    or not all(isinstance(x, str) and x for x in cases)
+                    or len(set(cases)) != len(cases)):
+                raise ValueError(f"{family}: executed sub-case list is empty or not unique")
+            if record["legacy_success"]:
+                legacy_successes.append(family)
+                if expected != "NONE":
+                    raise ValueError(f"{family}: a recorded success must declare category NONE")
+            else:
+                if family == MUTATION_LEGACY_FAMILY:
+                    raise ValueError(f"{family}: genuine legacy reviewability was not retained")
+                if expected == "NONE":
+                    raise ValueError(f"{family}: a mutation must name an exact fail-closed category")
+            declared_producer = entry["producer"]
+            if not isinstance(declared_producer, dict) or set(declared_producer) != MUTATION_PRODUCER_FIELDS:
+                raise ValueError(f"{family}: declared producer field set is not closed")
+            if producer_for(entry["path"], payload) != declared_producer:
+                raise ValueError(f"{family}: declared producer does not match the ledger event")
+            covered.update(MUTATION_ORIENTATIONS if entry["orientation"] == "both"
+                           else (entry["orientation"],))
+        if legacy_successes != [MUTATION_LEGACY_FAMILY]:
+            raise ValueError(f"exactly the genuine-legacy family may succeed; got {legacy_successes}")
+        if covered != set(MUTATION_ORIENTATIONS):
+            raise ValueError(f"matrix does not cover both primary orientations "
+                             f"(covered={sorted(covered)})")
+        return True, (f"{len(entries)} AC-007 families proven for {sha[:12]} generation "
+                      f"{generation} via {manifest_producer['event_id']}")
+    except Exception as exc:
+        return False, _one_line_ascii(f"{type(exc).__name__}: {exc}")
+
+
 fails = []
 def check(name, ok, detail=""):
     print(("  PASS " if ok else "  FAIL ") + name + (f"  [{detail}]" if detail else ""))
@@ -753,6 +1038,17 @@ for a in asserts:
                   "false is unsupported; this is a positive fail-closed trust assertion")
         else:
             check("trusted_unavailability_chain", status, detail)
+    elif k == "mutation_matrix_proven":
+        want = (v.lower() == "true")
+        status, detail = mutation_matrix_proven()
+        # Same rule as trusted_unavailability_chain: `false` is not an assertion mode. Inverting a
+        # positive fail-closed proof would let ANY parse, identity, or correlation failure satisfy
+        # the assertion, so an eval could pass precisely because its mutation evidence was broken.
+        if not want:
+            check("mutation_matrix_proven", False,
+                  "false is unsupported; this is a positive fail-closed proof assertion")
+        else:
+            check("mutation_matrix_proven", status, detail)
     else:
         check(f"unknown_assertion:{k}", False)
 

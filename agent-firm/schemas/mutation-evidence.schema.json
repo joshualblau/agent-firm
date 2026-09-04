@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm/schemas/mutation-evidence.schema.json",
+  "title": "AC-007 mutation-evidence manifest and per-family record",
+  "description": "Closed, schema-versioned, current-candidate-bound record of the executed AC-007 preflight mutation matrix. The manifest indexes one immutable evidence document per required family; each document records the family's expected and observed fail-closed category, that no seal or reusable partial generation was produced, that the tested ledger prefix stayed byte-identical, and that the provider-call count did not change. Only the one declared genuine-legacy family may record a success.",
+  "oneOf": [{"$ref": "#/$defs/manifest"}, {"$ref": "#/$defs/family_record"}],
+  "$defs": {
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "criterion", "run_id", "candidate_sha", "generation", "families"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "kind": {"const": "mutation_matrix_manifest"},
+        "criterion": {"const": "AC-007"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "generation": {"type": "integer", "minimum": 1},
+        "families": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/manifest_entry"}
+        }
+      }
+    },
+    "manifest_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "orientation", "expected_category", "path", "bytes", "sha256", "producer"],
+      "properties": {
+        "family": {"$ref": "#/$defs/family_id"},
+        "orientation": {"$ref": "#/$defs/orientation"},
+        "expected_category": {"$ref": "#/$defs/category"},
+        "path": {"type": "string", "pattern": "^09-test-evidence/mutation-evidence/[a-z0-9][a-z0-9_]{0,95}\\.json$"},
+        "bytes": {"type": "integer", "minimum": 1, "maximum": 262144},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "producer": {"$ref": "#/$defs/producer"}
+      }
+    },
+    "family_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "criterion", "family", "orientation", "run_id",
+                   "candidate_sha", "generation", "expected_category", "observed_category",
+                   "legacy_success", "seal_published", "partial_generation_present",
+                   "ledger_prefix_before", "ledger_prefix_after", "provider_calls_before",
+                   "provider_calls_after", "cases"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "kind": {"const": "mutation_family_evidence"},
+        "criterion": {"const": "AC-007"},
+        "family": {"$ref": "#/$defs/family_id"},
+        "orientation": {"$ref": "#/$defs/orientation"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "generation": {"type": "integer", "minimum": 1},
+        "expected_category": {"$ref": "#/$defs/category"},
+        "observed_category": {"$ref": "#/$defs/category"},
+        "legacy_success": {"type": "boolean"},
+        "seal_published": {"type": "boolean"},
+        "partial_generation_present": {"type": "boolean"},
+        "ledger_prefix_before": {"$ref": "#/$defs/prefix"},
+        "ledger_prefix_after": {"$ref": "#/$defs/prefix"},
+        "provider_calls_before": {"type": "integer", "minimum": 0},
+        "provider_calls_after": {"type": "integer", "minimum": 0},
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128,
+                    "pattern": "^[a-z0-9][a-z0-9_]{0,127}$"}
+        }
+      }
+    },
+    "family_id": {"type": "string", "pattern": "^ac007_[a-z0-9][a-z0-9_]{0,89}$"},
+    "orientation": {"enum": ["claude", "codex", "both"]},
+    "category": {"type": "string", "pattern": "^(NONE|[A-Z][A-Z0-9_]{1,63})$"},
+    "prefix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "sha256"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "event", "stage", "role", "role_start_event_id"],
+      "properties": {
+        "event_id": {"type": "string", "pattern": "^evt-[A-Za-z0-9._:-]{1,128}$"},
+        "event": {"const": "evidence_produced"},
+        "stage": {"type": "string", "minLength": 1, "maxLength": 256},
+        "role": {"type": "string", "minLength": 1, "maxLength": 64},
+        "role_start_event_id": {"type": "string", "pattern": "^evt-[A-Za-z0-9._:-]{1,128}$"}
+      }
+    }
+  }
+}
