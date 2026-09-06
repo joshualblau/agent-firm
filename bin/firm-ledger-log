@@ -87,6 +87,11 @@ EVIDENCE_CURRENT_FIELDS = COMMON_FIELDS | {
 EVIDENCE_LEGACY_FIELDS = COMMON_FIELDS | {
     "sha", "generation", "path", "sha256", "bytes",
 }
+# The three fields that exist ONLY in the closed current shape. Their presence on any
+# `evidence_produced` row is the observable proof that a run has entered the closed protocol, and it
+# is the discriminator `evidence_context_for_run` keys genuine-legacy recognition on. Derived, not
+# restated, so the two shapes cannot drift apart.
+EVIDENCE_CURRENT_ONLY_FIELDS = EVIDENCE_CURRENT_FIELDS - EVIDENCE_LEGACY_FIELDS
 MAX_EVIDENCE_ARTIFACT = 64 * 1024 * 1024
 # OBSERVATION SHAPES — the closed key sets this writer admits from an out-of-band observer (the
 # PreToolUse hooks). Each is matched EXACTLY: an extra key or a missing one is not a lenient
@@ -196,10 +201,22 @@ def safe_identity(value):
     return value
 
 
-def ordinary_fail(strict, message):
+def ordinary_fail(strict, message, announce=False):
+    """Best-effort logging keeps its exit status; `announce` only makes the reason visible.
+
+    Ordinary logging stays best-effort by default (exit 0) so a logging fault never fails a caller
+    that only wanted to record something. But there is one class of ordinary failure that is a
+    property of the LEDGER rather than of the caller's arguments: the pre-existing ledger content no
+    longer classifies, so nothing can be appended to this run again. Exiting 0 with no output made
+    the audit spine go read-only with a success status and no diagnostic. `announce` writes the
+    reason to stderr without changing the exit status, so the exit contract every caller relies on
+    is unchanged and the operator still sees it.
+    """
     if strict:
         print(f"firm-ledger-log: {message}", file=sys.stderr)
         raise SystemExit(1)
+    if announce:
+        print(f"firm-ledger-log: {message}", file=sys.stderr)
     raise SystemExit(0)
 
 
@@ -445,10 +462,38 @@ def validate_seal_publish_record(record, ledger_run_id):
             raise LedgerError("invalid evidence seal artifact identity")
 
 
+def legacy_evidence_shape(record):
+    """The shape that was valid for `evidence_produced` BEFORE the closed family existed.
+
+    Pre-existing audit rows were classified by the `ordinary` branch: the four common fields plus
+    any number of safe, printable extension fields. Real historical rows use that latitude (one row
+    in .agent-firm/runs/20260903T141518Z-... carries `provider` and `attempt_id`), so pinning legacy
+    recognition to an exact nine-key set would still refuse audit history that was valid when it was
+    written -- which is the promise AC-011 and AC-016 make. This is deliberately the OLD ordinary
+    rule intersected with the legacy core requirement: strictly narrower than what was accepted
+    before, never wider. Reserved producer fields and the three current-only fields are excluded, so
+    a row cannot wear half of the closed shape and be read as legacy.
+    """
+    if not isinstance(record, dict) or not EVIDENCE_LEGACY_FIELDS <= set(record):
+        return False
+    for key, value in record.items():
+        if key in EVIDENCE_LEGACY_FIELDS:
+            continue
+        if (not isinstance(key, str) or not SAFE_FIELD.fullmatch(key)
+                or key in PRODUCER_RESERVED or key in NATIVE_ONLY_FIELDS
+                or key in EVIDENCE_CURRENT_ONLY_FIELDS
+                or not printable(value, 4096, allow_empty=True)):
+            return False
+    return True
+
+
 def validate_evidence_record(record, ledger_run_id, context):
     mode = context.get("mode") if isinstance(context, dict) else "invalid"
-    expected = EVIDENCE_LEGACY_FIELDS if mode == "legacy" else EVIDENCE_CURRENT_FIELDS
-    if not exact_keys(record, expected) or record.get("event") != "evidence_produced":
+    if mode == "legacy":
+        shaped = legacy_evidence_shape(record)
+    else:
+        shaped = exact_keys(record, EVIDENCE_CURRENT_FIELDS)
+    if not shaped or record.get("event") != "evidence_produced":
         raise LedgerError("invalid evidence publication fields")
     validate_common_record(record, ledger_run_id)
     if not re.fullmatch(r"[0-9a-f]{40}", str(record.get("sha", ""))):
@@ -1005,6 +1050,8 @@ def evidence_context_for_run(run):
     first = None
     seal_signal = False
     ledger_valid = True
+    legacy_history = False
+    current_history = False
     try:
         ledger_value = open_stable_relative(
             run, "run.jsonl", MAX_LEDGER_LINE * 4, {0o600}, "ledger"
@@ -1024,11 +1071,40 @@ def evidence_context_for_run(run):
                 row.get("event") in ("evidence_seal_required", "evidence_seal_published")
                 or "evidence_seal_protocol" in row for row in rows
             )
+            published = [row for row in rows if row.get("event") == "evidence_produced"]
+            current_history = any(
+                EVIDENCE_CURRENT_ONLY_FIELDS & set(row) for row in published
+            )
+            legacy_history = bool(published) and not current_history
     except (ValidationError, UnicodeError, ValueError, json.JSONDecodeError):
         ledger_valid = False
     finally:
         close_stable_relative(ledger_value)
 
+    # GENUINE-LEGACY RECOGNITION, and the exact boundary it is allowed to cover.
+    #
+    # `metadata_present` is a RUN-SHAPE signal ("firm-new-run made this run"), not an evidence
+    # signal, and every run in this repository carries it. Keying the closed shape on it made the
+    # `legacy` mode below unreachable for every real run: `scan_ledger` re-validates the WHOLE
+    # existing ledger before every append, so five healthy unrelated runs whose only fault was
+    # having published audit rows under the previous rules became permanently unappendable, and
+    # `--classify-ledger-file` refused them. Same defect shape as 18bbb6a; do not re-conflate them.
+    #
+    # A run has entered the closed protocol iff that is OBSERVABLE in its own state: a seal signal,
+    # a final-evidence bundle, or an `evidence_produced` row wearing a current-only field. A run
+    # that shows none of those and has ALREADY published evidence under the previous rules is
+    # genuine legacy history, and stays readable and appendable exactly as it was.
+    #
+    # The predicate is deliberately anchored on published history rather than on the absence of
+    # metadata/candidate state, because it must NOT fire for a live run that has published nothing
+    # yet: such a run must still be held to the closed shape for its first publication (this is
+    # what the opted_in/present/unknown/partial_candidate no-fallback cases pin). It cannot fire for
+    # the malformed source run either -- that run's rows carry `stage`/`role`/`role_start_event_id`,
+    # so `current_history` is true and AC-015's refusal is untouched.
+    if (legacy_history and not seal_signal and not final_present and ledger_valid
+            and isinstance(first, dict) and first.get("event") == "run_started"
+            and first.get("run_id") == run.name and "evidence_seal_protocol" not in first):
+        return {"mode": "legacy", "candidate_sha": None, "generation": None}
     if metadata_present or candidate_present or final_present or seal_signal:
         if current_metadata is None:
             return {"mode": "invalid", "candidate_sha": None, "generation": None}
@@ -2757,7 +2833,14 @@ def ordinary_main(argv):
         ledger_barrier(run, "after_result_construction")
     except DuplicateEvent:
         ordinary_fail(strict, f"duplicate event id: {event_id}")
-    except (LedgerError, CommitError):
+    except LedgerError:
+        # The existing ledger content was refused, not this call's arguments: this run cannot be
+        # appended to again by anyone. Announce it even in best-effort mode.
+        ordinary_fail(
+            strict, "could not append target ledger: existing ledger content is unclassifiable",
+            announce=True,
+        )
+    except CommitError:
         ordinary_fail(strict, "could not append target ledger")
     finally:
         for _, fd, _ in reversed(held):

@@ -445,6 +445,180 @@ else
   t_skip "current-no-fallback and genuine-legacy evidence cases" "requires a supported P2 ledger write host"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# POSITIVE CONTROL for the canonical classifier, on a fixture shaped like a REAL run.
+#
+# The classifier previously had only negatives: rc 1 on the malformed source run, and rc != 0 on
+# smuggled rows. "rejects the malformed source run" and "rejects every run that ever published
+# evidence" were therefore indistinguishable to this suite -- and the second one was true. Every
+# no-fallback fixture above and the genuine-legacy fixture in tests/test-evidence-seal.sh are built
+# by bare `mkdir` with no run-metadata.json, so they only ever exercised the metadata-absent branch
+# and could not tell a bounded legacy predicate from an unreachable one.
+#
+# These fixtures are built with `firm-new-run`, so they carry a schema_version-2 run-metadata.json
+# and a bound 09-test-evidence/qa-candidate.json exactly like all 25 runs in this repository, and
+# their pre-existing evidence rows are written straight into run.jsonl the way the previous release
+# wrote them. Anything that makes genuine-legacy recognition unreachable again fails here.
+# ---------------------------------------------------------------------------------------------
+t_case "a real-shaped run whose evidence predates the closed family stays classifiable and appendable"
+if t_p2_row_supported; then
+  # mk_history_run <slug> — a firm-new-run run carrying the schema_version-2 run-metadata.json and
+  # the bound qa-candidate.json every real run in this repository has. Ledger rows are written by
+  # patch_rows below, so each case states its own ledger explicitly.
+  mk_history_run() {
+    local _slug="$1"
+    local _repo _sha _relative _run
+    _repo="$(mk_repo)" || return 1
+    _sha="$(sha_of "$_repo" main)"
+    _relative="$(cd "$_repo" && "$BIN/firm-new-run" --primary codex --base "$_sha" "$_slug" full_track)" || return 1
+    _run="$_repo/$_relative"
+    mkdir -p "$_run/09-test-evidence"
+    t_python - "$_run" <<'PY' || return 1
+import json, os, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+metadata = json.load(open(run / "run-metadata.json"))
+candidate = {
+    "schema_version": 2, "run_id": run.name,
+    "repository_root": metadata["repository_root"], "git_common_dir": metadata["git_common_dir"],
+    "checkout_path": metadata["repository_root"], "source_ref": "refs/heads/integration/history",
+    "source_ref_sha": metadata["accepted_base_sha"], "base_sha": metadata["accepted_base_sha"],
+    "candidate_sha": metadata["accepted_base_sha"], "generation": 1,
+}
+target = run / "09-test-evidence" / "qa-candidate.json"
+target.write_text(json.dumps(candidate, sort_keys=True) + "\n")
+os.chmod(target, 0o600)
+PY
+    printf '%s\n' history > "$_run/09-test-evidence/history.log"
+    chmod 600 "$_run/09-test-evidence/history.log"
+    printf '%s\n' "$_repo" "$_run"
+  }
+
+  history_digest="0000000000000000000000000000000000000000000000000000000000000000"
+  history_sha="0000000000000000000000000000000000000000"
+  legacy_row='{"ts":"2026-08-01T00:00:01Z","event":"evidence_produced","event_id":"evt-history-legacy","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8"}'
+  extended_row='{"ts":"2026-08-01T00:00:02Z","event":"evidence_produced","event_id":"evt-history-extended","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","provider":"claude","attempt_id":"qa-primary-claude-1"}'
+  current_row='{"ts":"2026-08-01T00:00:03Z","event":"evidence_produced","event_id":"evt-history-current","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","stage":"test/Q-01","role":"qa-tester","role_start_event_id":"evt-history-start"}'
+  malformed_row='{"ts":"2026-08-01T00:00:04Z","event":"evidence_produced","event_id":"evt-history-malformed","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"not-a-digest","bytes":"8"}'
+  reserved_row='{"ts":"2026-08-01T00:00:05Z","event":"evidence_produced","event_id":"evt-history-reserved","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","agent":"/root/x"}'
+
+  history_fixture="$(mk_history_run legacy-history)"
+  history_repo="$(printf '%s\n' "$history_fixture" | sed -n '1p')"
+  history_run="$(printf '%s\n' "$history_fixture" | sed -n '2p')"
+  if [ -z "$history_run" ]; then
+    _t_no "real-shaped legacy-history fixture created" "fixture setup failed"
+  else
+    _t_ok "real-shaped legacy-history fixture created"
+    # patch_rows <run> <keep|drop marker> <row...> — rewrite the ledger as firm-new-run's own
+    # run_started line plus the given rows, with RUNID substituted, so every case below starts from
+    # an identical, explicit ledger.
+    #
+    # `drop` removes the `evidence_seal_protocol` marker that today's firm-new-run stamps on the
+    # first row. That is what makes the fixture HISTORICAL rather than merely old: the five runs in
+    # this repository that the classifier refused were created before the marker existed, and their
+    # first rows do not carry it. Everything else about the fixture -- metadata, candidate binding,
+    # provenance fields -- stays exactly as the real tool wrote it.
+    # The pristine run_started row is captured ONCE, here, and every case is rebuilt from it. Reading
+    # it back out of run.jsonl would make each case depend on what the previous case wrote -- the
+    # first `drop` would strip the marker permanently and every later `keep` would silently be a
+    # `drop`, which is exactly the way a matrix stops testing what its names say.
+    history_started_marked="$(head -n 1 "$history_run/run.jsonl")"
+    history_started_plain="$(printf '%s' "$history_started_marked" | t_python -c \
+      'import json,sys; row=json.loads(sys.stdin.read()); row.pop("evidence_seal_protocol",None); print(json.dumps(row,separators=(",",":")))')"
+    patch_rows() {
+      local _run="$1" _marker="$2" _id _tmp _row; shift 2
+      _id="$(basename "$_run")"
+      _tmp="$_run/.rows.$$"
+      if [ "$_marker" = drop ]; then
+        printf '%s\n' "$history_started_plain" > "$_tmp"
+      else
+        printf '%s\n' "$history_started_marked" > "$_tmp"
+      fi
+      for _row in "$@"; do printf '%s\n' "${_row//RUNID/$_id}" >> "$_tmp"; done
+      mv "$_tmp" "$_run/run.jsonl"; chmod 600 "$_run/run.jsonl"
+    }
+    assert_output "the fixture's run_started row carries firm-new-run's protocol marker" \
+      '"evidence_seal_protocol"' printf '%s' "$history_started_marked"
+    assert_ok "the historical variant of that row drops only the marker" \
+      t_python - "$history_started_marked" "$history_started_plain" <<'PY'
+import json, sys
+marked, plain = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert set(marked) - set(plain) == {"evidence_seal_protocol"}, (sorted(marked), sorted(plain))
+assert all(plain[k] == marked[k] for k in plain)
+PY
+
+    assert_ok "the fixture has the run-metadata.json every real run has" \
+      test -f "$history_run/run-metadata.json"
+    assert_ok "the fixture has the bound qa-candidate.json every real run has" \
+      test -f "$history_run/09-test-evidence/qa-candidate.json"
+
+    patch_rows "$history_run" drop "$legacy_row"
+    assert_rc "canonical classifier accepts a genuine-legacy real-shaped run" 0 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    history_lines_before="$(wc -l < "$history_run/run.jsonl" | tr -d ' ')"
+    history_append="$($LOG --run "$history_run" --strict --print-event-id --event-id evt-history-ordinary \
+      review_recorded note=still-appendable 2> "$history_repo/history.err")"; history_append_rc=$?
+    assert_eq "an ordinary event still appends to a genuine-legacy real-shaped run" 0 "$history_append_rc"
+    assert_eq "the ordinary append returns its own id" evt-history-ordinary "$history_append"
+    assert_eq "the ordinary append adds exactly one line" \
+      "$((history_lines_before + 1))" "$(wc -l < "$history_run/run.jsonl" | tr -d ' ')"
+    assert_eq "the ordinary append emits no diagnostic" "" "$(cat "$history_repo/history.err")"
+
+    patch_rows "$history_run" drop "$legacy_row" "$extended_row"
+    assert_rc "legacy rows keep the safe extension fields real history carries" 0 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    patch_rows "$history_run" drop "$legacy_row" "$reserved_row"
+    assert_rc "a legacy row wearing a reserved producer field is refused" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    patch_rows "$history_run" drop "$legacy_row" "$malformed_row"
+    assert_rc "a malformed digest is still refused inside a genuine-legacy run" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # THE OTHER SIDE OF THE BOUNDARY: one current-shape row anywhere in the ledger makes the run
+    # protocol-current, and its legacy-shaped rows are then refused exactly as before.
+    patch_rows "$history_run" drop "$legacy_row" "$current_row"
+    assert_rc "one current-shape row makes the run protocol-current and refuses legacy rows" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # And a run created by today's firm-new-run, which stamps evidence_seal_protocol on its first
+    # row, is protocol-current from birth: identical ledger, marker kept, refused.
+    patch_rows "$history_run" keep "$legacy_row"
+    assert_rc "the run-started protocol marker keeps a real-shaped run out of legacy" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # And the silent-failure repair: best-effort logging keeps exit 0, but says why.
+    history_silent="$($LOG --run "$history_run" --print-event-id \
+      review_recorded note=unclassifiable 2> "$history_repo/silent.err")"; history_silent_rc=$?
+    assert_eq "best-effort logging over an unclassifiable ledger keeps its exit status" 0 "$history_silent_rc"
+    assert_eq "best-effort logging over an unclassifiable ledger writes no receipt" "" "$history_silent"
+    assert_output "best-effort logging over an unclassifiable ledger announces the reason" \
+      "existing ledger content is unclassifiable" cat "$history_repo/silent.err"
+  fi
+
+  # A real-shaped run that has published NOTHING must still be held to the closed shape: the
+  # genuine-legacy branch is anchored on published history, not on the absence of run state.
+  fresh_fixture="$(mk_history_run fresh-history)"
+  fresh_run="$(printf '%s\n' "$fresh_fixture" | sed -n '2p')"
+  if [ -z "$fresh_run" ]; then
+    _t_no "real-shaped fresh fixture created" "fixture setup failed"
+  else
+    _t_ok "real-shaped fresh fixture created"
+    fresh_digest="$(shasum -a 256 "$fresh_run/09-test-evidence/history.log" | awk '{print $1}')"
+    fresh_bytes="$(wc -c < "$fresh_run/09-test-evidence/history.log" | tr -d ' ')"
+    fresh_before="$(sha_or_absent "$fresh_run/run.jsonl")"
+    assert_rc "a real-shaped run with no published history refuses a legacy-shaped publication" 1 \
+      "$LOG" --run "$fresh_run" --strict evidence_produced \
+      sha=0000000000000000000000000000000000000000 generation=1 \
+      path=09-test-evidence/history.log "sha256=$fresh_digest" "bytes=$fresh_bytes"
+    assert_eq "the refused publication leaves the ledger exact" "$fresh_before" \
+      "$(sha_or_absent "$fresh_run/run.jsonl")"
+  fi
+else
+  t_skip "real-shaped genuine-legacy classifier positive control" "requires a supported P2 ledger write host"
+fi
+
 t_case "malformed source-run evidence is rejected without normalization or mutation"
 source_common="$(git -C "$FIRM_ROOT" rev-parse --git-common-dir)"
 case $source_common in /*) ;; *) source_common="$FIRM_ROOT/$source_common";; esac

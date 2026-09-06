@@ -913,6 +913,27 @@ def _operator_home_identity_bindings(metadata, candidate):
     }
 
 
+def _privacy_command_cwd(repo, cwd):
+    """Project `cwd` the way argv[0] and `--run` are already projected.
+
+    The privacy report is self-scanned with NO identity bindings, and it classifies as
+    `test_evidence`, a surface the `operator_home` deny category covers. So any absolute cwd beneath
+    an operator home aborted seal creation with a PRIVACY_MATCH naming the sealer's own report --
+    on the exact `/Users/<operator>/...` shape AC-003 exists to support, from anywhere but the
+    repository root. This firm's own agents work in `.agent-firm/worktrees/...`, so that was the
+    normal path, not an edge case. `repository_relative/v1` therefore covers the whole repository
+    subtree, not just its root; `.` is still `.` so the pinned root case is unchanged.
+    `canonical_absolute/v1` keeps its declared meaning: a cwd genuinely OUTSIDE the repository.
+    """
+    real_cwd = os.path.realpath(cwd)
+    real_repo = os.path.realpath(repo)
+    if real_cwd == real_repo:
+        return ".", "repository_relative/v1"
+    if real_cwd.startswith(real_repo + os.sep):
+        return os.path.relpath(real_cwd, real_repo), "repository_relative/v1"
+    return real_cwd, "canonical_absolute/v1"
+
+
 def _privacy_command_argv(cli_argv, run, cwd):
     if not cli_argv:
         raise SealError("COMMAND_EVIDENCE", "privacy command argv is empty")
@@ -1095,14 +1116,14 @@ def _create_seal_in_place(run_path, policy_path, cli_argv, cwd):
     scanned.append(ledger_scan)
     privacy_rel = bundle_rel + "/privacy.json"
     privacy_command_finished = datetime.datetime.now(datetime.timezone.utc)
+    projected_cwd, projected_cwd_kind = _privacy_command_cwd(repo, cwd)
     privacy = {
         "schema_version": 1, "protocol": PROTOCOL,
         "command": {
             "argv": _privacy_command_argv(cli_argv, run, cwd),
             "argv_projection": "logical_tool_and_run_relative/v1",
-            "cwd": "." if os.path.realpath(cwd) == os.path.realpath(repo) else os.path.realpath(cwd),
-            "cwd_projection": ("repository_relative/v1" if os.path.realpath(cwd) == os.path.realpath(repo)
-                               else "canonical_absolute/v1"),
+            "cwd": projected_cwd,
+            "cwd_projection": projected_cwd_kind,
             "started_at": _format_rfc3339_ms(privacy_started),
             "finished_at": _format_rfc3339_ms(privacy_command_finished),
             "duration_ms": int((privacy_command_finished - privacy_started).total_seconds() * 1000),

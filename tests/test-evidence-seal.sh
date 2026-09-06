@@ -10,6 +10,14 @@ seal_for_run() {
   (cd "$_seal_repo" && "$SEAL" "$@" --run "$_seal_run")
 }
 
+# seal_for_run_from <cwd> <run> [args...] — invoke the sealer from an arbitrary working directory,
+# which is how this firm's agents actually invoke it. seal_for_run always cds to the repository
+# root, so it could only ever pin the cwd == repo case.
+seal_for_run_from() {
+  local _seal_cwd="$1" _seal_run="$2"; shift 2
+  (cd "$_seal_cwd" && "$SEAL" "$@" --run "$_seal_run")
+}
+
 seal_for_run_rejected_p2() {
   (export FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux; seal_for_run "$1")
 }
@@ -339,6 +347,40 @@ assert privacy['command']['argv_projection']=='logical_tool_and_run_relative/v1'
 assert privacy['command']['cwd']=='.'
 assert privacy['command']['cwd_projection']=='repository_relative/v1'
 PY
+      # AC-003 on the production shape: the sealer must work from where agents actually stand.
+      #
+      # `cwd` was the one dimension the operator-home repair did not project. Recorded as the
+      # canonical ABSOLUTE path from anywhere but the repository root, it landed in the privacy
+      # report -- which is then self-scanned with no identity bindings and classifies as
+      # `test_evidence`, a surface the `operator_home` deny category covers. So on any repository
+      # under /Users/<operator>/, sealing from a worktree aborted with PRIVACY_MATCH naming the
+      # sealer's own report. This firm's default working pattern puts every agent in
+      # .agent-firm/worktrees/..., so that was the normal path, not an edge case.
+      worktree_fixture="$(make_sealable_run claude "$users_repo")"; worktree_fixture_rc=$?
+      worktree_run="$(printf '%s\n' "$worktree_fixture" | sed -n '2p')"
+      worktree_cwd="$users_repo/.agent-firm/worktrees/seal-from-worktree"
+      mkdir -p "$worktree_cwd"
+      if [ "$worktree_fixture_rc" -ne 0 ] || [ -z "$worktree_run" ]; then
+        _t_no "second users-hierarchy sealable run created" "fixture setup failed"
+      else
+        _t_ok "second users-hierarchy sealable run created"
+        assert_ok "sealing succeeds when invoked from a worktree, not the repository root" \
+          seal_for_run_from "$worktree_cwd" "$worktree_run"
+        assert_ok "independent verifier accepts the worktree-invoked seal" \
+          seal_for_run_from "$worktree_cwd" "$worktree_run" --verify --phase publication
+        assert_ok "the worktree cwd is projected run-relative, not as an operator-home path" \
+          t_python - "$worktree_run" <<'PY'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+privacy=json.load(open(run/'09-test-evidence/final-evidence/g1/privacy.json'))
+prefix="/"+"Users"+"/"
+assert privacy['command']['cwd']=='.agent-firm/worktrees/seal-from-worktree', privacy['command']['cwd']
+assert privacy['command']['cwd_projection']=='repository_relative/v1'
+assert not privacy['command']['cwd'].startswith(prefix)
+assert privacy['command']['argv'][0]=='firm-seal-qa-evidence'
+assert privacy['command']['argv'][-1]=='.agent-firm/runs/'+run.name
+PY
+      fi
     fi
     assert_ok "owned users-hierarchy fixture cleanup succeeds" cleanup_users_repo "$users_repo"
     assert_no_file "owned users-hierarchy fixture leaves no residue" "$users_repo"
@@ -403,21 +445,49 @@ finally:e.os.lstat=original
 PY
 
 mk_legacy_run() {
-  # A GENUINE historical legacy run: no run-metadata.json, no qa-candidate.json, no seal marker and
-  # no seal state -- the only shape whose legacy-shaped evidence rows stay valid. Everything else
-  # (present, partial, required, opted-in, unknown) is current state and must never fall back to it.
-  local _repo="$1" _id="legacy-evidence-run" _run _raw _digest _bytes
-  _run="$_repo/.agent-firm/runs/$_id"
-  mkdir -p "$_run"
-  _raw='legacy evidence artifact'
-  printf '%s\n' "$_raw" > "$_run/legacy-artifact.txt"
+  # A GENUINE historical legacy run, built the way REAL runs are built.
+  #
+  # This fixture used to be a bare `mkdir` with a hand-written two-line ledger and no
+  # run-metadata.json -- and its own comment said so: "the only shape whose legacy-shaped evidence
+  # rows stay valid". No run in this repository has that shape, so the family that discharges
+  # AC-011's legacy clause was proven against a run that cannot exist, and could not distinguish a
+  # BOUNDED legacy predicate from an UNREACHABLE one. It did not: `legacy` was unreachable for all
+  # 25 real runs, and every one of them that had published evidence became unappendable.
+  #
+  # So it is now made with `firm-new-run`: real schema_version-2 run-metadata.json, real bound
+  # 09-test-evidence/qa-candidate.json. The one thing removed is the `evidence_seal_protocol` marker
+  # today's firm-new-run stamps on the run_started row -- that is exactly what makes it historical,
+  # and it matches the real runs whose evidence predates the closed family.
+  local _repo="$1" _sha _relative _run _digest _bytes _id
+  _sha="$(sha_of "$_repo" main)" || return 1
+  _relative="$(cd "$_repo" && "$BIN/firm-new-run" --primary claude --base "$_sha" legacy-evidence full_track)" || return 1
+  _run="$_repo/$_relative"
+  _id="$(basename "$_run")"
+  mkdir -p "$_run/09-test-evidence"
+  t_python - "$_run" <<'PY' || return 1
+import json, os, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+metadata = json.load(open(run / "run-metadata.json"))
+candidate = {
+    "schema_version": 2, "run_id": run.name,
+    "repository_root": metadata["repository_root"], "git_common_dir": metadata["git_common_dir"],
+    "checkout_path": metadata["repository_root"], "source_ref": "refs/heads/integration/legacy",
+    "source_ref_sha": metadata["accepted_base_sha"], "base_sha": metadata["accepted_base_sha"],
+    "candidate_sha": metadata["accepted_base_sha"], "generation": 1,
+}
+target = run / "09-test-evidence" / "qa-candidate.json"
+target.write_text(json.dumps(candidate, sort_keys=True) + "\n")
+os.chmod(target, 0o600)
+PY
+  printf '%s\n' 'legacy evidence artifact' > "$_run/legacy-artifact.txt"
   _digest="$(shasum -a 256 "$_run/legacy-artifact.txt" | awk '{print $1}')"
   _bytes="$(wc -c < "$_run/legacy-artifact.txt" | tr -d ' ')"
-  {
-    printf '{"ts":"2024-01-01T00:00:00Z","event":"run_started","event_id":"evt-legacy-start","run_id":"%s"}\n' "$_id"
-    printf '{"ts":"2024-01-01T00:00:01Z","event":"evidence_produced","event_id":"evt-legacy-evidence","run_id":"%s","sha":"%s","generation":"1","path":"legacy-artifact.txt","sha256":"%s","bytes":"%s"}\n' \
-      "$_id" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$_digest" "$_bytes"
-  } > "$_run/run.jsonl"
+  head -n 1 "$_run/run.jsonl" | t_python -c \
+    'import json,sys; row=json.loads(sys.stdin.read()); row.pop("evidence_seal_protocol",None); print(json.dumps(row,separators=(",",":")))' \
+    > "$_run/.legacy.rows" || return 1
+  printf '{"ts":"2024-01-01T00:00:01Z","event":"evidence_produced","event_id":"evt-legacy-evidence","run_id":"%s","sha":"%s","generation":"1","path":"legacy-artifact.txt","sha256":"%s","bytes":"%s"}\n' \
+    "$_id" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$_digest" "$_bytes" >> "$_run/.legacy.rows"
+  mv "$_run/.legacy.rows" "$_run/run.jsonl"
   chmod 600 "$_run/run.jsonl"
   printf '%s' "$_run"
 }
