@@ -69,8 +69,9 @@ done
 # if it really requires a supported write host.
 requires_supported_p2() {
   case "$1" in
-    check-assertions|final-qa-check|ledger-compatibility|ledger-log|ledger-role-start|merge-guard|\
-    new-worktree|policy-hire|provider-reviewers|qa-checkout|qa-clean-check|reviewer-hermeticity) return 0 ;;
+    check-assertions|eval-candidate-tools|evidence-seal|final-qa-check|ledger-compatibility|\
+    ledger-log|ledger-role-start|merge-guard|new-worktree|policy-hire|provider-reviewers|\
+    qa-checkout|qa-clean-check|reviewer-hermeticity) return 0 ;;
     *) return 1 ;;
   esac
 }
