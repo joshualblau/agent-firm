@@ -88,7 +88,13 @@ jobs:
     # is single-digit minutes on these runners.
     timeout-minutes: 45
     steps:
+      # fetch-depth: 0 (full history) — the default shallow (depth-1) checkout only has the tip
+      # commit, but the AC-048 capsule-attack suite proves ancestry against a real, older commit in
+      # this branch's own history. A shallow clone makes that `git rev-list` fail with exit 128 on
+      # a missing object, which is a checkout artifact, not evidence the ancestry claim is wrong.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
