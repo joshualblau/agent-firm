@@ -1,15 +1,60 @@
 #!/usr/bin/env bash
-# integrate [integration-branch]
-# Creates/uses an integration branch and merges this run's implementer worktree branches into it.
+# firm-integrate [--run <run-dir>] [integration-branch]
+# Creates/uses an integration branch and merges ONE run's implementer worktree branches into it.
 # On conflict, aborts that merge and reports it for the Integrator agent to resolve by hand —
 # never silently drops a change. Merging to the DEFAULT branch is a human gate (not done here).
+#
+# WHICH RUN. `--run <run-dir>` is authoritative and is resolved by bin/firm-run-resolve; with no
+# `--run`, that same resolver falls back to .agent-firm/CURRENT_RUN and validates it identically.
+# The resolved run id drives BOTH selections this script makes, and it has to be both:
+#   · the merge-source glob `wt/${run_id}-*` — which branches get merged;
+#   · the firm-ledger-log call at the end — which run's ledger records that they were.
+# Threading the flag into only the first half would merge the RIGHT branches and then write the
+# integration event into somebody else's ledger: a silent wrong-target write, and the harder half to
+# notice, because the merge itself looks correct (F3, 02-architecture-options.md; AC-002 covers it).
+#
+# The ambient read this replaces (`[[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat ...)"`) had no
+# validation of any kind and no failure case: with no pointer it computed run_id="none", created a
+# branch called `integration/none`, merged nothing into it and exited 0. That is now a refusal.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
+. "$SELF/firm-run-resolve"   # one resolved RUN for the whole firm; see bin/firm-run-resolve
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
-run_id="$(basename "${run_dir:-none}")"
+# `--run` is parsed ahead of the positional [integration-branch], so every pre-existing form still
+# works unchanged: `firm-integrate` and `firm-integrate <integration-branch>` (AC-006).
+run_sel=""; have_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run)
+      [[ $# -ge 2 ]] || { echo "firm-integrate: --run needs a run directory argument" >&2; exit 2; }
+      run_sel="$2"; have_run=1; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "firm-integrate: unknown option $1" >&2
+        echo "usage: firm-integrate [--run <run-dir>] [integration-branch]" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[[ $# -le 1 ]] || { echo "firm-integrate: unexpected argument $2" >&2; exit 2; }
+
+# FAIL CLOSED, and say so in this script's own vocabulary. "NOTHING merged" is the phrase the
+# switch-failure path below already uses, because it is the fact an Integrator needs first; what
+# distinguishes this from that path, and from a conflict, is that it names run SELECTION as the
+# thing that could not be settled.
+if [[ $have_run -eq 1 ]]; then
+  run_dir="$(firm_run_resolve --run "$run_sel")" || {
+    echo "firm-integrate: cannot resolve the run named by --run — NOTHING merged." >&2
+    exit 2
+  }
+else
+  run_dir="$(firm_run_resolve)" || {
+    echo "firm-integrate: no run resolvable — NOTHING merged." >&2
+    echo "  Pass --run <run-dir>, or run firm-new-run first." >&2
+    exit 2
+  }
+fi
+run_id="$(basename "$run_dir")"
 intb="${1:-integration/${run_id}}"
 
 # The target must be an integration/* branch — a POSITIVE allowlist, on purpose. Denylisting
@@ -66,7 +111,12 @@ done <<< "$branches"
 
 echo "integration branch: $intb"
 echo "merged: $merged   conflicts: $conflicts"
-[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
+# --run is EXPLICIT here, and that is half of AC-002 rather than a tidy-up. Without it this call
+# falls back to firm-ledger-log's own CURRENT_RUN read, so a --run-selected integration would merge
+# run A's branches and then record the event in whatever run the ambient pointer names. The merge
+# would be right and the evidence would be attached to the wrong run — which is worse than a wrong
+# merge, because nothing about the output looks wrong.
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" --run "$run_dir" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
 echo "NEXT: reconcile shared state, run the COMBINED suite, write a draft, then publish it immutably:"
 echo "  firm-integration-summary --stage integrate/<stage-instance> --source <draft.md>"
 [[ $conflicts -eq 0 ]]
