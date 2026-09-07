@@ -110,6 +110,17 @@ jobs:
         run: |
           bin/firm-python --status
           bin/firm-python -c 'import jsonschema, yaml, sys; print("deps ok on", sys.executable)'
+      # test-run-evals-structural.sh shells out to `rg`, which neither hosted runner image carries.
+      # Its absence must fail the assertion loudly (rg: command not found), not be silently absorbed
+      # — installing it here is what makes that check actually run, rather than leaving it permanently
+      # unable to.
+      - name: install ripgrep (test-run-evals-structural.sh needs it)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          else
+            brew install ripgrep
+          fi
       - name: run unsupported-P2 suite (modern Bash and GNU userland)
         if: runner.os == 'Linux'
         run: bash tests/run-tests.sh --unsupported-p2
