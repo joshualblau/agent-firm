@@ -77,4 +77,59 @@ t_case "firm-hire: hire_scaffolded ledger event lands with the role"
 assert_output "event present" '"event":"hire_scaffolded"' cat "$run_dir3/run.jsonl"
 assert_output "role recorded"  '"role":"data-engineer"'    cat "$run_dir3/run.jsonl"
 
+# ---------------------------------------------------------------------------
+t_case "firm-hire: --run is authoritative — the spec AND the ledger event follow it, not CURRENT_RUN"
+# Both runs are real and valid, and CURRENT_RUN names the one that must NOT be written to. A fixture
+# with only one usable run would pass even if the tool ignored the selector entirely.
+repo4="$(mk_repo)"
+run_a4="$( (cd "$repo4" && "$NEW_RUN" hire-alpha fast_path) )"
+run_b4="$( (cd "$repo4" && "$NEW_RUN" hire-bravo fast_path) )"   # second, so CURRENT_RUN -> B
+id_a4="$(basename "$run_a4")"; id_b4="$(basename "$run_b4")"
+assert_ne "fixture precondition: the two runs are genuinely different runs" "$id_a4" "$id_b4"
+assert_eq "fixture precondition: CURRENT_RUN really names run B" \
+  ".agent-firm/runs/$id_b4" "$(cat "$repo4/.agent-firm/CURRENT_RUN")"
+
+out4="$( (cd "$repo4" && "$HIRE" --run ".agent-firm/runs/$id_a4" data-engineer) )"
+assert_file "job spec was scaffolded into run A" "$repo4/.agent-firm/runs/$id_a4/hires/data-engineer.job.yaml"
+assert_no_file "run B got no hires/ directory at all" "$repo4/.agent-firm/runs/$id_b4/hires"
+assert_output "the printed path names run A" ".agent-firm/runs/$id_a4/hires/data-engineer.job.yaml" printf '%s' "$out4"
+assert_output "hire_scaffolded landed in run A's ledger" '"event":"hire_scaffolded"' \
+  cat "$repo4/.agent-firm/runs/$id_a4/run.jsonl"
+# The other half of the defect: that ledger call carried no --run before this change, so the event
+# went wherever CURRENT_RUN pointed even when the scaffold did not.
+assert_fail "run B's ledger got NO hire_scaffolded event" \
+  grep -q hire_scaffolded "$repo4/.agent-firm/runs/$id_b4/run.jsonl"
+
+t_case "firm-hire: an absolute --run works, and the zero-selector form still follows CURRENT_RUN"
+out4b="$( (cd "$repo4" && "$HIRE" --run "$repo4/.agent-firm/runs/$id_a4" ml-engineer) )"
+assert_output "absolute selector writes into run A too" ".agent-firm/runs/$id_a4/hires/ml-engineer.job.yaml" printf '%s' "$out4b"
+out4c="$( (cd "$repo4" && "$HIRE" sre) )"   # no --run: the pre-change invocation form
+assert_output "unchanged: no selector means CURRENT_RUN, i.e. run B" ".agent-firm/runs/$id_b4/hires/sre.job.yaml" printf '%s' "$out4c"
+
+t_case "firm-hire: a selector it will not accept refuses and scaffolds nothing"
+assert_rc "--run=<dir> is refused by spelling" 2 \
+  sh -c "cd '$repo4' && '$HIRE' --run=.agent-firm/runs/$id_a4 data-engineer"
+assert_output "and names the accepted two-word form" "two words" \
+  sh -c "cd '$repo4' && '$HIRE' --run=.agent-firm/runs/$id_a4 data-engineer"
+assert_rc "a run directory that does not exist is refused" 2 \
+  sh -c "cd '$repo4' && '$HIRE' --run .agent-firm/runs/nope data-engineer"
+assert_output "the diagnostic names the specific violation" "does not exist" \
+  sh -c "cd '$repo4' && '$HIRE' --run .agent-firm/runs/nope data-engineer"
+assert_no_file "no run directory was fabricated for the refused selector" "$repo4/.agent-firm/runs/nope"
+assert_rc "a role-position argument beginning with '-' is refused, not sanitized into a role name" 2 \
+  sh -c "cd '$repo4' && '$HIRE' -data-engineer"
+assert_no_file "so no junk-named job spec was written" "$repo4/.agent-firm/runs/$id_b4/hires/-data-engineer.job.yaml"
+
+t_case "firm-hire: invoked from a subdirectory it refuses by name (its written paths are CWD-relative)"
+# A deliberate behavior change, pinned rather than left as prose: the CWD-relative ambient read used
+# to make this fail by accident, and firm-run-resolve anchors the pointer at the repository root on
+# purpose, so the precondition is now asserted instead of inherited.
+mkdir -p "$repo4/sub"
+assert_rc "exit 1 from a subdirectory" 1 sh -c "cd '$repo4/sub' && '$HIRE' data-scientist"
+assert_output "and it names the repository root it requires" "repository root" \
+  sh -c "cd '$repo4/sub' && '$HIRE' data-scientist"
+assert_no_file "no run tree was created under the subdirectory" "$repo4/sub/.agent-firm"
+assert_ok "the same call from the repository root still works" \
+  sh -c "cd '$repo4' && '$HIRE' data-scientist"
+
 t_summary
