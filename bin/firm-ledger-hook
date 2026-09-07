@@ -10,10 +10,20 @@ run_dir=""
 [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
 [[ -n "$run_dir" && -d "$run_dir" ]] || exit 0
 
+# CURRENT_RUN is DATA, not an instruction: whatever can write it must not be able to steer these
+# appends outside the project the hook is running in. (SEC-11 — the bash twin of the containment
+# check in bin/firm-merge-guard's ledger(); grep SEC-11 to find both. Same two-way comparison:
+# equal, or a prefix ENDING IN A SEPARATOR, so a sibling `<here>-other` is not "under" `<here>`.)
+# Refusing is silent and still exits 0: this hook is best-effort and never fails a tool call.
+here="$(pwd -P 2>/dev/null)" || here=""
+target="$(CDPATH= cd -P -- "$run_dir" 2>/dev/null && pwd -P)" || target=""
+[[ -n "$here" && -n "$target" ]] || exit 0
+[[ "$target" == "$here" || "$target" == "$here"/* ]] || exit 0
+
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if command -v jq >/dev/null 2>&1; then
   cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
   [[ -n "$cmd" ]] && jq -cn --arg ts "$ts" --arg cmd "$cmd" \
-    '{ts:$ts, event:"bash", cmd:$cmd}' >> "$run_dir/run.jsonl" 2>/dev/null || true
+    '{ts:$ts, event:"bash", cmd:$cmd}' >> "$target/run.jsonl" 2>/dev/null || true
 fi
 exit 0
