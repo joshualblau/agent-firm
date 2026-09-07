@@ -128,12 +128,22 @@ assert_ok "the real implementer worktree is a real, usable git checkout" \
   sh -c "cd '$wt_dir9' && printf 'real work\n' > feature.txt && git add -A && git commit -qm 'wo1 work'"
 
 before_main="$(sha_of "$repo9" main)"
+head_before9="$( (cd "$repo9" && git rev-parse --abbrev-ref HEAD) )"
 assert_ok "firm-integrate (real, from PR 1) finds and merges the real worktree branch" \
   sh -c "cd '$repo9' && '$INTEGRATE'"
-assert_ok "HEAD is now the integration branch" \
-  sh -c "cd '$repo9' && [ \"\$(git rev-parse --abbrev-ref HEAD)\" = 'integration/$run_id9' ]"
-assert_file "the worktree's real commit landed in the integration branch" \
-  "$repo9/feature.txt"
+# AMENDED BY WO-4 (Decision D1), and flagged here because this file belongs to another work order.
+# These two assertions observed the merge result THROUGH the caller's working tree, which is exactly
+# what firm-integrate no longer writes to: it merges in .agent-firm/integration/<run_id> and leaves
+# the caller's HEAD alone. The cross-script claim this case exists to make — that a real
+# firm-new-worktree branch really does merge through the real firm-integrate — is unchanged and is
+# now checked against the integration branch itself, which is where the merge actually is.
+assert_eq "the caller's HEAD is unchanged (was: it became the integration branch)" \
+  "$head_before9" "$( (cd "$repo9" && git rev-parse --abbrev-ref HEAD) )"
+assert_ok "the integration branch exists and is where the merge went" \
+  sh -c "git -C '$repo9' cat-file -e 'integration/$run_id9:feature.txt'"
+assert_file "the worktree's real commit landed in the integration worktree" \
+  "$repo9/.agent-firm/integration/$run_id9/feature.txt"
+assert_no_file "…and NOT in the caller's checkout" "$repo9/feature.txt"
 assert_eq "main is untouched by a successful integration" \
   "$before_main" "$(sha_of "$repo9" main)"
 

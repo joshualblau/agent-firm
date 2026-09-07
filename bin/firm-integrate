@@ -1,15 +1,65 @@
 #!/usr/bin/env bash
-# integrate [integration-branch]
-# Creates/uses an integration branch and merges this run's implementer worktree branches into it.
+# firm-integrate [--run <run-dir>] [integration-branch]
+# Creates/uses an integration branch and merges ONE run's implementer worktree branches into it.
 # On conflict, aborts that merge and reports it for the Integrator agent to resolve by hand —
 # never silently drops a change. Merging to the DEFAULT branch is a human gate (not done here).
+#
+# WHERE THE MERGES HAPPEN. In a linked worktree at .agent-firm/integration/<run_id>, NOT on the
+# caller's checked-out HEAD, which this tool no longer touches at all. See the long note at the
+# integration-worktree block below for why (F2 / Decision D1), and note the rollback consequence:
+# removing that worktree is `git worktree remove` / `git worktree prune`, not `rm -rf`.
+#
+# WHICH RUN. `--run <run-dir>` is authoritative and is resolved by bin/firm-run-resolve; with no
+# `--run`, that same resolver falls back to .agent-firm/CURRENT_RUN and validates it identically.
+# The resolved run id drives BOTH selections this script makes, and it has to be both:
+#   · the merge-source glob `wt/${run_id}-*` — which branches get merged;
+#   · the firm-ledger-log call at the end — which run's ledger records that they were.
+# Threading the flag into only the first half would merge the RIGHT branches and then write the
+# integration event into somebody else's ledger: a silent wrong-target write, and the harder half to
+# notice, because the merge itself looks correct (F3, 02-architecture-options.md; AC-002 covers it).
+#
+# The ambient read this replaces (`[[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat ...)"`) had no
+# validation of any kind and no failure case: with no pointer it computed run_id="none", created a
+# branch called `integration/none`, merged nothing into it and exited 0. That is now a refusal.
 set -uo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
+. "$SELF/firm-run-resolve"   # one resolved RUN for the whole firm; see bin/firm-run-resolve
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
-run_id="$(basename "${run_dir:-none}")"
+# `--run` is parsed ahead of the positional [integration-branch], so every pre-existing form still
+# works unchanged: `firm-integrate` and `firm-integrate <integration-branch>` (AC-006).
+run_sel=""; have_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run)
+      [[ $# -ge 2 ]] || { echo "firm-integrate: --run needs a run directory argument" >&2; exit 2; }
+      run_sel="$2"; have_run=1; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "firm-integrate: unknown option $1" >&2
+        echo "usage: firm-integrate [--run <run-dir>] [integration-branch]" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[[ $# -le 1 ]] || { echo "firm-integrate: unexpected argument $2" >&2; exit 2; }
+
+# FAIL CLOSED, and say so in this script's own vocabulary. "NOTHING merged" is the phrase the
+# switch-failure path below already uses, because it is the fact an Integrator needs first; what
+# distinguishes this from that path, and from a conflict, is that it names run SELECTION as the
+# thing that could not be settled.
+if [[ $have_run -eq 1 ]]; then
+  run_dir="$(firm_run_resolve --run "$run_sel")" || {
+    echo "firm-integrate: cannot resolve the run named by --run — NOTHING merged." >&2
+    exit 2
+  }
+else
+  run_dir="$(firm_run_resolve)" || {
+    echo "firm-integrate: no run resolvable — NOTHING merged." >&2
+    echo "  Pass --run <run-dir>, or run firm-new-run first." >&2
+    exit 2
+  }
+fi
+run_id="$(basename "$run_dir")"
 intb="${1:-integration/${run_id}}"
 
 # The target must be an integration/* branch — a POSITIVE allowlist, on purpose. Denylisting
@@ -24,49 +74,242 @@ case "$intb" in
     exit 2 ;;
 esac
 
-# Reach the integration branch, or STOP. This previously discarded git's exit code: a failed switch
-# (dirty tree, or the branch already checked out in a linked worktree — routine here) left HEAD on
-# whatever happened to be checked out, and the merges below landed THERE. With the Lead sitting on
-# `main` that is an autonomous merge to the default branch — never-rule #1 — and the permission layer
-# cannot see it, because Bash(firm-integrate:*) is allow-listed while Bash(git merge:*) is only `ask`.
-if git show-ref --verify --quiet "refs/heads/${intb}"; then
-  sw_err="$(git switch "$intb" 2>&1)"; sw_rc=$?
-else
-  sw_err="$(git switch -c "$intb" 2>&1)"; sw_rc=$?
+# ---------------------------------------------------------------------------
+# THE INTEGRATION WORKTREE — this replaces the `git switch` onto the CALLER'S HEAD.
+#
+# WHAT WAS WRONG WITH SWITCHING (F2, 02-architecture-options.md). The old code switched the caller's
+# own HEAD onto <intb>, verified `HEAD == intb` ("belt and braces: prove we are standing on the
+# target"), and then merged in a loop. HEAD is ONE SLOT PER WORKING TREE and the window between the
+# verification and the last merge is unbounded, so the check was TOCTOU across the whole loop: two
+# invocations in one working tree can interleave so that A's check passes, B switches HEAD out from
+# under it, and A's merges land on B's branch. No amount of argument-passing fixes that — a perfect
+# --run makes each invocation choose the right BRANCHES and still merge them wherever HEAD happens
+# to be pointing at merge time (AC-004).
+#
+# So the tool stops sharing the caller's HEAD at all. Merges happen in a linked worktree at
+# .agent-firm/integration/<run_id> — one per run, mirroring what firm-qa-checkout already does for
+# .agent-firm/qa-checkout/<run_id>. Two runs integrating at once now touch two different
+# directories, each with its own HEAD, so there is no slot to contend for.
+#
+# THIS REMOVES A HAZARD CLASS RATHER THAN ADDING A FEATURE. The accident this script exists to
+# prevent — merging onto the default branch because the caller happened to be standing on `main` —
+# is no longer something a bug in this file can cause: it never touches the caller's HEAD, so there
+# is no path by which a merge can land there. That was previously guaranteed only by a test.
+#
+# ACCEPTED, ANNOUNCED COST (Decision D1). The caller's HEAD no longer ends up on <intb>, which is an
+# observable change for anyone who relied on "integrate, then look at my checkout". It is therefore
+# ANNOUNCED on every run — see the "integration performed in" line below — rather than left to be
+# discovered, which is the condition AC-006's D1 carve-out attaches to it.
+#
+# ROLLBACK: reverting this change requires `git worktree remove .agent-firm/integration/<run_id>`
+# (or `git worktree prune` once the directory is gone) for any worktree created under the new
+# behavior. The branch itself is ordinary and needs nothing (AC-011).
+
+# The repository root, derived from the run directory the resolver ALREADY validated
+# (<repo>/.agent-firm/runs/<run_id>) rather than asked for a second time. One source, so this cannot
+# disagree with the containment check that was actually enforced.
+repo="$(dirname "$(dirname "$(dirname "$run_dir")")")"
+
+# secure_owned_dir — VERBATIM from bin/firm-qa-checkout. Same bytes on purpose: a re-typed
+# containment check is how the weak copy gets written, and this is the never-rule-#1 surface. It
+# creates each component with mkdir(0700) through an O_NOFOLLOW|O_DIRECTORY descriptor chain, lstats
+# every component as an owned non-symlink directory, and finally requires the resolved path to equal
+# the expected one — so no component can be swapped for a link between the check and the use.
+#
+# INTEGRATOR ASK, recorded rather than fixed here: this is now the SECOND copy of this helper, which
+# is the same duplication WO-1 consolidated for run resolution. Consolidating it wants its own work
+# order; WO-4's file list is bin/firm-integrate and tests/test-integrate.sh only, and silently
+# widening that on this surface is worse than the debt.
+secure_owned_dir() {
+  firm_python - "$1" "$2" <<'PY'
+import os, stat, sys
+root=os.path.abspath(sys.argv[1]); relative=sys.argv[2]
+parts=relative.split("/")
+if not parts or any(part in ("", ".", "..") for part in parts):
+    raise SystemExit(2)
+root_info=os.lstat(root)
+if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid():
+    raise SystemExit(2)
+flags=os.O_RDONLY
+if hasattr(os,"O_DIRECTORY"): flags |= os.O_DIRECTORY
+if hasattr(os,"O_NOFOLLOW"): flags |= os.O_NOFOLLOW
+fd=os.open(root,flags)
+current=root
+try:
+    for part in parts:
+        try:
+            os.mkdir(part,0o700,dir_fd=fd)
+        except FileExistsError:
+            pass
+        info=os.stat(part,dir_fd=fd,follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise SystemExit(2)
+        next_fd=os.open(part,flags,dir_fd=fd)
+        os.close(fd); fd=next_fd; current=os.path.join(current,part)
+    os.fchmod(fd,0o700)
+    expected=os.path.join(root,*parts)
+    if os.path.abspath(current) != expected or os.path.realpath(current) != expected:
+        raise SystemExit(2)
+    print(expected)
+finally:
+    os.close(fd)
+PY
+}
+
+# Record the caller's HEAD BEFORE anything happens, so the announcement reports what it actually was
+# and cannot accidentally report the integration branch.
+caller_head="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [[ -z "$caller_head" ]]; then
+  caller_head="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  caller_head="detached at ${caller_head}"
 fi
-if [[ $sw_rc -ne 0 ]]; then
-  echo "firm-integrate: cannot reach '${intb}' (git rc=${sw_rc}) — NOTHING merged." >&2
-  echo "  ${sw_err}" >&2
-  echo "  Resolve it (commit/stash local changes, or release the branch from its other worktree) and re-run." >&2
+
+int_parent="$(secure_owned_dir "$repo" ".agent-firm/integration")" || {
+  echo "firm-integrate: integration worktree parent is unsafe or redirected — NOTHING merged." >&2
+  exit 1
+}
+int_dir="$int_parent/$run_id"
+
+# RESOLVE OR CREATE, never force-replace. firm-qa-checkout may `git worktree remove --force` its own
+# directory because a QA checkout is a disposable materialization of a committed SHA. An integration
+# worktree is not: it is where the Integrator resolves conflicts BY HAND, so force-removing it on a
+# re-run would delete that work. An existing directory here is therefore either usable as-is or a
+# refusal, and never something this script silently destroys.
+if [[ -e "$int_dir" || -L "$int_dir" ]]; then
+  [[ ! -L "$int_dir" ]] || {
+    echo "firm-integrate: refusing symlinked integration worktree at ${int_dir} — NOTHING merged." >&2
+    exit 1
+  }
+  # TWO questions, and BOTH are load-bearing. Asking only the second one is a live foot-gun that
+  # this file's own test caught: .agent-firm/integration/<run_id> is INSIDE the repository, so for a
+  # plain directory sitting there `git -C` walks up and answers every question about the CALLER's
+  # worktree — same common dir, and `symbolic-ref HEAD` returns the caller's branch. The `switch`
+  # below would then have moved the caller's HEAD, which is the exact hazard this work order exists
+  # to remove, reintroduced through the resolve-an-existing-directory path.
+  #
+  #   1. is it its OWN worktree root?  `--show-toplevel` must be the directory itself. A plain
+  #      subdirectory answers with the repository root instead, and is refused here.
+  #   2. is it a worktree of THIS repository?  `--git-common-dir` must match. An unrelated clone or
+  #      a nested repo passes (1) and is refused here.
+  int_top="$(git -C "$int_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -z "$int_top" ]] || int_top="$(cd -P "$int_top" 2>/dev/null && pwd -P || true)"
+  int_dir_real="$(cd -P "$int_dir" 2>/dev/null && pwd -P || true)"
+  int_common="$(git -C "$int_dir" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [[ -n "$int_common" ]]; then
+    case "$int_common" in /*) ;; *) int_common="$int_dir/$int_common" ;; esac
+    int_common="$(cd -P "$int_common" 2>/dev/null && pwd -P || true)"
+  fi
+  repo_common="$(git -C "$repo" rev-parse --git-common-dir)"
+  case "$repo_common" in /*) ;; *) repo_common="$repo/$repo_common" ;; esac
+  repo_common="$(cd -P "$repo_common" && pwd -P)"
+  if [[ -z "$int_top" || -z "$int_dir_real" || "$int_top" != "$int_dir_real" \
+        || -z "$int_common" || "$int_common" != "$repo_common" ]]; then
+    echo "firm-integrate: ${int_dir} exists but is not a worktree of this repository — NOTHING merged." >&2
+    echo "  Inspect it and remove it deliberately (git worktree remove, or rm -rf if it is not a" >&2
+    echo "  worktree at all), then re-run. This script will not delete it for you." >&2
+    exit 1
+  fi
+  int_head="$(git -C "$int_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ "$int_head" != "$intb" ]]; then
+    if git -C "$repo" show-ref --verify --quiet "refs/heads/${intb}"; then
+      sw_err="$(git -C "$int_dir" switch "$intb" 2>&1)"; sw_rc=$?
+    else
+      sw_err="$(git -C "$int_dir" switch -c "$intb" 2>&1)"; sw_rc=$?
+    fi
+    if [[ $sw_rc -ne 0 ]]; then
+      echo "firm-integrate: cannot put the integration worktree on '${intb}' (git rc=${sw_rc}) — NOTHING merged." >&2
+      echo "  ${sw_err}" >&2
+      echo "  This is ${int_dir}, not your checkout; resolve it there (commit/stash/abort) and re-run." >&2
+      exit 1
+    fi
+  fi
+else
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/${intb}"; then
+    wt_err="$(git -C "$repo" worktree add "$int_dir" "$intb" 2>&1)"; wt_rc=$?
+  else
+    # Created from the caller's HEAD, which is what `git switch -c` did before. Reading HEAD is not
+    # moving it.
+    wt_err="$(git -C "$repo" worktree add -b "$intb" "$int_dir" HEAD 2>&1)"; wt_rc=$?
+  fi
+  if [[ $wt_rc -ne 0 ]]; then
+    echo "firm-integrate: cannot create the integration worktree for '${intb}' (git rc=${wt_rc}) — NOTHING merged." >&2
+    echo "  ${wt_err}" >&2
+    echo "  Usually the branch is checked out somewhere else; release it (git worktree remove) and re-run." >&2
+    exit 1
+  fi
+fi
+
+# The materialized directory is re-checked rather than trusted, exactly as firm-qa-checkout re-checks
+# its own: `git worktree add` is being told where to write, and this proves it wrote there.
+#
+# NOT EXERCISED BY tests/test-integrate.sh, AND SAID SO RATHER THAN LEFT TO BE ASSUMED. Deleting it
+# turns no assertion red — measured with a mutation run — because reaching it needs the leaf to be
+# swapped for a link BETWEEN secure_owned_dir returning and git finishing the add, which no
+# deterministic fixture can arrange. It stays for the same reason firm-qa-checkout's identical check
+# stays: the reachable half of that race (a redirected PARENT) is refused above and IS tested, and
+# this is the cheap assertion that the two halves agree. A defensive check with no constructible
+# fixture is worth keeping; pretending a test covers it would not be.
+firm_python - "$int_dir" "$int_parent/$run_id" <<'PY' || {
+import os,stat,sys
+path,expected=sys.argv[1:]
+info=os.lstat(path)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    raise SystemExit(1)
+if os.path.abspath(path) != expected or os.path.realpath(path) != expected:
+    raise SystemExit(1)
+PY
+  echo "firm-integrate: integration worktree escaped its canonical path — NOTHING merged." >&2
+  exit 1
+}
+
+# Belt and braces, kept but MOVED: prove the tree we are about to merge in is standing on the target.
+# This is not the check that was deleted. The deleted one asked about the CALLER's HEAD, which every
+# other process in that working tree can move; this asks about a directory that belongs to this run
+# alone. Two runs can no longer answer it for each other, which is the whole point of AC-004.
+#
+# Like the identity re-check above, it is NOT exercised by a fixture and that is measured, not
+# assumed: every path into it either put this worktree on <intb> or already exited non-zero, so a
+# single-process test cannot reach the refusal. Its value is against the residual SAME-RUN race
+# (two invocations for the SAME run share this one directory), which the per-run split does not
+# close and which no assertion here claims to.
+int_head_now="$(git -C "$int_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '?')"
+if [[ "$int_head_now" != "$intb" ]]; then
+  echo "firm-integrate: integration worktree is on '${int_head_now}', expected '${intb}' — refusing to merge." >&2
   exit 1
 fi
 
-# Belt and braces: prove we are standing on the target before a single merge runs.
-head_now="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-if [[ "$head_now" != "$intb" ]]; then
-  echo "firm-integrate: expected HEAD on '${intb}' but it is '${head_now}' — refusing to merge." >&2
-  exit 1
-fi
+# Announced, not discovered (Decision D1). Printed BEFORE the early exit below as well, so an
+# operator learns where integration lives even on a no-op run.
+echo "integration performed in .agent-firm/integration/${run_id}; your HEAD is unchanged (${caller_head})"
 
 # bash 3.2 compatible (macOS): no `mapfile`.
 # strip leading markers: '*' (current), '+' (checked out in a linked worktree), and spaces
-branches="$(git branch --list "wt/${run_id}-*" | sed 's/^[*+ ]*//')"
+branches="$(git -C "$repo" branch --list "wt/${run_id}-*" | sed 's/^[*+ ]*//')"
 if [[ -z "$branches" ]]; then echo "no worktree branches for ${run_id}; nothing to integrate"; exit 0; fi
 
+# Every git call below is `-C "$int_dir"`. There is deliberately no `cd`: a bare `git merge` here is
+# the defect this work order removes, and an explicit -C on each call is the form a reviewer can
+# check line by line without having to track what the current directory is.
 conflicts=0; merged=0
 while IFS= read -r b; do
   [[ -z "$b" ]] && continue
   printf 'merging %-50s ... ' "$b"
-  if git merge --no-edit "$b" >/dev/null 2>&1; then
+  if git -C "$int_dir" merge --no-edit "$b" >/dev/null 2>&1; then
     echo "ok"; merged=$((merged+1))
   else
-    echo "CONFLICT (left for Integrator to resolve)"; git merge --abort 2>/dev/null || true; conflicts=$((conflicts+1))
+    echo "CONFLICT (left for Integrator to resolve)"; git -C "$int_dir" merge --abort 2>/dev/null || true; conflicts=$((conflicts+1))
   fi
 done <<< "$branches"
 
 echo "integration branch: $intb"
 echo "merged: $merged   conflicts: $conflicts"
-[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
+# --run is EXPLICIT here, and that is half of AC-002 rather than a tidy-up. Without it this call
+# falls back to firm-ledger-log's own CURRENT_RUN read, so a --run-selected integration would merge
+# run A's branches and then record the event in whatever run the ambient pointer names. The merge
+# would be right and the evidence would be attached to the wrong run — which is worse than a wrong
+# merge, because nothing about the output looks wrong.
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" --run "$run_dir" integrated branch="$intb" merged="$merged" conflicts="$conflicts" || true
 echo "NEXT: reconcile shared state, run the COMBINED suite, write a draft, then publish it immutably:"
+echo "  cd ${int_dir}    # the merges are HERE, not in your checkout"
 echo "  firm-integration-summary --stage integrate/<stage-instance> --source <draft.md>"
 [[ $conflicts -eq 0 ]]
