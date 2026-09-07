@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# firm-bench-record <role> <success|failure> [qa_verdict]
+# firm-bench-record [--run-id <label>] <role> <success|failure> [qa_verdict]
 # Appends ONE raw usage-event line for a specialist/role at retirement — the evidence a human
 # reviews before promoting anything to bench/registry.yaml. Never rewrites, never rotates.
 #
@@ -35,9 +35,48 @@ NL='
 '
 CR="$(printf '\r')"
 
+# ---- the run label, and why it is `--run-id` and not `--run` ---------------
+# The sibling tools this landed with (bin/firm-new-worktree and bin/firm-hire) take `--run <run-dir>`:
+# a PATH, resolved and containment-validated by bin/firm-run-resolve, which then selects the
+# filesystem target they act on. This tool's run_id does none of that. It is a DATA
+# LABEL written into one field of the JSONL record below (see the run_id argument to the encoders) and
+# it selects nothing — the log path comes from --git-common-dir, not from the run. Spelling it `--run`
+# would give it the sibling tools' NAME while giving it none of their validation, which invites a
+# reader (and the next maintainer) to assume this value was checked the way theirs are. `--run-id
+# <label>` says exactly what it is and cannot be mistaken for a path selector. No containment check is
+# performed on it because there is no path being resolved.
+#
+# It IS charset-checked below, with the same valid_token() layer-1 allow-list as role/qa_verdict: this
+# flag adds a THIRD caller-supplied free-text field to a file that is promotion evidence, and layer 1
+# exists precisely so such a field cannot be shaped into a forged line. The AMBIENT label (basename of
+# CURRENT_RUN) is deliberately left unchecked, exactly as before — it derives from a filesystem name
+# this cannot restrict without mangling legitimate run directories, and layer 2's encoder escapes it.
+run_id_label=""; run_id_given=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run-id)
+      if [ $# -lt 2 ]; then echo "firm-bench-record: --run-id needs a label argument" >&2; exit 2; fi
+      run_id_label="$2"; run_id_given=1; shift 2 ;;
+    --run-id=*)
+      echo "firm-bench-record: use \"--run-id <label>\" (two words), not --run-id=<label>" >&2; exit 2 ;;
+    --run|--run=*)
+      # Named rather than swept into "unknown option": this tool takes no run DIRECTORY, and silently
+      # accepting one would imply a containment guarantee it does not make.
+      echo "firm-bench-record: there is no --run here — this tool records a run LABEL, not a run" >&2
+      echo "firm-bench-record: directory, and resolves no path from it. Use \"--run-id <label>\"." >&2
+      exit 2 ;;
+    --) shift; break ;;
+    -*)
+      echo "firm-bench-record: unknown option $1" >&2
+      echo "usage: firm-bench-record [--run-id <label>] <role> <success|failure> [qa_verdict]" >&2
+      exit 2 ;;
+    *)  break ;;
+  esac
+done
+
 role="${1:-}"; outcome="${2:-}"; qa_verdict="${3:-}"
 if [[ -z "$role" || -z "$outcome" ]]; then
-  echo "usage: firm-bench-record <role> <success|failure> [qa_verdict]" >&2
+  echo "usage: firm-bench-record [--run-id <label>] <role> <success|failure> [qa_verdict]" >&2
   exit 2
 fi
 case "$outcome" in
@@ -74,6 +113,10 @@ if [[ -n "$qa_verdict" ]] && ! valid_token "$qa_verdict"; then
   echo "firm-bench-record: invalid qa_verdict — must be 1-64 characters of [A-Za-z0-9._:-] starting with a letter or digit" >&2
   exit 2
 fi
+if [[ $run_id_given -eq 1 ]] && ! valid_token "$run_id_label"; then
+  echo "firm-bench-record: invalid --run-id — must be 1-64 characters of [A-Za-z0-9._:-] starting with a letter or digit" >&2
+  exit 2
+fi
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "firm-bench-record: not inside a git work tree — nowhere to record this" >&2
@@ -100,8 +143,14 @@ if ! mkdir -p "$log_dir"; then
   exit 1
 fi
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
-run_id="$(basename "${run_dir:-unknown}")"
+if [[ $run_id_given -eq 1 ]]; then
+  # Explicit beats ambient, and CURRENT_RUN is not read at all in this branch — the same precedence
+  # the run-scoped tools follow, applied to the one thing this tool actually has: the label.
+  run_id="$run_id_label"
+else
+  run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN 2>/dev/null || true)"
+  run_id="$(basename "${run_dir:-unknown}")"
+fi
 # Same unguarded-capture shape as --git-common-dir above, one severity lower: this one only feeds a
 # DATA field, not a path, so it degrades to "unknown" (like run_id) instead of aborting the record.
 toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"

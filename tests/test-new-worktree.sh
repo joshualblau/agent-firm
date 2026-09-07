@@ -137,4 +137,106 @@ assert_file "the worktree's real commit landed in the integration branch" \
 assert_eq "main is untouched by a successful integration" \
   "$before_main" "$(sha_of "$repo9" main)"
 
+# ---------------------------------------------------------------------------
+t_case "--run is authoritative: branch, worktree dir AND ledger follow it, not CURRENT_RUN (AC-003)"
+# Two REAL runs, both valid, with CURRENT_RUN naming the one that must NOT be used. That is the whole
+# property: not "the tool can find a run" but "the tool does not quietly prefer the ambient one".
+# Run B is left fully valid on purpose — a fixture where B is broken would pass even if the tool
+# consulted it, which is the assertion-that-cannot-fail this suite exists to avoid.
+repo10="$(mk_repo)"
+run_a="$( (cd "$repo10" && "$NEW_RUN" wt-alpha fast_path) )"
+run_b="$( (cd "$repo10" && "$NEW_RUN" wt-bravo fast_path) )"   # created second, so CURRENT_RUN -> B
+id_a="$(basename "$run_a")"; id_b="$(basename "$run_b")"
+assert_ne "fixture precondition: the two runs are genuinely different runs" "$id_a" "$id_b"
+assert_eq "fixture precondition: CURRENT_RUN really names run B" \
+  ".agent-firm/runs/$id_b" "$(cat "$repo10/.agent-firm/CURRENT_RUN")"
+
+out10="$( (cd "$repo10" && "$NEW_WT" --run ".agent-firm/runs/$id_a" implementer wo1) )"
+assert_ok "branch is named for run A" \
+  sh -c "cd '$repo10' && git show-ref --verify --quiet 'refs/heads/wt/${id_a}-implementer-wo1'"
+assert_fail "no branch was created under run B's name" \
+  sh -c "cd '$repo10' && git show-ref --verify --quiet 'refs/heads/wt/${id_b}-implementer-wo1'"
+assert_file "worktree directory is named for run A" "$repo10/.agent-firm/worktrees/${id_a}-implementer-wo1"
+assert_no_file "no worktree directory under run B's name" "$repo10/.agent-firm/worktrees/${id_b}-implementer-wo1"
+assert_output "the printed worktree path names run A" ".agent-firm/worktrees/${id_a}-implementer-wo1" printf '%s' "$out10"
+assert_output "env file's branch names run A too" "WORKTREE_BRANCH=wt/${id_a}-implementer-wo1" \
+  cat "$repo10/.agent-firm/worktrees/${id_a}-implementer-wo1/.agent-firm-worktree.env"
+assert_output "worktree_created landed in run A's ledger" '"event":"worktree_created"' \
+  cat "$repo10/.agent-firm/runs/$id_a/run.jsonl"
+# The half that was unscoped before this change: the ledger call carried no --run at all, so the
+# event was attributed to whatever CURRENT_RUN said (F3's defect class, one tool over).
+assert_fail "run B's ledger got NO worktree_created event" \
+  grep -q worktree_created "$repo10/.agent-firm/runs/$id_b/run.jsonl"
+
+t_case "--run also accepts an absolute run directory, and CURRENT_RUN still selects when it is absent"
+out10b="$( (cd "$repo10" && "$NEW_WT" --run "$repo10/.agent-firm/runs/$id_a" implementer wo2) )"
+assert_output "absolute selector produces run A's naming as well" \
+  ".agent-firm/worktrees/${id_a}-implementer-wo2" printf '%s' "$out10b"
+out10c="$( (cd "$repo10" && "$NEW_WT" implementer wo3) )"   # no --run: the pre-change form
+assert_output "the zero-selector form still follows CURRENT_RUN (run B), unchanged" \
+  ".agent-firm/worktrees/${id_b}-implementer-wo3" printf '%s' "$out10c"
+
+t_case "F6: a <role> beginning with '-' is refused, not turned into a silently-wrong worktree"
+# The hazard, stated exactly: this tool is positional-first, so an OLD copy handed `--run <dir>` takes
+# "--run" as the role, keeps the hyphens through `tr -cd 'a-zA-Z0-9-'`, and creates
+# wt/<AMBIENT-run>--run-<junk>. This copy must refuse instead. (Residual, and it is not closed here:
+# the refusal only fires when the NEW copy is the one executing.)
+assert_rc "exit 2 rather than create a worktree" 2 sh -c "cd '$repo10' && '$NEW_WT' -implementer wo9"
+assert_output "the diagnostic names the leading dash" "begins with '-'" \
+  sh -c "cd '$repo10' && '$NEW_WT' -implementer wo9"
+assert_output "and states the two-word run selector" "--run <run-dir>" \
+  sh -c "cd '$repo10' && '$NEW_WT' -implementer wo9"
+assert_rc "a bare --run with no directory is refused, not consumed as the <role>" 2 \
+  sh -c "cd '$repo10' && '$NEW_WT' --run"
+assert_output "--run=<dir> is refused by spelling, naming the accepted form" "two words" \
+  sh -c "cd '$repo10' && '$NEW_WT' --run=.agent-firm/runs/$id_a implementer wo9"
+# The property behind those three: none of the refused calls created anything. Only the three
+# worktrees created above exist.
+assert_eq "no branch was created by any refused call" 3 \
+  "$( (cd "$repo10" && git for-each-ref --format='%(refname:short)' 'refs/heads/wt/*') | wc -l | tr -d ' ')"
+assert_no_file "no worktree directory was created for the refused role" \
+  "$repo10/.agent-firm/worktrees/${id_b}--implementer-wo9"
+
+t_case "an explicit --run that fails containment refuses and scaffolds nothing (AC-008, via firm-run-resolve)"
+assert_rc "a run directory that does not exist is refused" 2 \
+  sh -c "cd '$repo10' && '$NEW_WT' --run .agent-firm/runs/nope implementer wo4"
+assert_output "the diagnostic names the specific violation, not a generic failure" "does not exist" \
+  sh -c "cd '$repo10' && '$NEW_WT' --run .agent-firm/runs/nope implementer wo4"
+assert_rc "a path outside <repo>/.agent-firm/runs/ is refused" 2 \
+  sh -c "cd '$repo10' && '$NEW_WT' --run .agent-firm implementer wo4"
+assert_no_file "nothing was scaffolded for a refused selector" \
+  "$repo10/.agent-firm/worktrees/nope-implementer-wo4"
+assert_fail "and the refused selector wrote no event into run B's ledger either" \
+  grep -q wo4 "$repo10/.agent-firm/runs/$id_b/run.jsonl"
+
+# ---------------------------------------------------------------------------
+# The two DELIBERATE behavior changes that come with routing this tool through firm-run-resolve.
+# Both are pinned here rather than left as prose, because both replace something that used to
+# "succeed": a worktree named after a run that does not exist, and a worktree created under whatever
+# subdirectory the caller happened to be in.
+t_case "an ambient pointer that no longer resolves refuses, instead of naming a worktree after it"
+repo11="$(mk_repo)"
+run_out11="$( (cd "$repo11" && "$NEW_RUN" wt-dangling fast_path) )"
+run_id11="$(basename "$run_out11")"
+printf '%s\n' '.agent-firm/runs/does-not-exist' > "$repo11/.agent-firm/CURRENT_RUN"
+assert_rc "exit 1 — this tool's historical status for 'no usable run'" 1 \
+  sh -c "cd '$repo11' && '$NEW_WT' implementer wo1"
+assert_output "the diagnostic says which directory is missing" "does not exist" \
+  sh -c "cd '$repo11' && '$NEW_WT' implementer wo1"
+assert_no_file "no branch/worktree was named after the dangling pointer" \
+  "$repo11/.agent-firm/worktrees/does-not-exist-implementer-wo1"
+
+t_case "invoked from a subdirectory: refused by name, because every path it writes is CWD-relative"
+# Before this change the CWD-relative ambient read made this fail by accident ('.agent-firm/CURRENT_RUN'
+# is not there). firm-run-resolve anchors the pointer at the repository root on purpose, so the
+# precondition now has to be asserted instead of inherited.
+printf '%s\n' ".agent-firm/runs/$run_id11" > "$repo11/.agent-firm/CURRENT_RUN"
+mkdir -p "$repo11/sub"
+assert_rc "exit 1 from a subdirectory" 1 sh -c "cd '$repo11/sub' && '$NEW_WT' implementer wo1"
+assert_output "and it names the repository root it requires" "repository root" \
+  sh -c "cd '$repo11/sub' && '$NEW_WT' implementer wo1"
+assert_no_file "nothing was created under the subdirectory" "$repo11/sub/.agent-firm"
+assert_ok "the same call from the repository root still works" \
+  sh -c "cd '$repo11' && '$NEW_WT' implementer wo1"
+
 t_summary
