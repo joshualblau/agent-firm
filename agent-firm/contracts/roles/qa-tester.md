@@ -38,6 +38,11 @@ immutable attempt, attempt-local verdict, canonical projection, and one terminal
 provider/SHA/generation/attempt and current selection. Return both verdicts, blockers, untested risks,
 and the recorded disposition state.
 
+For protocol-v1 runs, primary QA stops after final primary verdict and strict traceability production.
+The Packager freezes the candidate-facing draft handoff, and the Lead—not QA—runs the canonical
+finalizer before the opposite-provider wrapper. QA must not fabricate publication or pre-claim its
+future secondary verdict.
+
 If the mechanical Final check returns `decision_required` (exit 4), report that nonpassing state to the
 Lead. It authorizes only a non-ship-ready draft handoff and one exact Final human interaction; it does
 not authorize QA approval, packaging completion, or a manufactured human record. Report the complete

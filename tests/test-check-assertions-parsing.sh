@@ -598,9 +598,10 @@ vocab="$(af parse_only_vocab 'assertions:
   - no_default_branch_merge: false
   - final_gate_pending: true
   - qa_checkout_clean: false
-  - trusted_unavailability_chain: true')"
+  - trusted_unavailability_chain: true
+  - mutation_matrix_proven: true')"
 assert_rc "full known vocabulary parses without evaluating" 0 "$CA" --parse-only "$vocab"
-assert_output "authoritative count is reported" "assertions: 11 parsed" "$CA" --parse-only "$vocab"
+assert_output "authoritative count is reported" "assertions: 12 parsed" "$CA" --parse-only "$vocab"
 assert_output "completion marker disclaims execution" "no assertion or payload executed" "$CA" --parse-only "$vocab"
 
 t_case "parse-only mutation failures cover unknown, empty, malformed, verdict, boolean, and type axes"
@@ -786,5 +787,24 @@ false_chain="$(af false_chain 'assertions:
   - trusted_unavailability_chain: false')"
 assert_rc "negative inversion is unsupported" 1 env FIRM_EVAL_PROVIDER=claude FIRM_FINAL_CALLS="$CHAIN_FINAL_CALLS" \
   "$CHAIN_CA" "$false_chain" "$CHAIN_REPO"
+
+# AC-012. The COMPLETE positive/negative matrix for this verb lives in tests/test-evidence-seal.sh,
+# where a real published mutation matrix exists to mutate one dimension at a time. What belongs
+# HERE is the property this file owns for every other verb: a golden proof that cannot look must
+# report FAIL, never PASS -- an eval whose repo has no ledger, no manifest, or a manifest that is
+# merely prose has proven nothing at all.
+t_case "mutation_matrix_proven fails closed when there is nothing to verify"
+MATRIX_REPO="$W/matrix-empty"; mkdir -p "$MATRIX_REPO"
+matrix_assert="$(af matrix_assert 'assertions:
+  - mutation_matrix_proven: true')"
+assert_rc "no run ledger at all is a FAIL" 1 "$CA" "$matrix_assert" "$MATRIX_REPO"
+assert_output "and it says why rather than passing quietly" "no run ledger found" \
+  "$CA" "$matrix_assert" "$MATRIX_REPO"
+mkdir -p "$MATRIX_REPO/.agent-firm/runs/matrix-run/09-test-evidence/mutation-evidence"
+printf '.agent-firm/runs/matrix-run\n' > "$MATRIX_REPO/.agent-firm/CURRENT_RUN"
+assert_rc "a ledger with no manifest is a FAIL" 1 "$CA" "$matrix_assert" "$MATRIX_REPO"
+printf 'the AC-007 mutation matrix was executed in full.\n' \
+  > "$MATRIX_REPO/.agent-firm/runs/matrix-run/09-test-evidence/mutation-evidence/ac007-manifest.json"
+assert_rc "a prose claim that the matrix ran is not a manifest" 1 "$CA" "$matrix_assert" "$MATRIX_REPO"
 
 t_summary

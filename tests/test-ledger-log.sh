@@ -6,6 +6,16 @@ set -uo pipefail
 
 LOG="$BIN/firm-ledger-log"
 
+sha_or_absent() {
+  if [ -e "$1" ] || [ -L "$1" ]; then shasum -a 256 "$1" | awk '{print $1}'; else printf absent; fi
+}
+
+wait_ready() {
+  _ready="$1"; _n=0
+  while [ ! -f "$_ready" ] && [ "$_n" -lt 1000 ]; do _n=$((_n+1)); sleep 0.01; done
+  [ -f "$_ready" ]
+}
+
 # is_valid_json <text> — feeds via STDIN rather than embedding into a python source string, so JSON
 # containing quotes/backslashes can never break out of a quoted literal.
 is_valid_json() { printf '%s' "$1" | python3 -c "import json,sys; json.load(sys.stdin)"; }
@@ -180,5 +190,465 @@ import json,sys
 row=json.loads(open(sys.argv[1],encoding="utf-8").read())
 assert row["event_id"]=="evt-empty-extension" and row["note"]==""
 PY
+
+t_case "closed evidence publication validates current identity and bytes before append"
+make_current_evidence_run() {
+  _repo="$(mk_repo)"; _sha="$(sha_of "$_repo" main)"
+  _relative="$(cd "$_repo" && "$BIN/firm-new-run" --primary codex --base "$_sha" evidence-event full_track)" || return 1
+  _run="$_repo/$_relative"; mkdir -p "$_run/09-test-evidence" "$_run/role-contracts"
+  _common="$(git -C "$_repo" rev-parse --git-common-dir)"; case $_common in /*) ;; *) _common="$_repo/$_common";; esac
+  printf '{"schema_version":2,"run_id":"%s","repository_root":"%s","git_common_dir":"%s","checkout_path":"%s","source_ref":"refs/heads/main","source_ref_sha":"%s","base_sha":"%s","candidate_sha":"%s","generation":1}\n' \
+    "$(basename "$_run")" "$_repo" "$_common" "$_repo" "$_sha" "$_sha" "$_sha" \
+    > "$_run/09-test-evidence/qa-candidate.json"
+  chmod 600 "$_run/09-test-evidence/qa-candidate.json"
+  printf '%s\n' '# evidence event fixture' > "$_run/role-contracts/Q-01-qa-tester.md"
+  chmod 644 "$_run/role-contracts/Q-01-qa-tester.md"
+  _run_event="$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["event_id"])' "$_run/run.jsonl")"
+  _authority="$(t_python -c 'import json,sys; rid=sys.argv[1]; print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":sys.argv[2],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":sys.argv[3]}}}],separators=(",",":")))' "$(basename "$_run")" "$_run_event" "$_sha")"
+  _activation="$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)" || return 1
+  _start="$("$LOG" --run "$_run" --strict --role-start --stage test/Q-01 --role qa-tester \
+    --contract role-contracts/Q-01-qa-tester.md --event qa_started --authority-json "$_authority" \
+    --agent /root/evidence_event_fixture --activation-json "$_activation" | \
+    t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')" || return 1
+  printf '%s\n' "$_repo" "$_run" "$_sha" "$_start"
+}
+
+assert_evidence_reject() {
+  _label="$1"; _run="$2"; shift 2
+  _ledger="$_run/run.jsonl"; _before="$(sha_or_absent "$_ledger")"
+  _lock_before="$(sha_or_absent "$_run/run.jsonl.lock")"
+  _out="$($LOG --run "$_run" --strict --print-event-id "$@" 2> "$_run/reject.err")"; _rc=$?
+  assert_eq "$_label fails closed" 1 "$_rc"
+  assert_eq "$_label emits no success receipt" "" "$_out"
+  assert_eq "$_label leaves ledger bytes unchanged" "$_before" "$(sha_or_absent "$_ledger")"
+  assert_eq "$_label leaves coordination state unchanged" "$_lock_before" \
+    "$(sha_or_absent "$_run/run.jsonl.lock")"
+  assert_eq "$_label leaves no transaction residue" 0 \
+    "$(find "$_run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+}
+
+if t_p2_row_supported; then
+  current_fixture="$(make_current_evidence_run)"; current_fixture_rc=$?
+  current_repo="$(printf '%s\n' "$current_fixture" | sed -n '1p')"
+  current_run="$(printf '%s\n' "$current_fixture" | sed -n '2p')"
+  current_sha="$(printf '%s\n' "$current_fixture" | sed -n '3p')"
+  current_start="$(printf '%s\n' "$current_fixture" | sed -n '4p')"
+  if [ "$current_fixture_rc" -ne 0 ] || [ -z "$current_start" ]; then
+    _t_no "current evidence fixture created" "rc=$current_fixture_rc"
+  else
+    _t_ok "current evidence fixture created"
+    evidence_path=09-test-evidence/proof.log
+    printf '%s\n' 'canonical evidence bytes' > "$current_run/$evidence_path"
+    chmod 600 "$current_run/$evidence_path"
+    evidence_digest="$(shasum -a 256 "$current_run/$evidence_path" | awk '{print $1}')"
+    evidence_bytes="$(wc -c < "$current_run/$evidence_path" | tr -d ' ')"
+    common_args=(evidence_produced "sha=$current_sha" generation=1 "path=$evidence_path" \
+      "sha256=$evidence_digest" "bytes=$evidence_bytes" stage=test/Q-01 role=qa-tester \
+      "role_start_event_id=$current_start")
+    evidence_id=evt-current-evidence-proof
+    evidence_out="$($LOG --run "$current_run" --strict --print-event-id --event-id "$evidence_id" \
+      "${common_args[@]}")"; evidence_rc=$?
+    assert_eq "valid current publication succeeds" 0 "$evidence_rc"
+    assert_eq "valid current publication returns its exact event id" "$evidence_id" "$evidence_out"
+    assert_ok "valid current publication appends one exact closed record" t_python - \
+      "$current_run/run.jsonl" "$evidence_id" "$evidence_path" "$evidence_digest" "$evidence_bytes" \
+      "$current_sha" "$current_start" <<'PY'
+import json,sys
+ledger,eid,path,digest,count,sha,start=sys.argv[1:]
+rows=[json.loads(line) for line in open(ledger,encoding="utf-8")]
+matches=[row for row in rows if row.get("event_id")==eid]
+assert len(matches)==1
+row=matches[0]
+assert set(row)=={"ts","event","event_id","run_id","sha","generation","path","sha256","bytes","stage","role","role_start_event_id"}
+assert row["event"]=="evidence_produced" and row["path"]==path
+assert row["sha256"]==digest and row["bytes"]==count and row["sha"]==sha and row["generation"]=="1"
+assert row["stage"]=="test/Q-01" and row["role"]=="qa-tester" and row["role_start_event_id"]==start
+PY
+
+    # Shape and shell-boundary negatives use another path so the duplicate-publication rule is not
+    # the reason they fail.
+    negative_path=09-test-evidence/negative.log
+    printf '%s\n' 'negative evidence bytes' > "$current_run/$negative_path"; chmod 600 "$current_run/$negative_path"
+    negative_digest="$(shasum -a 256 "$current_run/$negative_path" | awk '{print $1}')"
+    negative_bytes="$(wc -c < "$current_run/$negative_path" | tr -d ' ')"
+    negative_args=("sha=$current_sha" generation=1 "path=$negative_path" \
+      "sha256=$negative_digest" "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester \
+      "role_start_event_id=$current_start")
+    assert_evidence_reject "shell-split path plus bare event id" "$current_run" \
+      evidence_produced "${negative_args[@]}" evt-split-token
+    assert_evidence_reject "shell-joined path and event id" "$current_run" \
+      evidence_produced "sha=$current_sha" generation=1 "path=$negative_path evt-joined" \
+      "sha256=$negative_digest" "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester \
+      "role_start_event_id=$current_start"
+    assert_evidence_reject "composite path plus event id" "$current_run" \
+      evidence_produced "sha=$current_sha" generation=1 "path=$negative_path+evt-composite" \
+      "sha256=$negative_digest" "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester \
+      "role_start_event_id=$current_start"
+    assert_evidence_reject "omitted digest" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "bytes=$negative_bytes" \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "empty digest" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" sha256= "bytes=$negative_bytes" \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "omitted byte count" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "sha256=$negative_digest" \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "empty byte count" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "sha256=$negative_digest" bytes= \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "duplicate path field" "$current_run" evidence_produced \
+      "${negative_args[@]}" "path=$negative_path"
+    assert_evidence_reject "stale candidate" "$current_run" evidence_produced \
+      "sha=0000000000000000000000000000000000000000" generation=1 "path=$negative_path" \
+      "sha256=$negative_digest" "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester \
+      "role_start_event_id=$current_start"
+    assert_evidence_reject "stale generation" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=2 "path=$negative_path" "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    for spec in generation=0 generation=01 generation=x bytes=-1 bytes=01 bytes=x; do
+      _key="${spec%%=*}"; _value="${spec#*=}"
+      _args=("${negative_args[@]}")
+      if [ "$_key" = generation ]; then _args[1]="generation=$_value"; else _args[4]="bytes=$_value"; fi
+      assert_evidence_reject "malformed $_key $_value" "$current_run" evidence_produced "${_args[@]}"
+    done
+    assert_evidence_reject "uppercase digest" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" \
+      "sha256=$(printf '%s' "$negative_digest" | tr 'a-f' 'A-F')" "bytes=$negative_bytes" \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "missing role start" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester
+    assert_evidence_reject "stale role start" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester role_start_event_id=evt-unknown-start
+    assert_evidence_reject "wrong role window stage" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-02 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "changed artifact bytes" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$negative_path" \
+      "sha256=0000000000000000000000000000000000000000000000000000000000000000" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "missing artifact" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 path=09-test-evidence/missing.log "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    ln -s negative.log "$current_run/09-test-evidence/symlink.log"
+    assert_evidence_reject "symlink artifact" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 path=09-test-evidence/symlink.log "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    ln "$current_run/$negative_path" "$current_run/09-test-evidence/hardlink.log"
+    assert_evidence_reject "hardlink alias artifact" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 path=09-test-evidence/hardlink.log "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+    assert_evidence_reject "outside-run artifact" "$current_run" evidence_produced \
+      "sha=$current_sha" generation=1 "path=$current_repo/outside.log" "sha256=$negative_digest" \
+      "bytes=$negative_bytes" stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start"
+
+    race_path=09-test-evidence/race.log
+    printf '%s\n' 'before race' > "$current_run/$race_path"; chmod 600 "$current_run/$race_path"
+    race_digest="$(shasum -a 256 "$current_run/$race_path" | awk '{print $1}')"
+    race_bytes="$(wc -c < "$current_run/$race_path" | tr -d ' ')"
+    race_before="$(sha_or_absent "$current_run/run.jsonl")"
+    race_barrier="$(mktemp -d "${TMPDIR:-/tmp}/firm-evidence-race.XXXXXX")"; t_track "$race_barrier"
+    ( FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_BARRIER_PHASE=after_lock \
+      FIRM_LEDGER_BARRIER_DIR="$race_barrier" FIRM_LEDGER_BARRIER_TOKEN=evidence \
+      "$LOG" --run "$current_run" --strict --print-event-id evidence_produced \
+      "sha=$current_sha" generation=1 "path=$race_path" "sha256=$race_digest" "bytes=$race_bytes" \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$current_start" \
+      > "$race_barrier/out" 2> "$race_barrier/err"; printf '%s' "$?" > "$race_barrier/rc" ) & race_pid=$!
+    assert_ok "TOCTOU writer reaches the post-validation lock barrier" wait_ready "$race_barrier/evidence.ready"
+    printf '%s\n' 'mutated during lock barrier' > "$current_run/$race_path"
+    printf '%s\n' release > "$race_barrier/evidence.release"; wait "$race_pid"
+    assert_eq "TOCTOU mutation fails closed" 1 "$(cat "$race_barrier/rc")"
+    assert_eq "TOCTOU mutation emits no success receipt" "" "$(cat "$race_barrier/out")"
+    assert_eq "TOCTOU mutation leaves ledger prefix byte-identical" "$race_before" \
+      "$(sha_or_absent "$current_run/run.jsonl")"
+    assert_eq "TOCTOU mutation leaves no transaction residue" 0 \
+      "$(find "$current_run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  fi
+else
+  t_skip "closed current evidence publication matrix" "requires a supported P2 ledger write host"
+fi
+
+t_case "current or partial seal state never falls back, while genuine historical evidence remains bounded"
+if t_p2_row_supported; then
+  partial_repo="$(mk_repo)"; partial_sha="$(sha_of "$partial_repo" main)"
+  partial_relative="$(cd "$partial_repo" && "$BIN/firm-new-run" --primary codex --base "$partial_sha" partial-evidence full_track)"
+  partial_run="$partial_repo/$partial_relative"; mkdir -p "$partial_run/09-test-evidence"
+  printf '%s\n' partial > "$partial_run/09-test-evidence/partial.log"; chmod 600 "$partial_run/09-test-evidence/partial.log"
+  partial_digest="$(shasum -a 256 "$partial_run/09-test-evidence/partial.log" | awk '{print $1}')"
+  partial_bytes="$(wc -c < "$partial_run/09-test-evidence/partial.log" | tr -d ' ')"
+  partial_before="$(sha_or_absent "$partial_run/run.jsonl")"
+  partial_out="$($LOG --run "$partial_run" --strict --print-event-id evidence_produced \
+    "sha=$partial_sha" generation=1 path=09-test-evidence/partial.log "sha256=$partial_digest" \
+    "bytes=$partial_bytes" 2> "$partial_run/partial.err")"; partial_rc=$?
+  assert_eq "approval-eligible partial state rejects legacy-shaped fallback" 1 "$partial_rc"
+  assert_eq "partial-state rejection emits no receipt" "" "$partial_out"
+  assert_eq "partial-state rejection leaves ledger exact" "$partial_before" \
+    "$(sha_or_absent "$partial_run/run.jsonl")"
+  assert_no_file "partial-state rejection creates no coordination lock" "$partial_run/run.jsonl.lock"
+
+  for no_fallback_state in opted_in present unknown partial_candidate; do
+    state_repo="$(mk_repo)"; state_run="$state_repo/.agent-firm/runs/state-$no_fallback_state"
+    mkdir -p "$state_run/09-test-evidence"
+    printf '%s\n' '{"ts":"2026-08-01T00:00:00Z","event":"run_started","event_id":"evt-state-run-start","run_id":"state-'"$no_fallback_state"'","repo":"fixture","base_sha":"0000000000000000000000000000000000000000","track":"full_track"}' > "$state_run/run.jsonl"
+    chmod 600 "$state_run/run.jsonl"
+    case $no_fallback_state in
+      opted_in)
+        printf '%s\n' '{"ts":"2026-08-01T00:00:01Z","event":"evidence_seal_required","event_id":"evt-state-opt-in","run_id":"state-opted_in","protocol":"1"}' >> "$state_run/run.jsonl"
+        ;;
+      present) mkdir -p "$state_run/09-test-evidence/final-evidence" ;;
+      unknown)
+        t_python - "$state_run/run.jsonl" <<'PY'
+import json,sys
+p=sys.argv[1]; row=json.loads(open(p).read()); row["evidence_seal_protocol"]="999"
+open(p,"w").write(json.dumps(row,separators=(",",":"))+"\n")
+PY
+        ;;
+      partial_candidate) printf '{bad\n' > "$state_run/09-test-evidence/qa-candidate.json" ;;
+    esac
+    printf '%s\n' state > "$state_run/09-test-evidence/state.log"; chmod 600 "$state_run/09-test-evidence/state.log"
+    state_digest="$(shasum -a 256 "$state_run/09-test-evidence/state.log" | awk '{print $1}')"
+    state_bytes="$(wc -c < "$state_run/09-test-evidence/state.log" | tr -d ' ')"
+    state_before="$(sha_or_absent "$state_run/run.jsonl")"
+    state_out="$($LOG --run "$state_run" --strict --print-event-id evidence_produced \
+      sha=0000000000000000000000000000000000000000 generation=1 \
+      path=09-test-evidence/state.log "sha256=$state_digest" "bytes=$state_bytes" \
+      2> "$state_run/state.err")"; state_rc=$?
+    assert_eq "$no_fallback_state state rejects legacy fallback" 1 "$state_rc"
+    assert_eq "$no_fallback_state rejection emits no receipt" "" "$state_out"
+    assert_eq "$no_fallback_state rejection leaves ledger exact" "$state_before" \
+      "$(sha_or_absent "$state_run/run.jsonl")"
+    assert_no_file "$no_fallback_state rejection creates no lock" "$state_run/run.jsonl.lock"
+    assert_eq "$no_fallback_state rejection creates no temp" 0 \
+      "$(find "$state_run" -maxdepth 1 -name '.run.jsonl.tmp.*' | wc -l | tr -d ' ')"
+  done
+
+  legacy_repo="$(mk_repo)"; legacy_run="$legacy_repo/.agent-firm/runs/legacy-evidence"
+  mkdir -p "$legacy_run/09-test-evidence"
+  printf '%s\n' '{"ts":"2026-08-01T00:00:00Z","event":"run_started","event_id":"evt-legacy-run-start","run_id":"legacy-evidence","repo":"fixture","base_sha":"0000000000000000000000000000000000000000","track":"full_track"}' > "$legacy_run/run.jsonl"
+  chmod 600 "$legacy_run/run.jsonl"
+  printf '%s\n' legacy > "$legacy_run/09-test-evidence/legacy.log"; chmod 600 "$legacy_run/09-test-evidence/legacy.log"
+  legacy_digest="$(shasum -a 256 "$legacy_run/09-test-evidence/legacy.log" | awk '{print $1}')"
+  legacy_bytes="$(wc -c < "$legacy_run/09-test-evidence/legacy.log" | tr -d ' ')"
+  legacy_out="$($LOG --run "$legacy_run" --strict --print-event-id --event-id evt-legacy-evidence \
+    evidence_produced sha=0000000000000000000000000000000000000000 generation=1 \
+    path=09-test-evidence/legacy.log "sha256=$legacy_digest" "bytes=$legacy_bytes")"; legacy_rc=$?
+  assert_eq "genuine pre-provider legacy publication succeeds" 0 "$legacy_rc"
+  assert_eq "genuine legacy publication returns its id" evt-legacy-evidence "$legacy_out"
+  assert_ok "genuine legacy record has only the bounded legacy fields" t_python - "$legacy_run/run.jsonl" <<'PY'
+import json,sys
+row=[json.loads(line) for line in open(sys.argv[1])][-1]
+assert set(row)=={"ts","event","event_id","run_id","sha","generation","path","sha256","bytes"}
+assert row["event"]=="evidence_produced" and row["event_id"]=="evt-legacy-evidence"
+PY
+else
+  t_skip "current-no-fallback and genuine-legacy evidence cases" "requires a supported P2 ledger write host"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# POSITIVE CONTROL for the canonical classifier, on a fixture shaped like a REAL run.
+#
+# The classifier previously had only negatives: rc 1 on the malformed source run, and rc != 0 on
+# smuggled rows. "rejects the malformed source run" and "rejects every run that ever published
+# evidence" were therefore indistinguishable to this suite -- and the second one was true. Every
+# no-fallback fixture above and the genuine-legacy fixture in tests/test-evidence-seal.sh are built
+# by bare `mkdir` with no run-metadata.json, so they only ever exercised the metadata-absent branch
+# and could not tell a bounded legacy predicate from an unreachable one.
+#
+# These fixtures are built with `firm-new-run`, so they carry a schema_version-2 run-metadata.json
+# and a bound 09-test-evidence/qa-candidate.json exactly like all 25 runs in this repository, and
+# their pre-existing evidence rows are written straight into run.jsonl the way the previous release
+# wrote them. Anything that makes genuine-legacy recognition unreachable again fails here.
+# ---------------------------------------------------------------------------------------------
+t_case "a real-shaped run whose evidence predates the closed family stays classifiable and appendable"
+if t_p2_row_supported; then
+  # mk_history_run <slug> — a firm-new-run run carrying the schema_version-2 run-metadata.json and
+  # the bound qa-candidate.json every real run in this repository has. Ledger rows are written by
+  # patch_rows below, so each case states its own ledger explicitly.
+  mk_history_run() {
+    local _slug="$1"
+    local _repo _sha _relative _run
+    _repo="$(mk_repo)" || return 1
+    _sha="$(sha_of "$_repo" main)"
+    _relative="$(cd "$_repo" && "$BIN/firm-new-run" --primary codex --base "$_sha" "$_slug" full_track)" || return 1
+    _run="$_repo/$_relative"
+    mkdir -p "$_run/09-test-evidence"
+    t_python - "$_run" <<'PY' || return 1
+import json, os, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+metadata = json.load(open(run / "run-metadata.json"))
+candidate = {
+    "schema_version": 2, "run_id": run.name,
+    "repository_root": metadata["repository_root"], "git_common_dir": metadata["git_common_dir"],
+    "checkout_path": metadata["repository_root"], "source_ref": "refs/heads/integration/history",
+    "source_ref_sha": metadata["accepted_base_sha"], "base_sha": metadata["accepted_base_sha"],
+    "candidate_sha": metadata["accepted_base_sha"], "generation": 1,
+}
+target = run / "09-test-evidence" / "qa-candidate.json"
+target.write_text(json.dumps(candidate, sort_keys=True) + "\n")
+os.chmod(target, 0o600)
+PY
+    printf '%s\n' history > "$_run/09-test-evidence/history.log"
+    chmod 600 "$_run/09-test-evidence/history.log"
+    printf '%s\n' "$_repo" "$_run"
+  }
+
+  history_digest="0000000000000000000000000000000000000000000000000000000000000000"
+  history_sha="0000000000000000000000000000000000000000"
+  legacy_row='{"ts":"2026-08-01T00:00:01Z","event":"evidence_produced","event_id":"evt-history-legacy","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8"}'
+  extended_row='{"ts":"2026-08-01T00:00:02Z","event":"evidence_produced","event_id":"evt-history-extended","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","provider":"claude","attempt_id":"qa-primary-claude-1"}'
+  current_row='{"ts":"2026-08-01T00:00:03Z","event":"evidence_produced","event_id":"evt-history-current","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","stage":"test/Q-01","role":"qa-tester","role_start_event_id":"evt-history-start"}'
+  malformed_row='{"ts":"2026-08-01T00:00:04Z","event":"evidence_produced","event_id":"evt-history-malformed","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"not-a-digest","bytes":"8"}'
+  reserved_row='{"ts":"2026-08-01T00:00:05Z","event":"evidence_produced","event_id":"evt-history-reserved","run_id":"RUNID","sha":"'"$history_sha"'","generation":"1","path":"09-test-evidence/history.log","sha256":"'"$history_digest"'","bytes":"8","agent":"/root/x"}'
+
+  history_fixture="$(mk_history_run legacy-history)"
+  history_repo="$(printf '%s\n' "$history_fixture" | sed -n '1p')"
+  history_run="$(printf '%s\n' "$history_fixture" | sed -n '2p')"
+  if [ -z "$history_run" ]; then
+    _t_no "real-shaped legacy-history fixture created" "fixture setup failed"
+  else
+    _t_ok "real-shaped legacy-history fixture created"
+    # patch_rows <run> <keep|drop marker> <row...> — rewrite the ledger as firm-new-run's own
+    # run_started line plus the given rows, with RUNID substituted, so every case below starts from
+    # an identical, explicit ledger.
+    #
+    # `drop` removes the `evidence_seal_protocol` marker that today's firm-new-run stamps on the
+    # first row. That is what makes the fixture HISTORICAL rather than merely old: the five runs in
+    # this repository that the classifier refused were created before the marker existed, and their
+    # first rows do not carry it. Everything else about the fixture -- metadata, candidate binding,
+    # provenance fields -- stays exactly as the real tool wrote it.
+    # The pristine run_started row is captured ONCE, here, and every case is rebuilt from it. Reading
+    # it back out of run.jsonl would make each case depend on what the previous case wrote -- the
+    # first `drop` would strip the marker permanently and every later `keep` would silently be a
+    # `drop`, which is exactly the way a matrix stops testing what its names say.
+    history_started_marked="$(head -n 1 "$history_run/run.jsonl")"
+    history_started_plain="$(printf '%s' "$history_started_marked" | t_python -c \
+      'import json,sys; row=json.loads(sys.stdin.read()); row.pop("evidence_seal_protocol",None); print(json.dumps(row,separators=(",",":")))')"
+    patch_rows() {
+      local _run="$1" _marker="$2" _id _tmp _row; shift 2
+      _id="$(basename "$_run")"
+      _tmp="$_run/.rows.$$"
+      if [ "$_marker" = drop ]; then
+        printf '%s\n' "$history_started_plain" > "$_tmp"
+      else
+        printf '%s\n' "$history_started_marked" > "$_tmp"
+      fi
+      for _row in "$@"; do printf '%s\n' "${_row//RUNID/$_id}" >> "$_tmp"; done
+      mv "$_tmp" "$_run/run.jsonl"; chmod 600 "$_run/run.jsonl"
+    }
+    assert_output "the fixture's run_started row carries firm-new-run's protocol marker" \
+      '"evidence_seal_protocol"' printf '%s' "$history_started_marked"
+    assert_ok "the historical variant of that row drops only the marker" \
+      t_python - "$history_started_marked" "$history_started_plain" <<'PY'
+import json, sys
+marked, plain = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert set(marked) - set(plain) == {"evidence_seal_protocol"}, (sorted(marked), sorted(plain))
+assert all(plain[k] == marked[k] for k in plain)
+PY
+
+    assert_ok "the fixture has the run-metadata.json every real run has" \
+      test -f "$history_run/run-metadata.json"
+    assert_ok "the fixture has the bound qa-candidate.json every real run has" \
+      test -f "$history_run/09-test-evidence/qa-candidate.json"
+
+    patch_rows "$history_run" drop "$legacy_row"
+    assert_rc "canonical classifier accepts a genuine-legacy real-shaped run" 0 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    history_lines_before="$(wc -l < "$history_run/run.jsonl" | tr -d ' ')"
+    history_append="$($LOG --run "$history_run" --strict --print-event-id --event-id evt-history-ordinary \
+      review_recorded note=still-appendable 2> "$history_repo/history.err")"; history_append_rc=$?
+    assert_eq "an ordinary event still appends to a genuine-legacy real-shaped run" 0 "$history_append_rc"
+    assert_eq "the ordinary append returns its own id" evt-history-ordinary "$history_append"
+    assert_eq "the ordinary append adds exactly one line" \
+      "$((history_lines_before + 1))" "$(wc -l < "$history_run/run.jsonl" | tr -d ' ')"
+    assert_eq "the ordinary append emits no diagnostic" "" "$(cat "$history_repo/history.err")"
+
+    patch_rows "$history_run" drop "$legacy_row" "$extended_row"
+    assert_rc "legacy rows keep the safe extension fields real history carries" 0 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    patch_rows "$history_run" drop "$legacy_row" "$reserved_row"
+    assert_rc "a legacy row wearing a reserved producer field is refused" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    patch_rows "$history_run" drop "$legacy_row" "$malformed_row"
+    assert_rc "a malformed digest is still refused inside a genuine-legacy run" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # THE OTHER SIDE OF THE BOUNDARY: one current-shape row anywhere in the ledger makes the run
+    # protocol-current, and its legacy-shaped rows are then refused exactly as before.
+    patch_rows "$history_run" drop "$legacy_row" "$current_row"
+    assert_rc "one current-shape row makes the run protocol-current and refuses legacy rows" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # And a run created by today's firm-new-run, which stamps evidence_seal_protocol on its first
+    # row, is protocol-current from birth: identical ledger, marker kept, refused.
+    patch_rows "$history_run" keep "$legacy_row"
+    assert_rc "the run-started protocol marker keeps a real-shaped run out of legacy" 1 \
+      "$LOG" --classify-ledger-file "$(basename "$history_run")" "$history_run/run.jsonl"
+
+    # And the silent-failure repair: best-effort logging keeps exit 0, but says why.
+    history_silent="$($LOG --run "$history_run" --print-event-id \
+      review_recorded note=unclassifiable 2> "$history_repo/silent.err")"; history_silent_rc=$?
+    assert_eq "best-effort logging over an unclassifiable ledger keeps its exit status" 0 "$history_silent_rc"
+    assert_eq "best-effort logging over an unclassifiable ledger writes no receipt" "" "$history_silent"
+    assert_output "best-effort logging over an unclassifiable ledger announces the reason" \
+      "existing ledger content is unclassifiable" cat "$history_repo/silent.err"
+  fi
+
+  # A real-shaped run that has published NOTHING must still be held to the closed shape: the
+  # genuine-legacy branch is anchored on published history, not on the absence of run state.
+  fresh_fixture="$(mk_history_run fresh-history)"
+  fresh_run="$(printf '%s\n' "$fresh_fixture" | sed -n '2p')"
+  if [ -z "$fresh_run" ]; then
+    _t_no "real-shaped fresh fixture created" "fixture setup failed"
+  else
+    _t_ok "real-shaped fresh fixture created"
+    fresh_digest="$(shasum -a 256 "$fresh_run/09-test-evidence/history.log" | awk '{print $1}')"
+    fresh_bytes="$(wc -c < "$fresh_run/09-test-evidence/history.log" | tr -d ' ')"
+    fresh_before="$(sha_or_absent "$fresh_run/run.jsonl")"
+    assert_rc "a real-shaped run with no published history refuses a legacy-shaped publication" 1 \
+      "$LOG" --run "$fresh_run" --strict evidence_produced \
+      sha=0000000000000000000000000000000000000000 generation=1 \
+      path=09-test-evidence/history.log "sha256=$fresh_digest" "bytes=$fresh_bytes"
+    assert_eq "the refused publication leaves the ledger exact" "$fresh_before" \
+      "$(sha_or_absent "$fresh_run/run.jsonl")"
+  fi
+else
+  t_skip "real-shaped genuine-legacy classifier positive control" "requires a supported P2 ledger write host"
+fi
+
+t_case "malformed source-run evidence is rejected without normalization or mutation"
+source_common="$(git -C "$FIRM_ROOT" rev-parse --git-common-dir)"
+case $source_common in /*) ;; *) source_common="$FIRM_ROOT/$source_common";; esac
+source_repo="$(dirname "$source_common")"
+source_run="$source_repo/.agent-firm/runs/20260902T163746Z-evidence-seal-review-qa-completion"
+if [ -f "$source_run/run.jsonl" ]; then
+  source_before="$(sha_or_absent "$source_run/run.jsonl")"
+  assert_rc "canonical classifier rejects the ten malformed source records" 1 \
+    "$LOG" --classify-ledger-file "$(basename "$source_run")" "$source_run/run.jsonl"
+  assert_eq "source-run ledger remains byte-identical" "$source_before" \
+    "$(sha_or_absent "$source_run/run.jsonl")"
+else
+  t_skip "malformed source-run classifier case" "source audit run is unavailable in fixture checkout"
+fi
+
+t_case "the evidence writer preserves the interpreter-row/write-host-row distinction"
+if "$BIN/firm-python" --status | grep -q 'p2=yes'; then
+  divergent_repo="$(mk_repo)"; mk_run "$divergent_repo" divergent
+  divergent_run="$divergent_repo/.agent-firm/runs/divergent"
+  divergent_out="$(FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=macos_version_mismatch \
+    "$LOG" --run "$divergent_run" --strict --print-event-id evidence_produced \
+    sha=0000000000000000000000000000000000000000 generation=1 path=x \
+    sha256=0000000000000000000000000000000000000000000000000000000000000000 bytes=0 \
+    2> "$divergent_repo/divergent.err")"; divergent_rc=$?
+  assert_eq "compliant interpreter does not admit an unproven write-host row" 17 "$divergent_rc"
+  assert_eq "divergent write-host refusal emits no receipt" "" "$divergent_out"
+  assert_no_file "divergent write-host refusal creates no ledger" "$divergent_run/run.jsonl"
+  assert_no_file "divergent write-host refusal creates no lock" "$divergent_run/run.jsonl.lock"
+else
+  t_skip "modeled interpreter/write-host divergence" "resolved interpreter is not itself P2-compliant"
+fi
 
 t_summary

@@ -88,7 +88,13 @@ jobs:
     # is single-digit minutes on these runners.
     timeout-minutes: 45
     steps:
+      # fetch-depth: 0 (full history) — the default shallow (depth-1) checkout only has the tip
+      # commit, but the AC-048 capsule-attack suite proves ancestry against a real, older commit in
+      # this branch's own history. A shallow clone makes that `git rev-list` fail with exit 128 on
+      # a missing object, which is a checkout artifact, not evidence the ancestry claim is wrong.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -110,6 +116,17 @@ jobs:
         run: |
           bin/firm-python --status
           bin/firm-python -c 'import jsonschema, yaml, sys; print("deps ok on", sys.executable)'
+      # test-run-evals-structural.sh shells out to `rg`, which neither hosted runner image carries.
+      # Its absence must fail the assertion loudly (rg: command not found), not be silently absorbed
+      # — installing it here is what makes that check actually run, rather than leaving it permanently
+      # unable to.
+      - name: install ripgrep (test-run-evals-structural.sh needs it)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          else
+            brew install ripgrep
+          fi
       - name: run unsupported-P2 suite (modern Bash and GNU userland)
         if: runner.os == 'Linux'
         run: bash tests/run-tests.sh --unsupported-p2

@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-firm.local/schemas/eval-execution-authority.schema.json",
+  "title": "Disposable-Git candidate-bound eval execution authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "purpose", "invocation", "eval", "provider", "harness_root", "harness_commit", "harness_tree", "candidate_root", "candidate_commit", "candidate_tree", "patch_base", "patch_commit", "patch_bytes", "patch_sha256", "scratch_root", "scratch_dev", "scratch_ino", "request_root", "response_root", "runner", "tools", "capsule", "guardian", "seatbelt", "provider_capsule", "test_barrier"],
+  "properties": {
+    "schema_version": {"const": 3},
+    "purpose": {"const": "disposable_git_candidate_eval"},
+    "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"},
+    "eval": {"const": "final-evidence-seal"},
+    "provider": {"enum": ["claude", "codex"]},
+    "harness_root": {"type": "string", "minLength": 1},
+    "harness_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "harness_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "candidate_root": {"type": "string", "minLength": 1},
+    "candidate_commit": {"const": "a57a8d0b4754ed92b74c023c340aab3154845abb"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "patch_base": {"const": "369c86b18027281fcfec1288efaa1255df315c35"},
+    "patch_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "patch_bytes": {"const": 144413},
+    "patch_sha256": {"const": "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829"},
+    "scratch_root": {"type": "string", "minLength": 1},
+    "scratch_dev": {"type": "integer", "minimum": 0},
+    "scratch_ino": {"type": "integer", "minimum": 1},
+    "request_root": {"type": "string", "minLength": 1},
+    "response_root": {"type": "string", "minLength": 1},
+    "runner": {"$ref": "#/$defs/tool"},
+    "tools": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/tool"}},
+    "capsule": {"$ref": "#/$defs/capsule"},
+    "guardian": {"$ref": "#/$defs/guardian"},
+    "seatbelt": {"$ref": "#/$defs/seatbelt"},
+    "provider_capsule": {"$ref": "#/$defs/providerCapsule"},
+    "test_barrier": {"$ref": "#/$defs/testBarrier"}
+  },
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^firm-[a-z0-9-]+$"},
+        "path": {"type": "string", "minLength": 1},
+        "dev": {"type": "integer", "minimum": 0},
+        "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 256, "maximum": 511},
+        "nlink": {"const": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dev", "ino", "uid", "mode", "nlink", "bytes"],
+      "properties": {
+        "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 0, "maximum": 4095},
+        "nlink": {"type": "integer", "minimum": 1}, "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "fileIdentity": {
+      "allOf": [
+        {"$ref": "#/$defs/identity"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+         "properties": {
+           "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+           "uid": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 0, "maximum": 4095},
+           "nlink": {"const": 1}, "bytes": {"type": "integer", "minimum": 0},
+           "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+         }}
+      ]
+    },
+    "externalFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1}, "dev": {"type": "integer", "minimum": 0},
+        "ino": {"type": "integer", "minimum": 1}, "uid": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0, "maximum": 4095}, "nlink": {"const": 1},
+        "bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "guardian": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "candidate_commit", "pid", "root", "root_identity", "root_binding", "control", "socket", "socket_identity", "token_sha256", "failure_marker"],
+      "properties": {
+        "protocol_version": {"const": 3},
+        "candidate_commit": {"const": "a57a8d0b4754ed92b74c023c340aab3154845abb"},
+        "pid": {"type": "integer", "minimum": 1}, "root": {"type": "string", "minLength": 1},
+        "root_identity": {"$ref": "#/$defs/identity"},
+        "root_binding": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "control": {"type": "string", "minLength": 1},
+        "socket": {"type": "string", "minLength": 1},
+        "socket_identity": {"$ref": "#/$defs/identity"},
+        "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "failure_marker": {"type": "string", "minLength": 1}
+      }
+    },
+    "probeReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result", "stdout_sha256", "profile_sha256", "wrapper_sha256", "monotonic_ns"],
+      "properties": {
+        "result": {
+          "type": "object", "additionalProperties": false,
+          "required": ["canonical_read", "canonical_write", "alias_read", "alias_write", "capsule_read_write"],
+          "properties": {"canonical_read": {"const": true}, "canonical_write": {"const": true},
+            "alias_read": {"const": true}, "alias_write": {"const": true}, "capsule_read_write": {"const": true}}
+        },
+        "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "profile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "wrapper_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "monotonic_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "seatbelt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "wrapper", "provider", "real_common", "real_common_identity", "alias", "probe_file", "probe_file_identity", "capsule_sentinel", "supervisor_argv_prefix", "prepare_probe"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/externalFile"}, "wrapper": {"$ref": "#/$defs/externalFile"},
+        "provider": {"$ref": "#/$defs/providerExecutable"}, "real_common": {"type": "string", "minLength": 1},
+        "real_common_identity": {"$ref": "#/$defs/identity"}, "alias": {"type": "string", "minLength": 1},
+        "probe_file": {"type": "string", "minLength": 1}, "probe_file_identity": {"$ref": "#/$defs/externalFile"},
+        "capsule_sentinel": {"type": "string", "minLength": 1},
+        "supervisor_argv_prefix": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "string", "minLength": 1}},
+        "prepare_probe": {"$ref": "#/$defs/probeReceipt"}
+      }
+    },
+    "providerExecutable": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "maximum_bytes", "chunk_bytes", "timeout_ns", "path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "provider": {"enum": ["claude", "codex"]},
+        "maximum_bytes": {"type": "integer"}, "chunk_bytes": {"const": 1048576},
+        "timeout_ns": {"const": 10000000000}, "path": {"type": "string", "minLength": 1},
+        "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0}, "mode": {"type": "integer", "minimum": 1, "maximum": 4095},
+        "nlink": {"const": 1}, "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "oneOf": [
+        {"required": ["provider", "maximum_bytes", "bytes"],
+         "properties": {"provider": {"const": "codex"}, "maximum_bytes": {"const": 247464144},
+                        "bytes": {"type": "integer", "minimum": 1, "maximum": 247464144}}},
+        {"required": ["provider", "maximum_bytes", "bytes"],
+         "properties": {"provider": {"const": "claude"}, "maximum_bytes": {"const": 197220928},
+                        "bytes": {"type": "integer", "minimum": 1, "maximum": 197220928}}}
+      ]
+    },
+    "streamDigest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "sha256"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 262144},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "codesignCommand": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv", "cwd", "exit_code", "start_utc", "end_utc", "start_monotonic_ns", "end_monotonic_ns", "duration_ns", "stdout", "stderr"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "cwd": {"const": "/"},
+        "exit_code": {"type": "integer", "minimum": 0},
+        "start_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+        "end_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "stdout": {"$ref": "#/$defs/streamDigest"},
+        "stderr": {"$ref": "#/$defs/streamDigest"}
+      }
+    },
+    "codesignRecord": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "display_result"],
+          "properties": {
+            "state": {"const": "unsigned"},
+            "display_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "identifier", "team_identifier", "cdhash", "designated_requirement", "codedirectory_flags", "display_result", "strict_verify_result"],
+          "properties": {
+            "state": {"const": "adhoc_signed"},
+            "identifier": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "team_identifier": {"type": "null"},
+            "cdhash": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "designated_requirement": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "codedirectory_flags": {"type": "integer", "minimum": 0},
+            "display_result": {"$ref": "#/$defs/codesignCommand"},
+            "strict_verify_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "identifier", "team_identifier", "cdhash", "designated_requirement", "codedirectory_flags", "display_result", "strict_verify_result"],
+          "properties": {
+            "state": {"const": "team_signed"},
+            "identifier": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "team_identifier": {"type": "string", "pattern": "^[A-Z0-9]{10}$"},
+            "cdhash": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "designated_requirement": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "codedirectory_flags": {"type": "integer", "minimum": 0},
+            "display_result": {"$ref": "#/$defs/codesignCommand"},
+            "strict_verify_result": {"$ref": "#/$defs/codesignCommand"}
+          }
+        }
+      ]
+    },
+    "codesignSet": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "copy", "mounted"],
+      "properties": {
+        "source": {"$ref": "#/$defs/codesignRecord"},
+        "copy": {"$ref": "#/$defs/codesignRecord"},
+        "mounted": {"$ref": "#/$defs/codesignRecord"}
+      }
+    },
+    "macho": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "native_architecture", "architectures", "magic"],
+      "properties": {
+        "format": {"enum": ["thin32", "thin64", "fat32", "fat64"]},
+        "native_architecture": {"enum": ["arm64", "x86_64"]},
+        "architectures": {
+          "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?:arm64|x86_64|unsupported-[0-9a-f]{8})$"}
+        },
+        "magic": {"type": "string", "pattern": "^[0-9a-f]{8}$"}
+      }
+    },
+    "xattr": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "name_bytes", "bytes", "sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "name_bytes": {"type": "integer", "minimum": 1, "maximum": 255},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 1048576},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "copyTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_monotonic_ns", "end_monotonic_ns", "duration_ns", "bytes", "chunk_bytes", "timeout_ns"],
+      "properties": {
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "bytes": {"type": "integer", "minimum": 1},
+        "chunk_bytes": {"const": 1048576},
+        "timeout_ns": {"const": 10000000000}
+      }
+    },
+    "guardianCommandTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_monotonic_ns", "end_monotonic_ns", "duration_ns", "exit_code", "argv_sha256", "stdout_sha256", "stderr_sha256"],
+      "properties": {
+        "start_monotonic_ns": {"type": "integer", "minimum": 1},
+        "end_monotonic_ns": {"type": "integer", "minimum": 1},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "exit_code": {"const": 0},
+        "argv_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "mountAttachment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "device_identifier", "mountpoint", "filesystem", "bus_protocol", "volume_uuid", "readonly", "options", "disk_info_timing", "attach_timing"],
+      "properties": {
+        "device": {"type": "string", "pattern": "^/dev/disk[0-9]+(?:s[0-9]+)?$"},
+        "device_identifier": {"type": "string", "pattern": "^disk[0-9]+(?:s[0-9]+)?$"},
+        "mountpoint": {"type": "string", "minLength": 1},
+        "filesystem": {"const": "hfs"},
+        "bus_protocol": {"const": "Disk Image"},
+        "volume_uuid": {"type": "string", "minLength": 1},
+        "readonly": {"const": true},
+        "options": {
+          "type": "array", "minItems": 5, "uniqueItems": true, "items": {"type": "string", "minLength": 1},
+          "allOf": [
+            {"contains": {"const": "local"}}, {"contains": {"const": "nodev"}},
+            {"contains": {"const": "nosuid"}}, {"contains": {"const": "read-only"}},
+            {"contains": {"const": "nobrowse"}}
+          ]
+        },
+        "disk_info_timing": {"$ref": "#/$defs/guardianCommandTiming"},
+        "attach_timing": {"$ref": "#/$defs/guardianCommandTiming"}
+      }
+    },
+    "detachReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "mountpoint", "absent", "detach_timing"],
+      "properties": {
+        "device": {"type": "string", "pattern": "^/dev/disk[0-9]+(?:s[0-9]+)?$"},
+        "mountpoint": {"type": "string", "minLength": 1},
+        "absent": {"const": true},
+        "detach_timing": {"$ref": "#/$defs/guardianCommandTiming"}
+      }
+    },
+    "providerCapsuleGuardianState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "state", "provider", "source_bytes", "requested_image_bytes", "maximum_image_bytes", "root", "mountpoint_backing", "image", "attachment", "create_timing", "rw_detach"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "state": {"const": "RO_ATTACHED"},
+        "provider": {"enum": ["claude", "codex"]},
+        "source_bytes": {"type": "integer", "minimum": 1},
+        "requested_image_bytes": {"type": "integer", "minimum": 1},
+        "maximum_image_bytes": {"type": "integer", "minimum": 1},
+        "root": {"type": "string", "minLength": 1},
+        "mountpoint_backing": {"$ref": "#/$defs/identity"},
+        "image": {"$ref": "#/$defs/externalFile"},
+        "attachment": {"$ref": "#/$defs/mountAttachment"},
+        "create_timing": {"$ref": "#/$defs/guardianCommandTiming"},
+        "rw_detach": {"$ref": "#/$defs/detachReceipt"}
+      }
+    },
+    "providerCapsuleGuardian": {
+      "type": "object", "additionalProperties": false,
+      "required": ["create_sequence", "seal_sequence", "create_digest", "sealed_digest", "capsule"],
+      "properties": {
+        "create_sequence": {"const": 1},
+        "seal_sequence": {"const": 2},
+        "create_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sealed_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "capsule": {"$ref": "#/$defs/providerCapsuleGuardianState"}
+      }
+    },
+    "providerCapsule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "provider", "source", "macho", "xattrs", "copy", "mounted", "signing", "copy_timing", "guardian"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "provider": {"enum": ["claude", "codex"]},
+        "source": {"$ref": "#/$defs/providerExecutable"},
+        "macho": {"$ref": "#/$defs/macho"},
+        "xattrs": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/xattr"}},
+        "copy": {"$ref": "#/$defs/externalFile"},
+        "mounted": {"$ref": "#/$defs/providerExecutable"},
+        "signing": {"$ref": "#/$defs/codesignSet"},
+        "copy_timing": {"$ref": "#/$defs/copyTiming"},
+        "guardian": {"$ref": "#/$defs/providerCapsuleGuardian"}
+      }
+    },
+    "testBarrier": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"const": false}}},
+        {"type": "object", "additionalProperties": false,
+         "required": ["enabled", "protocol_version", "root", "root_identity", "root_binding", "token", "token_sha256", "phase", "invocation"],
+         "properties": {"enabled": {"const": true}, "protocol_version": {"const": 2},
+           "root": {"type": "string", "minLength": 1},
+           "root_identity": {"$ref": "#/$defs/testBarrierRootIdentity"},
+           "root_binding": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+           "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+           "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+           "phase": {"enum": ["manifest_read", "dispatch_commit", "use_exec", "cleanup_commit", "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"]},
+           "invocation": {"type": "string", "pattern": "^[0-9a-f]{48}$"}}}
+      ]
+    },
+    "testBarrierRootIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dev", "ino", "uid", "mode"],
+      "properties": {
+        "dev": {"type": "integer", "minimum": 0}, "ino": {"type": "integer", "minimum": 1},
+        "uid": {"type": "integer", "minimum": 0}, "mode": {"const": 448}
+      }
+    },
+    "protectedFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1}, "dev": {"type": "integer", "minimum": 0},
+        "ino": {"type": "integer", "minimum": 1}, "uid": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0, "maximum": 4095}, "nlink": {"const": 1},
+        "bytes": {"type": "integer", "minimum": 0}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "object": {
+      "type": "object", "additionalProperties": false, "required": ["oid", "type", "size", "sha256"],
+      "properties": {"oid": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "type": {"enum": ["blob", "tree", "commit", "tag"]}, "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "inventory": {
+      "type": "object", "additionalProperties": false, "required": ["entries", "sha256", "bytes"],
+      "properties": {"entries": {"type": "integer", "minimum": 0}, "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "protected": {
+      "type": "object", "additionalProperties": false,
+      "required": ["gitfile", "config", "candidate_ref", "base_ref", "harness_authority", "packs"],
+      "properties": {"gitfile": {"$ref": "#/$defs/protectedFile"}, "config": {"$ref": "#/$defs/protectedFile"},
+        "candidate_ref": {"$ref": "#/$defs/protectedFile"}, "base_ref": {"$ref": "#/$defs/protectedFile"},
+        "harness_authority": {"$ref": "#/$defs/protectedFile"},
+        "packs": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"$ref": "#/$defs/protectedFile"}}}
+    },
+    "capsule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["project", "common", "hooks", "root_identity", "project_identity", "common_identity", "objects_identity", "hooks_identity", "payload_tree", "closure", "fixture_tip", "fixture_tree", "protected", "real_root", "real_common", "real_common_before"],
+      "properties": {
+        "project": {"type": "string", "minLength": 1}, "common": {"type": "string", "minLength": 1},
+        "hooks": {"type": "string", "minLength": 1}, "root_identity": {"$ref": "#/$defs/identity"},
+        "project_identity": {"$ref": "#/$defs/identity"}, "common_identity": {"$ref": "#/$defs/identity"},
+        "objects_identity": {"$ref": "#/$defs/identity"}, "payload_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "hooks_identity": {"$ref": "#/$defs/identity"},
+        "closure": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/object"}},
+        "fixture_tip": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "fixture_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "protected": {"$ref": "#/$defs/protected"}, "real_root": {"type": "string", "minLength": 1},
+        "real_common": {"type": "string", "minLength": 1}, "real_common_before": {"$ref": "#/$defs/inventory"}
+      }
+    }
+  }
+}

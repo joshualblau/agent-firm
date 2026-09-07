@@ -396,7 +396,7 @@ fi
 # decision cannot live there; and tests/test-new-run.sh asserts the exact adjacent substring
 # "default_branch":"","default_branch_start_sha":"", so a field inserted between those two keys would
 # break a pre-existing assertion. The ledger is append-only and its consumers read by key.
-printf '{"ts":"%s","event":"run_started","event_id":"evt-run-started-%s","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s","base_source":"%s"}\n' \
+printf '{"ts":"%s","event":"run_started","event_id":"evt-run-started-%s","run_id":"%s","repo":"%s","base_sha":"%s","track":"%s","primary_provider":"%s","default_branch":"%s","default_branch_start_sha":"%s","base_source":"%s","evidence_seal_protocol":"1"}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$run_id" "$repo" "$base_sha" "$track" "$primary" "$default_branch" "$default_branch_start_sha" "$base_source" >> "$run_dir/run.jsonl"
 chmod 600 "$run_dir/run.jsonl"
 

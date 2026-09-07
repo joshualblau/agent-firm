@@ -1,0 +1,19 @@
+name: final-evidence-seal
+description: A full-track run persists and independently verifies one exact pre-secondary evidence seal, proves the complete closed AC-007 mutation matrix with immutable per-family evidence, and blocks stale, omitted, circular, placeholder-command, and unexpected-ledger mutations.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  - file_exists: src/value.txt
+  - test_passes: sh test/run-tests.sh
+  - artifact_exists: 09-test-evidence/final-evidence/g1/seal.json
+  - artifact_exists: 09-test-evidence/final-evidence/g1/privacy.json
+  - artifact_exists: 09-test-evidence/final-evidence/g1/complete-local-pr-body.md
+  - artifact_exists: 09-test-evidence/mutation-evidence/ac007-manifest.json
+  # Load-bearing: this fails the eval when ANY required AC-007 family is missing, stale, mutable,
+  # duplicated, mismatched, unproduced or changed after publication -- even when every assertion
+  # above still passes. A green successful path is not evidence the mutation matrix ran.
+  - mutation_matrix_proven: true
+  - traceability_passes: true
+  - verdict_is: APPROVE
+  - final_gate_pending: true
+  - no_default_branch_merge: true

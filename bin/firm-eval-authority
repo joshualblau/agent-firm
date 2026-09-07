@@ -1,0 +1,2443 @@
+#!/usr/bin/env bash
+# Private candidate-tool authority used only by firm-run-evals.
+set -uo pipefail
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do __dir="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__dir/$__src";; esac; done
+__self="$(cd -P "$(dirname "$__src")" && pwd)"
+. "$__self/firm-python"
+exec "${FIRM_PYTHON_ARGV[@]}" - "$__src" "$@" <<'PY'
+import argparse, ctypes, errno, hashlib, hmac, json, os, platform, plistlib, re, secrets, selectors, shlex, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SELF = Path(sys.argv[1]).resolve()
+ARGV = sys.argv[2:]
+PATCH_BASE = "369c86b18027281fcfec1288efaa1255df315c35"
+PATCH_COMMIT = "36acf5dd5ec1a3a22b797a30b053d4e592ce5c60"
+PAYLOAD_COMMIT = "a57a8d0b4754ed92b74c023c340aab3154845abb"
+PATCH_BYTES = 144413
+PATCH_SHA256 = "7e79d4dc34a7fdcf540781fee5a35c006b6dc4aefabfbac1636c5b855c502829"
+MAX_MESSAGE = 256 * 1024
+HEX64 = set("0123456789abcdef")
+GIT = str(Path(shutil.which("git") or "/usr/bin/git").resolve())
+SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+HDIUTIL = Path("/usr/bin/hdiutil")
+DISKUTIL = Path("/usr/sbin/diskutil")
+CODESIGN = Path("/usr/bin/codesign")
+MOUNT = Path("/sbin/mount")
+PROFILE_SOURCE = b'''(version 1)\n(allow default)\n(deny file-read* file-write* (subpath (param "REAL_COMMON")))\n'''
+GUARDIAN_PROTOCOL_VERSION = 3
+GUARDIAN_SOCKET_NAME = "guardian.sock"
+GUARDIAN_STABLE_IDENTITY = ("dev", "ino", "uid", "mode")
+TEST_BARRIER_PHASES = {"manifest_read", "dispatch_commit", "use_exec", "cleanup_commit",
+                       "provider_stream", "provider_preexec", "capsule_copy", "capsule_preexec"}
+TEST_BARRIER_PROTOCOL_VERSION = 2
+TEST_BARRIER_TIMEOUT_SECONDS = 10
+PROVIDER_EXECUTABLE_MAX_BYTES = {"codex": 247464144, "claude": 197220928}
+PROVIDER_EXECUTABLE_CHUNK_BYTES = 1024 * 1024
+PROVIDER_EXECUTABLE_TIMEOUT_NS = 10_000_000_000
+PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS = 30
+PROVIDER_CAPSULE_METADATA_MAX_COUNT = 64
+PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES = 255
+PROVIDER_CAPSULE_METADATA_MAX_VALUE_BYTES = 1024 * 1024
+PROVIDER_CAPSULE_METADATA_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES = 32 * 1024 * 1024
+CODESIGN_RESULT_MAX_BYTES = 256 * 1024
+CODESIGN_IDENTIFIER_MAX_BYTES = 1024
+CODESIGN_REQUIREMENT_MAX_BYTES = 16 * 1024
+PROVIDER_EXECUTABLE_FIELDS = {"provider", "maximum_bytes", "chunk_bytes", "timeout_ns", "path",
+                              "dev", "ino", "uid", "mode", "nlink", "bytes", "sha256"}
+SAFE_GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_COUNT": "0",
+    "GIT_TERMINAL_PROMPT": "0", "GIT_PROTOCOL_FROM_USER": "0",
+}
+
+def fail(message):
+    print("firm-eval-authority: INPUT_INVALID: " + message, file=sys.stderr)
+    raise SystemExit(2)
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+def digest_bytes(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def read_bytes(path, maximum=16 * 1024 * 1024):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > maximum:
+            fail("unsafe file")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk: break
+            total += len(chunk)
+            if total > maximum: fail("oversized file")
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if identity(st) != identity(after): fail("file changed while read")
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+def identity(st):
+    return {"dev": st.st_dev, "ino": st.st_ino, "uid": st.st_uid,
+            "mode": stat.S_IMODE(st.st_mode), "nlink": st.st_nlink,
+            "bytes": st.st_size}
+
+def no_symlink_components(path):
+    path = Path(path)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if stat.S_ISLNK(os.lstat(str(current)).st_mode): fail("symlinked path component")
+
+def git(root, *args, binary=False):
+    env = {"PATH":"/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL":"C"}
+    env.update(SAFE_GIT_ENV)
+    value = subprocess.check_output([GIT, "-C", str(root)] + list(args),
+                                    stderr=subprocess.DEVNULL, env=env)
+    return value if binary else value.decode("utf-8", "strict").strip()
+
+def prove_patch(root, head):
+    commits = git(root, "rev-list", "--first-parent", head).splitlines()
+    for commit in commits:
+        parents = git(root, "show", "-s", "--format=%P", commit).split()
+        if parents == [PATCH_BASE]:
+            raw = git(root, "diff", "--binary", "--full-index", PATCH_BASE, commit, binary=True)
+            if len(raw) == PATCH_BYTES and digest_bytes(raw) == PATCH_SHA256:
+                return commit
+            fail("immutable patch identity mismatch")
+    fail("immutable patch commit not found")
+
+def put_file(path, raw, mode):
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), mode)
+    try:
+        view = memoryview(raw)
+        while view:
+            count = os.write(fd, view); view = view[count:]
+        os.fsync(fd)
+    finally: os.close(fd)
+
+def path_record(path, content=True):
+    path = Path(path); no_symlink_components(path)
+    st = os.lstat(str(path))
+    if st.st_uid != os.getuid() or (stat.S_ISREG(st.st_mode) and st.st_nlink != 1):
+        fail("unsafe owned path identity")
+    item = identity(st)
+    if stat.S_ISREG(st.st_mode) and content:
+        raw, after = read_bytes(path, 512 * 1024 * 1024)
+        if identity(after) != item: fail("identity changed while recorded")
+        item["sha256"] = digest_bytes(raw)
+    return item
+
+def tree_inventory(root):
+    root = Path(root); rows=[]
+    for current, dirs, files in os.walk(str(root), topdown=True, followlinks=False):
+        dirs.sort(); files.sort()
+        for name in dirs + files:
+            path=Path(current)/name; st=os.lstat(str(path)); rel=str(path.relative_to(root))
+            if stat.S_ISLNK(st.st_mode): fail("symlink in protected tree")
+            if st.st_uid != os.getuid(): fail("foreign path in protected tree")
+            if stat.S_ISREG(st.st_mode):
+                if st.st_nlink != 1: fail("hardlink in protected tree")
+                raw,after=read_bytes(path,512*1024*1024)
+                if identity(st)!=identity(after): fail("protected tree changed while read")
+                rows.append({"path":rel,"kind":"file","mode":stat.S_IMODE(st.st_mode),
+                             "bytes":len(raw),"sha256":digest_bytes(raw)})
+            elif stat.S_ISDIR(st.st_mode):
+                rows.append({"path":rel,"kind":"dir","mode":stat.S_IMODE(st.st_mode)})
+            else: fail("special path in protected tree")
+    raw=(canonical(rows)+"\n").encode("ascii")
+    return {"entries":len(rows),"sha256":digest_bytes(raw),"bytes":len(raw)}
+
+def owned_directory(path, mode=0o700):
+    st=os.lstat(str(path))
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid!=os.getuid()
+            or stat.S_IMODE(st.st_mode)!=mode):
+        fail("unsafe owned directory")
+    return st
+
+def provider_capsule_image_size(provider, source_bytes):
+    maximum=PROVIDER_EXECUTABLE_MAX_BYTES.get(provider)
+    if maximum is None or not isinstance(source_bytes,int) or source_bytes<1 or source_bytes>maximum:
+        raise RuntimeError("provider capsule size policy")
+    quantum=1024*1024
+    requested=((source_bytes+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES+quantum-1)//quantum)*quantum
+    maximum_image=((maximum+PROVIDER_CAPSULE_IMAGE_OVERHEAD_BYTES+quantum-1)//quantum)*quantum
+    if requested>maximum_image: raise RuntimeError("provider capsule image cap")
+    return requested,maximum_image
+
+def guardian_run(argv, timeout=PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS):
+    started=time.monotonic_ns()
+    try:
+        done=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            close_fds=True,timeout=timeout,
+                            env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+    except (OSError,subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("provider capsule command unavailable: %s"%type(exc).__name__)
+    finished=time.monotonic_ns()
+    if done.returncode!=0:
+        message=done.stderr.decode("utf-8","replace").strip().replace("\n"," ")[:500]
+        raise RuntimeError("provider capsule command failed rc=%d: %s"%(done.returncode,message))
+    return done.stdout,{"start_monotonic_ns":started,"end_monotonic_ns":finished,
+                        "duration_ns":finished-started,"exit_code":done.returncode,
+                        "argv_sha256":digest_bytes(canonical(argv).encode("ascii")),
+                        "stdout_sha256":digest_bytes(done.stdout),"stderr_sha256":digest_bytes(done.stderr)}
+
+def guardian_mount_line(mountpoint):
+    raw,_=guardian_run([str(MOUNT)])
+    prefix=None
+    suffix=" on "+mountpoint+" ("
+    rows=[]
+    for line in raw.decode("utf-8","strict").splitlines():
+        if suffix in line and line.endswith(")"):
+            device,options=line.split(suffix,1); rows.append((device,options[:-1]))
+    if len(rows)!=1: raise RuntimeError("provider capsule mount identity")
+    device,raw_options=rows[0]
+    options=sorted(item.strip() for item in raw_options.split(",") if item.strip())
+    return device,options
+
+def guardian_mount_record(device, mountpoint, readonly):
+    observed_device,options=guardian_mount_line(mountpoint)
+    if observed_device!=device or ("read-only" in options)!=readonly or "nobrowse" not in options:
+        raise RuntimeError("provider capsule mount flags")
+    if readonly and not {"local","nodev","nosuid","read-only","nobrowse"}.issubset(set(options)):
+        raise RuntimeError("provider capsule read-only flags")
+    raw,timing=guardian_run([str(DISKUTIL),"info","-plist",device])
+    try: info=plistlib.loads(raw)
+    except Exception: raise RuntimeError("provider capsule disk info")
+    identifier=device.removeprefix("/dev/")
+    if (not isinstance(info,dict) or info.get("MountPoint")!=mountpoint
+            or info.get("DeviceIdentifier")!=identifier or info.get("FilesystemType")!="hfs"
+            or info.get("BusProtocol")!="Disk Image"
+            or not isinstance(info.get("VolumeUUID"),str) or not info["VolumeUUID"]):
+        raise RuntimeError("provider capsule disk identity")
+    return {"device":device,"device_identifier":identifier,"mountpoint":mountpoint,
+            "filesystem":"hfs","bus_protocol":"Disk Image","volume_uuid":info["VolumeUUID"],
+            "readonly":readonly,"options":options,"disk_info_timing":timing}
+
+def guardian_attach(image, mountpoint, readonly):
+    argv=[str(HDIUTIL),"attach","-kernel","-readonly" if readonly else "-readwrite",
+          "-nobrowse","-owners","on","-mountpoint",mountpoint,"-plist",image]
+    raw,timing=guardian_run(argv)
+    try: result=plistlib.loads(raw)
+    except Exception: raise RuntimeError("provider capsule attach result")
+    entities=result.get("system-entities") if isinstance(result,dict) else None
+    mounted=[] if not isinstance(entities,list) else [item for item in entities
+        if isinstance(item,dict) and item.get("mount-point")==mountpoint and isinstance(item.get("dev-entry"),str)]
+    if len(mounted)!=1: raise RuntimeError("provider capsule attach ambiguity")
+    device=mounted[0]["dev-entry"]
+    if not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)?",device):
+        raise RuntimeError("provider capsule device identity")
+    record=guardian_mount_record(device,mountpoint,readonly)
+    record["attach_timing"]=timing
+    return record
+
+def guardian_reprove_attachment(expected):
+    observed=guardian_mount_record(expected["device"],expected["mountpoint"],expected["readonly"])
+    observed["attach_timing"]=expected["attach_timing"]
+    observed["disk_info_timing"]=expected["disk_info_timing"]
+    if observed!=expected: raise RuntimeError("provider capsule attachment drift")
+
+def guardian_detach_attachment(expected):
+    guardian_reprove_attachment(expected)
+    _,timing=guardian_run([str(HDIUTIL),"detach",expected["device"]])
+    try: guardian_mount_line(expected["mountpoint"])
+    except RuntimeError:
+        return {"device":expected["device"],"mountpoint":expected["mountpoint"],"absent":True,
+                "detach_timing":timing}
+    raise RuntimeError("provider capsule detach residue")
+
+def guardian_hash_fd(fd, maximum):
+    before=os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size<1 or before.st_size>maximum:
+        raise RuntimeError("provider capsule image identity")
+    digest=hashlib.sha256(); total=0; deadline=time.monotonic_ns()+PROVIDER_EXECUTABLE_TIMEOUT_NS
+    while total<before.st_size:
+        if time.monotonic_ns()>=deadline: raise RuntimeError("provider capsule image hash timeout")
+        part=os.pread(fd,min(PROVIDER_EXECUTABLE_CHUNK_BYTES,before.st_size-total),total)
+        if not part: raise RuntimeError("provider capsule image short read")
+        digest.update(part); total+=len(part)
+    after=os.fstat(fd)
+    if provider_stat_stability(before)!=provider_stat_stability(after):
+        raise RuntimeError("provider capsule image drift")
+    return {**identity(before),"sha256":digest.hexdigest()}
+
+def guardian_capsule_public(state):
+    if state is None: return {"state":"ABSENT"}
+    return {key:value for key,value in state.items() if not key.startswith("_")}
+
+def guardian_capsule_digest(state):
+    return digest_bytes(canonical(guardian_capsule_public(state)).encode("ascii"))
+
+def guardian_capsule_close(state):
+    if state is None: return
+    for key in ("_mount_fd","_image_fd"):
+        descriptor=state.pop(key,None)
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+
+def guardian_capsule_detach(state):
+    if state is None: return {"state":"ABSENT","absent":True}
+    attachment=state.get("attachment")
+    if state.get("_mount_fd") is not None:
+        os.close(state.pop("_mount_fd"))
+    if state.get("state") not in ("RW_ATTACHED","RO_ATTACHED") or not isinstance(attachment,dict):
+        raise RuntimeError("provider capsule cleanup state")
+    receipt=guardian_detach_attachment(attachment)
+    state["state"]="DETACHED"; state["detach"]=receipt; state.pop("attachment",None)
+    descriptor=state.pop("_image_fd",None)
+    if descriptor is not None: os.close(descriptor)
+    return receipt
+
+def guardian_auth(token, record):
+    return hmac.new(bytes.fromhex(token),canonical(record).encode("ascii"),hashlib.sha256).hexdigest()
+
+def guardian_signed(token, unsigned):
+    value=dict(unsigned); value["auth"]=guardian_auth(token,unsigned)
+    return value
+
+def guardian_root_binding(root_id):
+    if not isinstance(root_id,dict) or any(not isinstance(root_id.get(key),int) for key in GUARDIAN_STABLE_IDENTITY):
+        return ""
+    stable={key:root_id[key] for key in GUARDIAN_STABLE_IDENTITY}
+    return digest_bytes(canonical(stable).encode("ascii"))
+
+def test_barrier_config(root, token, phase, invocation):
+    root=Path(root).resolve(); root_st=owned_directory(root)
+    if (not re.fullmatch(r"[0-9a-f]{64}",str(token)) or phase not in TEST_BARRIER_PHASES
+            or not re.fullmatch(r"[0-9a-f]{48}",str(invocation))):
+        fail("test barrier binding")
+    root_identity={key:identity(root_st)[key] for key in GUARDIAN_STABLE_IDENTITY}
+    return {"enabled":True,"protocol_version":TEST_BARRIER_PROTOCOL_VERSION,"root":str(root),
+            "root_identity":root_identity,"root_binding":guardian_root_binding(root_identity),
+            "token":token,"token_sha256":digest_bytes(bytes.fromhex(token)),
+            "phase":phase,"invocation":invocation}
+
+def validate_test_barrier_config(config):
+    required={"enabled","protocol_version","root","root_identity","root_binding","token",
+              "token_sha256","phase","invocation"}
+    if (not isinstance(config,dict) or not exact_keys(config,required) or config.get("enabled") is not True
+            or config.get("protocol_version")!=TEST_BARRIER_PROTOCOL_VERSION
+            or not re.fullmatch(r"[0-9a-f]{64}",str(config.get("token","")))
+            or config.get("token_sha256")!=digest_bytes(bytes.fromhex(config["token"]))
+            or config.get("phase") not in TEST_BARRIER_PHASES
+            or not re.fullmatch(r"[0-9a-f]{48}",str(config.get("invocation","")))):
+        fail("test barrier config")
+    root=Path(config["root"])
+    if not root.is_absolute() or root.resolve()!=root: fail("test barrier root")
+    root_st=owned_directory(root)
+    current={key:identity(root_st)[key] for key in GUARDIAN_STABLE_IDENTITY}
+    if current!=config.get("root_identity") or guardian_root_binding(current)!=config.get("root_binding"):
+        fail("test barrier root identity")
+    return root
+
+def reprove_test_barrier_root(config,root_fd):
+    try:
+        descriptor={key:identity(os.fstat(root_fd))[key] for key in GUARDIAN_STABLE_IDENTITY}
+        named={key:identity(os.lstat(config["root"]))[key] for key in GUARDIAN_STABLE_IDENTITY}
+    except OSError: fail("test barrier root unavailable")
+    if descriptor!=config["root_identity"] or named!=descriptor:
+        fail("test barrier root drift")
+
+def guardian_registration_digest(registrations):
+    rows=[{"sequence":item["sequence"],"role":item["role"],"pid":item["pid"],
+           "pgid":item["pgid"],"nonce":item["nonce"],"request_sha256":item["request_sha256"]}
+          for item in sorted(registrations,key=lambda item:item["sequence"])]
+    return digest_bytes(canonical(rows).encode("ascii"))
+
+def guardian_write_all(fd, raw):
+    view=memoryview(raw)
+    while view:
+        count=os.write(fd,view)
+        if count<=0: raise RuntimeError("guardian short write")
+        view=view[count:]
+
+def guardian_recv_frame(connection, timeout):
+    connection.settimeout(timeout); raw=b""
+    while True:
+        part=connection.recv(min(65536,MAX_MESSAGE+1-len(raw)))
+        if not part: break
+        raw+=part
+        if len(raw)>MAX_MESSAGE: raise RuntimeError("guardian oversized frame")
+    if not raw.endswith(b"\n") or raw.count(b"\n")!=1:
+        raise RuntimeError("guardian partial or extra frame")
+    try: value=json.loads(raw[:-1].decode("ascii"))
+    except Exception: raise RuntimeError("guardian malformed frame")
+    if not isinstance(value,dict): raise RuntimeError("guardian frame shape")
+    return value
+
+def guardian_send_frame(connection, token, unsigned):
+    value=guardian_signed(token,unsigned)
+    raw=(canonical(value)+"\n").encode("ascii")
+    if len(raw)>MAX_MESSAGE: raise RuntimeError("guardian response too large")
+    connection.sendall(raw); connection.shutdown(socket.SHUT_WR)
+
+def guardian_verify_response(token, response):
+    if not isinstance(response,dict): fail("guardian response shape")
+    value=dict(response); auth=value.pop("auth",None)
+    if not isinstance(auth,str) or not hmac.compare_digest(auth,guardian_auth(token,value)):
+        fail("guardian response authentication")
+    return value,auth
+
+def guardian_client_request(control, token, unsigned, timeout=10):
+    if not re.fullmatch(r"[0-9a-f]{64}",token): fail("guardian token")
+    socket_path=Path(control)/GUARDIAN_SOCKET_NAME
+    owned_directory(Path(control)); socket_st=os.lstat(str(socket_path))
+    if (not stat.S_ISSOCK(socket_st.st_mode) or socket_st.st_uid!=os.getuid()
+            or stat.S_IMODE(socket_st.st_mode)!=0o600):
+        fail("guardian socket identity")
+    request=guardian_signed(token,unsigned)
+    raw=(canonical(request)+"\n").encode("ascii")
+    if len(raw)>MAX_MESSAGE: fail("guardian request too large")
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    try:
+        connection.settimeout(timeout); connection.connect(str(socket_path))
+        connection.sendall(raw); connection.shutdown(socket.SHUT_WR)
+        response=guardian_recv_frame(connection,timeout)
+    except (OSError,RuntimeError) as exc:
+        fail("guardian request failed: %s"%exc)
+    finally: connection.close()
+    value,auth=guardian_verify_response(token,response)
+    value["auth"]=auth
+    return value
+
+def write_failure_marker(parent_fd, marker_name, token, invocation, root, root_binding,
+                         reason, request=None):
+    value={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"status":"BLOCK",
+           "invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,"root":str(root),
+           "root_binding":root_binding,"reason":str(reason)[:1000],"guardian_pid":os.getpid(),
+           "request_sha256":request.get("request_sha256") if request else None,
+           "request_sequence":request.get("sequence") if request else None,
+           "monotonic_ns":time.monotonic_ns()}
+    raw=(canonical(guardian_signed(token,value))+"\n").encode("ascii")
+    fd=os.open(marker_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600,
+               dir_fd=parent_fd)
+    try: guardian_write_all(fd,raw); os.fsync(fd)
+    finally: os.close(fd)
+
+def remove_owned_tree_fd(fd):
+    for entry in list(os.scandir(fd)):
+        st=os.stat(entry.name,dir_fd=fd,follow_symlinks=False)
+        if st.st_uid!=os.getuid(): raise RuntimeError("foreign cleanup entry")
+        if stat.S_ISDIR(st.st_mode):
+            child=os.open(entry.name,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0),dir_fd=fd)
+            try: remove_owned_tree_fd(child)
+            finally: os.close(child)
+            os.rmdir(entry.name,dir_fd=fd)
+        elif stat.S_ISREG(st.st_mode):
+            if st.st_nlink!=1: raise RuntimeError("hardlinked cleanup entry")
+            os.unlink(entry.name,dir_fd=fd)
+        elif stat.S_ISLNK(st.st_mode):
+            os.unlink(entry.name,dir_fd=fd)
+        else: raise RuntimeError("special cleanup entry")
+
+def test_barrier_signed(token, unsigned):
+    value=dict(unsigned); value["auth"]=guardian_auth(token,unsigned)
+    return value
+
+def test_barrier_put(path, token, unsigned):
+    # O_EXCL is the one-use property: each state of the machine may be published exactly once, so a
+    # second wrapper sharing the root, or a replay of an earlier run, collides here instead of
+    # silently overwriting a state another reader has already bound itself to.  The collision is a
+    # stated BLOCK rather than an unhandled FileExistsError, because an unhandled traceback out of a
+    # pre-exec guard is exactly the ambiguous outcome this barrier exists to remove.
+    try: put_file(path,(canonical(test_barrier_signed(token,unsigned))+"\n").encode("ascii"),0o600)
+    except OSError: fail("test barrier exclusive state publication")
+
+def test_barrier_names(root):
+    try:
+        with os.scandir(str(root)) as entries: return {entry.name for entry in entries}
+    except OSError: fail("test barrier root enumeration")
+
+def test_barrier_read(path, token, label):
+    try: raw,st=read_bytes(path,MAX_MESSAGE)
+    except (OSError,SystemExit): fail("test barrier "+label+" state")
+    if stat.S_IMODE(st.st_mode)!=0o600: fail("test barrier "+label+" mode")
+    try: value=json.loads(raw.decode("ascii"))
+    except Exception: fail("test barrier "+label+" JSON")
+    if raw!=(canonical(value)+"\n").encode("ascii") or not isinstance(value,dict):
+        fail("test barrier "+label+" canonical state")
+    unsigned=dict(value); auth=unsigned.pop("auth",None)
+    if not isinstance(auth,str) or not hmac.compare_digest(auth,guardian_auth(token,unsigned)):
+        fail("test barrier "+label+" authentication")
+    return value,unsigned,digest_bytes(raw)
+
+def test_barrier_wait(path, label):
+    deadline=time.monotonic()+TEST_BARRIER_TIMEOUT_SECONDS
+    while time.monotonic()<deadline:
+        try:
+            os.lstat(str(path)); return
+        except FileNotFoundError: time.sleep(0.005)
+        except OSError: fail("test barrier "+label+" state")
+    fail("test barrier "+label+" timeout")
+
+def capsule_preexec_barrier(config, observed):
+    # The exclusive, authenticated, one-use state machine that opens the check-then-use window for a
+    # synchronized mutator, and refuses to open it at all unless every binding below holds.
+    #
+    # READY -> MUTATED -> RESUME -> RELEASE -> CONSUMED.  The wrapper publishes READY, RESUME and
+    # CONSUMED; the mutator publishes MUTATED and RELEASE.  Each record is HMAC-authenticated under
+    # the barrier token, canonically encoded, and chained to the digest of the record before it, so
+    # the sequence cannot be reordered, spliced, or partially replayed.
+    #
+    # WHAT IS BOUND, and why each one is load-bearing:
+    #   root/root_identity/root_binding  the owned 0700 directory this run was given, proven by
+    #                                    descriptor AND by name before every state transition, so a
+    #                                    swapped or remounted barrier root is caught mid-protocol.
+    #   token/token_sha256               a random per-run secret.  State FILENAMES use the digest,
+    #                                    never the token, so the secret is not published by listing.
+    #   invocation                       the run.  A record minted for another run does not verify.
+    #   phase                            this exact phase; a record for another phase is foreign.
+    #   wrapper_pid                      the live pre-exec process.  A record naming another process
+    #                                    (`wrong_process`) is refused even when correctly signed.
+    #   capsule_digest                   the sealed capsule.  A record from another capsule
+    #                                    (`cross_capsule`) is refused.
+    #   mounted/logical_argv             the exact executable identity and argv about to be used.
+    #
+    # BOUNDED BY CONSTRUCTION: there is no unbounded wait anywhere.  Both waits are
+    # TEST_BARRIER_TIMEOUT_SECONDS deadline loops (test_barrier_wait), the state machine is a fixed
+    # five-step sequence with no retry, and every enumeration reads one directory once.  An absent,
+    # late, or never-arriving counterparty therefore ends as a timeout BLOCK, not a hang.
+    #
+    # PRODUCTION REACHABILITY: none.  test_barrier() only routes here when the manifest carries an
+    # enabled barrier AND the four environment variables match it exactly; a production manifest
+    # carries {"enabled": false} and prepare() refuses to build one while any of those variables is
+    # set at all.  The provider never inherits them (provider_exec strips them before execve).
+    root=validate_test_barrier_config(config); token=config["token"]
+    if config["phase"]!="capsule_preexec": return
+    if (not isinstance(observed,dict)
+            or not exact_keys(observed,{"capsule_digest","mounted","logical_argv"})
+            or not re.fullmatch(r"[0-9a-f]{64}",str(observed.get("capsule_digest","")))
+            or not isinstance(observed.get("mounted"),dict)
+            or not isinstance(observed.get("logical_argv"),list) or not observed["logical_argv"]
+            or any(not isinstance(value,str) or "\0" in value for value in observed["logical_argv"])):
+        fail("capsule preexec barrier observation")
+    try: root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    except OSError: fail("capsule preexec barrier root")
+    reprove_test_barrier_root(config,root_fd)
+    # The root must be EMPTY on entry.  This is what makes "early" and "replayed" state detectable:
+    # a RELEASE or CONSUMED record planted before the wrapper ever arrives cannot be mistaken for
+    # one this run produced, because this run refuses to start on a root that already holds state.
+    if test_barrier_names(root): os.close(root_fd); fail("capsule preexec barrier pre-existing state")
+    token_id=config["token_sha256"]
+    prefix=root/(token_id+".capsule_preexec")
+    paths={name:Path(str(prefix)+"."+name) for name in ("ready","mutated","resume","release","consumed")}
+    wrapper_pid=os.getpid()
+    try:
+        if os.getpgid(wrapper_pid)<=0: raise ProcessLookupError
+        os.kill(wrapper_pid,0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier wrapper not live")
+    common={"schema_version":1,"protocol_version":TEST_BARRIER_PROTOCOL_VERSION,
+            "phase":"capsule_preexec","token_sha256":token_id,"invocation":config["invocation"],
+            "barrier_root":str(root),"barrier_root_binding":config["root_binding"],
+            "wrapper_pid":wrapper_pid,"capsule_digest":observed["capsule_digest"],
+            "mounted":observed["mounted"],"logical_argv":observed["logical_argv"]}
+    enter_ns=time.monotonic_ns()
+    ready_unsigned={**common,"state":"READY","enter_monotonic_ns":enter_ns}
+    reprove_test_barrier_root(config,root_fd)
+    test_barrier_put(paths["ready"],token,ready_unsigned)
+    _,ready,ready_sha=test_barrier_read(paths["ready"],token,"ready")
+    if ready!=ready_unsigned: fail("capsule preexec barrier ready binding")
+    test_barrier_wait(paths["mutated"],"mutation")
+    reprove_test_barrier_root(config,root_fd)
+    _,mutation,mutation_sha=test_barrier_read(paths["mutated"],token,"mutation")
+    required=set(common)|{"state","enter_monotonic_ns","ready_sha256","mutator_pid",
+                          "mutate_monotonic_ns","changed"}
+    if (not exact_keys(mutation,required) or any(mutation.get(key)!=value for key,value in common.items())
+            or mutation.get("state")!="MUTATED" or mutation.get("enter_monotonic_ns")!=enter_ns
+            or mutation.get("ready_sha256")!=ready_sha
+            or not isinstance(mutation.get("mutator_pid"),int) or mutation["mutator_pid"]<=0
+            or not isinstance(mutation.get("mutate_monotonic_ns"),int)
+            or mutation["mutate_monotonic_ns"]<=enter_ns
+            or not isinstance(mutation.get("changed"),dict) or not mutation["changed"]):
+        fail("capsule preexec barrier mutation binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier mutator not live")
+    resume_ns=time.monotonic_ns()
+    resume_unsigned={**common,"state":"RESUME","enter_monotonic_ns":enter_ns,
+                     "ready_sha256":ready_sha,"mutator_pid":mutation["mutator_pid"],
+                     "mutation_sha256":mutation_sha,"resume_monotonic_ns":resume_ns}
+    reprove_test_barrier_root(config,root_fd); test_barrier_put(paths["resume"],token,resume_unsigned)
+    test_barrier_wait(paths["release"],"release")
+    reprove_test_barrier_root(config,root_fd)
+    _,release,release_sha=test_barrier_read(paths["release"],token,"release")
+    release_required=set(common)|{"state","enter_monotonic_ns","ready_sha256","mutator_pid",
+                                  "mutation_sha256","resume_sha256","release_monotonic_ns"}
+    resume_raw=(canonical(test_barrier_signed(token,resume_unsigned))+"\n").encode("ascii")
+    if (not exact_keys(release,release_required) or any(release.get(key)!=value for key,value in common.items())
+            or release.get("state")!="RELEASE" or release.get("enter_monotonic_ns")!=enter_ns
+            or release.get("ready_sha256")!=ready_sha or release.get("mutator_pid")!=mutation["mutator_pid"]
+            or release.get("mutation_sha256")!=mutation_sha
+            or release.get("resume_sha256")!=digest_bytes(resume_raw)
+            or not isinstance(release.get("release_monotonic_ns"),int)
+            or release["release_monotonic_ns"]<resume_ns):
+        fail("capsule preexec barrier release binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except (OSError,ProcessLookupError): fail("capsule preexec barrier release process")
+    # Before consuming, the root must hold EXACTLY the four states published so far and nothing
+    # else.  A duplicate or extra record means more than one counterparty wrote into this run's
+    # root, and the wrapper cannot tell which one the release it just verified belongs to — so it
+    # refuses rather than guess.  The same enumeration runs again after CONSUMED is published.
+    if test_barrier_names(root)!={paths[name].name for name in ("ready","mutated","resume","release")}:
+        os.close(root_fd); fail("capsule preexec barrier duplicate state")
+    consumed_unsigned={**common,"state":"CONSUMED","enter_monotonic_ns":enter_ns,
+                       "ready_sha256":ready_sha,"mutator_pid":mutation["mutator_pid"],
+                       "mutation_sha256":mutation_sha,"resume_sha256":digest_bytes(resume_raw),
+                       "release_sha256":release_sha,"consumed_monotonic_ns":time.monotonic_ns()}
+    reprove_test_barrier_root(config,root_fd); test_barrier_put(paths["consumed"],token,consumed_unsigned)
+    if test_barrier_names(root)!={path.name for path in paths.values()}:
+        os.close(root_fd); fail("capsule preexec barrier duplicate state")
+    reprove_test_barrier_root(config,root_fd); os.close(root_fd)
+
+def raw_test_barrier(config, phase, observed):
+    if not config or not config.get("enabled") or config.get("phase")!=phase: return
+    root=validate_test_barrier_config(config)
+    token=config["token"]
+    if not re.fullmatch(r"[0-9a-f]{64}",token) or config.get("invocation") is None:
+        fail("test barrier binding")
+    prefix=str(root/(token+"."+phase))
+    ready=Path(prefix+".ready")
+    mutated=Path(prefix+".mutated")
+    resume=Path(prefix+".resume")
+    release=Path(prefix+".release")
+    if release.exists(): return
+    record={"schema_version":1,"phase":phase,"token":token,"invocation":config["invocation"],
+            "authority_pid":os.getpid(),"enter_monotonic_ns":time.monotonic_ns(),"observed":observed}
+    put_file(ready,(canonical(record)+"\n").encode("ascii"),0o600)
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not mutated.exists(): time.sleep(0.005)
+    if not mutated.exists(): fail("test barrier mutation timeout")
+    mutation_raw,_=read_bytes(mutated,MAX_MESSAGE)
+    try: mutation=json.loads(mutation_raw.decode("ascii"))
+    except Exception: fail("test barrier mutation JSON")
+    required={"schema_version","phase","token","invocation","mutator_pid","mutate_monotonic_ns","changed"}
+    if (not exact_keys(mutation,required) or mutation["schema_version"]!=1 or mutation["phase"]!=phase
+            or mutation["token"]!=token or mutation["invocation"]!=config["invocation"]
+            or not isinstance(mutation["mutator_pid"],int) or mutation["mutator_pid"]<=0
+            or not isinstance(mutation["mutate_monotonic_ns"],int)
+            or mutation["mutate_monotonic_ns"]<=record["enter_monotonic_ns"]
+            or not isinstance(mutation["changed"],dict) or not mutation["changed"]):
+        fail("test barrier mutation binding")
+    try: os.kill(mutation["mutator_pid"],0)
+    except ProcessLookupError: fail("test barrier mutator not concurrent")
+    resume_ns=time.monotonic_ns()
+    put_file(resume,(canonical({"schema_version":1,"phase":phase,"token":token,"invocation":config["invocation"],
+                               "authority_pid":os.getpid(),"resume_monotonic_ns":resume_ns})+"\n").encode("ascii"),0o600)
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not release.exists(): time.sleep(0.005)
+    if not release.exists(): fail("test barrier release timeout")
+    release_raw,_=read_bytes(release,MAX_MESSAGE)
+    try: release_doc=json.loads(release_raw.decode("ascii"))
+    except Exception: fail("test barrier release JSON")
+    if (not exact_keys(release_doc,{"schema_version","phase","token","invocation","mutator_pid","release_monotonic_ns"})
+            or release_doc["schema_version"]!=1 or release_doc["phase"]!=phase or release_doc["token"]!=token
+            or release_doc["invocation"]!=config["invocation"] or release_doc["mutator_pid"]!=mutation["mutator_pid"]
+            or not isinstance(release_doc["release_monotonic_ns"],int) or release_doc["release_monotonic_ns"]<resume_ns):
+        fail("test barrier release binding")
+
+def test_barrier(doc,phase,observed):
+    config=doc.get("test_barrier",{"enabled":False})
+    supplied={"root":os.environ.get("FIRM_EVAL_TEST_BARRIER_ROOT"),
+              "token":os.environ.get("FIRM_EVAL_TEST_BARRIER_TOKEN"),
+              "invocation":os.environ.get("FIRM_EVAL_TEST_BARRIER_INVOCATION"),
+              "phase":os.environ.get("FIRM_EVAL_TEST_BARRIER_PHASE")}
+    if config.get("enabled"):
+        validate_test_barrier_config(config)
+        expected={key:config[key] for key in supplied}
+        if supplied!=expected: fail("test barrier environment binding")
+        if phase=="capsule_preexec": capsule_preexec_barrier(config,observed)
+        else: raw_test_barrier(config,phase,observed)
+    elif any(value is not None for value in supplied.values()):
+        fail("production invocation rejects test barrier")
+
+def guardian_group_alive(pgid):
+    try: os.killpg(pgid,0); return True
+    except ProcessLookupError: return False
+    except PermissionError: raise RuntimeError("cannot prove registered group absent")
+
+def terminate_groups(registrations):
+    observations=[]
+    for item in registrations:
+        pid=item["pid"]; pgid=item["pgid"]
+        try:
+            if os.getpgid(pid)!=pgid or os.getsid(pid)!=pid:
+                raise RuntimeError("registered process identity drift")
+        except ProcessLookupError:
+            pass
+    groups=sorted(set(item["pgid"] for item in registrations))
+    for pgid in groups:
+        try: os.killpg(pgid,signal.SIGTERM); outcome="sent"
+        except ProcessLookupError: outcome="absent"
+        except PermissionError: raise RuntimeError("cannot signal registered group")
+        observations.append({"signal":"TERM","pgid":pgid,"outcome":outcome})
+    deadline=time.monotonic()+2
+    alive=[]
+    while time.monotonic()<deadline:
+        alive=[pgid for pgid in groups if guardian_group_alive(pgid)]
+        if not alive: break
+        time.sleep(0.02)
+    for pgid in alive:
+        try: os.killpg(pgid,signal.SIGKILL); outcome="sent"
+        except ProcessLookupError: outcome="absent"
+        except PermissionError: raise RuntimeError("cannot kill registered group")
+        observations.append({"signal":"KILL","pgid":pgid,"outcome":outcome})
+    deadline=time.monotonic()+2
+    while time.monotonic()<deadline:
+        alive=[pgid for pgid in groups if guardian_group_alive(pgid)]
+        if not alive: break
+        time.sleep(0.02)
+    if alive: raise RuntimeError("registered group did not quiesce")
+    for pgid in groups:
+        observations.append({"signal":"PROBE","pgid":pgid,"outcome":"absent"})
+    return observations
+
+def guardian_same_identity(current, expected):
+    return all(current[key]==expected[key] for key in GUARDIAN_STABLE_IDENTITY)
+
+def guardian_delete_root(parent_fd, root, root_fd, root_id, control_fd, socket_path,
+                         socket_id, listener, barrier):
+    if listener is not None: listener.close()
+    path_id=identity(os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False))
+    if (not guardian_same_identity(path_id,root_id)
+            or not guardian_same_identity(identity(os.fstat(root_fd)),root_id)):
+        raise RuntimeError("guardian root identity drift")
+    if socket_id is not None:
+        socket_st=os.stat(GUARDIAN_SOCKET_NAME,dir_fd=control_fd,follow_symlinks=False)
+        if (not stat.S_ISSOCK(socket_st.st_mode)
+                or not guardian_same_identity(identity(socket_st),socket_id)):
+            raise RuntimeError("guardian socket identity drift")
+        os.unlink(GUARDIAN_SOCKET_NAME,dir_fd=control_fd)
+    raw_test_barrier(barrier,"cleanup_commit",root_id)
+    path_id=identity(os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False))
+    if not guardian_same_identity(path_id,root_id): raise RuntimeError("guardian cleanup race")
+    remove_owned_tree_fd(root_fd)
+    os.close(control_fd); control_fd=None
+    os.close(root_fd); root_fd=None
+    os.rmdir(root.name,dir_fd=parent_fd)
+    try: os.stat(root.name,dir_fd=parent_fd,follow_symlinks=False)
+    except FileNotFoundError: return {"removed":True,"absent":True,"method":"parent_fd_relative"},root_fd,control_fd
+    raise RuntimeError("guardian cleanup residue")
+
+def guardian_daemon(ready_fd, parent, launcher_pid, invocation, token, barrier):
+    root=None; root_fd=None; parent_fd=None; control_fd=None; listener=None; cleanup_connection=None
+    registrations=[]; sequence=0; accepted=None; state="BOOTSTRAP"; quiescence=None; root_binding=None
+    capsule_state=None; capsule_detach=None; socket_id=None; socket_path=None
+    marker_name="firm-eval-block-"+invocation+".json"
+    try:
+        parent_path=Path(parent); parent_fd=os.open(str(parent_path),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+        try: os.stat(marker_name,dir_fd=parent_fd,follow_symlinks=False); raise RuntimeError("guardian failure marker collision")
+        except FileNotFoundError: pass
+        state="BOOTSTRAP_ROOT"; root=Path(tempfile.mkdtemp(prefix="firm-eval-"+invocation[:12]+".",dir=parent)).resolve()
+        capsule=root/"capsule"; control=root/"control"; provider_capsule=root/"provider-capsule"
+        socket_path=control/GUARDIAN_SOCKET_NAME
+        state="BOOTSTRAP_DIRECTORIES"
+        capsule.mkdir(mode=0o700); control.mkdir(mode=0o700); provider_capsule.mkdir(mode=0o700)
+        (provider_capsule/"mount").mkdir(mode=0o700)
+        state="BOOTSTRAP_DESCRIPTORS"
+        root_fd=os.open(str(root),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+        control_fd=os.open("control",os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0),dir_fd=root_fd)
+        root_id=identity(os.fstat(root_fd)); root_binding=guardian_root_binding(root_id)
+        state="BOOTSTRAP_SOCKET"; listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(str(socket_path)); os.chmod(str(socket_path),0o600)
+        listener.listen(8); listener.settimeout(0.05)
+        socket_id=identity(os.lstat(str(socket_path)))
+        if not stat.S_ISSOCK(os.lstat(str(socket_path)).st_mode): raise RuntimeError("guardian socket type")
+        marker=str(parent_path/marker_name)
+        unsigned={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"status":"ready",
+                  "invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,"guardian_pid":os.getpid(),
+                  "launcher_pid":launcher_pid,"root":str(root),"capsule":str(capsule),"control":str(control),
+                  "provider_capsule":str(provider_capsule),
+                  "socket":str(socket_path),"socket_identity":socket_id,"root_identity":root_id,
+                  "root_binding":root_binding,"failure_marker":marker,
+                  "token_sha256":digest_bytes(bytes.fromhex(token))}
+        ready=guardian_signed(token,unsigned)
+        guardian_write_all(ready_fd,(canonical(ready)+"\n").encode("ascii")); os.close(ready_fd); ready_fd=None
+        state="ACCEPTING"; interrupted=[None]
+        def request_cleanup(signum,*_): interrupted[0]="guardian signal %d"%signum
+        for signum in (signal.SIGHUP,signal.SIGINT,signal.SIGTERM): signal.signal(signum,request_cleanup)
+        while accepted is None:
+            if interrupted[0]: raise RuntimeError(interrupted[0])
+            try: os.kill(launcher_pid,0)
+            except ProcessLookupError: raise RuntimeError("launcher liveness EOF")
+            try: connection,_=listener.accept()
+            except socket.timeout: continue
+            try:
+                try: request=guardian_recv_frame(connection,2)
+                except Exception:
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"NACK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"reason":"unauthenticated or malformed frame"})
+                    continue
+                unsigned_request=dict(request); auth=unsigned_request.pop("auth",None)
+                authenticated=isinstance(auth,str) and hmac.compare_digest(auth,guardian_auth(token,unsigned_request))
+                if not authenticated:
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"NACK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"reason":"authentication failed"})
+                    continue
+                common={"schema_version","protocol_version","kind","invocation","candidate_commit","sequence",
+                        "nonce","guardian_pid","root_binding"}
+                if (request.get("schema_version")!=1 or request.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+                        or request.get("invocation")!=invocation or request.get("candidate_commit")!=PAYLOAD_COMMIT
+                        or request.get("guardian_pid")!=os.getpid() or request.get("root_binding")!=root_binding
+                        or not re.fullmatch(r"[0-9a-f]{64}",str(request.get("nonce","")))):
+                    raise RuntimeError("authenticated guardian binding fault")
+                kind=request.get("kind")
+                if kind=="status":
+                    if not exact_keys(request,common|{"auth"}) or request["sequence"]!=sequence+1:
+                        raise RuntimeError("guardian status sequence or shape")
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"STATE","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":state,"next_sequence":sequence+1,
+                        "request_nonce":request["nonce"],"root_binding":root_binding,
+                        "registration_digest":guardian_registration_digest(registrations),
+                        "registered_roles":sorted(item["role"] for item in registrations),
+                        "capsule_state":guardian_capsule_public(capsule_state).get("state"),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
+                elif kind=="capsule_create":
+                    keys=common|{"provider","source_bytes","auth"}
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or capsule_state is not None):
+                        raise RuntimeError("provider capsule create sequence or shape")
+                    requested,maximum_image=provider_capsule_image_size(request.get("provider"),request.get("source_bytes"))
+                    image_path=provider_capsule/"provider.dmg"; mountpoint=provider_capsule/"mount"
+                    if image_path.exists() or any(os.scandir(str(mountpoint))):
+                        raise RuntimeError("provider capsule create collision")
+                    backing=identity(os.lstat(str(mountpoint)))
+                    # hdiutil's `b` suffix denotes 512-byte blocks, not bytes.  Every policy value
+                    # is MiB-aligned, so pass a closed MiB count and verify the resulting byte size.
+                    create_argv=[str(HDIUTIL),"create","-size",str(requested//(1024*1024))+"m","-fs","HFS+",
+                                 "-volname","FIRM_CAPSULE","-uid",str(os.getuid()),"-gid",str(os.getgid()),
+                                 "-mode","0700","-layout","NONE","-type","UDIF","-plist",str(image_path)]
+                    _,create_timing=guardian_run(create_argv)
+                    image_fd=os.open(str(image_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+                    image_st=os.fstat(image_fd)
+                    if (not stat.S_ISREG(image_st.st_mode) or image_st.st_uid!=os.getuid()
+                            or image_st.st_nlink!=1 or image_st.st_size>maximum_image):
+                        os.close(image_fd); raise RuntimeError("provider capsule image creation identity")
+                    attachment=guardian_attach(str(image_path),str(mountpoint),False)
+                    capsule_state={"schema_version":1,"state":"RW_ATTACHED","provider":request["provider"],
+                                   "source_bytes":request["source_bytes"],"requested_image_bytes":requested,
+                                   "maximum_image_bytes":maximum_image,"root":str(provider_capsule),
+                                   "mountpoint_backing":backing,"image":{"path":str(image_path),**identity(image_st)},
+                                   "attachment":attachment,"create_timing":create_timing,"_image_fd":image_fd}
+                    capsule_state["_mount_fd"]=os.open(str(mountpoint),os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+                    sequence+=1
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"CAPSULE_RW_ATTACHED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "root_binding":root_binding,"capsule":guardian_capsule_public(capsule_state),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
+                elif kind=="capsule_seal":
+                    keys=common|{"capsule_digest","auth"}
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or capsule_state is None or capsule_state.get("state")!="RW_ATTACHED"
+                            or request.get("capsule_digest")!=guardian_capsule_digest(capsule_state)):
+                        raise RuntimeError("provider capsule seal sequence or shape")
+                    if capsule_state.get("_mount_fd") is not None:
+                        os.close(capsule_state.pop("_mount_fd"))
+                    rw_detach=guardian_detach_attachment(capsule_state["attachment"])
+                    image_path=Path(capsule_state["image"]["path"])
+                    os.chmod(str(image_path),0o400); os.fsync(capsule_state["_image_fd"])
+                    image=guardian_hash_fd(capsule_state["_image_fd"],capsule_state["maximum_image_bytes"])
+                    if image["mode"]!=0o400: raise RuntimeError("provider capsule sealed image mode")
+                    ro_attachment=guardian_attach(str(image_path),capsule_state["attachment"]["mountpoint"],True)
+                    capsule_state.update({"state":"RO_ATTACHED","image":{"path":str(image_path),**image},
+                                          "rw_detach":rw_detach,"attachment":ro_attachment})
+                    capsule_state["_mount_fd"]=os.open(ro_attachment["mountpoint"],os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+                    sequence+=1
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"CAPSULE_RO_ATTACHED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "root_binding":root_binding,"capsule":guardian_capsule_public(capsule_state),
+                        "capsule_digest":guardian_capsule_digest(capsule_state)})
+                elif kind=="register":
+                    keys=common|{"role","pid","pgid","auth"}
+                    if not exact_keys(request,keys) or request["sequence"]!=sequence+1:
+                        raise RuntimeError("guardian registration sequence or shape")
+                    role=request.get("role"); pid=request.get("pid"); pgid=request.get("pgid")
+                    if role not in ("broker","provider") or not isinstance(pid,int) or pid<=0 or pid!=pgid:
+                        raise RuntimeError("guardian registration identity")
+                    if role in {item["role"] for item in registrations} or request["nonce"] in {item["nonce"] for item in registrations}:
+                        raise RuntimeError("guardian registration replay")
+                    try:
+                        if os.getpgid(pid)!=pgid or os.getsid(pid)!=pid: raise RuntimeError("guardian registration session")
+                        os.kill(pid,0)
+                    except ProcessLookupError: raise RuntimeError("guardian registration process absent")
+                    request_sha=digest_bytes(canonical(unsigned_request).encode("ascii")); sequence+=1
+                    registration={"sequence":sequence,"role":role,"pid":pid,"pgid":pgid,
+                                  "nonce":request["nonce"],"request_sha256":request_sha}
+                    registrations.append(registration)
+                    guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"REGISTERED","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"sequence":sequence,"nonce":request["nonce"],
+                        "role":role,"pid":pid,"pgid":pgid,"root_binding":root_binding,
+                        "request_sha256":request_sha,"registration_digest":guardian_registration_digest(registrations)})
+                elif kind=="cleanup":
+                    keys=common|{"registration_digest","expected_roles","capsule_state","capsule_digest","auth"}
+                    roles=request.get("expected_roles")
+                    if (not exact_keys(request,keys) or request["sequence"]!=sequence+1
+                            or not isinstance(roles,list) or roles!=sorted(set(roles))
+                            or any(role not in ("broker","provider") for role in roles)
+                            or roles!=sorted(item["role"] for item in registrations)
+                            or request.get("registration_digest")!=guardian_registration_digest(registrations)
+                            or request.get("capsule_state")!=guardian_capsule_public(capsule_state).get("state")
+                            or request.get("capsule_digest")!=guardian_capsule_digest(capsule_state)):
+                        raise RuntimeError("guardian cleanup sequence, registration, or shape")
+                    sequence+=1; state="CLEANUP_ACCEPTED"
+                    accepted={"sequence":sequence,"nonce":request["nonce"],
+                              "request_sha256":digest_bytes(canonical(unsigned_request).encode("ascii")),
+                              "registration_digest":request["registration_digest"],
+                              "capsule_digest":request["capsule_digest"]}
+                    cleanup_connection=connection; connection=None
+                    listener.close(); listener=None
+                else: raise RuntimeError("guardian request kind")
+            except BaseException as exc:
+                if connection is not None:
+                    try: guardian_send_frame(connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                        "status":"TERMINAL_BLOCK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                        "guardian_pid":os.getpid(),"state":"TERMINAL_BLOCK","reason":str(exc)[:1000]})
+                    except Exception: pass
+                raise
+            finally:
+                if connection is not None: connection.close()
+        state="QUIESCING"; quiescence=terminate_groups(registrations)
+        quiescence_digest=digest_bytes(canonical(quiescence).encode("ascii"))
+        state="DETACHING_CAPSULE"; capsule_detach=guardian_capsule_detach(capsule_state)
+        state="DELETING"
+        deletion,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
+                                                         socket_path,socket_id,listener,barrier)
+        listener=None; state="PROVING_ABSENT"
+        terminal={"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"kind":"terminal",
+                  "status":"TERMINAL_OK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                  "guardian_pid":os.getpid(),"terminal_sequence":sequence+1,"request_sequence":accepted["sequence"],
+                  "request_nonce":accepted["nonce"],"request_sha256":accepted["request_sha256"],
+                  "root_identity":root_id,"root_binding":root_binding,
+                  "registration_digest":accepted["registration_digest"],"quiescence_digest":quiescence_digest,
+                  "capsule_digest":accepted["capsule_digest"],"capsule_detach":capsule_detach,
+                  "deletion":deletion,"absent":True}
+        state="TERMINAL_OK"; guardian_send_frame(cleanup_connection,token,terminal); cleanup_connection.close(); cleanup_connection=None
+    except BaseException as exc:
+        failed_state=state; state="TERMINAL_BLOCK"
+        failure_reason="%s: %s: %s"%(failed_state,type(exc).__name__,exc)
+        if listener is not None:
+            try: listener.close()
+            except Exception: pass
+            listener=None
+        if cleanup_connection is not None:
+            try: guardian_send_frame(cleanup_connection,token,{"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,
+                "status":"TERMINAL_BLOCK","invocation":invocation,"candidate_commit":PAYLOAD_COMMIT,
+                "guardian_pid":os.getpid(),"state":state,"reason":str(exc)[:1000],
+                "request_sequence":accepted.get("sequence") if accepted else None,
+                "request_sha256":accepted.get("request_sha256") if accepted else None})
+            except Exception: pass
+        # A fault before cleanup acceptance can never become success, but the guardian still owns
+        # lifecycle cleanup.  Quiesce every authenticated group and remove only the still-pinned
+        # root.  If quiescence or identity proof fails, retain the root and make that failure loud.
+        if accepted is None and root_fd is not None and control_fd is not None:
+            try:
+                quiescence=terminate_groups(registrations)
+                capsule_detach=guardian_capsule_detach(capsule_state)
+                _,root_fd,control_fd=guardian_delete_root(parent_fd,root,root_fd,root_id,control_fd,
+                                                           socket_path,socket_id,None,barrier)
+            except Exception as cleanup_exc:
+                failure_reason+="; abnormal cleanup failed: %s: %s"%(type(cleanup_exc).__name__,cleanup_exc)
+        guardian_capsule_close(capsule_state)
+        try:
+            if parent_fd is not None and root is not None:
+                write_failure_marker(parent_fd,marker_name,token,invocation,root,root_binding or "0"*64,
+                                     failure_reason,accepted)
+        except Exception: pass
+        for descriptor in (ready_fd,):
+            if descriptor is not None:
+                try: os.close(descriptor)
+                except OSError: pass
+        if cleanup_connection is not None:
+            try: cleanup_connection.close()
+            except Exception: pass
+        os._exit(1)
+    os._exit(0)
+
+def guardian_start(ns):
+    parent=Path(ns.parent).resolve(); pst=os.lstat(str(parent))
+    if not stat.S_ISDIR(pst.st_mode) or stat.S_ISLNK(pst.st_mode): fail("guardian parent")
+    if str(parent)!="/private/tmp": fail("guardian parent")
+    if ns.launcher_pid<=0:
+        fail("guardian launcher pid")
+    try: os.kill(ns.launcher_pid,0)
+    except ProcessLookupError: fail("guardian launcher not live")
+    invocation=ns.invocation or secrets.token_hex(24); token=secrets.token_hex(32)
+    barrier={"enabled":False}
+    if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
+        if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("guardian test barrier")
+        barrier=test_barrier_config(ns.test_barrier_root,ns.test_barrier_token,ns.test_barrier_phase,invocation)
+    left,right=socket.socketpair(); pid=os.fork()
+    if pid==0:
+        left.close(); os.setsid()
+        # The bootstrap parent alone publishes readiness.  The independent child must not retain the
+        # launcher's command-substitution pipe (or any future provider-visible inherited descriptor),
+        # and closing descriptors performs no filesystem allocation before the guardian's mkdtemp.
+        for descriptor in (0,1,2):
+            try: os.close(descriptor)
+            except OSError: pass
+        guardian_daemon(right.detach(),str(parent),ns.launcher_pid,invocation,token,barrier)
+    right.close(); data=b""; deadline=time.monotonic()+10
+    while time.monotonic()<deadline and b"\n" not in data:
+        left.settimeout(max(0.01,deadline-time.monotonic()))
+        try: data+=left.recv(MAX_MESSAGE-len(data))
+        except socket.timeout: break
+    left.close()
+    try: receipt=json.loads(data.decode("ascii")); auth=receipt.pop("auth")
+    except Exception: fail("guardian readiness")
+    if (not hmac.compare_digest(auth,guardian_auth(token,receipt)) or receipt.get("guardian_pid")!=pid
+            or receipt.get("status")!="ready" or receipt.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or receipt.get("candidate_commit")!=PAYLOAD_COMMIT): fail("guardian readiness binding")
+    receipt["auth"]=auth; receipt["token"]=token; receipt["test_barrier"]=barrier
+    print(canonical(receipt))
+
+def guardian_request_base(control, invocation, sequence, guardian_pid, nonce=None):
+    try: root_id=identity(os.lstat(str(Path(control).parent)))
+    except OSError: fail("guardian root unavailable")
+    return {"schema_version":1,"protocol_version":GUARDIAN_PROTOCOL_VERSION,"invocation":invocation,
+            "candidate_commit":PAYLOAD_COMMIT,"sequence":sequence,"nonce":nonce or secrets.token_hex(32),
+            "guardian_pid":guardian_pid,"root_binding":guardian_root_binding(root_id)}
+
+def guardian_capsule_request(control, token, invocation, guardian_pid, sequence, action,
+                             provider=None, source_bytes=None, capsule_digest=None):
+    base=guardian_request_base(str(control),invocation,sequence,guardian_pid)
+    base["kind"]=action
+    if action=="capsule_create": base.update({"provider":provider,"source_bytes":source_bytes})
+    elif action=="capsule_seal": base["capsule_digest"]=capsule_digest
+    else: fail("guardian capsule action")
+    response=guardian_client_request(str(control),token,base,PROVIDER_CAPSULE_COMMAND_TIMEOUT_SECONDS+5)
+    value,_=guardian_verify_response(token,response)
+    required={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid",
+              "sequence","nonce","root_binding","capsule","capsule_digest"}
+    expected_status="CAPSULE_RW_ATTACHED" if action=="capsule_create" else "CAPSULE_RO_ATTACHED"
+    if (not exact_keys(value,required) or value.get("schema_version")!=1
+            or value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION or value.get("status")!=expected_status
+            or value.get("invocation")!=invocation or value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or value.get("guardian_pid")!=guardian_pid or value.get("sequence")!=sequence
+            or value.get("nonce")!=base["nonce"] or value.get("root_binding")!=base["root_binding"]
+            or value.get("capsule_digest")!=digest_bytes(canonical(value.get("capsule")).encode("ascii"))):
+        fail("guardian capsule ACK binding")
+    return value
+
+def guardian_command(ns):
+    base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid,ns.nonce)
+    if ns.action=="register":
+        if ns.pid is None or ns.pgid is None or ns.role is None: fail("guardian registration")
+        base.update({"kind":"register","role":ns.role,"pid":ns.pid,"pgid":ns.pgid})
+        response=guardian_client_request(ns.control,ns.token,base)
+        if response.get("status")!="REGISTERED": fail("guardian registration NACK")
+        print(canonical(response)); return
+    status_base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid)
+    status_base["kind"]="status"
+    status=guardian_client_request(ns.control,ns.token,status_base)
+    status_value,_=guardian_verify_response(ns.token,status)
+    expected_status={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid",
+                     "state","next_sequence","request_nonce","root_binding","registration_digest","registered_roles",
+                     "capsule_state","capsule_digest"}
+    roles=sorted(set(filter(None,(ns.expected_roles or "").split(","))))
+    if (not exact_keys(status_value,expected_status) or status_value.get("status")!="STATE"
+            or status_value.get("next_sequence")!=ns.sequence or status_value.get("request_nonce")!=status_base["nonce"]
+            or status_value.get("schema_version")!=1 or status_value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or status_value.get("invocation")!=ns.invocation or status_value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or status_value.get("guardian_pid")!=ns.guardian_pid or status_value.get("root_binding")!=base["root_binding"]
+            or not isinstance(status_value.get("registered_roles"),list)
+            or status_value["registered_roles"]!=sorted(set(status_value["registered_roles"]))
+            or any(role not in ("broker","provider") for role in status_value["registered_roles"])
+            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("registration_digest","")))
+            or status_value.get("capsule_state") not in ("ABSENT","RW_ATTACHED","RO_ATTACHED")
+            or not re.fullmatch(r"[0-9a-f]{64}",str(status_value.get("capsule_digest","")))):
+        fail("guardian status binding")
+    base.update({"kind":"cleanup","registration_digest":status_value["registration_digest"],
+                 "expected_roles":roles,"capsule_state":status_value["capsule_state"],
+                 "capsule_digest":status_value["capsule_digest"]})
+    terminal=guardian_client_request(ns.control,ns.token,base,10)
+    terminal_value,_=guardian_verify_response(ns.token,terminal)
+    required={"schema_version","protocol_version","kind","status","invocation","candidate_commit","guardian_pid",
+              "terminal_sequence","request_sequence","request_nonce","request_sha256","root_identity","root_binding",
+              "registration_digest","quiescence_digest","capsule_digest","capsule_detach","deletion","absent"}
+    request_unsigned=dict(base); request_sha=digest_bytes(canonical(request_unsigned).encode("ascii"))
+    if (not exact_keys(terminal_value,required) or terminal_value.get("kind")!="terminal"
+            or terminal_value.get("schema_version")!=1 or terminal_value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or terminal_value.get("status")!="TERMINAL_OK" or terminal_value.get("invocation")!=ns.invocation
+            or terminal_value.get("candidate_commit")!=PAYLOAD_COMMIT or terminal_value.get("guardian_pid")!=ns.guardian_pid
+            or terminal_value.get("terminal_sequence")!=ns.sequence+1
+            or terminal_value.get("request_sequence")!=ns.sequence or terminal_value.get("request_nonce")!=base["nonce"]
+            or terminal_value.get("request_sha256")!=request_sha or terminal_value.get("root_binding")!=base["root_binding"]
+            or guardian_root_binding(terminal_value.get("root_identity",{}))!=base["root_binding"]
+            or terminal_value.get("registration_digest")!=status_value["registration_digest"]
+            or terminal_value.get("capsule_digest")!=status_value["capsule_digest"]
+            or not isinstance(terminal_value.get("capsule_detach"),dict)
+            or terminal_value["capsule_detach"].get("absent") is not True
+            or not re.fullmatch(r"[0-9a-f]{64}",str(terminal_value.get("quiescence_digest","")))
+            or terminal_value.get("absent") is not True
+            or terminal_value.get("deletion")!={"removed":True,"absent":True,"method":"parent_fd_relative"}):
+        fail("guardian terminal receipt binding")
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        try: os.kill(ns.guardian_pid,0)
+        except ProcessLookupError: break
+        time.sleep(0.01)
+    else: fail("guardian terminal exit timeout")
+    marker=Path("/private/tmp")/("firm-eval-block-"+ns.invocation+".json")
+    if marker.exists(): fail("guardian cleanup BLOCK marker: "+str(marker))
+    print(canonical(terminal))
+
+def guardian_exec(ns, rest):
+    if not rest: fail("guardian exec argv")
+    pid=os.getpid(); pgid=os.getpgrp()
+    if (pid!=pgid or os.getsid(pid)!=pid) and ns.role=="broker":
+        os.setsid(); pid=os.getpid(); pgid=os.getpgrp()
+    if pid!=pgid or os.getsid(pid)!=pid: fail("guardian exec requires bounded child session leader")
+    base=guardian_request_base(ns.control,ns.invocation,ns.sequence,ns.guardian_pid,ns.nonce)
+    base.update({"kind":"register","role":ns.role,"pid":pid,"pgid":pgid})
+    response=guardian_client_request(ns.control,ns.token,base)
+    value,_=guardian_verify_response(ns.token,response)
+    required={"schema_version","protocol_version","status","invocation","candidate_commit","guardian_pid","sequence",
+              "nonce","role","pid","pgid","root_binding","request_sha256","registration_digest"}
+    request_sha=digest_bytes(canonical(base).encode("ascii"))
+    if (not exact_keys(value,required) or value.get("status")!="REGISTERED" or value.get("sequence")!=ns.sequence
+            or value.get("schema_version")!=1 or value.get("protocol_version")!=GUARDIAN_PROTOCOL_VERSION
+            or value.get("invocation")!=ns.invocation or value.get("candidate_commit")!=PAYLOAD_COMMIT
+            or value.get("guardian_pid")!=ns.guardian_pid
+            or value.get("nonce")!=base["nonce"] or value.get("role")!=ns.role or value.get("pid")!=pid
+            or value.get("pgid")!=pgid or value.get("request_sha256")!=request_sha
+            or value.get("root_binding")!=base["root_binding"]):
+        fail("guardian registration ACK binding")
+    os.execv(rest[0],rest)
+
+def external_file_record(path, maximum=64*1024*1024):
+    path=Path(path)
+    if path.resolve()!=path or not path.is_absolute(): fail("external executable path")
+    no_symlink_components(path)
+    fd=os.open(str(path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>maximum:
+            fail("external executable identity")
+        raw=b""
+        while len(raw)<=maximum:
+            part=os.read(fd,65536)
+            if not part: break
+            raw+=part
+        after=os.fstat(fd)
+        if identity(before)!=identity(after) or len(raw)!=before.st_size: fail("external executable drift")
+    finally: os.close(fd)
+    return {**identity(before),"sha256":digest_bytes(raw),"path":str(path)}
+
+class ProviderReadTimeout(Exception):
+    pass
+
+def provider_timeout_handler(*_):
+    raise ProviderReadTimeout()
+
+def provider_stat_stability(st):
+    return {"dev":st.st_dev,"ino":st.st_ino,"uid":st.st_uid,"mode":stat.S_IMODE(st.st_mode),
+            "nlink":st.st_nlink,"bytes":st.st_size,"blocks":getattr(st,"st_blocks",-1),
+            "mtime_ns":getattr(st,"st_mtime_ns",int(st.st_mtime*1_000_000_000)),
+            "ctime_ns":getattr(st,"st_ctime_ns",int(st.st_ctime*1_000_000_000))}
+
+def validate_provider_stat(st, maximum):
+    mode=stat.S_IMODE(st.st_mode)
+    blocks=getattr(st,"st_blocks",None)
+    if (not stat.S_ISREG(st.st_mode) or st.st_size<1 or st.st_size>maximum or st.st_nlink!=1
+            or st.st_uid not in (0,os.geteuid()) or not (mode&0o111) or mode&0o022
+            or blocks is None or blocks*512<st.st_size):
+        fail("provider executable identity")
+
+def provider_read(fd, amount, deadline_ns):
+    before=time.monotonic_ns()
+    if before>=deadline_ns: fail("provider executable stream timeout")
+    remaining=(deadline_ns-before)/1_000_000_000
+    previous_handler=signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM,provider_timeout_handler)
+        previous_timer=signal.setitimer(signal.ITIMER_REAL,remaining)
+    except (AttributeError,ValueError):
+        try: signal.signal(signal.SIGALRM,previous_handler)
+        except Exception: pass
+        fail("provider executable stream deadline unavailable")
+    if previous_timer!=(0.0,0.0):
+        signal.setitimer(signal.ITIMER_REAL,*previous_timer)
+        signal.signal(signal.SIGALRM,previous_handler)
+        fail("provider executable stream timer conflict")
+    try:
+        try: part=os.read(fd,amount)
+        except ProviderReadTimeout: fail("provider executable stream timeout")
+        except OSError: fail("provider executable stream read error")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL,0)
+        signal.signal(signal.SIGALRM,previous_handler)
+    if time.monotonic_ns()>=deadline_ns: fail("provider executable stream timeout")
+    return part
+
+def provider_native_architecture():
+    value=platform.machine().lower()
+    aliases={"amd64":"x86_64","x86_64":"x86_64","arm64":"arm64","aarch64":"arm64"}
+    result=aliases.get(value)
+    if result is None: fail("provider capsule native architecture")
+    return result
+
+def provider_macho_record(fd, size):
+    if sys.platform!="darwin": fail("provider capsule unsupported host")
+    raw=os.pread(fd,min(size,4096),0)
+    if len(raw)<8: fail("provider executable is not native Mach-O")
+    magic=raw[:4]; native=provider_native_architecture()
+    cpu_names={0x01000007:"x86_64",0x0100000c:"arm64"}
+    thin={b"\xce\xfa\xed\xfe":("little","thin32"),b"\xcf\xfa\xed\xfe":("little","thin64"),
+          b"\xfe\xed\xfa\xce":("big","thin32"),b"\xfe\xed\xfa\xcf":("big","thin64")}
+    fat={b"\xca\xfe\xba\xbe":("big",20,"fat32"),b"\xbe\xba\xfe\xca":("little",20,"fat32"),
+         b"\xca\xfe\xba\xbf":("big",32,"fat64"),b"\xbf\xba\xfe\xca":("little",32,"fat64")}
+    if magic in thin:
+        endian,kind=thin[magic]; cputype=int.from_bytes(raw[4:8],endian,signed=False)
+        architecture=cpu_names.get(cputype)
+        if architecture!=native: fail("provider executable has no native Mach-O slice")
+        return {"format":kind,"native_architecture":native,"architectures":[architecture],"magic":magic.hex()}
+    if magic in fat:
+        endian,width,kind=fat[magic]; count=int.from_bytes(raw[4:8],endian,signed=False)
+        if count<1 or count>16 or len(raw)<8+count*width: fail("provider executable Mach-O header")
+        architectures=[]
+        for index in range(count):
+            offset=8+index*width; cputype=int.from_bytes(raw[offset:offset+4],endian,signed=False)
+            architecture=cpu_names.get(cputype,"unsupported-%08x"%cputype)
+            if architecture in architectures: fail("provider executable duplicate Mach-O slice")
+            architectures.append(architecture)
+        if native not in architectures: fail("provider executable has no native Mach-O slice")
+        return {"format":kind,"native_architecture":native,"architectures":architectures,"magic":magic.hex()}
+    fail("provider executable is not native Mach-O")
+
+def provider_xattrs(fd):
+    if sys.platform!="darwin": fail("provider capsule xattr unsupported")
+    libc=ctypes.CDLL(None,use_errno=True)
+    flist=getattr(libc,"flistxattr",None); fget=getattr(libc,"fgetxattr",None)
+    if flist is None or fget is None: fail("provider capsule xattr unavailable")
+    size=flist(fd,None,0,0)
+    if size<0: fail("provider capsule xattr list")
+    if size>PROVIDER_CAPSULE_METADATA_MAX_COUNT*(PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES+1):
+        fail("provider capsule xattr names cap")
+    names_raw=b""
+    if size:
+        buffer=ctypes.create_string_buffer(size); observed=flist(fd,buffer,size,0)
+        if observed!=size: fail("provider capsule xattr list drift")
+        names_raw=buffer.raw[:size]
+    names=[item for item in names_raw.split(b"\0") if item]
+    if len(names)>PROVIDER_CAPSULE_METADATA_MAX_COUNT or len(names)!=len(set(names)):
+        fail("provider capsule xattr count")
+    values={}; records=[]; total=0
+    for raw_name in sorted(names):
+        if len(raw_name)>PROVIDER_CAPSULE_METADATA_MAX_NAME_BYTES:
+            fail("provider capsule xattr name cap")
+        try: name=raw_name.decode("utf-8","strict")
+        except UnicodeDecodeError: fail("provider capsule xattr name encoding")
+        length=fget(fd,raw_name,None,0,0,0)
+        if length<0 or length>PROVIDER_CAPSULE_METADATA_MAX_VALUE_BYTES:
+            fail("provider capsule xattr value cap")
+        value=b""
+        if length:
+            buffer=ctypes.create_string_buffer(length); observed=fget(fd,raw_name,buffer,length,0,0)
+            if observed!=length: fail("provider capsule xattr value drift")
+            value=buffer.raw[:length]
+        total+=len(raw_name)+len(value)
+        if total>PROVIDER_CAPSULE_METADATA_MAX_TOTAL_BYTES: fail("provider capsule xattr aggregate cap")
+        values[raw_name]=value
+        records.append({"name":name,"name_bytes":len(raw_name),"bytes":len(value),"sha256":digest_bytes(value)})
+    return records,values
+
+def provider_set_xattrs(fd, values):
+    libc=ctypes.CDLL(None,use_errno=True); fset=getattr(libc,"fsetxattr",None)
+    if fset is None: fail("provider capsule xattr unavailable")
+    for name,value in sorted(values.items()):
+        buffer=ctypes.create_string_buffer(value,len(value)) if value else None
+        pointer=ctypes.cast(buffer,ctypes.c_void_p) if buffer is not None else None
+        if fset(fd,name,pointer,len(value),0,0)!=0: fail("provider capsule xattr copy")
+
+def provider_copy_to_capsule(source_fd, expected, destination, barrier):
+    source_before=os.fstat(source_fd); stable=provider_stat_stability(source_before)
+    if source_before.st_uid!=os.geteuid(): fail("provider capsule cannot preserve source owner")
+    macho=provider_macho_record(source_fd,source_before.st_size)
+    xattrs,xattr_values=provider_xattrs(source_fd)
+    flags=os.O_RDWR|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0)
+    destination_fd=os.open(str(destination),flags,0o600)
+    started=time.monotonic_ns(); digest=hashlib.sha256(); total=0
+    try:
+        os.lseek(source_fd,0,os.SEEK_SET); deadline=started+PROVIDER_EXECUTABLE_TIMEOUT_NS
+        while total<source_before.st_size:
+            amount=min(PROVIDER_EXECUTABLE_CHUNK_BYTES,source_before.st_size-total)
+            part=provider_read(source_fd,amount,deadline)
+            if len(part)!=amount: fail("provider capsule source short read")
+            view=memoryview(part)
+            while view:
+                count=os.write(destination_fd,view)
+                if count<=0: fail("provider capsule copy short write")
+                view=view[count:]
+            digest.update(part); total+=len(part)
+            if total==len(part): raw_test_barrier(barrier,"capsule_copy",{"source":expected,"copied":total})
+        if provider_read(source_fd,1,deadline): fail("provider capsule source overrun")
+        provider_set_xattrs(destination_fd,xattr_values)
+        os.fchmod(destination_fd,expected["mode"]); os.fsync(destination_fd)
+        destination_after=os.fstat(destination_fd); source_after=os.fstat(source_fd)
+        if (provider_stat_stability(source_after)!=stable or digest.hexdigest()!=expected["sha256"]
+                or total!=expected["bytes"]): fail("provider capsule source drift")
+        validate_provider_stat(destination_after,expected["maximum_bytes"])
+        if (destination_after.st_uid!=expected["uid"] or stat.S_IMODE(destination_after.st_mode)!=expected["mode"]
+                or destination_after.st_nlink!=1): fail("provider capsule copy metadata")
+        copied_xattrs,_=provider_xattrs(destination_fd)
+        if copied_xattrs!=xattrs: fail("provider capsule copied xattr mismatch")
+        finished=time.monotonic_ns()
+        copy={"path":str(destination),**identity(destination_after),"sha256":digest.hexdigest()}
+        timing={"start_monotonic_ns":started,"end_monotonic_ns":finished,"duration_ns":finished-started,
+                "bytes":total,"chunk_bytes":PROVIDER_EXECUTABLE_CHUNK_BYTES,
+                "timeout_ns":PROVIDER_EXECUTABLE_TIMEOUT_NS}
+        return copy,macho,xattrs,timing
+    finally: os.close(destination_fd)
+
+def reprove_provider_source_descriptor(source_fd, expected):
+    before=os.fstat(source_fd); validate_provider_stat(before,expected["maximum_bytes"])
+    named_before=os.lstat(expected["path"]); validate_provider_stat(named_before,expected["maximum_bytes"])
+    required={key:expected[key] for key in ("dev","ino","uid","mode","nlink","bytes")}
+    if identity(before)!=required or identity(named_before)!=required:
+        fail("provider capsule source path descriptor drift")
+    digest=hashlib.sha256(); total=0; deadline=time.monotonic_ns()+PROVIDER_EXECUTABLE_TIMEOUT_NS
+    os.lseek(source_fd,0,os.SEEK_SET)
+    while total<before.st_size:
+        amount=min(PROVIDER_EXECUTABLE_CHUNK_BYTES,before.st_size-total)
+        part=provider_read(source_fd,amount,deadline)
+        if len(part)!=amount: fail("provider capsule source short read")
+        digest.update(part); total+=len(part)
+    if provider_read(source_fd,1,deadline): fail("provider capsule source overrun")
+    after=os.fstat(source_fd); named_after=os.lstat(expected["path"])
+    if (identity(after)!=required or identity(named_after)!=required or digest.hexdigest()!=expected["sha256"]
+            or provider_stat_stability(after)!=provider_stat_stability(before)):
+        fail("provider capsule source path descriptor drift")
+
+def codesign_utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z")
+
+def codesign_stream_text(raw, label):
+    if not isinstance(raw,bytes) or len(raw)>CODESIGN_RESULT_MAX_BYTES:
+        fail("provider capsule codesign "+label+" cap")
+    if any(byte<0x20 and byte!=0x0a or byte==0x7f for byte in raw):
+        fail("provider capsule codesign "+label+" control data")
+    if raw and (not raw.endswith(b"\n") or b"\r" in raw):
+        fail("provider capsule codesign "+label+" line endings")
+    try: text=raw.decode("utf-8","strict")
+    except UnicodeDecodeError: fail("provider capsule codesign "+label+" encoding")
+    return [] if not text else text[:-1].split("\n")
+
+def codesign_command(argv):
+    if (not isinstance(argv,list) or not argv or argv[0]!=str(CODESIGN)
+            or str(CODESIGN)!="/usr/bin/codesign" or os.path.realpath(str(CODESIGN))!=str(CODESIGN)):
+        fail("provider capsule codesign canonical tool")
+    try:
+        tool_st=os.lstat(str(CODESIGN))
+        if (not stat.S_ISREG(tool_st.st_mode) or not tool_st.st_mode&stat.S_IXUSR
+                or tool_st.st_uid not in (0,os.geteuid()) or stat.S_IMODE(tool_st.st_mode)&0o022):
+            fail("provider capsule codesign canonical tool")
+    except OSError: fail("provider capsule codesign unavailable")
+    started_utc=codesign_utc_now(); started=time.monotonic_ns(); process=None
+    captured={"stdout":bytearray(),"stderr":bytearray()}; selector=selectors.DefaultSelector()
+    try:
+        process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                 close_fds=True,cwd="/",env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+        for name,stream in (("stdout",process.stdout),("stderr",process.stderr)):
+            os.set_blocking(stream.fileno(),False); selector.register(stream,selectors.EVENT_READ,name)
+        deadline=started+10_000_000_000
+        while selector.get_map():
+            remaining=deadline-time.monotonic_ns()
+            if remaining<=0: fail("provider capsule codesign timeout")
+            for key,_ in selector.select(min(remaining/1_000_000_000,0.1)):
+                try: part=os.read(key.fileobj.fileno(),65536)
+                except BlockingIOError: continue
+                except OSError: fail("provider capsule codesign stream read")
+                if not part:
+                    selector.unregister(key.fileobj); key.fileobj.close(); continue
+                target=captured[key.data]
+                target.extend(part)
+                if len(target)>CODESIGN_RESULT_MAX_BYTES:
+                    fail("provider capsule codesign "+key.data+" cap")
+        remaining=deadline-time.monotonic_ns()
+        if remaining<=0: fail("provider capsule codesign timeout")
+        try: exit_code=process.wait(timeout=remaining/1_000_000_000)
+        except subprocess.TimeoutExpired: fail("provider capsule codesign timeout")
+    except OSError: fail("provider capsule codesign unavailable")
+    finally:
+        selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            try: process.wait(timeout=1)
+            except Exception: pass
+    finished=time.monotonic_ns(); finished_utc=codesign_utc_now()
+    if not isinstance(exit_code,int) or exit_code<0: fail("provider capsule codesign signal")
+    stdout=bytes(captured["stdout"]); stderr=bytes(captured["stderr"])
+    codesign_stream_text(stdout,"stdout"); codesign_stream_text(stderr,"stderr")
+    result={"argv":argv,"cwd":"/","exit_code":exit_code,"start_utc":started_utc,"end_utc":finished_utc,
+            "start_monotonic_ns":started,"end_monotonic_ns":finished,"duration_ns":finished-started,
+            "stdout":{"bytes":len(stdout),"sha256":digest_bytes(stdout)},
+            "stderr":{"bytes":len(stderr),"sha256":digest_bytes(stderr)}}
+    return stdout,stderr,result
+
+def codesign_single(lines, prefix, required=True):
+    values=[line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(values)!=(1 if required else 0): fail("provider capsule signing identity")
+    return values[0] if required else None
+
+def codesign_bounded_value(value, maximum, label):
+    if (not isinstance(value,str) or not value or value!=value.strip()
+            or len(value.encode("utf-8"))>maximum):
+        fail("provider capsule "+label)
+    return value
+
+def codesign_classify_display(path, exit_code, stdout, stderr):
+    raw_path=str(path); stdout_lines=codesign_stream_text(stdout,"stdout")
+    stderr_lines=codesign_stream_text(stderr,"stderr")
+    unsigned_stderr=(raw_path+": code object is not signed at all\n").encode("utf-8")
+    if exit_code!=0:
+        if exit_code<0 or stdout!=b"" or stderr!=unsigned_stderr:
+            fail("provider capsule signing ambiguity")
+        return {"state":"unsigned"}
+    if stdout==b"" or stderr==b"": fail("provider capsule signing identity")
+    forbidden_stdout=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=")
+    if any(any(marker in line for marker in forbidden_stdout) for line in stdout_lines):
+        fail("provider capsule signing stream ambiguity")
+    if any("designated => " in line for line in stderr_lines):
+        fail("provider capsule signing stream ambiguity")
+    recognized_stderr=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=")
+    for line in stderr_lines:
+        if any(marker in line for marker in recognized_stderr) and not line.startswith(recognized_stderr):
+            fail("provider capsule signing stream ambiguity")
+    identifier=codesign_single(stderr_lines,"Identifier=")
+    team=codesign_single(stderr_lines,"TeamIdentifier=")
+    cdhash=codesign_single(stderr_lines,"CDHash=")
+    codedirectory=[line for line in stderr_lines if line.startswith("CodeDirectory ")]
+    if len(codedirectory)!=1 or codedirectory[0].count("flags=")!=1:
+        fail("provider capsule signing flags")
+    flag_match=re.search(r"(?:^| )flags=0x([0-9a-f]+)\(([^()]*)\)(?: |$)",codedirectory[0])
+    if flag_match is None: fail("provider capsule signing flags")
+    flags=int(flag_match.group(1),16); token_text=flag_match.group(2)
+    if token_text=="none":
+        if flags!=0: fail("provider capsule signing flags")
+        flag_tokens=set()
+    else:
+        if not re.fullmatch(r"[a-z0-9-]+(?:,[a-z0-9-]+)*",token_text):
+            fail("provider capsule signing flags")
+        tokens=token_text.split(",")
+        if len(tokens)!=len(set(tokens)): fail("provider capsule signing flags")
+        flag_tokens=set(tokens)
+    signatures=[line[len("Signature="):] for line in stderr_lines if line.startswith("Signature=")]
+    adhoc_evidence=(bool(flags&0x2),"adhoc" in flag_tokens,signatures==["adhoc"])
+    has_any_adhoc=any(adhoc_evidence) or bool(signatures)
+    has_all_adhoc=all(adhoc_evidence)
+    if team=="not set":
+        if not has_all_adhoc: fail("provider capsule signing ambiguity")
+        state="adhoc_signed"; team_identifier=None; requirement_prefix="# designated => "
+    else:
+        if not re.fullmatch(r"[A-Z0-9]{10}",team) or has_any_adhoc:
+            fail("provider capsule signing ambiguity")
+        state="team_signed"; team_identifier=team; requirement_prefix="designated => "
+    if has_any_adhoc and not has_all_adhoc: fail("provider capsule signing ambiguity")
+    if len(stdout_lines)!=1 or not stdout_lines[0].startswith(requirement_prefix):
+        fail("provider capsule designated requirement")
+    requirement=codesign_bounded_value(stdout_lines[0][len(requirement_prefix):],
+                                       CODESIGN_REQUIREMENT_MAX_BYTES,"designated requirement")
+    identifier=codesign_bounded_value(identifier,CODESIGN_IDENTIFIER_MAX_BYTES,"signing identifier")
+    if not re.fullmatch(r"[0-9a-f]{40}",cdhash): fail("provider capsule signing CDHash")
+    return {"state":state,"identifier":identifier,"team_identifier":team_identifier,"cdhash":cdhash,
+            "designated_requirement":requirement,"codedirectory_flags":flags}
+
+def codesign_result_schema(value, expected_argv):
+    keys={"argv","cwd","exit_code","start_utc","end_utc","start_monotonic_ns","end_monotonic_ns",
+          "duration_ns","stdout","stderr"}
+    if (not isinstance(value,dict) or not exact_keys(value,keys) or value["argv"]!=expected_argv
+            or value["cwd"]!="/" or type(value["exit_code"]) is not int or value["exit_code"]<0
+            or type(value["start_monotonic_ns"]) is not int or type(value["end_monotonic_ns"]) is not int
+            or value["end_monotonic_ns"]<value["start_monotonic_ns"]
+            or value["duration_ns"]!=value["end_monotonic_ns"]-value["start_monotonic_ns"]):
+        fail("provider capsule codesign result schema")
+    utc_pattern=r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z"
+    if (not re.fullmatch(utc_pattern,str(value["start_utc"]))
+            or not re.fullmatch(utc_pattern,str(value["end_utc"]))):
+        fail("provider capsule codesign result time")
+    try:
+        start=datetime.fromisoformat(value["start_utc"].replace("Z","+00:00"))
+        end=datetime.fromisoformat(value["end_utc"].replace("Z","+00:00"))
+    except ValueError: fail("provider capsule codesign result time")
+    if start.tzinfo!=timezone.utc or end.tzinfo!=timezone.utc or end<start:
+        fail("provider capsule codesign result time")
+    for name in ("stdout","stderr"):
+        stream=value[name]
+        if (not isinstance(stream,dict) or not exact_keys(stream,{"bytes","sha256"})
+                or type(stream["bytes"]) is not int or not 0<=stream["bytes"]<=CODESIGN_RESULT_MAX_BYTES
+                or not re.fullmatch(r"[0-9a-f]{64}",str(stream["sha256"]))):
+            fail("provider capsule codesign result stream")
+
+def codesign_record_from_observations(path, display, strict_verify=None):
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    if (not isinstance(display,tuple) or len(display)!=3): fail("provider capsule codesign display result")
+    stdout,stderr,display_result=display; codesign_result_schema(display_result,display_argv)
+    if (display_result["stdout"]!={"bytes":len(stdout),"sha256":digest_bytes(stdout)}
+            or display_result["stderr"]!={"bytes":len(stderr),"sha256":digest_bytes(stderr)}):
+        fail("provider capsule codesign display binding")
+    fields=codesign_classify_display(path,display_result["exit_code"],stdout,stderr)
+    if fields["state"]=="unsigned":
+        if strict_verify is not None: fail("provider capsule unsigned verification")
+        return {**fields,"display_result":display_result}
+    if not isinstance(strict_verify,tuple) or len(strict_verify)!=3:
+        fail("provider capsule strict code signature")
+    verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+    verify_stdout,verify_stderr,verify_result=strict_verify
+    codesign_result_schema(verify_result,verify_argv)
+    if (display_result["end_monotonic_ns"]>verify_result["start_monotonic_ns"]
+            or display_result["end_utc"]>verify_result["start_utc"]):
+        fail("provider capsule codesign command order")
+    if (verify_result["stdout"]!={"bytes":len(verify_stdout),"sha256":digest_bytes(verify_stdout)}
+            or verify_result["stderr"]!={"bytes":len(verify_stderr),"sha256":digest_bytes(verify_stderr)}):
+        fail("provider capsule codesign verify binding")
+    codesign_stream_text(verify_stdout,"verify stdout"); verify_lines=codesign_stream_text(verify_stderr,"verify stderr")
+    recognized=("Identifier=","TeamIdentifier=","CDHash=","CodeDirectory ","Signature=","designated => ")
+    if verify_result["exit_code"]!=0 or any(any(marker in line for marker in recognized) for line in verify_lines):
+        fail("provider capsule strict code signature")
+    return {**fields,"display_result":display_result,"strict_verify_result":verify_result}
+
+def codesign_record(path):
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    display=codesign_command(display_argv)
+    if display[2]["exit_code"]!=0:
+        return codesign_record_from_observations(path,display)
+    verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+    return codesign_record_from_observations(path,display,codesign_command(verify_argv))
+
+def codesign_stable_identity(value):
+    fields=("state",) if value.get("state")=="unsigned" else (
+        "state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags")
+    return {name:value[name] for name in fields}
+
+def codesign_reproof_identity(value):
+    result=codesign_stable_identity(value)
+    for name in ("display_result","strict_verify_result"):
+        if name in value:
+            command=value[name]
+            result[name]={key:command[key] for key in ("argv","cwd","exit_code","stdout","stderr")}
+    return result
+
+def validate_codesign_reproof(expected, observed):
+    if codesign_reproof_identity(observed)!=codesign_reproof_identity(expected):
+        fail("provider capsule signing reproof drift")
+
+def provider_executable_record(provider, canonical_path, barrier=None, retain_descriptor=False):
+    maximum=PROVIDER_EXECUTABLE_MAX_BYTES.get(provider)
+    if maximum is None: fail("provider executable policy")
+    raw_path=os.fspath(canonical_path)
+    if not raw_path.startswith("/") or os.path.realpath(raw_path)!=raw_path:
+        fail("provider executable canonical path")
+    path=Path(raw_path); fd=None; retained=False
+    try:
+        no_symlink_components(path)
+        named_before=os.lstat(raw_path)
+        nofollow=getattr(os,"O_NOFOLLOW",None)
+        if nofollow is None: fail("provider executable no-follow unavailable")
+        fd=os.open(raw_path,os.O_RDONLY|nofollow)
+        os.set_inheritable(fd,False)
+        before=os.fstat(fd)
+        validate_provider_stat(named_before,maximum); validate_provider_stat(before,maximum)
+        if identity(named_before)!=identity(before): fail("provider executable path descriptor disagreement")
+        stable=provider_stat_stability(before)
+        if provider_stat_stability(named_before)!=stable: fail("provider executable initial identity drift")
+        digest=hashlib.sha256(); total=0; deadline=time.monotonic_ns()+PROVIDER_EXECUTABLE_TIMEOUT_NS
+        while total<before.st_size:
+            amount=min(PROVIDER_EXECUTABLE_CHUNK_BYTES,before.st_size-total)
+            part=provider_read(fd,amount,deadline)
+            if len(part)!=amount: fail("provider executable short read")
+            digest.update(part); total+=len(part)
+            if total==len(part): raw_test_barrier(barrier,"provider_stream",{"provider":provider,**identity(before),"read":total})
+        if provider_read(fd,1,deadline): fail("provider executable grew while streamed")
+        after_hash=os.fstat(fd)
+        if provider_stat_stability(after_hash)!=stable: fail("provider executable drift")
+        raw_test_barrier(barrier,"provider_preexec",{"provider":provider,**identity(after_hash),"sha256":digest.hexdigest()})
+        final_descriptor=os.fstat(fd); no_symlink_components(path); named_after=os.lstat(raw_path)
+        validate_provider_stat(final_descriptor,maximum); validate_provider_stat(named_after,maximum)
+        if (provider_stat_stability(final_descriptor)!=stable or provider_stat_stability(named_after)!=stable
+                or identity(final_descriptor)!=identity(named_after)):
+            fail("provider executable final identity drift")
+        record={"provider":provider,"maximum_bytes":maximum,
+                "chunk_bytes":PROVIDER_EXECUTABLE_CHUNK_BYTES,"timeout_ns":PROVIDER_EXECUTABLE_TIMEOUT_NS,
+                "path":raw_path,**identity(before),"sha256":digest.hexdigest()}
+        if retain_descriptor:
+            retained=True
+            return record,fd
+        return record
+    except OSError:
+        fail("provider executable filesystem error")
+    finally:
+        if fd is not None and not retained: os.close(fd)
+
+def reprove_provider_executable(expected, barrier=None, retain_descriptor=False):
+    if not isinstance(expected,dict) or not exact_keys(expected,PROVIDER_EXECUTABLE_FIELDS):
+        fail("provider executable record schema")
+    result=provider_executable_record(expected["provider"],expected["path"],barrier,retain_descriptor)
+    if retain_descriptor:
+        observed,fd=result
+        if observed!=expected:
+            os.close(fd); fail("provider executable manifest mismatch")
+        return fd
+    if result!=expected: fail("provider executable manifest mismatch")
+
+def provider_capsule_attachment_schema(value):
+    keys={"device","device_identifier","mountpoint","filesystem","bus_protocol","volume_uuid",
+          "readonly","options","disk_info_timing","attach_timing"}
+    if not isinstance(value,dict) or not exact_keys(value,keys): fail("provider capsule attachment schema")
+    for name in ("disk_info_timing","attach_timing"):
+        timing=value[name]
+        required={"start_monotonic_ns","end_monotonic_ns","duration_ns","exit_code","argv_sha256",
+                  "stdout_sha256","stderr_sha256"}
+        if (not isinstance(timing,dict) or not exact_keys(timing,required)
+                or timing["duration_ns"]!=timing["end_monotonic_ns"]-timing["start_monotonic_ns"]
+                or timing["duration_ns"]<0 or timing["exit_code"]!=0): fail("provider capsule timing schema")
+
+def provider_capsule_guardian_schema(value):
+    required={"create_sequence","seal_sequence","create_digest","sealed_digest","capsule"}
+    if not isinstance(value,dict) or not exact_keys(value,required): fail("provider capsule guardian schema")
+    capsule=value["capsule"]
+    keys={"schema_version","state","provider","source_bytes","requested_image_bytes","maximum_image_bytes",
+          "root","mountpoint_backing","image","attachment","create_timing","rw_detach"}
+    if (not isinstance(capsule,dict) or not exact_keys(capsule,keys) or capsule.get("schema_version")!=1
+            or capsule.get("state")!="RO_ATTACHED" or value["create_sequence"]!=1 or value["seal_sequence"]!=2
+            or value["sealed_digest"]!=digest_bytes(canonical(capsule).encode("ascii"))):
+        fail("provider capsule guardian state")
+    provider_capsule_attachment_schema(capsule["attachment"])
+    image=capsule["image"]
+    if not isinstance(image,dict) or not exact_keys(image,{"path","dev","ino","uid","mode","nlink","bytes","sha256"}):
+        fail("provider capsule image schema")
+    detach=capsule["rw_detach"]
+    if (not isinstance(detach,dict) or not exact_keys(detach,{"device","mountpoint","absent","detach_timing"})
+            or detach.get("absent") is not True): fail("provider capsule detach schema")
+
+def codesign_record_schema(value, path):
+    unsigned={"state","display_result"}
+    signed={"state","identifier","team_identifier","cdhash","designated_requirement","codedirectory_flags",
+            "display_result","strict_verify_result"}
+    if not isinstance(value,dict): fail("provider capsule signing schema")
+    state=value.get("state")
+    if state=="unsigned":
+        if not exact_keys(value,unsigned): fail("provider capsule signing schema")
+    elif state in ("adhoc_signed","team_signed"):
+        if (not exact_keys(value,signed) or not isinstance(value["identifier"],str) or not value["identifier"]
+                or value["identifier"]!=value["identifier"].strip()
+                or len(value["identifier"].encode("utf-8"))>CODESIGN_IDENTIFIER_MAX_BYTES
+                or not re.fullmatch(r"[0-9a-f]{40}",str(value["cdhash"]))
+                or not isinstance(value["designated_requirement"],str) or not value["designated_requirement"]
+                or value["designated_requirement"]!=value["designated_requirement"].strip()
+                or len(value["designated_requirement"].encode("utf-8"))>CODESIGN_REQUIREMENT_MAX_BYTES
+                or type(value["codedirectory_flags"]) is not int or value["codedirectory_flags"]<0):
+            fail("provider capsule signing schema")
+        if state=="adhoc_signed":
+            if value["team_identifier"] is not None or not value["codedirectory_flags"]&0x2:
+                fail("provider capsule signing schema")
+        elif (not re.fullmatch(r"[A-Z0-9]{10}",str(value["team_identifier"]))
+                or value["codedirectory_flags"]&0x2):
+            fail("provider capsule signing schema")
+    else: fail("provider capsule signing schema")
+    display_argv=[str(CODESIGN),"--display","--requirements","-","--verbose=4",str(path)]
+    codesign_result_schema(value["display_result"],display_argv)
+    if (state=="unsigned")!=(value["display_result"]["exit_code"]!=0):
+        fail("provider capsule signing display relationship")
+    if state!="unsigned":
+        verify_argv=[str(CODESIGN),"--verify","--strict","--verbose=4",str(path)]
+        codesign_result_schema(value["strict_verify_result"],verify_argv)
+        if value["strict_verify_result"]["exit_code"]!=0:
+            fail("provider capsule strict code signature")
+        if (value["display_result"]["end_monotonic_ns"]>value["strict_verify_result"]["start_monotonic_ns"]
+                or value["display_result"]["end_utc"]>value["strict_verify_result"]["start_utc"]):
+            fail("provider capsule codesign command order")
+
+def provider_capsule_schema(value):
+    keys={"schema_version","provider","source","macho","xattrs","copy","mounted","signing","copy_timing","guardian"}
+    if not isinstance(value,dict) or not exact_keys(value,keys) or value.get("schema_version")!=1:
+        fail("provider capsule schema")
+    if not isinstance(value["source"],dict) or not exact_keys(value["source"],PROVIDER_EXECUTABLE_FIELDS):
+        fail("provider capsule source schema")
+    copy_keys={"path","dev","ino","uid","mode","nlink","bytes","sha256"}
+    if not isinstance(value["copy"],dict) or not exact_keys(value["copy"],copy_keys):
+        fail("provider capsule copy schema")
+    if not isinstance(value["mounted"],dict) or not exact_keys(value["mounted"],PROVIDER_EXECUTABLE_FIELDS):
+        fail("provider capsule mounted schema")
+    macho=value["macho"]
+    if (not isinstance(macho,dict) or not exact_keys(macho,{"format","native_architecture","architectures","magic"})
+            or macho["native_architecture"] not in macho["architectures"]): fail("provider capsule Mach-O schema")
+    if not isinstance(value["xattrs"],list) or len(value["xattrs"])>PROVIDER_CAPSULE_METADATA_MAX_COUNT:
+        fail("provider capsule xattr schema")
+    names=[]
+    for item in value["xattrs"]:
+        if (not isinstance(item,dict) or not exact_keys(item,{"name","name_bytes","bytes","sha256"})
+                or not isinstance(item["name"],str) or not re.fullmatch(r"[0-9a-f]{64}",str(item["sha256"]))):
+            fail("provider capsule xattr schema")
+        names.append(item["name"])
+    if names!=sorted(set(names)): fail("provider capsule xattr order")
+    timing=value["copy_timing"]
+    if (not isinstance(timing,dict) or not exact_keys(timing,{"start_monotonic_ns","end_monotonic_ns","duration_ns",
+            "bytes","chunk_bytes","timeout_ns"}) or timing["duration_ns"]!=timing["end_monotonic_ns"]-timing["start_monotonic_ns"]):
+        fail("provider capsule copy timing")
+    signing=value["signing"]
+    if not isinstance(signing,dict) or not exact_keys(signing,{"source","copy","mounted"}):
+        fail("provider capsule signing schema")
+    for name,path in (("source",value["source"]["path"]),("copy",value["copy"]["path"]),
+                      ("mounted",value["mounted"]["path"])):
+        codesign_record_schema(signing[name],path)
+    identities=[codesign_stable_identity(signing[name]) for name in ("source","copy","mounted")]
+    if identities[1:]!=identities[:-1]: fail("provider capsule signing identity mismatch")
+    provider_capsule_guardian_schema(value["guardian"])
+
+def build_provider_capsule(provider, source_path, control, guardian_pid, guardian_token, invocation, barrier):
+    source,source_fd=provider_executable_record(provider,source_path,barrier,retain_descriptor=True)
+    try:
+        source_stable=provider_stat_stability(os.fstat(source_fd))
+        reprove_provider_source_descriptor(source_fd,source)
+        source_signing=codesign_record(Path(source["path"]))
+        reprove_provider_source_descriptor(source_fd,source)
+        created=guardian_capsule_request(control,guardian_token,invocation,guardian_pid,1,"capsule_create",
+                                         provider=provider,source_bytes=source["bytes"])
+        rw=created["capsule"]
+        if (rw.get("state")!="RW_ATTACHED" or rw.get("provider")!=provider
+                or rw.get("source_bytes")!=source["bytes"]): fail("provider capsule create receipt")
+        destination=Path(rw["attachment"]["mountpoint"])/"provider"
+        copy,macho,xattrs,copy_timing=provider_copy_to_capsule(source_fd,source,destination,barrier)
+        copy_signing=codesign_record(destination)
+        observed_copy=provider_executable_record(provider,str(destination))
+        if any(copy[key]!=observed_copy[key] for key in ("path","dev","ino","uid","mode","nlink","bytes","sha256")):
+            fail("provider capsule copy signing drift")
+        reprove_provider_source_descriptor(source_fd,source)
+        after_xattrs,_=provider_xattrs(source_fd)
+        if provider_stat_stability(os.fstat(source_fd))!=source_stable or after_xattrs!=xattrs:
+            fail("provider capsule source mutation")
+        sealed=guardian_capsule_request(control,guardian_token,invocation,guardian_pid,2,"capsule_seal",
+                                        capsule_digest=created["capsule_digest"])
+        final=sealed["capsule"]; mounted_path=Path(final["attachment"]["mountpoint"])/"provider"
+        mounted=provider_executable_record(provider,str(mounted_path),barrier)
+        mounted_fd=os.open(str(mounted_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+        try: mounted_xattrs,_=provider_xattrs(mounted_fd)
+        finally: os.close(mounted_fd)
+        if (mounted_xattrs!=xattrs or any(source[key]!=copy[key] or source[key]!=mounted[key]
+                for key in ("uid","mode","nlink","bytes","sha256"))):
+            fail("provider capsule source-copy-mounted mismatch")
+        mounted_signing=codesign_record(mounted_path)
+        signing={"source":source_signing,"copy":copy_signing,"mounted":mounted_signing}
+        identities=[codesign_stable_identity(signing[name]) for name in ("source","copy","mounted")]
+        if identities[1:]!=identities[:-1]: fail("provider capsule signing identity mismatch")
+        result={"schema_version":1,"provider":provider,"source":source,"macho":macho,"xattrs":xattrs,
+                "copy":copy,"mounted":mounted,"signing":signing,"copy_timing":copy_timing,
+                "guardian":{"create_sequence":1,"seal_sequence":2,"create_digest":created["capsule_digest"],
+                            "sealed_digest":sealed["capsule_digest"],"capsule":final}}
+        provider_capsule_schema(result)
+        return result
+    finally: os.close(source_fd)
+
+def validate_provider_capsule(doc, dynamic=True):
+    capsule=doc["provider_capsule"]; provider_capsule_schema(capsule)
+    source=capsule["source"]; copy=capsule["copy"]; mounted=capsule["mounted"]
+    if capsule["provider"]!=doc["provider"] or source["provider"]!=doc["provider"] or mounted["provider"]!=doc["provider"]:
+        fail("provider capsule provider binding")
+    guardian=capsule["guardian"]["capsule"]; root=Path(doc["guardian"]["root"])/"provider-capsule"
+    mounted_path=root/"mount"/"provider"
+    if (Path(guardian["root"])!=root or Path(guardian["image"]["path"])!=root/"provider.dmg"
+            or Path(guardian["attachment"]["mountpoint"])!=root/"mount"
+            or Path(copy["path"])!=mounted_path or Path(mounted["path"])!=mounted_path):
+        fail("provider capsule path binding")
+    if any(source[key]!=copy[key] or source[key]!=mounted[key] for key in ("uid","mode","nlink","bytes","sha256")):
+        fail("provider capsule byte binding")
+    if not dynamic: return
+    try: guardian_reprove_attachment(guardian["attachment"])
+    except RuntimeError as exc: fail(str(exc))
+    image_st=os.lstat(guardian["image"]["path"])
+    if identity(image_st)!={key:guardian["image"][key] for key in ("dev","ino","uid","mode","nlink","bytes")}:
+        fail("provider capsule image drift")
+    observed=provider_executable_record(doc["provider"],mounted["path"],doc["test_barrier"])
+    if observed!=mounted: fail("provider capsule mounted executable drift")
+    descriptor=os.open(mounted["path"],os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try: observed_xattrs,_=provider_xattrs(descriptor)
+    finally: os.close(descriptor)
+    current_signing=codesign_record(Path(mounted["path"]))
+    if observed_xattrs!=capsule["xattrs"]: fail("provider capsule metadata drift")
+    validate_codesign_reproof(capsule["signing"]["mounted"],current_signing)
+
+def provider_exec(ns, rest):
+    if not rest: fail("provider exec argv")
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation:
+        fail("provider exec manifest binding")
+    seatbelt=doc["seatbelt"]; expected=doc["provider_capsule"]["mounted"]
+    if ns.terminal:
+        if len(rest)<2 or rest[0]!=doc["provider_capsule"]["source"]["path"] or rest[1]!=expected["path"]:
+            fail("provider terminal argv")
+        validate_provider_capsule(doc)
+        capsule=doc["provider_capsule"]
+        # The barrier releases a synchronized mutator INSIDE the check-then-use window.  It is a
+        # no-op in production (manifest test_barrier disabled and no barrier environment), and the
+        # revalidation below is deliberately kept AFTER it: an attack that lands between the two
+        # validations must be observed here rather than carried into execve.
+        test_barrier(doc,"capsule_preexec",{
+            "capsule_digest":capsule["guardian"]["sealed_digest"],
+            "mounted":expected,
+            "logical_argv":[rest[0]]+rest[2:],
+        })
+        validate_provider_capsule(doc)
+        argv=[os.fsencode(rest[0])]+[os.fsencode(value) for value in rest[2:]]
+        provider_env=os.environb.copy()
+        # The barrier is the wrapper's own synchronization channel.  The provider never inherits it,
+        # so a provider process can neither observe nor forge barrier state.
+        for name in (b"FIRM_EVAL_TEST_BARRIER_ROOT",b"FIRM_EVAL_TEST_BARRIER_TOKEN",
+                     b"FIRM_EVAL_TEST_BARRIER_INVOCATION",b"FIRM_EVAL_TEST_BARRIER_PHASE"):
+            provider_env.pop(name,None)
+        # The residual path-exec window cannot be closed by revalidation (this platform's os.execve
+        # does not accept a descriptor), so a refused exec must still be a stated BLOCK, never an
+        # unhandled traceback that a caller could read as an ambiguous outcome.
+        try: os.execve(os.fsencode(expected["path"]),argv,provider_env)
+        except OSError: fail("provider terminal exec")
+    prefix=seatbelt["supervisor_argv_prefix"]
+    if rest[:len(prefix)]!=prefix or len(rest)<=len(prefix) or rest[len(prefix)]!="/usr/bin/env":
+        fail("provider exec supervisor argv")
+    cursor=len(prefix)+1
+    assignment=re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$",re.DOTALL)
+    while cursor<len(rest) and assignment.fullmatch(rest[cursor]): cursor+=1
+    if cursor>=len(rest) or rest[cursor]!=expected.get("path"):
+        fail("provider exec executable argv")
+    validate_provider_capsule(doc)
+    terminal=[str(SELF),"provider-exec","--manifest",ns.manifest,"--digest",ns.digest,
+              "--invocation",ns.invocation,"--terminal","--",doc["provider_capsule"]["source"]["path"]]
+    rewritten=rest[:cursor]+terminal+rest[cursor:]
+    os.execve(os.fsencode(rewritten[0]),[os.fsencode(value) for value in rewritten],os.environb.copy())
+
+def find_probe_file(real_common):
+    for current,dirs,files in os.walk(str(real_common),topdown=True,followlinks=False):
+        dirs.sort(); files.sort()
+        for name in files:
+            path=Path(current)/name; st=os.lstat(str(path))
+            if (stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid()
+                    and st.st_mode&stat.S_IRUSR and st.st_mode&stat.S_IWUSR):
+                return path
+    fail("no safe real-common probe file")
+
+def run_seatbelt_probe(seatbelt, capsule):
+    profile=Path(seatbelt["profile"]["path"]); real_common=Path(seatbelt["real_common"])
+    alias=Path(seatbelt["alias"]); probe=Path(seatbelt["probe_file"]); sentinel=Path(seatbelt["capsule_sentinel"])
+    rel=probe.relative_to(real_common); alias_probe=alias/rel
+    script=r'''import errno,json,os,sys
+real,alias,sentinel=sys.argv[1:]
+def denied(path,flags):
+    try:
+        fd=os.open(path,flags)
+    except OSError as exc:
+        return exc.errno in (errno.EACCES,errno.EPERM)
+    else:
+        os.close(fd); return False
+ok={"canonical_read":denied(real,os.O_RDONLY),
+    "canonical_write":denied(real,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0)),
+    "alias_read":denied(alias,os.O_RDONLY),
+    "alias_write":denied(alias,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0))}
+with open(sentinel,"rb") as handle: before=handle.read()
+fd=os.open(sentinel,os.O_WRONLY|getattr(os,"O_NOFOLLOW",0)); os.write(fd,b"seatbelt-capsule-ok\n"); os.fsync(fd); os.close(fd)
+with open(sentinel,"rb") as handle: after=handle.read()
+ok["capsule_read_write"]=before==b"seatbelt-capsule-ok\n" and after==before
+print(json.dumps(ok,sort_keys=True,separators=(",",":")))
+raise SystemExit(0 if all(ok.values()) else 3)
+'''
+    done=subprocess.run([seatbelt["wrapper"]["path"],"-D","REAL_COMMON="+str(real_common),"-f",str(profile),
+                         sys.executable,"-c",script,str(probe),str(alias_probe),str(sentinel)],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,close_fds=True,timeout=10)
+    if done.returncode!=0: fail("Seatbelt denial self-probe")
+    try: result=json.loads(done.stdout.decode("ascii"))
+    except Exception: fail("Seatbelt probe result")
+    expected={"canonical_read":True,"canonical_write":True,"alias_read":True,"alias_write":True,"capsule_read_write":True}
+    if result!=expected: fail("Seatbelt probe incomplete")
+    return {"result":result,"stdout_sha256":digest_bytes(done.stdout),"profile_sha256":seatbelt["profile"]["sha256"],
+            "wrapper_sha256":seatbelt["wrapper"]["sha256"],"monotonic_ns":time.monotonic_ns()}
+
+def prepare_seatbelt(real_common, capsule_root, control, provider, provider_executable,
+                     guardian_pid, guardian_token, invocation, barrier=None):
+    if sys.platform!="darwin" or not SANDBOX_EXEC.exists(): fail("Seatbelt unsupported")
+    wrapper=external_file_record(SANDBOX_EXEC)
+    provider_capsule=build_provider_capsule(provider,provider_executable,control,guardian_pid,
+                                            guardian_token,invocation,barrier)
+    provider_record=provider_capsule["source"]
+    profile=control/"provider.sb"; put_file(profile,PROFILE_SOURCE,0o400)
+    alias=control/"real-common-alias"; os.symlink(str(real_common),str(alias))
+    sentinel=control/"seatbelt-capsule-sentinel"; put_file(sentinel,b"seatbelt-capsule-ok\n",0o600)
+    probe=find_probe_file(real_common)
+    seatbelt={"profile":{"path":str(profile),**path_record(profile)},"wrapper":wrapper,"provider":provider_record,
+              "real_common":str(real_common),"real_common_identity":path_record(real_common,False),
+              "alias":str(alias),"probe_file":str(probe),"probe_file_identity":{"path":str(probe),**path_record(probe)},
+              "capsule_sentinel":str(sentinel),"supervisor_argv_prefix":[str(SANDBOX_EXEC),"-D","REAL_COMMON="+str(real_common),"-f",str(profile)]}
+    seatbelt["prepare_probe"]=run_seatbelt_probe(seatbelt,{})
+    return seatbelt,provider_capsule
+
+def validate_seatbelt(doc, post=False):
+    seatbelt=doc["seatbelt"]
+    if external_file_record(Path(seatbelt["wrapper"]["path"]))!=seatbelt["wrapper"]: fail("Seatbelt wrapper drift")
+    if seatbelt["provider"]!=doc["provider_capsule"]["source"]: fail("Seatbelt provider binding")
+    validate_provider_capsule(doc)
+    profile={"path":seatbelt["profile"]["path"],**path_record(Path(seatbelt["profile"]["path"]))}
+    if profile!=seatbelt["profile"] or Path(seatbelt["profile"]["path"]).read_bytes()!=PROFILE_SOURCE: fail("Seatbelt profile drift")
+    real=Path(seatbelt["real_common"])
+    if path_record(real,False)!=seatbelt["real_common_identity"] or tree_inventory(real)!=doc["capsule"]["real_common_before"]:
+        fail("real common identity drift")
+    alias=Path(seatbelt["alias"])
+    if not alias.is_symlink() or Path(os.readlink(str(alias)))!=real: fail("Seatbelt alias drift")
+    if {"path":seatbelt["probe_file"],**path_record(Path(seatbelt["probe_file"]))}!=seatbelt["probe_file_identity"]: fail("Seatbelt probe target drift")
+    receipt=run_seatbelt_probe(seatbelt,doc["capsule"])
+    receipt["phase"]="post" if post else "prelaunch"
+    return receipt
+
+def seatbelt_probe(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("Seatbelt invocation binding")
+    receipt=validate_seatbelt(doc,ns.post)
+    print(canonical(receipt))
+
+def test_barrier_probe(ns):
+    root=Path(ns.root).resolve(); owned_directory(root)
+    target=Path(ns.target).resolve()
+    if target.parent!=root or not re.fullmatch(r"[0-9a-f]{64}",ns.token) or not re.fullmatch(r"[0-9a-f]{48}",ns.invocation):
+        fail("test barrier probe binding")
+    if ns.phase not in TEST_BARRIER_PHASES or not re.fullmatch(r"[0-9a-f]{40}",ns.candidate): fail("test barrier probe scope")
+    before_raw,before_st=read_bytes(target,MAX_MESSAGE)
+    before={"candidate":ns.candidate,"identity":identity(before_st),"sha256":digest_bytes(before_raw)}
+    config=test_barrier_config(root,ns.token,ns.phase,ns.invocation)
+    raw_test_barrier(config,ns.phase,before)
+    try: after_raw,after_st=read_bytes(target,MAX_MESSAGE)
+    except BaseException: fail("concurrent "+ns.phase+" mutation detected")
+    after={"identity":identity(after_st),"sha256":digest_bytes(after_raw)}
+    if after["identity"]!=before["identity"] or after["sha256"]!=before["sha256"]:
+        fail("concurrent "+ns.phase+" mutation detected")
+    fail("test barrier mutation not detected")
+
+def object_closure(root, commit):
+    names=git(root,"rev-list","--objects","--no-object-names",commit).splitlines()
+    if not names or len(names)!=len(set(names)) or any(not re.fullmatch(r"[0-9a-f]{40}",x) for x in names):
+        fail("noncanonical object closure")
+    proc=subprocess.Popen([GIT,"-C",str(root),"cat-file","--batch"],stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                          env={**SAFE_GIT_ENV,"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"})
+    out,err=proc.communicate(("\n".join(names)+"\n").encode("ascii"))
+    if proc.returncode: fail("cannot read payload object closure")
+    cursor=0; rows=[]
+    for expected in names:
+        end=out.find(b"\n",cursor)
+        if end<0: fail("truncated object closure")
+        header=out[cursor:end].decode("ascii").split(); cursor=end+1
+        if len(header)!=3 or header[0]!=expected or header[1] not in ("blob","tree","commit","tag"):
+            fail("object closure header")
+        size=int(header[2]); body=out[cursor:cursor+size]; cursor+=size
+        if len(body)!=size or out[cursor:cursor+1]!=b"\n": fail("object closure framing")
+        cursor+=1; rows.append({"oid":expected,"type":header[1],"size":size,
+                               "sha256":digest_bytes(body)})
+    if cursor!=len(out): fail("extra object closure bytes")
+    return rows
+
+def copy_fixture(src, dst):
+    src=Path(src); dst=Path(dst); no_symlink_components(src)
+    for current,dirs,files in os.walk(str(src),topdown=True,followlinks=False):
+        dirs.sort(); files.sort(); rel=Path(current).relative_to(src)
+        for name in dirs:
+            source=Path(current)/name; st=os.lstat(str(source))
+            if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode): fail("unsafe fixture directory")
+            target=dst/rel/name
+            if target.exists() or target.is_symlink(): fail("fixture collision")
+            target.mkdir(mode=stat.S_IMODE(st.st_mode)&0o755)
+        for name in files:
+            source=Path(current)/name; st=os.lstat(str(source)); target=dst/rel/name
+            if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_nlink!=1:
+                fail("unsafe fixture file")
+            if target.exists() or target.is_symlink(): fail("fixture collision")
+            if hasattr(os,"listxattr") and os.listxattr(str(source)): fail("fixture xattr")
+            raw,_=read_bytes(source,16*1024*1024); put_file(target,raw,stat.S_IMODE(st.st_mode)&0o755)
+
+def isolated_git(cwd, args, data=None, extra=None):
+    env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL":"C"}; env.update(SAFE_GIT_ENV)
+    if extra: env.update(extra)
+    done=subprocess.run([GIT,"-C",str(cwd)]+list(args),input=data,stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,env=env)
+    if done.returncode:
+        detail=done.stderr.decode("utf-8","replace").strip().replace("\n"," ")[:500]
+        fail("contained git command failed (%s): %s"%(" ".join(args[:4]),detail))
+    return done.stdout
+
+def build_capsule(root, scratch, fixture):
+    if (scratch/".git").exists() or (scratch/"project").exists() or (scratch/"git-common").exists():
+        fail("capsule must begin outside a repository")
+    real_common=Path(git(root,"rev-parse","--path-format=absolute","--git-common-dir"))
+    no_symlink_components(real_common); before=tree_inventory(real_common)
+    chain=[git(root,"rev-parse",x) for x in (PATCH_BASE,PATCH_COMMIT,PAYLOAD_COMMIT)]
+    if chain!=[PATCH_BASE,PATCH_COMMIT,PAYLOAD_COMMIT] or git(root,"show","-s","--format=%P",PATCH_COMMIT)!=PATCH_BASE or git(root,"show","-s","--format=%P",PAYLOAD_COMMIT)!=PATCH_COMMIT:
+        fail("payload parent chain")
+    payload_tree=git(root,"rev-parse",PAYLOAD_COMMIT+"^{tree}")
+    closure=object_closure(root,PAYLOAD_COMMIT)
+    project=scratch/"project"; common=scratch/"git-common"; hooks=scratch/"no-hooks"
+    project.mkdir(mode=0o700); common.mkdir(mode=0o700); hooks.mkdir(mode=0o500)
+    for rel in ("objects","objects/pack","objects/info","refs","refs/heads","refs/firm-eval","info","worktrees"):
+        (common/rel).mkdir(mode=0o700)
+    config=("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+            "\tlogallrefupdates = true\n\tworktree = %s\n\thooksPath = %s\n"
+            "[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"%(project,hooks)).encode("utf-8")
+    put_file(common/"config",config,0o400)
+    put_file(common/"HEAD",b"ref: refs/heads/main\n",0o600)
+    pack=isolated_git(root,["pack-objects","--revs","--stdout"],(PAYLOAD_COMMIT+"\n").encode("ascii"))
+    env={"GIT_OBJECT_DIRECTORY":str(common/"objects")}
+    isolated_git(root,["--git-dir",str(common),"index-pack","--stdin","--fix-thin"],pack,env)
+    pack_files=[]
+    for path in sorted((common/"objects/pack").iterdir()):
+        if path.suffix not in (".pack",".idx",".rev") or path.is_symlink():
+            fail("unexpected initial pack: "+path.name)
+        os.chmod(str(path),0o400); item={"path":str(path.relative_to(scratch))}; item.update(path_record(path)); pack_files.append(item)
+    if len(pack_files) not in (2,3): fail("protected pack shape")
+    put_file(common/"refs/heads/main",(PAYLOAD_COMMIT+"\n").encode("ascii"),0o600)
+    put_file(common/"refs/firm-eval/candidate",(PAYLOAD_COMMIT+"\n").encode("ascii"),0o400)
+    put_file(common/"refs/firm-eval/base",(PATCH_BASE+"\n").encode("ascii"),0o400)
+    gitfile=("gitdir: %s\n"%common).encode("utf-8"); put_file(project/".git",gitfile,0o400)
+    isolated_git(project,["reset","--hard",PAYLOAD_COMMIT])
+    if git(project,"rev-parse","HEAD")!=PAYLOAD_COMMIT or git(project,"rev-parse","HEAD^{tree}")!=payload_tree:
+        fail("payload checkout identity")
+    # The launcher-owned authority is the one intentional harness overlay.  Candidate tools remain
+    # byte-exact a57 payload files; the a57 writer requires its authority at TOOL_ROOT/bin, so the
+    # manifest classifies and protects this path as harness identity rather than relabelling it.
+    authority_raw,_=read_bytes(SELF)
+    os.unlink(str(project/"bin/firm-eval-authority"))
+    put_file(project/"bin/firm-eval-authority",authority_raw,0o500)
+    copy_fixture(fixture,project)
+    isolated_git(project,["add","-A"])
+    fixed={"GIT_AUTHOR_NAME":"Firm Eval","GIT_AUTHOR_EMAIL":"eval@firm.invalid",
+           "GIT_COMMITTER_NAME":"Firm Eval","GIT_COMMITTER_EMAIL":"eval@firm.invalid",
+           "GIT_AUTHOR_DATE":"2000-01-01T00:00:00Z","GIT_COMMITTER_DATE":"2000-01-01T00:00:00Z"}
+    isolated_git(project,["commit","-m","fixture"],extra=fixed)
+    fixture_tip=git(project,"rev-parse","HEAD"); fixture_tree=git(project,"rev-parse","HEAD^{tree}")
+    if git(project,"status","--porcelain","--untracked-files=all"): fail("dirty fixture tip")
+    present=set(git(project,"cat-file","--batch-all-objects","--batch-check=%(objectname)").splitlines())
+    if not set(row["oid"] for row in closure).issubset(present): fail("payload object omission")
+    if tree_inventory(real_common)!=before: fail("real common changed during materialization")
+    protected={"gitfile":{"path":"project/.git",**path_record(project/".git")},
+               "config":{"path":"git-common/config",**path_record(common/"config")},
+               "candidate_ref":{"path":"git-common/refs/firm-eval/candidate",**path_record(common/"refs/firm-eval/candidate")},
+               "base_ref":{"path":"git-common/refs/firm-eval/base",**path_record(common/"refs/firm-eval/base")},
+               "harness_authority":{"path":"project/bin/firm-eval-authority",**path_record(project/"bin/firm-eval-authority")},
+               "packs":pack_files}
+    return {"project":str(project),"common":str(common),"hooks":str(hooks),
+            "root_identity":path_record(scratch,False),"project_identity":path_record(project,False),
+            "common_identity":path_record(common,False),"objects_identity":path_record(common/"objects",False),
+            "hooks_identity":path_record(hooks,False),
+            "payload_tree":payload_tree,"closure":closure,"fixture_tip":fixture_tip,
+            "fixture_tree":fixture_tree,"protected":protected,
+            "real_root":str(root),"real_common":str(real_common),"real_common_before":before}
+
+def validate_capsule(doc, final=False):
+    cap=doc["capsule"]; root=Path(doc["scratch_root"]); project=Path(cap["project"]); common=Path(cap["common"])
+    for path,key in ((root,"root_identity"),(project,"project_identity"),(common,"common_identity"),(common/"objects","objects_identity"),(Path(cap["hooks"]),"hooks_identity")):
+        actual=path_record(path,False); expected=cap[key]
+        if path.resolve()!=path or any(actual[name]!=expected[name] for name in ("dev","ino","uid","mode")):
+            fail("capsule directory identity")
+        if os.path.commonpath((str(root),str(path)))!=str(root): fail("capsule containment")
+    if (root/".git").exists() or (root/".git").is_symlink(): fail("outer capsule became repository")
+    for item in [cap["protected"]["gitfile"],cap["protected"]["config"],cap["protected"]["candidate_ref"],cap["protected"]["base_ref"],cap["protected"]["harness_authority"]]+cap["protected"]["packs"]:
+        path=root/item["path"]
+        if path_record(path)!={k:v for k,v in item.items() if k!="path"}: fail("protected capsule bytes changed")
+    if (project/".git").read_bytes() != ("gitdir: %s\n"%common).encode(): fail("gitfile escape")
+    resolved=[git(project,"rev-parse","--show-toplevel"),git(project,"rev-parse","--path-format=absolute","--git-dir"),git(project,"rev-parse","--path-format=absolute","--git-common-dir"),git(project,"rev-parse","--path-format=absolute","--git-path","objects")]
+    if resolved != [str(project),str(common),str(common),str(common/"objects")]: fail("resolved git path escape")
+    if git(project,"rev-parse","refs/firm-eval/candidate")!=PAYLOAD_COMMIT or git(project,"rev-parse","refs/firm-eval/base")!=PATCH_BASE:
+        fail("anchor ref changed")
+    for forbidden in (common/"objects/info/alternates",common/"info/grafts",common/"shallow",common/"packed-refs"):
+        if forbidden.exists() or forbidden.is_symlink(): fail("forbidden git indirection")
+    if any((common/"refs/replace").glob("*")) if (common/"refs/replace").exists() else False: fail("replace ref")
+    if list(Path(cap["hooks"]).iterdir()): fail("hook appeared")
+    config=(common/"config").read_text("utf-8")
+    for token in ("remote \"","include","promisor","partialclonefilter","submodule","credential","filter \""):
+        if token.lower() in config.lower(): fail("unsafe repository config")
+    for current,dirs,files in os.walk(str(common),topdown=True,followlinks=False):
+        for name in dirs+files:
+            path=Path(current)/name; st=os.lstat(str(path))
+            if stat.S_ISLNK(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink!=1): fail("git metadata link escape")
+            if os.path.commonpath((str(root),str(path.resolve())))!=str(root): fail("git metadata path escape")
+    for path in (common/"worktrees").glob("*"):
+        if not path.is_dir() or path.is_symlink(): fail("worktree administration shape")
+        gitdir=(path/"gitdir").read_text("utf-8").strip(); commondir=(path/"commondir").read_text("utf-8").strip()
+        if Path(gitdir).resolve().name!=".git" or os.path.commonpath((str(root),str(Path(gitdir).resolve())))!=str(root): fail("linked worktree gitfile escape")
+        if (path/commondir).resolve()!=common: fail("linked worktree common-dir escape")
+    if tree_inventory(Path(cap["real_common"]))!=cap["real_common_before"]: fail("real repository changed")
+
+def reject_git_environment():
+    denied={"GIT_DIR","GIT_WORK_TREE","GIT_COMMON_DIR","GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES","GIT_REPLACE_REF_BASE","GIT_NAMESPACE",
+            "GIT_INDEX_FILE","GIT_SHALLOW_FILE","GIT_CEILING_DIRECTORIES","GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_PARAMETERS","GIT_TEMPLATE_DIR","GIT_EXEC_PATH","GIT_SSH","GIT_SSH_COMMAND",
+            "GIT_ASKPASS","GIT_PROTOCOL"}
+    for key,value in os.environ.items():
+        if key in SAFE_GIT_ENV and SAFE_GIT_ENV[key]!=value:
+            fail("unsafe Git environment")
+        if key in denied or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            fail("unsafe Git environment")
+
+def exact_keys(value, keys):
+    return isinstance(value, dict) and set(value) == set(keys)
+
+def validate_tool(tool, root):
+    keys = {"name","path","dev","ino","uid","mode","nlink","bytes","sha256"}
+    if not exact_keys(tool, keys): fail("tool schema")
+    path = Path(tool["path"])
+    if path.parent != root / "bin" or path.name != tool["name"] or path.resolve() != path:
+        fail("tool path escape")
+    no_symlink_components(path)
+    raw, st = read_bytes(path)
+    if identity(st) != {key: tool[key] for key in ("dev","ino","uid","mode","nlink","bytes")}:
+        fail("tool identity changed")
+    if st.st_nlink != 1 or not (st.st_mode & stat.S_IXUSR) or digest_bytes(raw) != tool["sha256"]:
+        fail("tool bytes or mode changed")
+    return raw, st
+
+def load_manifest(path):
+    manifest_path=Path(path); fd=os.open(str(manifest_path),os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        st=os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_nlink!=1
+                or st.st_size>4*1024*1024 or stat.S_IMODE(st.st_mode)!=0o600): fail("manifest mode")
+        raw=b""
+        while True:
+            part=os.read(fd,65536)
+            if not part: break
+            raw+=part
+            if len(raw)>4*1024*1024: fail("oversized manifest")
+        try: doc=json.loads(raw.decode("utf-8","strict"))
+        except Exception: fail("manifest JSON")
+        if not isinstance(doc,dict): fail("manifest JSON")
+        test_barrier(doc,"manifest_read",identity(st))
+        os.lseek(fd,0,os.SEEK_SET); second=b""
+        while True:
+            part=os.read(fd,65536)
+            if not part: break
+            second+=part
+        after=os.fstat(fd); named=os.lstat(str(manifest_path))
+        if raw!=second or identity(st)!=identity(after) or identity(after)!=identity(named):
+            fail("manifest changed across read interval")
+    finally: os.close(fd)
+    keys = {"schema_version","purpose","invocation","eval","provider","harness_root",
+            "harness_commit","harness_tree","candidate_root","candidate_commit","candidate_tree",
+            "patch_base","patch_commit","patch_bytes","patch_sha256","scratch_root","scratch_dev",
+            "scratch_ino","request_root","response_root","runner","tools","capsule","guardian",
+            "seatbelt","provider_capsule","test_barrier"}
+    if not exact_keys(doc, keys) or doc["schema_version"] != 3 or doc["purpose"] != "disposable_git_candidate_eval":
+        fail("manifest schema")
+    root = Path(doc["candidate_root"])
+    if root.resolve() != root: fail("candidate root")
+    if doc["patch_base"] != PATCH_BASE or doc["patch_bytes"] != PATCH_BYTES or doc["patch_sha256"] != PATCH_SHA256:
+        fail("patch binding")
+    if doc["provider"] not in ("claude","codex") or doc["eval"] != "final-evidence-seal": fail("scope")
+    request_root, response_root = Path(doc["request_root"]), Path(doc["response_root"])
+    scratch = Path(doc["scratch_root"])
+    if os.path.commonpath((str(scratch),str(request_root))) != str(scratch): fail("request root")
+    if response_root.parent != Path(path).resolve().parent: fail("response root")
+    for directory in (request_root,response_root):
+        dst=os.lstat(str(directory))
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid!=os.getuid() or stat.S_IMODE(dst.st_mode)!=0o700: fail("transport root")
+    if not isinstance(doc["tools"], list) or not doc["tools"]: fail("empty tools")
+    names = [item.get("name") for item in doc["tools"] if isinstance(item, dict)]
+    if len(names) != len(doc["tools"]) or len(names) != len(set(names)): fail("duplicate tools")
+    for tool in doc["tools"]: validate_tool(tool, root)
+    barrier=doc["test_barrier"]
+    if barrier.get("enabled"):
+        validate_test_barrier_config(barrier)
+        if barrier["invocation"]!=doc["invocation"]: fail("test barrier manifest")
+    elif barrier!={"enabled":False}: fail("test barrier manifest")
+    provider_capsule_schema(doc["provider_capsule"])
+    guardian=doc["guardian"]
+    if (not exact_keys(guardian,{"protocol_version","candidate_commit","pid","root","root_identity","root_binding",
+                                "control","socket","socket_identity","token_sha256","failure_marker"})
+            or guardian["protocol_version"]!=GUARDIAN_PROTOCOL_VERSION or guardian["candidate_commit"]!=PAYLOAD_COMMIT
+            or guardian["pid"]<=0 or Path(guardian["root"]).resolve()!=Path(doc["scratch_root"]).parent
+            or Path(guardian["control"]).resolve()!=Path(path).resolve().parent
+            or Path(guardian["socket"])!=Path(guardian["control"])/GUARDIAN_SOCKET_NAME
+            or guardian["root_binding"]!=guardian_root_binding(guardian["root_identity"])
+            or not re.fullmatch(r"[0-9a-f]{64}",guardian["token_sha256"])): fail("guardian manifest")
+    try: os.kill(guardian["pid"],0)
+    except ProcessLookupError: fail("guardian dead")
+    return doc, raw
+
+def prepare(ns):
+    root = Path(ns.root).resolve(); scratch = Path(ns.scratch).resolve()
+    fixture = Path(ns.fixture).resolve()
+    manifest = Path(ns.manifest); shims = Path(ns.shims)
+    request_root = Path(ns.request_root).resolve(); response_root = Path(ns.response_root).resolve()
+    guardian_root=Path(ns.guardian_root).resolve(); control=manifest.resolve().parent
+    if scratch.parent!=guardian_root or control.parent!=guardian_root or scratch.name!="capsule" or control.name!="control":
+        fail("guardian containment")
+    root_st=owned_directory(guardian_root); owned_directory(scratch); owned_directory(control)
+    if not re.fullmatch(r"[0-9a-f]{64}",ns.guardian_token) or ns.guardian_pid<=0: fail("guardian binding")
+    try: os.kill(ns.guardian_pid,0)
+    except ProcessLookupError: fail("guardian not live")
+    invocation=ns.invocation
+    if not re.fullmatch(r"[0-9a-f]{48}",invocation): fail("invocation binding")
+    test_barrier_doc={"enabled":False}
+    barrier_env=("FIRM_EVAL_TEST_BARRIER_ROOT","FIRM_EVAL_TEST_BARRIER_TOKEN",
+                 "FIRM_EVAL_TEST_BARRIER_INVOCATION","FIRM_EVAL_TEST_BARRIER_PHASE")
+    if any(os.environ.get(key) is not None for key in barrier_env):
+        fail("inherited test barrier environment")
+    if ns.test_barrier_root or ns.test_barrier_token or ns.test_barrier_phase:
+        if not (ns.test_barrier_root and ns.test_barrier_token and ns.test_barrier_phase in TEST_BARRIER_PHASES): fail("test barrier arguments")
+        test_barrier_doc=test_barrier_config(ns.test_barrier_root,ns.test_barrier_token,
+                                             ns.test_barrier_phase,invocation)
+    no_symlink_components(root); no_symlink_components(scratch)
+    if git(root, "rev-parse", "--show-toplevel") != str(root): fail("repository root")
+    if git(root, "status", "--porcelain", "--untracked-files=all"): fail("dirty harness")
+    head = git(root, "rev-parse", "HEAD"); tree = git(root, "rev-parse", "HEAD^{tree}")
+    patch_commit = prove_patch(root, PAYLOAD_COMMIT)
+    scratch_st = os.lstat(str(scratch))
+    if not stat.S_ISDIR(scratch_st.st_mode) or scratch_st.st_uid != os.getuid() or stat.S_IMODE(scratch_st.st_mode) & 0o022:
+        fail("unsafe scratch")
+    capsule = build_capsule(root,scratch,fixture)
+    candidate_root=Path(capsule["project"])
+    tools = []
+    for path in sorted((candidate_root / "bin").glob("firm-*")):
+        if path.name == "firm-eval-authority": continue
+        if path.is_symlink() or not path.is_file() or not os.access(str(path), os.X_OK): continue
+        raw, st = read_bytes(path)
+        if st.st_nlink != 1: fail("hardlinked candidate tool")
+        item = {"name":path.name,"path":str(path),"sha256":digest_bytes(raw)}
+        item.update(identity(st)); tools.append(item)
+    if not any(item["name"] == "firm-ledger-log" for item in tools): fail("writer missing")
+    runner_raw,runner_st=read_bytes(SELF.parent/"firm-run-evals")
+    runner={"name":"firm-run-evals","path":str(SELF.parent/"firm-run-evals"),"sha256":digest_bytes(runner_raw)}
+    runner.update(identity(runner_st))
+    guardian_socket=control/GUARDIAN_SOCKET_NAME; socket_st=os.lstat(str(guardian_socket))
+    if not stat.S_ISSOCK(socket_st.st_mode): fail("guardian socket")
+    guardian={"protocol_version":GUARDIAN_PROTOCOL_VERSION,"candidate_commit":PAYLOAD_COMMIT,
+              "pid":ns.guardian_pid,"root":str(guardian_root),"root_identity":identity(root_st),
+              "root_binding":guardian_root_binding(identity(root_st)),"control":str(control),
+              "socket":str(guardian_socket),"socket_identity":identity(socket_st),
+              "token_sha256":digest_bytes(bytes.fromhex(ns.guardian_token)),
+              "failure_marker":ns.guardian_failure_marker}
+    seatbelt,provider_capsule=prepare_seatbelt(Path(capsule["real_common"]),scratch,control,ns.provider,
+                              ns.provider_executable,ns.guardian_pid,ns.guardian_token,invocation,test_barrier_doc)
+    doc = {"schema_version":3,"purpose":"disposable_git_candidate_eval","invocation":invocation,
+           "eval":ns.eval,"provider":ns.provider,"harness_root":str(root),"harness_commit":head,
+           "harness_tree":tree,"candidate_root":str(candidate_root),
+           "candidate_commit":PAYLOAD_COMMIT,"candidate_tree":capsule["payload_tree"],"patch_base":PATCH_BASE,
+           "patch_commit":patch_commit,"patch_bytes":PATCH_BYTES,"patch_sha256":PATCH_SHA256,
+           "scratch_root":str(scratch),"scratch_dev":scratch_st.st_dev,"scratch_ino":scratch_st.st_ino,
+           "request_root":str(request_root),"response_root":str(response_root),
+           "runner":runner,"tools":tools,"capsule":capsule,"guardian":guardian,"seatbelt":seatbelt,
+           "provider_capsule":provider_capsule,
+           "test_barrier":test_barrier_doc}
+    raw = (canonical(doc) + "\n").encode("ascii")
+    if manifest.resolve().parent!=control: fail("manifest control root")
+    fd = os.open(str(manifest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
+    try: os.write(fd, raw); os.fsync(fd)
+    finally: os.close(fd)
+    request_root.mkdir(mode=0o700); response_root.mkdir(mode=0o700)
+    shims.mkdir(mode=0o700)
+    shim_body = b'''#!/bin/sh\nset -eu\nexec "$FIRM_EVAL_AUTHORITY_BIN" request-exec --request-root "$FIRM_EVAL_AUTHORITY_REQUEST_ROOT" --response-root "$FIRM_EVAL_AUTHORITY_RESPONSE_ROOT" --manifest "$FIRM_EVAL_AUTHORITY_MANIFEST" --digest "$FIRM_EVAL_AUTHORITY_DIGEST" --invocation "$FIRM_EVAL_INVOCATION" --tool "$(basename "$0")" -- "$@"\n'''
+    for tool in tools:
+        path = shims / tool["name"]
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o700)
+        try: os.write(fd, shim_body); os.fsync(fd)
+        finally: os.close(fd)
+    shell_env = manifest.parent / "shell-env"
+    shell_env.mkdir(mode=0o700)
+    exports = {
+        "PATH": str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+        "FIRM_EVAL_AUTHORITY_BIN": str(candidate_root / "bin" / "firm-eval-authority"),
+        "FIRM_EVAL_AUTHORITY_REQUEST_ROOT": doc["request_root"],
+        "FIRM_EVAL_AUTHORITY_RESPONSE_ROOT": doc["response_root"],
+        "FIRM_EVAL_AUTHORITY_MANIFEST": str(manifest),
+        "FIRM_EVAL_AUTHORITY_DIGEST": digest_bytes(raw),
+        "FIRM_EVAL_INVOCATION": doc["invocation"],
+    }
+    exports.update(SAFE_GIT_ENV)
+    shell_raw = "".join("export %s=%s\n" % (key, shlex.quote(value)) for key,value in exports.items()).encode("utf-8")
+    for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin", ".bash-env", ".sh-env"):
+        path = shell_env / name
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0), 0o600)
+        try: os.write(fd, shell_raw); os.fsync(fd)
+        finally: os.close(fd)
+    validate_capsule(doc)
+    print(canonical({"schema_version":3,"manifest":str(manifest),"manifest_digest":digest_bytes(raw),
+                     "invocation":doc["invocation"],"shim_dir":str(shims),"candidate_commit":PAYLOAD_COMMIT,
+                     "candidate_tree":capsule["payload_tree"],"patch_commit":patch_commit,"tool_count":len(tools),
+                     "shell_env":str(shell_env),"project_root":str(candidate_root),"capsule_root":str(scratch),
+                     "authority_bin":str(candidate_root/"bin"/"firm-eval-authority"),
+                     "seatbelt_profile":seatbelt["profile"]["path"],"real_common":seatbelt["real_common"],
+                     "provider_executable":provider_capsule["mounted"]["path"],
+                     "provider_logical_argv0":provider_capsule["source"]["path"],"guardian_sequence":2,
+                     "guardian_pid":ns.guardian_pid,"guardian_root":str(guardian_root)}))
+
+def send_message(request_root, response_root, request):
+    request_id=secrets.token_hex(24)
+    envelope={"schema_version":1,"request_id":request_id,"request":request}
+    request_path=Path(request_root)/(request_id+".request")
+    response_path=Path(response_root)/(request_id+".response")
+    payload=(canonical(envelope)+"\n").encode("ascii")
+    fd=os.open(str(request_path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    try: os.write(fd,payload); os.fsync(fd)
+    finally: os.close(fd)
+    deadline=time.monotonic()+10.0
+    while time.monotonic()<deadline and not response_path.exists(): time.sleep(0.01)
+    if not response_path.exists(): fail("broker response timeout")
+    raw,st=read_bytes(response_path,MAX_MESSAGE)
+    if stat.S_IMODE(st.st_mode)!=0o600: fail("broker response mode")
+    try:
+        envelope=json.loads(raw.decode("ascii"))
+        if not exact_keys(envelope,{"schema_version","request_id","response"}) or envelope["schema_version"]!=1 or envelope["request_id"]!=request_id: raise ValueError()
+        response=envelope["response"]
+    except Exception: fail("broker response JSON")
+    if not isinstance(response,dict) or response.get("ok") is not True: fail("broker refused request")
+    return response
+
+def append_receipt(path, record):
+    raw=(canonical(record)+"\n").encode("ascii")
+    fd=os.open(path, os.O_WRONLY|os.O_APPEND|getattr(os,"O_NOFOLLOW",0))
+    try: os.write(fd,raw); os.fsync(fd)
+    finally: os.close(fd)
+
+def serve(ns):
+    doc, raw = load_manifest(ns.manifest); digest=digest_bytes(raw)
+    if digest != ns.digest or doc["invocation"] != ns.invocation: fail("broker binding")
+    validate_capsule(doc)
+    request_root=Path(ns.request_root).resolve(); response_root=Path(ns.response_root).resolve(); receipts=Path(ns.receipts)
+    if str(request_root)!=doc["request_root"] or str(response_root)!=doc["response_root"]: fail("broker transport")
+    fd=os.open(str(receipts), os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600); os.close(fd)
+    pending={}; seen=set(); session_secret=secrets.token_bytes(32); stopping=[False]
+    def stop(*_): stopping[0]=True
+    signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
+    tools={item["name"]:item for item in doc["tools"]}; sequence=0
+    while not stopping[0]:
+        names=sorted(name for name in os.listdir(str(request_root)) if re.fullmatch(r"[0-9a-f]{48}\.request",name))
+        if not names: time.sleep(0.01); continue
+        for name in names:
+            request_id=name[:-8]
+            if request_id in seen: continue
+            seen.add(request_id); response={"ok":False}
+            try:
+                data,_=read_bytes(request_root/name,MAX_MESSAGE)
+                envelope=json.loads(data.decode("ascii"))
+                if not exact_keys(envelope,{"schema_version","request_id","request"}) or envelope["schema_version"]!=1 or envelope["request_id"]!=request_id: raise ValueError()
+                req=envelope["request"]
+                if req.get("manifest_digest") != digest or req.get("invocation") != doc["invocation"]: raise ValueError()
+                if req.get("op") == "exec" and exact_keys(req,{"op","manifest_digest","invocation","tool","argv","cwd"}):
+                    tool=tools.get(req["tool"])
+                    if tool is None or not isinstance(req["argv"],list) or not all(isinstance(x,str) and len(x)<=65536 for x in req["argv"]): raise ValueError()
+                    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"]))
+                    test_barrier(doc,"dispatch_commit",{"tool":tool["name"],"identity":{key:tool[key] for key in ("dev","ino","bytes","sha256")}})
+                    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"])); sequence += 1
+                    receipt={"schema_version":1,"sequence":sequence,"kind":"execution","tool":tool["name"],"path":tool["path"],"bytes":tool["bytes"],"sha256":tool["sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"argv_sha256":digest_bytes(canonical(req["argv"]).encode("ascii")),"cwd":req["cwd"]}
+                    append_receipt(str(receipts),receipt); response={"ok":True,"tool":tool,"receipt":receipt}
+                    if tool["name"] == "firm-ledger-log" and "--run" in req["argv"]:
+                        pos=req["argv"].index("--run")
+                        if pos+1 >= len(req["argv"]): raise ValueError()
+                        cwd=Path(req["cwd"])
+                        if not cwd.is_absolute() or cwd.resolve()!=cwd: raise ValueError()
+                        run=Path(req["argv"][pos+1]); run=(cwd/run).resolve() if not run.is_absolute() else run.resolve(); scratch=Path(doc["scratch_root"])
+                        if os.path.commonpath((str(scratch),str(run))) != str(scratch) or run == scratch: raise ValueError()
+                        rst=os.lstat(str(run))
+                        if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.getuid(): raise ValueError()
+                        token={"schema_version":1,"purpose":"eval_p2_write","token":secrets.token_hex(32),"invocation":doc["invocation"],"manifest_digest":digest,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"patch_sha256":doc["patch_sha256"],"eval":doc["eval"],"provider":doc["provider"],"writer_path":tool["path"],"writer_sha256":tool["sha256"],"scratch_root":str(scratch),"scratch_dev":doc["scratch_dev"],"scratch_ino":doc["scratch_ino"],"run_path":str(run),"run_dev":rst.st_dev,"run_ino":rst.st_ino,"macos":"26.5.1","kernel":"25.5.0","architecture":"arm64","python":"3.9.6","implementation":"cpython","filesystem":"apfs","issued_monotonic_ns":time.monotonic_ns(),"expires_monotonic_ns":time.monotonic_ns()+30_000_000_000}
+                        token["auth"]=hmac.new(session_secret,canonical(token).encode("ascii"),hashlib.sha256).hexdigest(); pending[token["token"]]=token; response["p2_attestation"]=token
+                elif req.get("op") == "validate_p2" and exact_keys(req,{"op","manifest_digest","invocation","token","writer_path","writer_sha256","run_path"}):
+                    token=req["token"] if isinstance(req["token"],dict) else {}; expected=pending.pop(token.get("token",None),None)
+                    unsigned=dict(token); auth=unsigned.pop("auth",None); valid_auth=isinstance(auth,str) and hmac.compare_digest(auth,hmac.new(session_secret,canonical(unsigned).encode("ascii"),hashlib.sha256).hexdigest())
+                    if expected is None or token != expected or not valid_auth or time.monotonic_ns()>token["expires_monotonic_ns"]: raise ValueError()
+                    if req["writer_path"]!=token["writer_path"] or req["writer_sha256"]!=token["writer_sha256"] or req["run_path"]!=token["run_path"]: raise ValueError()
+                    sequence += 1; append_receipt(str(receipts),{"schema_version":1,"sequence":sequence,"kind":"p2_consumed","tool":"firm-ledger-log","path":token["writer_path"],"bytes":tools["firm-ledger-log"]["bytes"],"sha256":token["writer_sha256"],"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],"manifest_digest":digest,"invocation":doc["invocation"],"run_path":token["run_path"],"token":token["token"]})
+                    response={"ok":True,"modeled":{"system":"Darwin","macos":token["macos"],"kernel":token["kernel"],"architecture":token["architecture"],"python":token["python"],"implementation":token["implementation"],"filesystem":token["filesystem"]}}
+            except Exception: response={"ok":False}
+            response_envelope=(canonical({"schema_version":1,"request_id":request_id,"response":response})+"\n").encode("ascii")
+            response_path=response_root/(request_id+".response")
+            fd=os.open(str(response_path),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+            try: os.write(fd,response_envelope); os.fsync(fd)
+            finally: os.close(fd)
+
+def request_exec(ns, rest):
+    doc, raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("shim binding")
+    reject_git_environment(); validate_capsule(doc)
+    response=send_message(ns.request_root,ns.response_root,{"op":"exec","manifest_digest":ns.digest,"invocation":ns.invocation,"tool":ns.tool,"argv":rest,"cwd":os.path.realpath(os.getcwd())})
+    tool=response.get("tool"); validate_tool(tool,Path(doc["candidate_root"]))
+    test_barrier(doc,"use_exec",{"tool":tool["name"],"identity":{key:tool[key] for key in ("dev","ino","bytes","sha256")}})
+    validate_capsule(doc); validate_tool(tool,Path(doc["candidate_root"]))
+    env=os.environ.copy()
+    if "p2_attestation" in response: env["FIRM_EVAL_P2_ATTESTATION"]=canonical(response["p2_attestation"])
+    os.execve(tool["path"],[tool["path"]]+rest,env)
+
+def validate_p2(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("writer binding")
+    reject_git_environment(); validate_capsule(doc)
+    try: token=json.loads(ns.token)
+    except Exception: fail("token JSON")
+    response=send_message(ns.request_root,ns.response_root,{"op":"validate_p2","manifest_digest":ns.digest,"invocation":ns.invocation,"token":token,"writer_path":ns.writer_path,"writer_sha256":ns.writer_sha256,"run_path":ns.run_path})
+    print(canonical(response))
+
+def verify(ns):
+    doc, raw=load_manifest(ns.manifest); expected=digest_bytes(raw)
+    if expected!=ns.digest: fail("verify digest")
+    validate_capsule(doc,final=True)
+    receipt_raw,_=read_bytes(Path(ns.receipts),8*1024*1024)
+    rows=[]
+    for line in receipt_raw.splitlines():
+        try: row=json.loads(line.decode("ascii"))
+        except Exception: fail("receipt JSON")
+        if row.get("manifest_digest")!=expected or row.get("invocation")!=doc["invocation"]: fail("receipt binding")
+        rows.append(row)
+    if not rows or not any(r.get("tool")=="firm-ledger-log" for r in rows) or not any(r.get("kind")=="p2_consumed" for r in rows): fail("missing required receipt")
+    output={"schema_version":3,"candidate_commit":doc["candidate_commit"],"candidate_tree":doc["candidate_tree"],
+            "patch_commit":doc["patch_commit"],"patch_bytes":doc["patch_bytes"],"patch_sha256":doc["patch_sha256"],
+            "manifest_digest":expected,"invocation":doc["invocation"],"tool_count":len(doc["tools"]),
+            "execution_receipts":sum(r.get("kind")=="execution" for r in rows),"p2_receipts":sum(r.get("kind")=="p2_consumed" for r in rows),
+            "receipt_sha256":digest_bytes(receipt_raw),"receipt_bytes":len(receipt_raw)}
+    print(canonical(output))
+
+def cleanup(ns):
+    doc,raw=load_manifest(ns.manifest)
+    if digest_bytes(raw)!=ns.digest or doc["invocation"]!=ns.invocation: fail("cleanup digest")
+    validate_capsule(doc,final=True); validate_seatbelt(doc,post=True)
+    if (doc["guardian"]["control"]!=str(Path(ns.control).resolve())
+            or doc["guardian"]["token_sha256"]!=digest_bytes(bytes.fromhex(ns.token))
+            or doc["guardian"]["pid"]!=ns.guardian_pid): fail("cleanup guardian binding")
+    ns.action="cleanup"; ns.nonce=None
+    guardian_command(ns)
+
+def main():
+    p=argparse.ArgumentParser(add_help=False); sub=p.add_subparsers(dest="command",required=True)
+    q=sub.add_parser("guardian-start"); q.add_argument("--parent",required=True); q.add_argument("--launcher-pid",type=int,required=True); q.add_argument("--invocation"); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
+    q=sub.add_parser("guardian-command"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--action",choices=("register","cleanup"),required=True); q.add_argument("--role",choices=("broker","provider")); q.add_argument("--pid",type=int); q.add_argument("--pgid",type=int); q.add_argument("--nonce"); q.add_argument("--expected-roles",default="")
+    q=sub.add_parser("guardian-exec"); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--role",choices=("broker","provider"),required=True); q.add_argument("--nonce")
+    q=sub.add_parser("provider-exec"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--terminal",action="store_true")
+    q=sub.add_parser("prepare"); q.add_argument("--root",required=True); q.add_argument("--eval",required=True); q.add_argument("--provider",required=True); q.add_argument("--provider-executable",required=True); q.add_argument("--scratch",required=True); q.add_argument("--fixture",required=True); q.add_argument("--manifest",required=True); q.add_argument("--shims",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--guardian-root",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--guardian-token",required=True); q.add_argument("--guardian-failure-marker",required=True); q.add_argument("--invocation",required=True); q.add_argument("--test-barrier-root"); q.add_argument("--test-barrier-token"); q.add_argument("--test-barrier-phase")
+    q=sub.add_parser("serve"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--receipts",required=True)
+    q=sub.add_parser("request-exec"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--tool",required=True)
+    q=sub.add_parser("validate-p2"); q.add_argument("--request-root",required=True); q.add_argument("--response-root",required=True); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--token",required=True); q.add_argument("--writer-path",required=True); q.add_argument("--writer-sha256",required=True); q.add_argument("--run-path",required=True)
+    q=sub.add_parser("verify"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--receipts",required=True)
+    q=sub.add_parser("seatbelt-probe"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--post",action="store_true")
+    q=sub.add_parser("test-barrier-probe"); q.add_argument("--root",required=True); q.add_argument("--token",required=True); q.add_argument("--invocation",required=True); q.add_argument("--candidate",required=True); q.add_argument("--phase",required=True); q.add_argument("--target",required=True)
+    q=sub.add_parser("cleanup"); q.add_argument("--manifest",required=True); q.add_argument("--digest",required=True); q.add_argument("--invocation",required=True); q.add_argument("--control",required=True); q.add_argument("--token",required=True); q.add_argument("--guardian-pid",type=int,required=True); q.add_argument("--sequence",type=int,required=True); q.add_argument("--expected-roles",default="")
+    ns,rest=p.parse_known_args(ARGV)
+    if ns.command=="guardian-start": guardian_start(ns)
+    elif ns.command=="guardian-command": guardian_command(ns)
+    elif ns.command=="guardian-exec":
+        if not rest or rest[0]!="--": fail("missing argv boundary")
+        guardian_exec(ns,rest[1:])
+    elif ns.command=="provider-exec":
+        if not rest or rest[0]!="--": fail("missing argv boundary")
+        provider_exec(ns,rest[1:])
+    elif ns.command=="prepare": prepare(ns)
+    elif ns.command=="serve": serve(ns)
+    elif ns.command=="request-exec":
+        if not rest or rest[0]!="--": fail("missing argv boundary")
+        request_exec(ns,rest[1:])
+    elif ns.command=="validate-p2": validate_p2(ns)
+    elif ns.command=="verify": verify(ns)
+    elif ns.command=="seatbelt-probe": seatbelt_probe(ns)
+    elif ns.command=="test-barrier-probe": test_barrier_probe(ns)
+    else: cleanup(ns)
+if __name__=="__main__": main()
+PY

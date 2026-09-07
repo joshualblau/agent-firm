@@ -69,8 +69,9 @@ done
 # if it really requires a supported write host.
 requires_supported_p2() {
   case "$1" in
-    check-assertions|final-qa-check|ledger-compatibility|ledger-log|ledger-role-start|merge-guard|\
-    new-worktree|policy-hire|provider-reviewers|qa-checkout|qa-clean-check|reviewer-hermeticity) return 0 ;;
+    check-assertions|eval-candidate-tools|evidence-seal|final-qa-check|ledger-compatibility|\
+    ledger-log|ledger-role-start|merge-guard|new-worktree|policy-hire|provider-reviewers|\
+    qa-checkout|qa-clean-check|reviewer-hermeticity) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -135,6 +136,20 @@ runs_alone() {
     # Accepted cost: an estimated ~412s -> ~590s, still roughly 2.2x faster than the 1287s serial
     # baseline. `--serial` and `--jobs N` are unaffected and still mean exactly what they meant.
     merge-guard) return 0 ;;
+    # WHY eval-capsule-attacks IS ALONE: it fails property 1 above in a way no `mktemp -d` can fix.
+    # The file's cleanup evidence is a GLOBAL observation — it reads /sbin/mount before and after the
+    # matrix and requires the set of `firm-eval-` capsule mounts to be byte-identical, which is how
+    # it proves no image, mountpoint or attachment survived any of its 27 cases. That assertion is
+    # about the whole machine, not about its own temp tree, so any concurrently running file that
+    # attaches a capsule (tests/test-eval-candidate-tools.sh does) makes it observe someone else's
+    # mount and either flake or, worse, pass while a residue check is silently measuring the wrong
+    # volume. It also requires the real checkout to be CLEAN for the whole run, since
+    # `firm-eval-authority prepare` binds the harness commit and refuses a dirty candidate.
+    #
+    # Accepted cost: ~200s of wall clock with the host to itself. `--serial` and `--jobs N` are
+    # unaffected. If the residue proof is ever narrowed to devices this file itself attached, this
+    # entry can go back on the pool.
+    eval-capsule-attacks) return 0 ;;
     *) return 1 ;;
   esac
 }

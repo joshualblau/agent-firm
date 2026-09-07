@@ -25,3 +25,7 @@ firm-final-qa-check exits 0 following the one FINAL human interaction. -->
 - **One Final human decision:** approve | reject | exact permitted option — actor/date (UTC):
 - **Typed record and ledger reference:** none | path, type, SHA-256, bytes, producer event
 - **Finalization rule:** rejection, stale/mismatched record, or nonzero fresh check leaves this draft blocked; do not prompt again in this Final cycle
+
+<!-- BEGIN COMPLETE LOCAL PR BODY -->
+<!-- Replace this line with the complete local PR body before `firm-seal-qa-evidence`. -->
+<!-- END COMPLETE LOCAL PR BODY -->

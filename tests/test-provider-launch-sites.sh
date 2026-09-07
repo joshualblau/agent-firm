@@ -31,6 +31,19 @@ for owner in bin/firm-doctor bin/firm-run-evals bin/firm-bootstrap; do
     sh -c "printf '%s' \"\$1\" | grep -q '$owner'" sh "$CLEAN"
 done
 
+# A FIXTURE THAT NAMES A PROVIDER IS NOT A FIXTURE THAT LAUNCHES ONE. tests/fixtures/ac007-mutation-
+# matrix.py passes "claude"/"codex" as an ORIENTATION LABEL and a list of SUB-CASE NAMES to a local
+# `record()` helper that writes a dict; it launches nothing, and test-run-evals-structural.sh asserts
+# separately that it cannot. The scanner read that shape as argv and reported an unaccounted launch
+# site, which is a guard crying wolf about its own test data. The anchor assertion below runs first
+# on purpose: without it, deleting or renaming the fixture would make the real assertion vacuous and
+# still green.
+FIXTURE="$REPO/tests/fixtures/ac007-mutation-matrix.py"
+assert_ok "the fixture whose data labels the scanner used to misread is still present and unchanged in shape" \
+  grep -q 'record("ac007_placeholder_argv", "claude", result, \["angle_bracket_placeholder_in_command_argv"\])' "$FIXTURE"
+assert_ok "a fixture that passes a provider name as DATA is not reported as a launch site" \
+  sh -c "! printf '%s' \"\$1\" | grep -q 'ac007-mutation-matrix.py'" sh "$CLEAN"
+
 # A mutant per defect actually found in the wild, plus one per rule that could be quietly relaxed.
 mutant() { # <name> <expected substring> <mutation>...
   local name="$1" expect="$2" out rc
@@ -68,7 +81,7 @@ t_case "the mutants that matter"
 # THE ONE THAT WAS REAL, in the file where it was real.
 mutant "the 2026-08-23 defect itself: -a moved after exec in firm-run-evals" \
   'is passed on `codex exec --help`' \
-  'bin/firm-run-evals:codex exec --ephemeral:codex exec -a never --ephemeral'
+  'bin/firm-run-evals:"$codex_command" exec --ephemeral:"$codex_command" exec -a never --ephemeral'
 # THE SECOND COPY, in firm-doctor, whose failure path is only a warn.
 mutant "the same defect in firm-doctor's probe" \
   'is passed on `codex exec --help`' \
@@ -90,13 +103,32 @@ mutant "a LAUNCH_OWNERS entry whose launch site no longer exists" \
   'bin/firm-bootstrap:"claude":"clauded"' \
   'bin/firm-bootstrap:"codex":"codexed"'
 
+# THE PYTHON SIDE STILL BITES. Not matching a fixture's data labels is only correct if a REAL python
+# launch in the SAME file still fails, so these three mutants inject one into the very file the
+# scanner stopped flagging, plus one into the registered python owner. `login status` carries no
+# control at all, so it can only be recognised by codex's OWN published subcommand list -- which is
+# the half of the rule a "must contain a dash" shortcut would have thrown away.
+mutant "a control-free python launch (subcommand-led argv) in a fixture is still unaccounted" \
+  'not accounted for in LAUNCH_OWNERS' \
+  'tests/fixtures/ac007-mutation-matrix.py:families = {}:families = {}
+subprocess.run(launcher("codex", ["login", "status"]))'
+mutant "a python launch whose argv opens with a control is still unaccounted" \
+  'not accounted for in LAUNCH_OWNERS' \
+  'tests/fixtures/ac007-mutation-matrix.py:families = {}:families = {}
+subprocess.run(launcher("claude", ["-p", "unregistered python launch"]))'
+# COVERAGE is not SURFACE: prove the derived_python path still splits argv and checks each control
+# against its own help text, in the one file registered `derived_python`.
+mutant "a control a python launcher passes that its surface does not accept" \
+  'needs a measurement in UNDOCUMENTED_CONTROLS' \
+  'bin/firm-bootstrap:require("claude", "version", ["--version"]):require("claude", "version", ["--version", "--not-a-real-control"])'
+
 t_case "the scanner's own blind spots"
 # Two blind spots the review measured against the real scan: an argv built from an array made the
 # surface line SILENTLY VANISH from the output, and an executable held in a variable evaded both the
 # surface check and the LAUNCH_OWNERS coverage rule.
 mutant "controls built from an array expansion are CANNOT CHECK, not a silent skip" \
   'CANNOT BE CHECKED' \
-  'bin/firm-run-evals:codex exec --ephemeral:codex "${badargs[@]}" --ephemeral'
+  'bin/firm-run-evals:"$codex_command" exec --ephemeral:"$codex_command" "${badargs[@]}" --ephemeral'
 mutant "an executable held in a variable is still a launch, and still needs an owner" \
   'not accounted for in LAUNCH_OWNERS' \
   "bin/firm-version:#!/usr/bin/env bash:#!/usr/bin/env bash
@@ -128,9 +160,9 @@ measured() { # <name> <expected substring> <registry-json> [mutation]...
 T_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/firm-measurements.XXXXXX")"; t_track "$T_REGISTRY"
 # The control fixture has to name the version that is INSTALLED, or it fails the staleness rule
 # instead of proving the seam works -- which is what it did after this branch was written against
-# claude 2.1.238 and landed on a host running 2.1.234. Re-measured 2026-08-25; the record in
-# tests/provider-launch-scan.py was re-taken at the same time and for the same reason.
-VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.234","date":"2026-08-25","argv":["claude","--max-turns","3","-p","x"],"rc":1,"observed":"rc 1 from unrecognized_model, not from an unknown option"}}]'
+# an older Claude version and landed on a newer host. Re-measured locally on 2026-09-01 with an
+# invalid numeric value, which proves the parser recognizes the control without starting a provider.
+VALID='[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"2.1.251","date":"2026-09-01","argv":["claude","--max-turns","text","-p","x"],"rc":1,"observed":"rc 1: option --max-turns argument text is invalid and must be a number"}}]'
 
 # Control: the real, well-formed measurement still passes through the seam, so the cases below fail
 # for their own reason and not because the seam breaks everything.
@@ -142,7 +174,7 @@ assert_eq "a well-formed current measurement still passes through the seam" "0" 
 measured "it cannot excuse a control the PARENT surface documents (the forbidden union)" \
   'cross-surface union this scanner exists to reject' \
   '[{"provider":"codex","subcommand":["exec"],"control":"-a","measurement":{"cli":"codex","version":"0.149.0","date":"2026-08-23","argv":["codex","exec","-a","never"],"rc":0,"observed":"fine, trust me"}}]' \
-  'bin/firm-run-evals:codex exec --ephemeral:codex exec -a never --ephemeral'
+  'bin/firm-run-evals:"$codex_command" exec --ephemeral:"$codex_command" exec -a never --ephemeral'
 measured "a measurement against a CLI version that is not installed is stale, not evidence" \
   'Stale evidence is not evidence' \
   '[{"provider":"claude","subcommand":[],"control":"--max-turns","measurement":{"cli":"claude","version":"0.0.0-not-installed","date":"2026-08-23","argv":["claude","--max-turns","3"],"rc":0,"observed":"ok"}}]'

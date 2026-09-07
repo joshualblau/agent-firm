@@ -100,6 +100,8 @@ failure: block
 Preserve the shared lifecycle order and budgets. Parallelize only independent work-orders, each in a
 `firm-new-worktree`; never delegate human gates. Reviewers and QA must be separate from implementers.
 Primary GPT QA writes `08-qa-verdict.json`; then run `firm-claude-qa` for the independent second voice.
+For protocol v1, first freeze the draft handoff and run
+`firm-seal-qa-evidence --run <exact-run-dir>`; any nonzero result blocks reviewer launch.
 Run `firm-validate-verdict`, `firm-traceability-check`, the Lead-owned `firm-qa-clean-check`, and
 `firm-final-qa-check`. Only a final-check exit 0 permits packaging, and packaging still stops at the
 mandatory human Final gate. Never merge, push, deploy, publish, or manufacture human approval.

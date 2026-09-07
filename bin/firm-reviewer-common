@@ -768,6 +768,11 @@ if args.print_capability_contract:
     }, indent=2, sort_keys=True))
     raise SystemExit(0)
 
+# Capability/credential contract introspection above is intentionally standalone: several contract
+# mutation tests copy only this executable. Runtime seal verification begins only for a real run.
+sys.path.insert(0, str(root / "agent-firm" / "lib"))
+from evidence_seal import SealError, manifest_v4_fields, validate_schema, verify_seal  # noqa: E402
+
 def stop(message, code=1):
     print(f"{label}: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -1002,6 +1007,19 @@ if (normalized_metadata.get("run_id") != run.name
         or normalized_metadata.get("accepted_base_sha") != candidate.get("base_sha")):
     stop("normalized run metadata does not match candidate repository/base identity", 2)
 
+# Protocol-v1 runs are verified by the same implementation that creates the seal. This happens
+# before an attempt id, directory, ledger START, provider discovery, or provider invocation exists.
+try:
+    seal_receipt = verify_seal(
+        run, root / "agent-firm" / "policy" / "evidence-privacy.yaml", "wrapper-preflight"
+    )
+except SealError as exc:
+    stop(f"final evidence seal preflight BLOCK {exc.category}: {exc.detail}", 1)
+if seal_receipt.get("state") == "sealed":
+    expected_secondary = "gpt" if normalized_metadata.get("primary_provider") == "claude" else "claude"
+    if provider != expected_secondary:
+        stop(f"sealed run requires secondary provider {expected_secondary}, not {provider}", 1)
+
 resolver_provider = "codex" if provider == "gpt" else "claude"
 resolved_done = subprocess.run(
     [str(self_dir / "firm-model-resolve"), "--provider", resolver_provider, "--role", "reviewer", "--format", "json"],
@@ -1037,6 +1055,7 @@ for old in list(private_run.iterdir()):
         stop(f"unsafe private reviewer-control entry: {old}", 2)
 
 lock = evidence / f".reviewer-{provider}.lock"
+recovered_dead_lock = False
 lock_owner = {"schema_version":1, "pid":os.getpid(), "provider":provider, "run_id":run.name,
               "candidate_sha":sha, "generation":generation,
               "started_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")}
@@ -1064,6 +1083,7 @@ except FileExistsError:
             alive = True
         if alive:
             stop(f"another {provider} reviewer attempt holds the run lock", 1)
+        recovered_dead_lock = True
         stale = evidence / f".reviewer-{provider}.stale.{os.getpid()}.{os.urandom(4).hex()}"
         os.rename(lock, stale)
         shutil.rmtree(stale)
@@ -1086,6 +1106,9 @@ def make_event_id(kind):
 
 def ledger(event, event_id=None, **fields):
     event_id = event_id or make_event_id(event)
+    if seal_receipt.get("state") == "sealed":
+        fields["seal_event_id"] = seal_receipt["publication_event_id"]
+        fields["seal_projection_sha256"] = seal_receipt["projection_sha256"]
     command = [str(self_dir / "firm-ledger-log"), "--run", str(run), "--strict", "--event-id", event_id, event]
     command.extend(f"{key}={value}" for key, value in fields.items())
     done = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -1112,6 +1135,18 @@ def finalize_attempt(status, exit_code, event, ledger_fields=None, **fields):
     event_fields.update(ledger_fields or {})
     ledger(event, event_id=outcome_event_id, **event_fields)
     return outcome_event_id
+
+if seal_receipt.get("state") == "sealed" and seal_receipt.get("open_attempt") is not None:
+    prior = seal_receipt["open_attempt"]
+    if not recovered_dead_lock or prior.get("provider") != provider:
+        stop("sealed reviewer suffix has an open attempt without one matching provably dead wrapper lock", 1)
+    ledger(
+        "reviewer_attempt_abandoned", provider=provider, generation=generation, sha=sha,
+        attempt=prior["attempt"], attempt_id=prior["attempt_id"],
+        started_event_id=prior["event_id"], reason="wrapper_death_before_terminal",
+    )
+elif seal_receipt.get("state") == "sealed" and recovered_dead_lock:
+    stop("dead sealed reviewer lock has no unmatched START to abandon", 1)
 
 try:
     attempts_dir = safe_dir(evidence / "reviewer-attempts", 0o700, create=True)
@@ -1168,6 +1203,14 @@ try:
     }
     atomic_write(attempt_path, json_bytes(attempt), 0o600)
     ledger("reviewer_attempt_started", event_id=started_event_id, provider=provider, generation=generation, sha=sha, attempt=attempt_rel, attempt_id=attempt_id)
+    if seal_receipt.get("state") == "sealed":
+        try:
+            seal_receipt = verify_seal(
+                run, root / "agent-firm" / "policy" / "evidence-privacy.yaml",
+                "reviewer-snapshot", provider, attempt_id,
+            )
+        except SealError as exc:
+            stop(f"final evidence seal snapshot BLOCK {exc.category}: {exc.detail}", 1)
 
     control = private_run / attempt_id
     os.mkdir(control, 0o700)
@@ -1387,6 +1430,12 @@ except Exception as exc:
     ]
     for origin in required_origins:
         add_source(origin)
+    if seal_receipt.get("state") == "sealed":
+        for origin in seal_receipt["ordinary_paths"]:
+            if origin == "run.jsonl#prefix":
+                continue
+            add_source(origin)
+        add_source(seal_receipt["seal_path"])
 
     # New runs publish every integration cycle to an immutable stage-specific path and retain a
     # digest-bound history index. Snapshot and verify the COMPLETE history: copying only the current
@@ -1778,7 +1827,7 @@ except Exception as exc:
     if len(diff) > 2 * 1024 * 1024:
         stop("trusted candidate diff exceeds 2 MiB controlled-root bound", 1)
     add_payload("candidate.diff", diff, 0o400)
-    manifest = {"schema_version":3, "run_id":run.name, "candidate_sha":sha, "generation":generation,
+    manifest = {"schema_version":seal_receipt.get("manifest_version", 3), "run_id":run.name, "candidate_sha":sha, "generation":generation,
                 "provider":provider, "entries":sorted(manifest_entries, key=lambda item:item["origin_path"]),
                 # Referenced paths the manifest deliberately does NOT follow, each with its reason
                 # and the artifact that supersedes it. This is the difference between an exclusion
@@ -1803,6 +1852,12 @@ except Exception as exc:
                 # The current attempt's own record is excluded by construction, not by accident:
                 # it is still being written while the judge reads this manifest.
                 "excludes_current_attempt":attempt_rel}
+    if seal_receipt.get("state") == "sealed":
+        try:
+            manifest.update(manifest_v4_fields(seal_receipt, seen_origins, provider))
+            validate_schema(manifest, "reviewer-manifest-v4.schema.json", "reviewer manifest v4")
+        except SealError as exc:
+            stop(f"sealed manifest BLOCK {exc.category}: {exc.detail}", 1)
     atomic_write(run_snapshot / "input-manifest.json", json_bytes(manifest), 0o400)
 
     for current, dirs, files in os.walk(instruction_root, topdown=False):
