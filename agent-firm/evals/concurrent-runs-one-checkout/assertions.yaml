@@ -1,0 +1,67 @@
+name: concurrent-runs-one-checkout
+description: >
+  Guards the concurrent-run property (AC-002, AC-004, AC-011, AC-012): two runs sharing ONE working
+  tree each resolve and produce their own integration and QA artifacts, neither invocation failing,
+  blocking on, or operating on the other. The teeth are the fixture suite's golden check
+  (test/concurrent-runs-check.py), which asserts four properties -- P1 the adversarial interleave
+  driven through the AMBIENT pointer, P2 the same interleave through the explicit --run selector with
+  the pointer parked on a decoy run, P3 the QA-checkout half, P4 rollback including the residual
+  per-run integration worktree -- 36 assertions in all.
+
+  IT GENUINELY INTERLEAVES, AND SAYS SO FROM EVIDENCE. The check does not merely start two processes
+  and hope the scheduler is unkind. It PARKS one process at a chosen point inside the operation under
+  test -- between two iterations of firm-integrate's merge loop (a post-merge hook), and inside
+  firm-qa-checkout's `git worktree add` (a post-checkout hook) -- drives the other process
+  start-to-finish while the first is demonstrably still parked, and only then releases it. Each
+  property carries an explicit overlap assertion (P1.2/P2.2/P3.2) that a sequential fixture cannot
+  satisfy: it requires the parked process to have been alive when the other one exited. If a
+  rendezvous times out while its process is still running, the check exits 2 (cannot evaluate) rather
+  than degrading to a sequential fixture and reporting a pass. That is the specific gap AC-012 and
+  02-architecture-options.md's "Note for WO-7's author" exist to close.
+
+  VERIFIED TO FAIL ON THE PRE-CHANGE TOOLS, FOR A REASON ITS OUTPUT STATES. Run against a checkout at
+  this engagement's accepted_base_sha (8f0375eb, before WO-1..WO-6): 6 assertions pass and 27 fail.
+  The load-bearing ones are in P1, whose invocations are the ZERO-ARGUMENT form that both tool
+  generations accept -- so the difference is the behaviour, not the interface. There, P1.1 and P1.2
+  still PASS (both invocations exit 0 and the interleave is real), and then P1.3 reports run A's
+  second merge absent from integration/A and "instead reachable from: decoy"; P1.5 reports run B's
+  branch carrying run A's file; P1.7 reports the caller's own decoy branch moved; P1.9 reports run A's
+  ledger holding zero integrated rows while run B's holds two, one of them naming run A's branch. The
+  pre-change tool exits 0 while doing all of that, which is why an eval, not an exit status, is what
+  catches it.
+
+  SCOPE, STATED PLAINLY. P4 models the reverted firm-integrate's first two operations (read
+  CURRENT_RUN, `git switch integration/<run-id>` in the caller's checkout) rather than vendoring a
+  copy of the pre-change script, which would rot. It therefore proves the residual worktree is
+  cleanly removable and that the reverted tool's operation succeeds once it is, not that a byte-exact
+  revert was executed. The check also does not close the SAME-run race (two firm-integrate
+  invocations for one run share one integration directory), which WO-4's execution report discloses
+  and no assertion here claims.
+
+  STATUS: the four fixture properties above were run and verified directly against this checkout and
+  against the pre-change checkout, in both directions. The MODEL-DRIVEN half of this eval -- whether
+  an agent can drive two run-scoped stages from the tools' help text alone -- is behaviorally
+  unverified; `firm-run-evals --structural` cannot prove it and no
+  `firm-run-evals concurrent-runs-one-checkout` run has been recorded yet.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  # The engagement's own deliverable. A NEW file, not one the fixture ships, so a run that did
+  # nothing at all cannot satisfy it.
+  - file_exists: test/runlabel-slug.test.sh
+  - file_exists: src/runlabel.sh
+  # THE TEETH. This one command carries P1, P2, P3 and P4; it is the reason this eval exists. It
+  # fails loudly, naming the assertion and quoting what it observed, if the concurrent-run property
+  # asserted by AC-002 and AC-004 regresses, and it fails closed (exit 2 -> non-zero) if it cannot
+  # locate the firm or establish its rendezvous at all.
+  - test_passes: sh test/run-tests.sh
+  # AC-002's claim for THIS engagement's own run: firm-integrate recorded its integration into the
+  # run it was given. firm-new-run's template scaffold seeds no run.jsonl integrated row, so this
+  # discriminates a real integrate from a run that stopped early.
+  - test_passes: 'l=$(cat .agent-firm/CURRENT_RUN)/run.jsonl; grep -q "\"event\":\"integrated\"" "$l" && grep -q "\"event\":\"qa_checkout\"" "$l" && echo ok'
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - traceability_passes: true
+  - qa_checkout_clean: true
+  - final_gate_pending: true
+  - no_default_branch_merge: true
