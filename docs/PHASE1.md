@@ -9,12 +9,17 @@ a true integration step, clean-checkout QA, acceptance traceability, and the loo
 improves itself under review.
 
 ## What's added on top of Phase 0
-- **Worktree + integration tooling** (`bin/`):
-  - `new-worktree <role> <wo>` — one isolated git worktree per work-order (base = local HEAD, named
-    `<run_id>-<role>-<wo>`, with a deterministic port + db name; copies only `.env.example`, never secrets).
-  - `integrate [branch]` — merges this run's worktree branches into an integration branch; conflicts are
-    reported for the Integrator to resolve, never silently dropped.
-  - `qa-checkout [branch]` — a fresh clean checkout at the integration HEAD so QA runs from known-clean state.
+- **Worktree + integration tooling** (`bin/`). *All three shipped in Phase 1 without a run selector,
+  reading `.agent-firm/CURRENT_RUN` and nothing else; the `--run <run-dir>` form below was added
+  later so two runs can share one checkout. Each tool's `--help` states the precedence — `--run` is
+  authoritative and `CURRENT_RUN` is not read at all when it is given.*
+  - `firm-new-worktree [--run <run-dir>] <role> <wo>` — one isolated git worktree per work-order (base
+    = local HEAD, named `<run_id>-<role>-<wo>`, with a deterministic port + db name; copies only
+    `.env.example`, never secrets).
+  - `firm-integrate [--run <run-dir>] [branch]` — merges this run's worktree branches into an
+    integration branch; conflicts are reported for the Integrator to resolve, never silently dropped.
+  - `firm-qa-checkout [--run <run-dir>] [branch]` — a fresh clean checkout at the integration HEAD so
+    QA runs from known-clean state.
 - **Traceability gate**: `firm-traceability-check` cross-references `01-acceptance-criteria.yaml` against
   the verdict's `acceptance_criteria_coverage` and fails if any criterion is uncovered without justification.
   Template: `agent-firm/templates/traceability.yaml`.

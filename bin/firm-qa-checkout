@@ -18,18 +18,45 @@ SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 . "$SELF/firm-run-resolve"   # one resolved RUN for the whole firm; see bin/firm-run-resolve
 
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- the shape bin/firm-new-run already uses, adopted here for the
+# same reason: two hand-written copies of an interface description drift, and AC-010 is a promise
+# that this text is accurate enough to use INSTEAD OF reading the source.
+usage() {
+  cat <<'EOF'
+usage: firm-qa-checkout [--run <run-dir>] [branch]
+
+Materialize and persist one detached, clean, full-SHA candidate generation for one run.
+
+  --run <run-dir>   the run to capture a candidate for. Authoritative.
+  [branch]          the integration/* branch to capture. Default: integration/<run-id>.
+  -h, --help        print this synopsis and exit 0; captures nothing.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all. With no --run, the ambient .agent-firm/CURRENT_RUN pointer is used and validated
+identically. Explicit beats ambient. Both go through bin/firm-run-resolve, whose --help states the
+validation this tool relies on.
+EOF
+}
+
 # `--run` is parsed ahead of the positional [branch], which keeps every pre-existing invocation form
 # working unchanged: `firm-qa-checkout`, `firm-qa-checkout <branch>`, and now
 # `firm-qa-checkout --run <run-dir> [branch]` (AC-006).
+#
+# `-h|--help` is matched AHEAD of the `-*` catch-all, so help is reachable the normal way rather
+# than only through the refusal path. That is the one deliberate parsing change in this file: before
+# it, `--help` fell into `-*` and exited 2 with "unknown option --help", which is a usable answer for
+# a typo and a useless one for somebody asking how the tool selects its run (AC-010).
 run_sel=""; have_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help) usage; exit 0 ;;
     --run)
       [[ $# -ge 2 ]] || { echo "firm-qa-checkout: --run needs a run directory argument" >&2; exit 2; }
       run_sel="$2"; have_run=1; shift 2 ;;
     --) shift; break ;;
     -*) echo "firm-qa-checkout: unknown option $1" >&2
-        echo "usage: firm-qa-checkout [--run <run-dir>] [branch]" >&2; exit 2 ;;
+        usage >&2; exit 2 ;;
     *) break ;;
   esac
 done

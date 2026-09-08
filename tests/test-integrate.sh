@@ -480,4 +480,46 @@ assert_eq "main SHA unchanged through every one of those refusals" "$before" "$(
 assert_eq "and the caller's HEAD never moved either" "main" \
   "$( (cd "$repo" && git rev-parse --abbrev-ref HEAD) )"
 
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help states how the run is selected, on stdout, exit 0, merging nothing"
+# --run arrived on this tool in this run; the statement of what it OUTRANKS did not, and `--help` fell
+# into the `-*` catch-all and exited 2 with "unknown option --help". This is the tool where that gap
+# costs the most: the run id it resolves picks BOTH the branches merged AND the ledger the merge is
+# recorded in, and F3 is precisely the failure of getting those two from different places.
+repoH="$(mk_repo)"
+mk_run "$repoH" "$RUN_ID"
+mk_wt_branch "$repoH" "$RUN_ID" wo1 feature.txt "wo1 work"
+beforeH="$(sha_of "$repoH" main)"
+helpH="$( integrate "$repoH" --help 2>/dev/null )"; rcH=$?
+assert_eq "--help exits 0" 0 "$rcH"
+assert_output "the synopsis is on stdout" "usage: firm-integrate" printf '%s' "$helpH"
+assert_output "it names the selector in the accepted two-word spelling" "--run <run-dir>" \
+  printf '%s' "$helpH"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$helpH"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$helpH"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$helpH"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$helpH"
+assert_output "…and states that the SAME run id drives the glob and the ledger (F3)" \
+  "BOTH selections" printf '%s' "$helpH"
+assert_eq "--help created no integration branch" "" \
+  "$( (cd "$repoH" && git for-each-ref --format='%(refname:short)' 'refs/heads/integration/*') )"
+assert_no_file "…and no integration worktree" "$repoH/.agent-firm/integration"
+assert_eq "main SHA unchanged" "$beforeH" "$(sha_of "$repoH" main)"
+assert_eq "and the caller's HEAD did not move" "main" \
+  "$( (cd "$repoH" && git rev-parse --abbrev-ref HEAD) )"
+helpH2="$( integrate "$repoH" -h 2>/dev/null )"; rcH2=$?
+assert_eq "-h exits 0 too" 0 "$rcH2"
+assert_eq "-h prints the byte-identical synopsis" "$helpH" "$helpH2"
+assert_rc "an unrelated option is still refused, and rc 2 is still its status" 2 \
+  integrate "$repoH" --bogus
+assert_output "…and the refusal now carries the same run-selection statement" "Explicit beats ambient" \
+  sh -c "cd '$repoH' && '$BIN/firm-integrate' --bogus 2>&1"
+# Without this, "created no integration branch" could be passing on a fixture where a real merge
+# creates nothing either -- a comparison that cannot fail.
+assert_ok "fixture precondition: a REAL invocation on this fixture does create one" integrate "$repoH"
+assert_ne "…so the emptiness asserted above was a live measurement" "" \
+  "$( (cd "$repoH" && git for-each-ref --format='%(refname:short)' 'refs/heads/integration/*') )"
+
 t_summary

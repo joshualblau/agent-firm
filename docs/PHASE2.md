@@ -27,8 +27,11 @@ framework-X guru) — that expertise is dead weight on the many projects that do
   tools/MCP, budget, retirement). Produces `04-staffing-plan.yaml`.
 - **`specialist`** (agent, Sonnet) — a domain-agnostic base. The Lead dispatches it with a job spec and
   it becomes that expert for one task, honoring its scope and `domain_guardrails`, then is retired.
-- **`firm-hire <role>`** — scaffolds a job-spec skeleton (schema-shaped) into the run ledger for the
-  Recruiter to fill; logs the hire.
+- **`firm-hire [--run <run-dir>] <role>`** — scaffolds a job-spec skeleton (schema-shaped) into the run
+  ledger for the Recruiter to fill; logs the hire. *Shipped in Phase 2 as `firm-hire <role>`, reading
+  `.agent-firm/CURRENT_RUN` and nothing else; `--run` was added later and is authoritative — with it,
+  `CURRENT_RUN` is not read at all, so neither the spec nor the ledger event can land in another run.
+  `firm-hire --help` states this.*
 - **`bench/registry.yaml`** — the durable bench (empty by design) + governance (promotion/retirement/
   scoping) + an illustrative (inactive) example of an entry's shape.
 

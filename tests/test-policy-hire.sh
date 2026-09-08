@@ -132,4 +132,59 @@ assert_no_file "no run tree was created under the subdirectory" "$repo4/sub/.age
 assert_ok "the same call from the repository root still works" \
   sh -c "cd '$repo4' && '$HIRE' data-scientist"
 
+# ---------------------------------------------------------------------------
+# wo6_inventory <repo> — everything a --help invocation must not change. Not a bare `find`: the
+# hire_scaffolded ledger event is an APPEND to a file that already exists, so a name-only snapshot
+# would call "help logged a hire" unchanged.
+wo6_inventory() {
+  ( cd "$1" 2>/dev/null || exit 0
+    find . -path ./.git -prune -o -type f -print 2>/dev/null | LC_ALL=C sort | while read -r f; do
+      cksum < "$f" 2>/dev/null | sed "s|\$| $f|"
+    done
+    find . -path ./.git -prune -o -type d -print 2>/dev/null | LC_ALL=C sort )
+}
+
+t_case "AC-010: firm-hire --help states how the run is selected, on stdout, exit 0, scaffolding nothing"
+# Before this, `--help` fell into the leading-dash catch-all: rc 2, and the answer to "which run does
+# this write into?" was "unknown option". Worse, the copy that predates --run scaffolded
+# hires/--help.job.yaml for the same call, so "help creates nothing" is a property with history.
+repo5="$(mk_repo)"
+run_out5="$( (cd "$repo5" && "$NEW_RUN" hire-help fast_path) )"
+inv5_before="$(wo6_inventory "$repo5")"
+help5="$( (cd "$repo5" && "$HIRE" --help) 2>/dev/null )"; rc5=$?
+inv5_after="$(wo6_inventory "$repo5")"
+assert_eq "--help exits 0" 0 "$rc5"
+assert_output "the synopsis is on stdout" "usage: firm-hire" printf '%s' "$help5"
+assert_output "it names the selector in the accepted two-word spelling" "--run <run-dir>" \
+  printf '%s' "$help5"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$help5"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$help5"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$help5"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$help5"
+assert_eq "--help wrote no job spec and appended no ledger event" "$inv5_before" "$inv5_after"
+assert_no_file "and scaffolded no hires/ directory at all" \
+  "$repo5/.agent-firm/runs/$(basename "$run_out5")/hires"
+help5b="$( (cd "$repo5" && "$HIRE" -h) 2>/dev/null )"; rc5b=$?
+assert_eq "-h exits 0 too" 0 "$rc5b"
+assert_eq "-h prints the byte-identical synopsis" "$help5" "$help5b"
+
+t_case "…and the leading-dash refusal was not widened by it"
+# Only -h and --help in the OPTION position are help. Everything the catch-all refused before, it
+# still refuses. (Deliberately NOT asserted here: `firm-hire -- -h`. Unlike firm-new-worktree, this
+# tool has never re-checked <role-name> for a leading dash after the `--` terminator, so that call
+# scaffolds hires/-h.job.yaml and exits 0. That is PRE-EXISTING and unchanged by the help carve-out --
+# it behaves identically with and without it -- and pinning it here would cement a wart this work
+# order is not authorised to fix. It is reported instead.)
+assert_rc "-data-engineer is still refused" 2 sh -c "cd '$repo5' && '$HIRE' -data-engineer"
+assert_rc "--run=<dir> is still refused by spelling" 2 \
+  sh -c "cd '$repo5' && '$HIRE' --run=.agent-firm/runs/x data-engineer"
+assert_eq "none of those refusals scaffolded anything" "$inv5_before" "$(wo6_inventory "$repo5")"
+# Without this, every comparison above could be passing because wo6_inventory watches something that
+# never moves. A real hire must move it.
+(cd "$repo5" && "$HIRE" data-engineer >/dev/null 2>&1)
+assert_ne "fixture precondition: a REAL hire does move that inventory" \
+  "$inv5_before" "$(wo6_inventory "$repo5")"
+
 t_summary

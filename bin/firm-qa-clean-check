@@ -9,10 +9,28 @@ while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
 
+# ONE usage synopsis for both refusal sites below. This tool has no --help flag and is NOT being given
+# one here: its convention is that a call it cannot serve prints the synopsis on stderr and exits 2,
+# and WO-6 changes text, not parsing. What is added is the run-selection paragraph, so that this
+# tool's precedence reads the same as firm-qa-checkout's and firm-integrate's even though its
+# behavior is untouched by this run (AC-010).
+usage() {
+  cat <<'EOF'
+usage: firm-qa-clean-check [--run <run-dir> [qa-checkout]]
+
+Lead-owned verification of one run's persisted QA candidate checkout.
+Exit 0 clean, 1 dirty/identity mismatch, 2 cannot verify.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all. With no arguments, the ambient .agent-firm/CURRENT_RUN pointer is used and converted
+into the same fully validated target. Explicit beats ambient.
+EOF
+}
+
 if [[ $# -eq 0 ]]; then
   current_file=".agent-firm/CURRENT_RUN"
   if [[ ! -f "$current_file" || -L "$current_file" ]] || ! run_dir="$(cat "$current_file" 2>/dev/null)" || [[ -z "$run_dir" ]]; then
-    echo "usage: firm-qa-clean-check [--run <run-dir> [qa-checkout]]" >&2
+    usage >&2
     exit 2
   fi
   qa_arg=""
@@ -20,7 +38,7 @@ elif [[ "${1:-}" == "--run" && -n "${2:-}" && $# -le 3 ]]; then
   run_dir="$2"
   qa_arg="${3:-}"
 else
-  echo "usage: firm-qa-clean-check [--run <run-dir> [qa-checkout]]" >&2
+  usage >&2
   exit 2
 fi
 

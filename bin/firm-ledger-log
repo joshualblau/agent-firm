@@ -2761,7 +2761,24 @@ def ordinary_main(argv):
         elif flag == "--print-event-id":
             print_event_id = True
         else:
+            # This tool has no --help flag and is not being given one: its only usage surface is this
+            # refusal, and WO-6 changes TEXT, not parsing -- a new flag in the loop that guards the
+            # firm's append-only ledger is not a documentation change. So the run-selection statement
+            # every in-scope tool states goes here, on the one path that already prints an interface
+            # diagnostic (AC-010). Behavior below is untouched by the run that added --run elsewhere.
             print(f"firm-ledger-log: unknown option {flag}", file=sys.stderr)
+            print("usage: firm-ledger-log [--run <run-dir>] [--strict] [--event-id <id>]"
+                  " [--print-event-id] <event> [key=value ...]", file=sys.stderr)
+            print("  Run selection: --run <run-dir> is AUTHORITATIVE -- with it,"
+                  " .agent-firm/CURRENT_RUN is not", file=sys.stderr)
+            print("  read at all. With no --run the ambient .agent-firm/CURRENT_RUN pointer is used.",
+                  file=sys.stderr)
+            print("  Explicit beats ambient. With NEITHER, this tool exits 0 having logged nothing,"
+                  " so that a", file=sys.stderr)
+            print("  logging fault never fails a caller that only wanted to record something. A"
+                  " caller that needs", file=sys.stderr)
+            print("  the event to exist must pass --run and check for the event, not just the exit"
+                  " status.", file=sys.stderr)
             raise SystemExit(2)
     event = argv.pop(0) if argv else "event"
     if target is None:
