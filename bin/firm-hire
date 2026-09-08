@@ -14,9 +14,38 @@ SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 # it: one definition of the containment validation rather than a local re-spelling of it.
 . "$SELF/firm-run-resolve"
 
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- bin/firm-new-run's shape, and the same one firm-new-worktree
+# uses, so the two sibling tools read alike.
+usage() {
+  cat <<'EOF'
+usage: firm-hire [--run <run-dir>] <role-name>
+
+Scaffold a job-spec skeleton (agent-firm/schemas/job-spec.schema.json) into one run's hires/
+directory for the Recruiter to fill in.
+
+  --run <run-dir>   the run the spec is written into and whose ledger records the hire.
+                    Authoritative. Goes BEFORE <role-name>, and is two words, not --run=<run-dir>.
+  <role-name>       e.g. data-engineer. Lower-cased and reduced to [a-z0-9-].
+  -h, --help        print this synopsis and exit 0; scaffolds nothing.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, so neither the scaffolded spec nor the hire_scaffolded ledger event can land in a
+different run than the one selected. With no --run, the ambient .agent-firm/CURRENT_RUN pointer is
+used and validated identically. Explicit beats ambient. Both go through bin/firm-run-resolve.
+
+Run this from the repository root: the path this tool prints is relative to it.
+EOF
+}
+
+# `-h|--help` is matched AHEAD of the `-*` catch-all so help is reachable the normal way. Before this,
+# `--help` fell into that catch-all, exited 2, and reported the run selector's spelling to somebody
+# who was asking what the selector MEANS -- leaving the precedence rule readable only in the source
+# (AC-010). The catch-all itself is unchanged and still refuses every other leading-dash argument.
 run_sel=""; run_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    -h|--help) usage; exit 0 ;;
     --run)
       if [ $# -lt 2 ]; then echo "firm-hire: --run needs a run directory argument" >&2; exit 2; fi
       run_sel="$2"; run_given=1; shift 2 ;;
@@ -29,14 +58,14 @@ while [ $# -gt 0 ]; do
       # copy of this tool handed `--run <dir>` sanitizes "--run" into a ROLE NAME, since the tr
       # pipeline below keeps hyphens. Refuse it here rather than scaffold hires/--run.job.yaml.
       echo "firm-hire: unknown option $1 — the run selector is \"--run <run-dir>\" (two words), before <role-name>" >&2
-      echo "usage: firm-hire [--run <run-dir>] <role-name>" >&2
+      usage >&2
       exit 2 ;;
     *)  break ;;
   esac
 done
 
 role="${1:-}"
-if [[ -z "$role" ]]; then echo "usage: firm-hire [--run <run-dir>] <role-name>" >&2; exit 2; fi
+if [[ -z "$role" ]]; then usage >&2; exit 2; fi
 role="$(printf '%s' "$role" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
 
 # Explicit beats ambient. The ambient failure keeps this tool's historical rc 1 (pre-change behavior,

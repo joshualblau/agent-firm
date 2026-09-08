@@ -18,6 +18,31 @@ SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by loca
 # gives: one definition of the containment validation, not another local copy of it.
 . "$SELF/firm-run-resolve"
 
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- bin/firm-new-run's shape. Factored so the synopsis the F6
+# refusal below quotes and the synopsis --help prints cannot drift apart.
+usage() {
+  cat <<'EOF'
+usage: firm-new-worktree [--run <run-dir>] <role> <work-order-id>
+
+Create one isolated git worktree for one implementer work-order, based on local HEAD.
+
+  --run <run-dir>     the run the branch, the worktree directory and the ledger event belong to.
+                      Authoritative. Goes BEFORE <role>, and is two words, not --run=<run-dir>.
+  <role>              e.g. implementer. May not begin with '-' (see below).
+  <work-order-id>     e.g. WO-1.
+  -h, --help          print this synopsis and exit 0; creates no branch and no worktree.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, so a second active run (or a stale pointer) cannot redirect the branch, the worktree
+directory or the ledger this call writes to. With no --run, the ambient .agent-firm/CURRENT_RUN
+pointer is used and validated identically. Explicit beats ambient. Both go through
+bin/firm-run-resolve.
+
+Run this from the repository root: every path this tool prints and creates is relative to it.
+EOF
+}
+
 # refuse_leading_dash <where> — F6, and the whole point of it is stated here rather than in a commit
 # message. This tool's signature is POSITIONAL-FIRST, so an OLD copy of it (one that predates --run)
 # handed `--run <dir>` takes "--run" as the ROLE: `tr -cd 'a-zA-Z0-9-'` below keeps the hyphens, and
@@ -33,13 +58,21 @@ refuse_leading_dash() {
   echo "firm-new-worktree: the run selector is \"--run <run-dir>\" (two words) and goes BEFORE <role>." >&2
   echo "firm-new-worktree: an older copy of this tool would have taken it as the role and silently" >&2
   echo "firm-new-worktree: created a worktree on the AMBIENT run; this copy fails closed instead." >&2
-  echo "usage: firm-new-worktree [--run <run-dir>] <role> <work-order-id>" >&2
+  usage >&2
   exit 2
 }
 
+# `-h|--help` is matched AHEAD of the `-*` catch-all, which is the whole point of adding it: before
+# this, `--help` fell into refuse_leading_dash and answered a request for the interface with the
+# four-line F6 hazard lecture and rc 2. Accurate, but not what someone typing --help is asking, and
+# it left this tool's run-selection contract unreachable except by reading the source (AC-010).
+# The F6 refusal is NOT widened or weakened by this: it still catches every other leading-dash
+# role-position argument, and `firm-new-worktree -- -h <wo>` still reaches it via the <role> check
+# below. Only the two spellings that unambiguously mean "explain yourself" are carved out.
 run_sel=""; run_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    -h|--help) usage; exit 0 ;;
     --run)
       if [ $# -lt 2 ]; then echo "firm-new-worktree: --run needs a run directory argument" >&2; exit 2; fi
       run_sel="$2"; run_given=1; shift 2 ;;
@@ -55,7 +88,7 @@ done
 
 role="${1:-}"; wo="${2:-}"
 if [[ -z "$role" || -z "$wo" ]]; then
-  echo "usage: firm-new-worktree [--run <run-dir>] <role> <work-order-id>" >&2; exit 2
+  usage >&2; exit 2
 fi
 case "$role" in -*) refuse_leading_dash "<role> argument" ;; esac
 role="$(printf '%s' "$role" | tr -cd 'a-zA-Z0-9-')"

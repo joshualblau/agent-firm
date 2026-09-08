@@ -27,17 +27,46 @@ while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
 . "$SELF/firm-run-resolve"   # one resolved RUN for the whole firm; see bin/firm-run-resolve
 
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- bin/firm-new-run's shape, adopted here so the interface
+# description cannot drift from the refusal that quotes it.
+usage() {
+  cat <<'EOF'
+usage: firm-integrate [--run <run-dir>] [integration-branch]
+
+Merge ONE run's implementer worktree branches (wt/<run-id>-*) into that run's integration branch.
+
+  --run <run-dir>        the run whose branches are merged and whose ledger records it.
+                         Authoritative.
+  [integration-branch]   the target. Must be integration/*. Default: integration/<run-id>.
+  -h, --help             print this synopsis and exit 0; merges nothing.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all. With no --run, the ambient .agent-firm/CURRENT_RUN pointer is used and validated
+identically. Explicit beats ambient. Both go through bin/firm-run-resolve. The resolved run id drives
+BOTH selections this tool makes: the merge-source glob AND the ledger the result is recorded in.
+
+Merges happen in a linked worktree at .agent-firm/integration/<run-id>. Your own HEAD is not moved.
+Merging to the default branch is a human gate and is never done here.
+EOF
+}
+
 # `--run` is parsed ahead of the positional [integration-branch], so every pre-existing form still
 # works unchanged: `firm-integrate` and `firm-integrate <integration-branch>` (AC-006).
+#
+# `-h|--help` is matched AHEAD of the `-*` catch-all so help is reachable the normal way. That is the
+# one deliberate parsing change here: `--help` used to fall into `-*` and exit 2 with "unknown option
+# --help", which tells a reader nothing about which run this tool is about to merge (AC-010).
 run_sel=""; have_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help) usage; exit 0 ;;
     --run)
       [[ $# -ge 2 ]] || { echo "firm-integrate: --run needs a run directory argument" >&2; exit 2; }
       run_sel="$2"; have_run=1; shift 2 ;;
     --) shift; break ;;
     -*) echo "firm-integrate: unknown option $1" >&2
-        echo "usage: firm-integrate [--run <run-dir>] [integration-branch]" >&2; exit 2 ;;
+        usage >&2; exit 2 ;;
     *) break ;;
   esac
 done

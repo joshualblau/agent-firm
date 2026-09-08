@@ -348,4 +348,38 @@ assert_output "the sourced function fails closed the same way" "does not exist" 
 assert_ok "sourcing it under set -euo pipefail does not abort the caller" \
   sh -c "cd '$repo20' && /bin/bash -c 'set -euo pipefail; . \"$RESOLVE\"; firm_run_resolve >/dev/null'"
 
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help carries the shared run-selection statement, and resolves nothing"
+# This file already had --help; what it did not have was the statement the other in-scope tools print,
+# and this is the copy that matters most, because every one of them resolves THROUGH this file. If the
+# shared sentence is ever true anywhere it has to be true here, so it is pinned here and not only in
+# the callers that quote it.
+repo21="$(mk_repo)"; mk_two_runs "$repo21"
+help21="$( (cd "$repo21" && "$RESOLVE" --help) 2>/dev/null )"; rc21=$?
+assert_eq "--help exits 0" 0 "$rc21"
+assert_output "the synopsis is on stdout" "usage: firm-run-resolve" printf '%s' "$help21"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$help21"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$help21"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$help21"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$help21"
+assert_output "…and that the precedence survives an INVALID explicit selector" "not even" \
+  printf '%s' "$help21"
+# The synopsis must not double as an answer: a caller that pipes stdout into a path variable would
+# otherwise get the help text where a run directory belongs.
+assert_output "help does not print anything shaped like a resolved run directory" \
+  "usage: firm-run-resolve" printf '%s' "$help21"
+case "$help21" in
+  *"/.agent-firm/runs/$RUN_A"*) _t_no "help resolves no run" "the synopsis contains a resolved run path" ;;
+  *) _t_ok "help resolves no run" ;;
+esac
+help21b="$( (cd "$repo21" && "$RESOLVE" -h) 2>/dev/null )"; rc21b=$?
+assert_eq "-h exits 0 too" 0 "$rc21b"
+assert_eq "-h prints the byte-identical synopsis" "$help21" "$help21b"
+# Help is argv[1]-scoped by the existing dispatch, and that boundary is asserted rather than assumed:
+# a --run whose VALUE is the string --help is a selector, not a request for help.
+assert_rc "--run --help is a refused selector, not help" 2 \
+  sh -c "cd '$repo21' && '$RESOLVE' --run --help"
+
 t_summary

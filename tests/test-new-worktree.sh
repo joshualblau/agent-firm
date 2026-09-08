@@ -20,6 +20,19 @@ expected_db() {
   printf 'firm_%s' "$(printf '%s' "${1}_${2}_${3}" | tr -cd 'a-zA-Z0-9_')"
 }
 
+# wo6_inventory <repo> — everything a --help invocation must not change. Deliberately NOT a bare
+# `find`: a ledger event is an APPEND to a file that already exists, so a name-only snapshot would
+# call "help wrote a worktree_created event" unchanged. cksum per file catches content, the directory
+# list catches creation, and for-each-ref catches the branch, which lives inside the pruned .git.
+wo6_inventory() {
+  ( cd "$1" 2>/dev/null || exit 0
+    find . -path ./.git -prune -o -type f -print 2>/dev/null | LC_ALL=C sort | while read -r f; do
+      cksum < "$f" 2>/dev/null | sed "s|\$| $f|"
+    done
+    find . -path ./.git -prune -o -type d -print 2>/dev/null | LC_ALL=C sort
+    git for-each-ref --format='%(refname:short) %(objectname)' 2>/dev/null | LC_ALL=C sort )
+}
+
 # ---------------------------------------------------------------------------
 t_case "no active run fails cleanly"
 repo="$(mk_repo)"
@@ -248,5 +261,57 @@ assert_output "and it names the repository root it requires" "repository root" \
 assert_no_file "nothing was created under the subdirectory" "$repo11/sub/.agent-firm"
 assert_ok "the same call from the repository root still works" \
   sh -c "cd '$repo11' && '$NEW_WT' implementer wo1"
+
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help states how the run is selected, on stdout, exit 0, creating nothing"
+# This tool had no --help at all: `--help` fell into the leading-dash catch-all and answered a request
+# for the INTERFACE with the F6 hazard lecture and rc 2, which left the run-selection rule readable
+# only by reading the source -- exactly what AC-010 forbids. Three separate things are pinned here,
+# because any one of them alone would let the criterion pass while failing its purpose: that help is
+# REACHABLE the normal way (rc 0), that it lands on STDOUT rather than the refusal path's stderr, and
+# that it actually STATES the precedence rather than merely listing the flag.
+repo12="$(mk_repo)"
+run_out12="$( (cd "$repo12" && "$NEW_RUN" wt-help fast_path) )"
+inv12_before="$(wo6_inventory "$repo12")"
+# stderr discarded, so this variable can hold ONLY what went to stdout.
+help12="$( (cd "$repo12" && "$NEW_WT" --help) 2>/dev/null )"; rc12=$?
+inv12_after="$(wo6_inventory "$repo12")"
+assert_eq "--help exits 0" 0 "$rc12"
+assert_output "the synopsis is on stdout" "usage: firm-new-worktree" printf '%s' "$help12"
+assert_output "it names the selector, in the accepted two-word spelling" "--run <run-dir>" \
+  printf '%s' "$help12"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$help12"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$help12"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$help12"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$help12"
+# A help flag that scaffolds is the D-03 defect firm-new-run already carries a test for; asserted here
+# because this tool's --help used to reach the refusal path, and now reaches a new one.
+assert_eq "--help creates no branch, no worktree, and appends no ledger event" \
+  "$inv12_before" "$inv12_after"
+help12b="$( (cd "$repo12" && "$NEW_WT" -h) 2>/dev/null )"; rc12b=$?
+assert_eq "-h exits 0 too" 0 "$rc12b"
+assert_eq "-h prints the byte-identical synopsis" "$help12" "$help12b"
+
+t_case "…and the F6 refusal was not widened by it: every other leading-dash argument still fails closed"
+# The risk in carving two spellings out of a fail-closed catch-all is that the carve-out is wider than
+# intended. It is not: only -h and --help in the OPTION position are help.
+assert_rc "-implementer is still refused" 2 sh -c "cd '$repo12' && '$NEW_WT' -implementer wo1"
+assert_output "and still names the hazard, rather than printing help at it" "begins with '-'" \
+  sh -c "cd '$repo12' && '$NEW_WT' -implementer wo1"
+assert_rc "a <role> of literally '-h' after the -- terminator is refused, not read as help" 2 \
+  sh -c "cd '$repo12' && '$NEW_WT' -- -h wo1"
+assert_output "…by the same F6 diagnostic" "begins with '-'" \
+  sh -c "cd '$repo12' && '$NEW_WT' -- -h wo1"
+assert_rc "--run=<dir> is still refused by spelling" 2 \
+  sh -c "cd '$repo12' && '$NEW_WT' --run=.agent-firm/runs/x implementer wo1"
+assert_eq "none of those refusals created anything either" \
+  "$inv12_before" "$(wo6_inventory "$repo12")"
+# Without this, every "created nothing" assertion above could be passing because wo6_inventory watches
+# something that never moves -- a comparison that cannot fail. A real invocation must move it.
+(cd "$repo12" && "$NEW_WT" implementer wo-inv >/dev/null)
+assert_ne "fixture precondition: a REAL invocation does move that inventory" \
+  "$inv12_before" "$(wo6_inventory "$repo12")"
 
 t_summary

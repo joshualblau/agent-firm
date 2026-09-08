@@ -301,8 +301,11 @@ case "${BASH_SOURCE[0]:-$0}" in
     set -uo pipefail
     case "${1:-}" in
       -h|--help)
-        # Short on purpose. The full run-selection statement every in-scope tool has to print is
-        # WO-6's, and it extends this rather than competing with it.
+        # The "Run selection:" paragraph below is the SHARED TEMPLATE every in-scope tool prints,
+        # near-verbatim, so a reader who has seen one tool's help recognizes the same statement in
+        # the next (AC-010). This file is where the sentence is true by construction rather than by
+        # convention: it is the resolver the other tools call, so its help and its behavior cannot
+        # drift apart the way a copied sentence in a sibling tool could.
         cat <<'USAGE'
 usage: firm-run-resolve [--run <run-dir>]
 
@@ -310,6 +313,13 @@ Resolve, validate and print the one run directory a firm tool is acting for.
 
   --run <run-dir>   authoritative; .agent-firm/CURRENT_RUN is not consulted at all
   (no --run)        fall back to <repo>/.agent-firm/CURRENT_RUN, validated identically
+  -h, --help        print this synopsis and exit 0; resolves nothing
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, not even as a tiebreak, not even if the explicit selector turns out to be invalid.
+With no --run, the ambient .agent-firm/CURRENT_RUN pointer is read and validated identically.
+Explicit beats ambient. Every firm tool that takes --run resolves it here, so this precedence is the
+same one firm-qa-checkout, firm-integrate, firm-new-worktree and firm-hire report in their own help.
 
 Prints the canonical absolute run directory on stdout and exits 0. On any failure it prints a
 diagnostic naming the specific violation on stderr and exits 2, having printed nothing on stdout.

@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
-# firm-traceability-check [run_dir] [verdict_path]
+# firm-traceability-check [--strict] [run_dir] [verdict_path]
 # Cross-references acceptance criteria (01-acceptance-criteria.yaml) against the QA verdict's
 # acceptance_criteria_coverage (08-qa-verdict.json). Defaults to the active run
 # (.agent-firm/CURRENT_RUN).
+#
+# RUN SELECTION. A NON-EMPTY [run_dir] argument is AUTHORITATIVE -- when it is given,
+# .agent-firm/CURRENT_RUN is not read at all. With no argument, the ambient .agent-firm/CURRENT_RUN
+# pointer is used. Explicit beats ambient. The selector here is a POSITIONAL run directory, not the
+# `--run <run-dir>` flag its run-scoped siblings take, and it is resolved here rather than through
+# bin/firm-run-resolve; the PRECEDENCE is the same, the spelling is not. Unchanged behavior --
+# restated so a producer can read the interface off this tool's own output (AC-010).
+#
+# "NON-EMPTY" is load-bearing: `firm-traceability-check ""` -- what an unset shell variable expands
+# to -- is treated as NO argument and falls back to CURRENT_RUN, where bin/firm-run-resolve refuses
+# the equivalent `--run ""` outright. Pre-existing here and unchanged; disclosed rather than glossed,
+# because a gate that silently verifies a different run than the caller named is the failure mode
+# this whole family of criteria exists for.
 #
 # The schema allows covered: yes | no | partial (agent-firm/schemas/qa-verdict.schema.json). This
 # script used to look at `no` ONLY, so a verdict where every criterion was `partial` printed
@@ -119,7 +132,14 @@ if [[ "${1:-}" == "--strict" ]]; then strict=1; shift; fi
 run_dir="${1:-}"
 verdict_path="${2:-}"
 if [[ -z "$run_dir" && -f .agent-firm/CURRENT_RUN ]]; then run_dir="$(cat .agent-firm/CURRENT_RUN)"; fi
-if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no run dir (pass one or set CURRENT_RUN)" >&2; exit 2; fi
+if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+  echo "no run dir (pass one or set CURRENT_RUN)" >&2
+  echo "usage: firm-traceability-check [--strict] [run_dir] [verdict_path]" >&2
+  echo "  Run selection: a NON-EMPTY [run_dir] is AUTHORITATIVE -- with it, .agent-firm/CURRENT_RUN" >&2
+  echo "  is not read at all. With no argument the ambient .agent-firm/CURRENT_RUN pointer is used." >&2
+  echo "  Explicit beats ambient. An EMPTY argument counts as no argument and falls back." >&2
+  exit 2
+fi
 if [[ -f "$run_dir/09-test-evidence/qa-candidate.json" ]]; then strict=1; fi
 
 if [[ $strict -eq 1 ]]; then

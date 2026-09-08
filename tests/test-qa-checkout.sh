@@ -293,4 +293,31 @@ assert_no_file "no checkout was materialized by any of those refusals" \
 assert_file "the symlink target is untouched" "$elsewhere10/PRECIOUS.txt"
 assert_no_file "…and received no checkout of its own" "$elsewhere10/$id10"
 
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help states how the run is selected, on stdout, exit 0, materializing nothing"
+# --run arrived on this tool in this run; the statement of what it OUTRANKS did not, and `--help` fell
+# into the `-*` catch-all and exited 2 with "unknown option --help". A producer could therefore only
+# learn the precedence by reading the source, which is the condition AC-010 names.
+repo11="$(mk_repo)"
+( cd "$repo11" && "$NEW_RUN" qac-help fast_path >/dev/null )
+help11="$( (cd "$repo11" && "$QAC" --help) 2>/dev/null )"; rc11=$?
+assert_eq "--help exits 0" 0 "$rc11"
+assert_output "the synopsis is on stdout" "usage: firm-qa-checkout" printf '%s' "$help11"
+assert_output "it names the selector in the accepted two-word spelling" "--run <run-dir>" \
+  printf '%s' "$help11"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$help11"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$help11"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$help11"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$help11"
+assert_no_file "--help materialized no QA checkout" "$repo11/.agent-firm/qa-checkout"
+help11b="$( (cd "$repo11" && "$QAC" -h) 2>/dev/null )"; rc11b=$?
+assert_eq "-h exits 0 too" 0 "$rc11b"
+assert_eq "-h prints the byte-identical synopsis" "$help11" "$help11b"
+assert_rc "an unrelated option is still refused, and rc 2 is still its status" 2 \
+  sh -c "cd '$repo11' && '$QAC' --bogus"
+assert_output "…and the refusal now carries the same run-selection statement" "Explicit beats ambient" \
+  sh -c "cd '$repo11' && '$QAC' --bogus 2>&1"
+
 t_summary
