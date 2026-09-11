@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# firm-merge-guard — refuse an AI-initiated merge/push unless the operator's identity is allow-listed.
+# firm-merge-guard — permit proved topic pushes; prohibit default pushes; gate merges by identity.
 #
 # ============================================================================================
 # WHAT THIS IS NOT (read first — this disclosure is a deliverable, not a caveat)
@@ -12,9 +12,9 @@
 #     · NOT branch protection,
 #     · and it CANNOT provide a "required PR review" — only GitHub can (see
 #       docs/BRANCH-PROTECTION-RUNBOOK.md for the exact calls, and the GitHub Pro requirement).
-#   Its actual scope is narrower and is the whole of the ask it satisfies: preventing an AI agent
-#   from performing an unauthorised merge or push through the tool surface. It stops an agent; it
-#   does not stop a determined human. Rated at its honest tier in docs/ENFORCEMENT.md.
+#   Its actual scope is narrower: preventing an AI agent from writing a remote default branch
+#   directly, while allowing a proved topic-branch push and retaining the identity gate for local
+#   merges and other remote-ref operations. It stops an agent; it does not stop a determined human.
 #   DO NOT trust this paragraph for SCOPE. `firm-merge-guard --surface` prints what is COVERED and
 #   what is a known GAP, and every line of BOTH lists has its own assertion in
 #   tests/test-merge-guard.sh — a covered line has a test that it BLOCKS, a gap line has a test
@@ -34,6 +34,14 @@
 #   Because that second axis is a plain string the restrained actor can write, `git config` WRITES
 #   to user.email / user.name are themselves on the gated surface. Reads are not.
 #
+# PUSH POLICY (0.9.0). An explicit push whose every resolved destination is a non-default branch is
+# ordinary work and does not consult the identity allowlist. A direct write/delete of the resolved
+# remote default branch is prohibited even for an allow-listed identity. Tags and other remote-ref
+# writes retain the identity gate. A push whose repository, remote, default branch, or destination
+# cannot be proved is CANNOT EVALUATE. Destination proof is bounded to one direct push per tool call;
+# multiple pushes, nested shells/launchers, and unsupported flags block rather than falling back to
+# blanket authority.
+#
 # FAILS CLOSED, ALWAYS. Anything that cannot be evaluated is a BLOCK, never a pass: no network,
 # `gh` absent, `gh` unauthenticated, empty/malformed/non-login `gh` output, `git` absent,
 # `user.email` unset or empty, allowlist missing/unreadable/unparseable/empty/unknown-key, no
@@ -43,8 +51,8 @@
 # code from the embedded checker outside its own contract.
 #
 # EXIT CONTRACT (check modes — the firm's three-way gate contract; AC-016)
-#   0  identity resolved AND allow-listed                     -> permitted
-#   1  identity resolved and NOT allow-listed                  -> refused
+#   0  proved topic push OR identity resolved and allow-listed -> permitted
+#   1  default push prohibited OR identity NOT allow-listed     -> refused
 #   2  CANNOT EVALUATE (any indeterminate path above)          -> refused
 #   Callers MUST treat anything other than 0 as a block. `--hook` does exactly that, and it does
 #   not distinguish 1 from 2 in the block decision (only in the message it prints).
@@ -540,9 +548,10 @@ GIT_CONFIG_WRITE_FLAGS = ("--add", "--replace-all", "--unset", "--unset-all",
                           "--rename-section", "--remove-section")
 
 SURFACE_COVERED = [
-    "git push — every flag form (--force, -f, --force-with-lease, --tags, --mirror, --delete), an",
-    "  explicit or forced refspec, any remote name or URL, `git -C <path> push`, `git -c k=v push`,",
-    "  `git --git-dir=<d> push`, `git --no-pager push`, and an absolute path to git",
+    "git push — structurally detected forms are destination-resolved before authority: explicit",
+    "  topic-branch refspecs (including force and delete) are permitted; the resolved remote",
+    "  default branch is prohibited; multiple/unsupported/ambiguous forms fail closed; tags retain",
+    "  the identity gate. `git -C <path>` and a preceding literal `cd` are resolved.",
     "git merge (any target, including while the default branch is checked out)",
     "git pull (it merges)",
     "git subtree push",
@@ -1328,42 +1337,53 @@ def classify_gh(args):
         return "gh repo sync" if sub == "sync" else None
     return None
 
+def preferred_hit(hits):
+    """Prefer push when a compound/ambiguous reading contains several gated operations.
+
+    Push policy is destination-sensitive while the other surfaces use the identity gate. Returning
+    a preceding merge would otherwise let a later default-branch push inherit the merge decision.
+    """
+    return "git push" if "git push" in hits else (hits[0] if hits else None)
+
+
 def classify_segment(seg, here, depth):
     argvs, cmdlike = launcher_argvs(seg)
     # EVERY candidate reading of the launcher prefix is classified, and the FIRST one that hits
     # gates the segment. See launcher_argvs: readings are ambiguous by construction, so "any hit
     # is a hit" is the only fail-closed way to combine them. (SEC-13)
+    hits = []
     for argv in argvs:
         prog = prog_name(argv[0])
         if prog in SHELLS:
             hit = shell_inline(argv, depth)
             if hit:
-                return hit
+                hits.append(hit)
             for hs in here:                     # `bash <<< 'git push'`
                 hit = classify(hs, depth + 1)
                 if hit:
-                    return hit
+                    hits.append(hit)
         elif prog == "git":
             hit = classify_git(argv[1:])
             if hit:
-                return hit
+                hits.append(hit)
         elif prog == "gh":
             hit = classify_gh(argv[1:])
             if hit:
-                return hit
+                hits.append(hit)
     for c in cmdlike:
         hit = classify(c, depth + 1)
         if hit:
-            return hit
-    return None
+            hits.append(hit)
+    return preferred_hit(hits)
 
 def classify_line(line, depth):
     """One reading of one logical line: its segments, its here-strings, its substitutions."""
     segs = segments(line)
+    hits = []
     for toks, here in segs:
         hit = classify_segment(toks, here, depth)
         if hit:
-            return hit
+            hits.append(hit)
     # A HERE-STRING belongs to the LINE, not to the segment that spells it: in
     # `cat <<< '<cmd>' | bash` the text is a command string even though the segment that owns
     # the `<<<` runs `cat`. That is the same rule logical_lines already applies to a heredoc
@@ -1374,12 +1394,12 @@ def classify_line(line, depth):
         for h in heres:
             hit = classify(h, depth + 1)
             if hit:
-                return hit
+                hits.append(hit)
     for inner in substitutions(line):
         hit = classify(inner, depth + 1)
         if hit:
-            return hit
-    return None
+            hits.append(hit)
+    return preferred_hit(hits)
 
 def classify(text, depth=0):
     """Return a label for the gated surface this command line touches, or None.
@@ -1398,14 +1418,15 @@ def classify(text, depth=0):
     """
     if depth > 3 or not text:
         return None
+    hits = []
     for line in logical_lines(text):
         if not line.strip():
             continue
         for reading in line_readings(line):
             hit = classify_line(reading, depth)
             if hit:
-                return hit
-    return None
+                hits.append(hit)
+    return preferred_hit(hits)
 
 # ---- the allowlist -------------------------------------------------------------------------
 TOP_KEYS   = ("schema_version", "allowed")
@@ -1513,6 +1534,241 @@ def resolve_git_email():
     if "@" not in val:
         return "", "git-malformed", "user.email is not an address: %r" % val[:120]
     return val, "ok", ""
+
+# ---- destination-sensitive push policy -----------------------------------------------------
+# Topic-branch publication is ordinary work in 0.9.0. A push is permitted without consulting the
+# identity allowlist only after this code proves every destination is a non-default branch. Direct
+# default-branch writes are prohibited even for an allow-listed identity. Unsupported, nested or
+# ambiguous command shapes fail closed; they never fall through to the older blanket identity gate.
+PUSH_VALUE_FLAGS = ("--receive-pack", "--exec", "--push-option", "-o")
+PUSH_FLAG_PREFIXES = ("--receive-pack=", "--exec=", "--push-option=",
+                      "--force-with-lease=", "--signed=")
+PUSH_SAFE_FLAGS = (
+    "--force", "--force-with-lease", "--force-if-includes", "--set-upstream", "--atomic",
+    "--dry-run", "--porcelain", "--quiet", "--verbose", "--no-verify", "--signed",
+    "--no-signed", "--ipv4", "--ipv6", "-f", "-u", "-n", "-q", "-v",
+)
+
+
+def git_read(cwd, args, required=True):
+    rc, out, errout, failure = run(["git", "-C", cwd] + list(args), GIT_TIMEOUT)
+    if not failure and rc == 0 and out:
+        return out.splitlines()[0].strip()
+    if not required:
+        return ""
+    detail = failure or (errout.splitlines() or ["git exited %d" % rc])[0][:160]
+    raise Cannot("cannot resolve push destination from %s: %s" % (cwd, detail))
+
+
+def push_default_branch(cwd, remote):
+    if not remote or remote.startswith("-"):
+        raise Cannot("push remote %r is not a valid repository operand" % remote)
+    rc, out, errout, failure = run(
+        ["git", "-C", cwd, "ls-remote", "--symref", remote, "HEAD"], GIT_TIMEOUT
+    )
+    if failure or rc != 0:
+        detail = failure or (errout.splitlines() or ["git exited %d" % rc])[0][:160]
+        raise Cannot("remote %r did not disclose its default branch: %s" % (remote, detail))
+    refs = []
+    for line in out.splitlines():
+        m = re.fullmatch(r"ref:\s+refs/heads/(.+)\s+HEAD", line.strip())
+        if m:
+            refs.append(m.group(1))
+    if len(refs) != 1 or not refs[0]:
+        raise Cannot("remote %r did not disclose exactly one symbolic HEAD branch" % remote)
+    return refs[0]
+
+
+def push_upstream(cwd):
+    ref = git_read(cwd, ["rev-parse", "--symbolic-full-name", "@{push}"], False)
+    m = re.fullmatch(r"refs/remotes/([^/]+)/(.+)", ref)
+    if not m:
+        raise Cannot("bare push has no uniquely resolvable remote-tracking @{push} destination")
+    return m.group(1), m.group(2)
+
+
+def git_push_invocation(args, cwd, wrapped):
+    """Return (cwd, push_args, ambiguous_reason) for one git push, or None."""
+    i, effective, unsupported = 0, cwd, ""
+    while i < len(args):
+        a = unquote(args[i])
+        if a == "-C":
+            if i + 1 >= len(args):
+                return effective, [], "git -C has no path"
+            path = os.path.expanduser(unquote(args[i + 1]))
+            effective = os.path.abspath(path if os.path.isabs(path) else os.path.join(effective, path))
+            i += 2
+            continue
+        if a.startswith("-C") and len(a) > 2:
+            path = os.path.expanduser(a[2:])
+            effective = os.path.abspath(path if os.path.isabs(path) else os.path.join(effective, path))
+            i += 1
+            continue
+        if a in GIT_OPT_WITH_VALUE:
+            if i + 1 >= len(args):
+                return effective, [], "%s has no value" % a
+            if a != "-C":
+                unsupported = "%s can change repository or push configuration" % a
+            i += 2
+            continue
+        if any(a.startswith(flag + "=") for flag in GIT_OPT_WITH_VALUE if flag != "-C"):
+            unsupported = "%s can change repository or push configuration" % a.split("=", 1)[0]
+            i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(args) or unquote(args[i]) != "push":
+        return None
+    if wrapped:
+        unsupported = "a launcher or nested shell owns the git process"
+    return effective, [unquote(x) for x in args[i + 1:]], unsupported
+
+
+def direct_push_invocations(text):
+    """Collect pushes whose repository and argv are visible in this shell command.
+
+    The existing classifier remains the authority on whether a push exists. This collector is only
+    allowed to prove a topic destination; missing a classified push therefore blocks in main().
+    """
+    found, seen = [], set()
+    for line in logical_lines(text):
+        if not line.strip():
+            continue
+        for reading in line_readings(line):
+            cwd = os.getcwd()
+            for toks, _here in segments(reading):
+                if not toks:
+                    continue
+                if prog_name(toks[0]) == "cd":
+                    if len(toks) != 2:
+                        found.append((cwd, [], "cd destination is not a single literal path"))
+                    else:
+                        path = os.path.expanduser(unquote(toks[1]))
+                        cwd = os.path.abspath(path if os.path.isabs(path) else os.path.join(cwd, path))
+                    continue
+                argvs, _cmdlike = launcher_argvs(toks)
+                wrapped = prog_name(toks[0]) != "git"
+                for argv in argvs:
+                    if not argv or prog_name(argv[0]) != "git":
+                        continue
+                    item = git_push_invocation(argv[1:], cwd, wrapped)
+                    if item is None:
+                        continue
+                    key = json.dumps(item, sort_keys=True)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(item)
+    return found
+
+
+def parse_push_args(cwd, args):
+    positional, delete, remote_override, non_branch = [], False, "", False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional.extend(args[i + 1:])
+            break
+        if a in ("--all", "--mirror"):
+            return "default", "%s includes the remote default branch" % a
+        if a in ("--tags", "--follow-tags"):
+            non_branch = True
+            i += 1
+            continue
+        if a in ("--delete", "-d"):
+            delete = True
+            i += 1
+            continue
+        if a == "--repo":
+            if i + 1 >= len(args):
+                raise Cannot("git push --repo has no repository value")
+            remote_override = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--repo="):
+            remote_override = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in PUSH_VALUE_FLAGS:
+            if i + 1 >= len(args):
+                raise Cannot("git push flag %s has no value" % a)
+            i += 2
+            continue
+        if a in PUSH_SAFE_FLAGS or any(a.startswith(p) for p in PUSH_FLAG_PREFIXES):
+            i += 1
+            continue
+        if a.startswith("-"):
+            raise Cannot("git push flag %r is not covered by the destination resolver" % a)
+        positional.append(a)
+        i += 1
+
+    if remote_override:
+        remote, specs = remote_override, positional
+    elif positional:
+        remote, specs = positional[0], positional[1:]
+    else:
+        remote, branch = push_upstream(cwd)
+        specs = [branch]
+    if non_branch:
+        return "gated", "push includes tag publication in addition to branch destinations"
+    default = push_default_branch(cwd, remote)
+    if not specs:
+        upstream_remote, upstream_branch = push_upstream(cwd)
+        if upstream_remote != remote:
+            raise Cannot("git push %s resolves @{push} through different remote %s" %
+                         (remote, upstream_remote))
+        specs = [upstream_branch]
+    current = git_read(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], False)
+    destinations = []
+    for raw in specs:
+        spec = raw.lstrip("+")
+        if "*" in spec:
+            raise Cannot("wildcard refspec %r cannot prove the default branch is excluded" % raw)
+        if delete:
+            dst = spec
+        elif ":" in spec:
+            _src, dst = spec.split(":", 1)
+            if not dst:
+                raise Cannot("refspec %r has no explicit destination" % raw)
+        else:
+            dst = current if spec == "HEAD" else spec
+        if not dst:
+            raise Cannot("refspec %r has no resolvable branch destination" % raw)
+        if dst.startswith("refs/tags/") or (dst.startswith("refs/") and not dst.startswith("refs/heads/")):
+            return "gated", "push targets a non-branch ref %s" % dst
+        dst = re.sub(r"^refs/heads/", "", dst)
+        destinations.append(dst)
+    if default in destinations:
+        action = "delete" if delete else "write"
+        return "default", "%s remote default branch %s on %s" % (action, default, remote)
+    return (
+        "topic",
+        "topic branches %s on %s (default %s)" % (", ".join(destinations), remote, default),
+    )
+
+
+def resolve_push_policy(command):
+    invocations = direct_push_invocations(command)
+    if not invocations:
+        raise Cannot("a push was classified but its repository/argv is not directly resolvable")
+    if len(invocations) != 1:
+        raise Cannot("a single tool call contains %d distinct pushes; destination proof is bounded "
+                     "to one push per call" % len(invocations))
+    decisions = []
+    for cwd, args, ambiguous in invocations:
+        if ambiguous:
+            raise Cannot("push destination is ambiguous: %s" % ambiguous)
+        root = git_read(cwd, ["rev-parse", "--show-toplevel"])
+        decisions.append(parse_push_args(root, args))
+    for decision, detail in decisions:
+        if decision == "default":
+            return decision, detail
+    for decision, detail in decisions:
+        if decision == "gated":
+            return decision, detail
+    return "topic", "; ".join(detail for _decision, detail in decisions)
 
 # ---- ledger (AC-021) -----------------------------------------------------------------------
 def ledger(event, fields):
@@ -1653,6 +1909,9 @@ def main():
                          "checker will parse, so it cannot be classified in time"
                          % (len(cmd), MAX_COMMAND_BYTES))
         hit = classify(cmd)
+        push_decision, push_detail = None, ""
+        if hit == "git push":
+            push_decision, push_detail = resolve_push_policy(cmd)
     except Cannot as e:
         err("firm-merge-guard: CANNOT EVALUATE — %s" % e)
         err("  command: %s" % cmd[:400])
@@ -1662,6 +1921,24 @@ def main():
         return CANNOT
     if not hit:
         return PERMIT        # not the gated surface: no allowlist read, no gh, no network
+
+    if push_decision == "topic":
+        err("firm-merge-guard: permitted topic-branch publication — %s" % push_detail)
+        return PERMIT
+
+    if push_decision == "default":
+        reason = "prohibited direct remote-default write: %s" % push_detail
+        err("firm-merge-guard: BLOCKED — %s." % reason)
+        err("  Push the topic branch and open a pull request instead; an agent never writes the")
+        err("  remote default branch directly, even under an allow-listed identity.")
+        err("  This is a CLIENT-SIDE safeguard, not a security boundary or branch protection;")
+        err("  the server-side ruleset is the authoritative default-branch control.")
+        ledger("merge_guard_block", {"decision": "refused", "reason": reason,
+                                     "cmd": cmd[:2000]})
+        return REFUSE
+
+    if push_decision == "gated":
+        hit = "git push (%s)" % push_detail
 
     # --- from here on the command IS gated, so identity must be established -----------------
     try:

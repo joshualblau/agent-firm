@@ -209,6 +209,9 @@ bench/registry.yaml           # durable specialist bench (governance, tracked). 
 - **Phase 6 / 0.8.0 implementation:** one root-source plugin for both runtimes, GPT-primary native subagents,
   shared lifecycle/role contracts, provider-specific hooks, dual bootstrap/update flow, and
   provider-aware behavioral evals. This describes repository content, not readiness of this repair.
+- **0.9.0 implementation:** writing-role worktree isolation, destination-resolved topic-branch
+  publication, prohibited direct remote-default writes, and PR create/edit as the reviewable delivery
+  path. The committed semantic version distinguishes this policy adoption from a local cache refresh.
 - **Phase 4 implementation:** versioned plugin distribution; portable secrets + per-project subscription profiles (`op` + direnv, `CLAUDE_CODE_OAUTH_TOKEN` + `CODEX_HOME`), a fail-closed `firm-doctor`, and chezmoi second-machine bootstrap. See [docs/PHASE4.md](docs/PHASE4.md).
 - **Phase 5 implementation:** hardening — opt-in default-deny **egress firewall**; **visual-regression** suite wired into the QA `visual` verdict (`firm-visual-check`); provider-agnostic **remote approval notifications** (`firm-notify` — phone alerts, notify-only); **full golden-eval execution** (`firm-run-evals` drives the firm headlessly + `firm-check-assertions`); adversarial-panel + durable-runner docs. See [docs/PHASE5.md](docs/PHASE5.md).
 - **Hardening and measurement implementation:** the firm's OWN tooling gets the same evidence-not-

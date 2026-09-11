@@ -1,14 +1,23 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "//": "Permissive by default: anything not matched below runs without a prompt. Precedence is deny > ask > allow, so the ask/deny lists are the ONLY gates. Ask ONLY for destructive actions, actions outside this project's scope (remote/cloud/system), and merge/push confirmations. Business-logic and product decisions are surfaced by the assistant as questions, not permission prompts.",
+    "//": "Permissive by default: anything not matched below runs without a prompt. Topic-branch push and PR create/edit are the reviewable delivery path. Direct remote-default writes and PR merges remain blocked or gated. Business-logic and product decisions are surfaced by the assistant as questions, not permission prompts.",
     "allow": [
       "Read",
       "Grep",
       "Glob",
       "Edit",
       "Write",
-      "Bash(*)"
+      "Bash(*)",
+      "Bash(git worktree:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh pr ready:*)"
     ],
     "ask": [
       "Bash(git merge:*)",
@@ -30,7 +39,19 @@
       "Bash(aws:*)",
       "Bash(az:*)",
       "Bash(kubectl:*)",
-      "Bash(gh:*)"
+      "Bash(gh api:*)",
+      "Bash(gh auth:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh release:*)",
+      "Bash(gh workflow:*)",
+      "Bash(gh secret:*)",
+      "Bash(gh variable:*)",
+      "Bash(gh ruleset:*)",
+      "Bash(gh project:*)",
+      "Bash(gh pr close:*)",
+      "Bash(gh pr reopen:*)",
+      "Bash(gh pr review:*)"
     ],
     "deny": [
       "Bash(sudo:*)",
@@ -50,7 +71,9 @@
       "Read(~/.aws/**)",
       "Read(~/.codex/auth.json)",
       "Read(~/.claude.json)",
-      "Bash(git push:*)",
+      "Bash(git push --all:*)",
+      "Bash(git push --mirror:*)",
+      "Bash(gh pr merge:*)",
       "Bash(cat ~/.codex/auth.json)",
       "Bash(cat ~/.claude.json)",
       "Bash(head .env*)",

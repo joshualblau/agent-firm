@@ -3,7 +3,7 @@
 
 never_rules:
   - never deploy or merge to the default branch without explicit human approval
-  - never push to a remote without explicit human approval
+  - never write, force-write, or delete a remote default branch directly; push a topic branch and use a pull request
   - never weaken, skip, or delete a test without a written test-change justification
   - never update visual/snapshot baselines without storing before/after evidence
   - never use production credentials inside an agent sandbox by default

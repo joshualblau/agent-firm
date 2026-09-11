@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # new-worktree <role> <work-order-id>
-# Creates an isolated git worktree for one implementer work-order, per worktree_policy:
+# Creates an isolated git worktree for one delegated writing role/stage, per worktree_policy:
 #  - base = local HEAD (in-progress feature), NOT origin/HEAD
 #  - branch/dir named <run_id>-<role>-<work_order>
 #  - allocates a deterministic port + db name so parallel units don't collide
 #  - copies ONLY .env.example; never real secrets/auth caches
+# Canonical run artifacts remain in the root run directory; this checkout isolates repository files.
 # Run from the work-project root with an active run (bin/new-run first).
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo

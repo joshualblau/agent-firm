@@ -1,9 +1,8 @@
 # Runbook — enabling real (server-side) protection on `main`
 
-**Status: NOT executed. The firm never runs this file.** Every call below is an external write to
-GitHub's configuration, and two of them cost money or change account state — human-only actions
-under `agent-firm/policy/action-scopes.yaml`. This document exists so the human can do it in one
-sitting, and so nobody mistakes the client-side gate for this.
+**Status: a ruleset is active as of 2026-09-02. The firm never runs this file.** Every mutating call
+below is an external write to GitHub's configuration and remains human-only. The setup steps are
+retained as a recovery/runbook; re-run the read-only measurements before acting.
 
 ## Why you would run this — what the client-side gate cannot do
 
@@ -21,7 +20,7 @@ Of the three asks, this is the split:
 | Ask | Client-side gate | Server-side (this runbook) |
 |---|---|---|
 | Block an AI agent merging to `main` | yes, fails closed | yes |
-| Block an AI agent pushing | yes, plus `Bash(git push:*)` is categorically denied in `.claude/settings.json` | yes |
+| Block an AI agent writing `main` directly | yes; proved topic-branch pushes are allowed | yes |
 | **Required PR review** | **no — impossible client-side** | **yes, this is the only way** |
 
 ## Step 0 — measured current state (re-run this before you start)
@@ -30,7 +29,7 @@ Of the three asks, this is the split:
 OWNER=joshualblau REPO=agent-firm
 
 # The unambiguous check. Readable by any collaborator, no admin needed.
-gh api "repos/$OWNER/$REPO/branches/main" --jq '.protected'      # => false  (today)
+gh api "repos/$OWNER/$REPO/branches/main" --jq '.protected'      # => true  (2026-09-02)
 
 # Is the repo private, and is it owned by a personal account or an org?
 gh api "repos/$OWNER/$REPO" --jq '{private, owner_type: .owner.type, default_branch}'
@@ -40,7 +39,7 @@ gh api "repos/$OWNER/$REPO" --jq '{private, owner_type: .owner.type, default_bra
 gh api "repos/$OWNER/$REPO" --jq '.permissions'
 ```
 
-Measured on 2026-08-03 from the `younglionsolutions` account:
+Historical measurement on 2026-08-03 from the `younglionsolutions` account:
 
 - `.protected` -> **`false`** — no protection in force.
 - `repos/$OWNER/$REPO/branches/main/protection` -> **404**. Do **not** read that 404 as proof of
@@ -49,6 +48,14 @@ Measured on 2026-08-03 from the `younglionsolutions` account:
   above is the check that actually distinguishes the two cases.
 - `repos/$OWNER/$REPO/rulesets` -> **403 `Upgrade to GitHub Pro or make this repository public to
   enable this feature.`** That is GitHub telling you the plan gate directly.
+
+Current measurement on 2026-09-02 from the repository-owner account:
+
+- `.protected` -> **`true`** at `main` commit `369c86b18027281fcfec1288efaa1255df315c35`.
+- `rules/branches/main` -> **`["deletion","non_fast_forward","pull_request"]`**. This is the
+  decisive evidence that a ruleset requires PRs and rejects deletion/non-fast-forward updates.
+- `branches/main/protection` still returns 404 because no classic protection object is configured;
+  the active mechanism is the ruleset, not the classic endpoint.
 
 ## Step 1 — the prerequisite you cannot skip
 
@@ -220,13 +227,14 @@ OWNER=joshualblau REPO=agent-firm
 # 1. CLASSIC route (Step 2) — the unambiguous boolean, works even without admin.
 gh api "repos/$OWNER/$REPO/branches/main" --jq '.protected'
 #    false = no classic protection in force   |   true = classic protection is active
-#    Verified on this repo: currently `false`. Do NOT use this to verify a RULESET.
+#    Observed on 2026-09-02: `true`; still use 1b to identify the active RULESET rules.
 
 # 1b. RULESET route (Step 3) — ask what rules apply to the branch. Needs no admin, and unlike
 #     `.protected` this endpoint is documented to answer for rulesets.
 gh api "repos/$OWNER/$REPO/rules/branches/main" --jq '[.[] | .type]'
 #    expect a non-empty list containing "pull_request", "deletion", "non_fast_forward"
 #    []  = no ruleset applies to main (whatever `.protected` says)
+#    Observed on 2026-09-02: ["deletion","non_fast_forward","pull_request"]
 
 # 2. If (and only if) you are an admin, read the classic detail back:
 gh api "repos/$OWNER/$REPO/branches/main/protection" \

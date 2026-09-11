@@ -7,9 +7,11 @@
 local_repository:
   read: allowed
   write: within_worktree          # edits only inside the run's git worktree
-  commit: ask                     # ask before committing
-  merge_to_main: human_gate       # never merge to the default branch without sign-off
-  push: human_gate
+  commit: allowed_in_worktree
+  push_topic_branch: allowed      # explicit non-default destinations only
+  delete_topic_branch: allowed_after_verified_merge
+  push_default_branch: prohibited # direct write, force-write, or deletion; use a PR
+  merge_to_default_branch: human_gate # local integration/merge still requires sign-off
 
 local_runtime:
   install_dependencies: ask_or_allowlisted   # lockfile installs ok; arbitrary global installs ask
@@ -21,7 +23,8 @@ local_runtime:
 external_systems:
   read: case_by_case              # read-only API/MCP reads ok when scoped (e.g. heightslabs)
   write: denied_by_default
-  pr_or_issue_creation: human_gate
+  pr_create_or_edit: allowed      # the reviewable delivery path for a topic branch
+  issue_creation: human_gate
   send_message_or_email: human_gate
   irreversible_actions: human_gate
 
@@ -38,3 +41,5 @@ financial_or_onchain:
 
 # Reference: gate-matrix.md (when a human gate fires + required evidence),
 # never-rules.yaml (hard prohibitions), execution-budget.yaml (caps).
+# The user-level provider configuration is authoritative for non-firm repositories. This policy is
+# the firm-owned contract and must stay semantically aligned without copying user-specific paths.

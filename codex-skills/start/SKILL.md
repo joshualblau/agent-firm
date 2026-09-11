@@ -97,14 +97,19 @@ failure_conditions: [resolver_nonzero, producer_nonzero, missing_result_field, r
 failure: block
 ```
 
-Preserve the shared lifecycle order and budgets. Parallelize only independent work-orders, each in a
-`firm-new-worktree`; never delegate human gates. Reviewers and QA must be separate from implementers.
+Preserve the shared lifecycle order and budgets. Before any delegated role writes repository files,
+create its dedicated `firm-new-worktree`; parallelize only independent work-orders and never delegate
+human gates. Canonical run artifacts remain in the central run directory. Reviewers and QA must be
+separate from implementers.
 Primary GPT QA writes `08-qa-verdict.json`; then run `firm-claude-qa` for the independent second voice.
 For protocol v1, first freeze the draft handoff and run
 `firm-seal-qa-evidence --run <exact-run-dir>`; any nonzero result blocks reviewer launch.
 Run `firm-validate-verdict`, `firm-traceability-check`, the Lead-owned `firm-qa-clean-check`, and
 `firm-final-qa-check`. Only a final-check exit 0 permits packaging, and packaging still stops at the
-mandatory human Final gate. Never merge, push, deploy, publish, or manufacture human approval.
+mandatory human Final gate. Commit inside the task worktree, push only an explicit non-default branch,
+and open or update its PR as the reviewable delivery record. Never directly modify the remote default
+branch, merge, deploy, release, or manufacture human approval.
+The remote default branch is never a direct publication target for the agent.
 An opposite-provider wrapper exit 3 is trusted unavailability, not approval: retain the target-run
 attempt/event, complete the unavailable traceability state, and surface the exact blocking state and
 copyable corrective command at Final.
