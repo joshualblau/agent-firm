@@ -1,0 +1,53 @@
+name: evidence-producer-contract-sync
+description: >
+  Guards the `evidence_produced` producer contract against silent drift. The fixture suite asserts
+  three independent properties: (P1/AC-019) the field set documented in
+  agent-firm/contracts/evidence-producer-contract.md is identical to bin/firm-ledger-log's LIVE
+  EVIDENCE_CURRENT_FIELDS, which the checker parses out of the writer's own source rather than
+  keeping a second copy of; (P2/AC-017) the writer's accept/refuse decision for a table of evidence
+  shapes -- current 12-key, 11-key, legacy 9-key, 13-key, stale candidate, generation 0, duplicate
+  -- is unchanged, since this item is documentation-only; (P3/AC-018) a run that published evidence
+  under the previous, undocumented-contract rules stays readable through the current classifier and
+  stays appendable with its existing bytes byte-for-byte intact.
+
+  P1's failure output NAMES the divergent field(s); it does not merely report inequality. Verified
+  by mutation in five directions before this eval shipped: removing a field row from the doc, adding
+  a field to the writer's constant, breaking the role contract's link to the document, removing the
+  role contract's own statement of the non-strict exit-0/no-row semantics, and deleting the doc's
+  machine-readable markers (which is a fail-CLOSED "cannot evaluate", never a quiet pass).
+
+  SCOPE OF P2, STATED PLAINLY. One checkout cannot literally diff a before against an after. The
+  accept/refuse expectations in test/producer-contract-sync.py ARE the before-state written down, so
+  the property catches a change to the writer rather than re-deriving the classifier. Do not read a
+  green run as proof that no behaviour anywhere in the writer changed.
+
+  WHICH CHECKOUT IS UNDER TEST. The eval fixture is copied to a scratch directory containing no copy
+  of the firm, so the checker resolves the firm through `firm-ledger-log` on PATH and can be pinned
+  with FIRM_CONTRACT_SYNC_ROOT. It refuses to run at all (exit 2) rather than guess.
+
+  STATUS: the three fixture properties above were run and mutation-verified directly against this
+  checkout. The MODEL-DRIVEN half of this eval -- whether an agent can publish evidence from the
+  contract document alone -- is behaviorally unverified; `firm-run-evals --structural` cannot prove
+  it and no `firm-run-evals evidence-producer-contract-sync` run has been recorded yet.
+fixture: ./fixture
+kickoff: ./task.md
+assertions:
+  # The engagement's own deliverable, so a run that did nothing cannot pass.
+  - file_exists: src/checksum.sh
+  - file_exists: test/checksum.test.sh
+  # THE TEETH. This one command carries P1, P2 and P3; it is the reason this eval exists. It fails
+  # loudly (naming the divergent field) if the documented producer contract and the writer's live
+  # EVIDENCE_CURRENT_FIELDS stop agreeing, and it fails closed (exit 2 -> non-zero) if it cannot
+  # locate the firm or read the document's markers at all.
+  - test_passes: sh test/run-tests.sh
+  # AC-014's real claim: a role following ONLY the contract document published a record the
+  # current-protocol classifier accepted, and the row is actually in the ledger. Grepping the run
+  # ledger for a current-shape evidence row discriminates this from a run that stopped early --
+  # firm-new-run's template scaffold seeds no run.jsonl evidence row.
+  - test_passes: 'l=$(cat .agent-firm/CURRENT_RUN)/run.jsonl; grep -q "\"event\": *\"evidence_produced\"" "$l" && grep -q "role_start_event_id" "$l" && echo ok'
+  - artifact_exists: 08-qa-verdict.json
+  - verdict_is: APPROVE
+  - traceability_passes: true
+  - qa_checkout_clean: true
+  - final_gate_pending: true
+  - no_default_branch_merge: true

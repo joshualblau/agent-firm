@@ -271,4 +271,83 @@ assert_output "and says it could not resolve it" "could not resolve the git comm
 assert_no_file "no root-level /agent-firm was ever created" "/agent-firm"
 assert_no_file "and the repo itself got no log from the stubbed runs" "$(common_log "$repo10")"
 
+# ---------------------------------------------------------------------------
+t_case "--run-id overrides the recorded run LABEL, and overrides nothing else"
+# The distinction this pins is the reason the flag is `--run-id` and not `--run`: run_id here is a
+# DATA FIELD, not a selector. The log path is chosen by --git-common-dir and must be identical with
+# and without the flag, so the flag cannot be a way to redirect a write.
+repo11="$(mk_repo)"
+log11="$(common_log "$repo11")"
+mk_run "$repo11" "20260907T000000Z-ambient-run"          # CURRENT_RUN exists and names a real run
+assert_ok "records with an explicit label" sh -c "cd '$repo11' && '$BR' --run-id 20260907T000000Z-other-run reviewer success APPROVE"
+assert_output "the explicit label is what was written" '"run_id":"20260907T000000Z-other-run"' cat "$log11"
+assert_fail "and the ambient CURRENT_RUN label was NOT consulted" grep -q "ambient-run" "$log11"
+assert_file "the log is still the one git-common-dir path, not one chosen by the flag" "$log11"
+assert_ok "the line is still valid JSON" python3 -c "import json; json.loads(open('$log11').readlines()[-1])"
+assert_output "role is unaffected by the flag" '"role":"reviewer"' cat "$log11"
+
+t_case "without --run-id the ambient CURRENT_RUN label is unchanged (pre-change behavior)"
+assert_ok "records with no flag" sh -c "cd '$repo11' && '$BR' hire success"
+assert_output "ambient label recorded exactly as before" '"run_id":"20260907T000000Z-ambient-run"' \
+  sh -c "tail -n 1 '$log11'"
+
+t_case "--run-id is charset-checked and its spelling is fixed; a refused label writes nothing"
+lines_before="$(wc -l < "$log11" | tr -d ' ')"
+assert_rc "a label with a shell/JSON-hostile character is refused" 2 \
+  sh -c "cd '$repo11' && '$BR' --run-id 'bad label\"' reviewer success"
+assert_rc "a label starting with a dash is refused" 2 \
+  sh -c "cd '$repo11' && '$BR' --run-id -nope reviewer success"
+assert_rc "a bare --run-id with no label is refused" 2 sh -c "cd '$repo11' && '$BR' --run-id"
+assert_rc "--run-id=<label> is refused by spelling" 2 \
+  sh -c "cd '$repo11' && '$BR' --run-id=20260907T000000Z-other-run reviewer success"
+assert_output "and names the accepted two-word form" "two words" \
+  sh -c "cd '$repo11' && '$BR' --run-id=x reviewer success 2>&1"
+assert_rc "--run is refused outright: this tool resolves no run directory" 2 \
+  sh -c "cd '$repo11' && '$BR' --run .agent-firm/runs/20260907T000000Z-ambient-run reviewer success"
+assert_output "and says why, rather than accepting a path it would not validate" "not a run" \
+  sh -c "cd '$repo11' && '$BR' --run .agent-firm/runs/20260907T000000Z-ambient-run reviewer success 2>&1"
+assert_eq "no refused call appended a record" "$lines_before" "$(wc -l < "$log11" | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help states that this tool selects NO run, on stdout, exit 0, recording nothing"
+# This tool is the NEGATIVE entry in the AC-010 family, and that is the whole point of asserting it
+# separately from the sibling tools. Its flag is a LABEL: no path is resolved from it, no containment
+# check applies, and the log file is the same one whatever the label says. A help text that reused the
+# siblings' "--run <run-dir> is authoritative" wording would manufacture exactly the assumption
+# --run-id was named to prevent, so the assertions below check for the DENIAL, not for the template.
+lines_help_before="$(wc -l < "$log11" | tr -d ' ')"
+help11="$( (cd "$repo11" && "$BR" --help) 2>/dev/null )"; rc11=$?
+assert_eq "--help exits 0" 0 "$rc11"
+assert_output "the synopsis is on stdout" "usage: firm-bench-record" printf '%s' "$help11"
+assert_output "it names the flag in the accepted two-word spelling" "--run-id <label>" \
+  printf '%s' "$help11"
+assert_output "it states outright that there is no run selection here" "Run selection: THERE IS NONE" \
+  printf '%s' "$help11"
+assert_output "…and that no run directory is resolved from the label" "resolves no run directory" \
+  printf '%s' "$help11"
+assert_output "…naming --git-common-dir as what actually decides the log path" "git-common-dir" \
+  printf '%s' "$help11"
+assert_output "…and that a literal --run is refused rather than treated as a synonym" \
+  "refused outright" printf '%s' "$help11"
+# The residual WO-5 disclosed and declined to half-fix, stated in the interface instead of only in a
+# report: under an explicit --run-id the JSONL line and the ledger event can name different runs.
+assert_output "it discloses that the ledger event is not scoped by --run-id" \
+  "NOT scoped by" printf '%s' "$help11"
+assert_output "…and points at the tools that DO select a run" "firm-run-resolve" printf '%s' "$help11"
+assert_eq "--help appended no record" "$lines_help_before" "$(wc -l < "$log11" | tr -d ' ')"
+help11b="$( (cd "$repo11" && "$BR" -h) 2>/dev/null )"; rc11b=$?
+assert_eq "-h exits 0 too" 0 "$rc11b"
+assert_eq "-h prints the byte-identical synopsis" "$help11" "$help11b"
+
+t_case "…and the unknown-option catch-all was not widened by it"
+assert_rc "an unrelated option is still refused" 2 sh -c "cd '$repo11' && '$BR' --bogus reviewer success"
+assert_rc "--run keeps its own dedicated refusal" 2 \
+  sh -c "cd '$repo11' && '$BR' --run .agent-firm/runs/x reviewer success"
+assert_eq "neither appended a record" "$lines_help_before" "$(wc -l < "$log11" | tr -d ' ')"
+# Without this the three "appended nothing" comparisons could pass on a log that never grows at all.
+assert_ok "fixture precondition: a real record still appends" \
+  sh -c "cd '$repo11' && '$BR' reviewer success"
+assert_ne "…so the line count above was a live measurement" \
+  "$lines_help_before" "$(wc -l < "$log11" | tr -d ' ')"
+
 t_summary

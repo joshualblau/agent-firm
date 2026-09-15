@@ -9,8 +9,21 @@ stale SHA, foreign run/repository, or historical `approval_eligible:false` metad
 
 Install from the lockfile; run the same unit, integration, e2e, and visual commands CI uses; capture
 command, exit, duration, and logs under `09-test-evidence/`. Check every acceptance criterion, state
-untested risks, and run relevant secret/dependency checks. For each completed artifact, record exactly
-one explicit-target producer event with `firm-ledger-log --run <run> --strict --event-id <id>`.
+untested risks, and run relevant secret/dependency checks.
+
+For each completed artifact, record exactly one explicit-target producer event. Follow
+`agent-firm/contracts/evidence-producer-contract.md` for the field set, the executable invocation and
+every precondition the writer enforces; do not reconstruct a field list from this contract. Publish
+with an explicit `--run` and with `--strict`. **A non-`--strict` publication that is refused exits 0
+and writes no ledger row** — the success status is a property of best-effort logging, not evidence
+that a record exists — so `--strict` is the invocation form to use, and it is the only one that
+surfaces the failure at all. Never treat exit status alone as proof of publication: read back the row
+in `run.jsonl`. Capture that row's `event_id` (`--event-id` to choose one, `--print-event-id` to read
+back the generated one); traceability cites that exact producer event. If a strict publication
+genuinely failed, do not re-run the identical call — the same `path`+`sha`+`generation` is refused as
+a duplicate. Establish from the ledger whether the first attempt landed, and re-publish only under a
+fresh generation.
+
 Bind integration evidence to the applicable immutable `integration-summaries/<stage-instance>.md`
 entry and verify the complete digest-bound index history; never cite the legacy singleton after an
 index exists.

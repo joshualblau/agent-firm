@@ -1,24 +1,128 @@
 #!/usr/bin/env bash
-# new-worktree <role> <work-order-id>
+# firm-new-worktree [--run <run-dir>] <role> <work-order-id>
 # Creates an isolated git worktree for one implementer work-order, per worktree_policy:
 #  - base = local HEAD (in-progress feature), NOT origin/HEAD
 #  - branch/dir named <run_id>-<role>-<work_order>
 #  - allocates a deterministic port + db name so parallel units don't collide
 #  - copies ONLY .env.example; never real secrets/auth caches
-# Run from the work-project root with an active run (bin/new-run first).
+# Run from the work-project root with an active run (firm-new-run first), or name the run explicitly
+# with `--run <run-dir>` — which is AUTHORITATIVE: .agent-firm/CURRENT_RUN is then not read at all,
+# so a second run being active (or a stale pointer) cannot redirect the branch, the worktree
+# directory, or the ledger this call writes to (AC-003).
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"   # resolve sibling scripts by location
 
+# THE one run resolver (bin/firm-run-resolve). Sourced, not shelled out to, for the reason that file
+# gives: one definition of the containment validation, not another local copy of it.
+. "$SELF/firm-run-resolve"
+
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- bin/firm-new-run's shape. Factored so the synopsis the F6
+# refusal below quotes and the synopsis --help prints cannot drift apart.
+usage() {
+  cat <<'EOF'
+usage: firm-new-worktree [--run <run-dir>] <role> <work-order-id>
+
+Create one isolated git worktree for one implementer work-order, based on local HEAD.
+
+  --run <run-dir>     the run the branch, the worktree directory and the ledger event belong to.
+                      Authoritative. Goes BEFORE <role>, and is two words, not --run=<run-dir>.
+  <role>              e.g. implementer. May not begin with '-' (see below).
+  <work-order-id>     e.g. WO-1.
+  -h, --help          print this synopsis and exit 0; creates no branch and no worktree.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, so a second active run (or a stale pointer) cannot redirect the branch, the worktree
+directory or the ledger this call writes to. With no --run, the ambient .agent-firm/CURRENT_RUN
+pointer is used and validated identically. Explicit beats ambient. Both go through
+bin/firm-run-resolve.
+
+Run this from the repository root: every path this tool prints and creates is relative to it.
+EOF
+}
+
+# refuse_leading_dash <where> — F6, and the whole point of it is stated here rather than in a commit
+# message. This tool's signature is POSITIONAL-FIRST, so an OLD copy of it (one that predates --run)
+# handed `--run <dir>` takes "--run" as the ROLE: `tr -cd 'a-zA-Z0-9-'` below keeps the hyphens, and
+# it silently creates wt/<AMBIENT-run>--run-<junk> — a worktree on the wrong run that nobody is told
+# about, which is worse than any error. This copy therefore refuses any role-position argument
+# beginning with '-'. NOTE THE RESIDUAL: this only helps once the NEW copy is the one executing. A
+# stale copy on $PATH still mis-parses, and that residual belongs to the still-unimplemented
+# system-changes/20260803T095255Z-firm-tools-resolve-to-primary-checkout.md, not to this tool.
+# The offending value is deliberately NOT echoed back (same rule bin/firm-bench-record applies to
+# rejected input): naming the violation is the diagnostic, replaying raw bytes at a terminal is not.
+refuse_leading_dash() {
+  echo "firm-new-worktree: the $1 begins with '-' — refusing rather than treating it as <role>" >&2
+  echo "firm-new-worktree: the run selector is \"--run <run-dir>\" (two words) and goes BEFORE <role>." >&2
+  echo "firm-new-worktree: an older copy of this tool would have taken it as the role and silently" >&2
+  echo "firm-new-worktree: created a worktree on the AMBIENT run; this copy fails closed instead." >&2
+  usage >&2
+  exit 2
+}
+
+# `-h|--help` is matched AHEAD of the `-*` catch-all, which is the whole point of adding it: before
+# this, `--help` fell into refuse_leading_dash and answered a request for the interface with the
+# four-line F6 hazard lecture and rc 2. Accurate, but not what someone typing --help is asking, and
+# it left this tool's run-selection contract unreachable except by reading the source (AC-010).
+# The F6 refusal is NOT widened or weakened by this: it still catches every other leading-dash
+# role-position argument, and `firm-new-worktree -- -h <wo>` still reaches it via the <role> check
+# below. Only the two spellings that unambiguously mean "explain yourself" are carved out.
+run_sel=""; run_given=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --run)
+      if [ $# -lt 2 ]; then echo "firm-new-worktree: --run needs a run directory argument" >&2; exit 2; fi
+      run_sel="$2"; run_given=1; shift 2 ;;
+    --run=*)
+      # Named, not swept into "unknown option": the caller wants the right thing in the wrong
+      # spelling, and firm-run-resolve's frozen interface is the two-word form.
+      echo "firm-new-worktree: use \"--run <run-dir>\" (two words), not --run=<run-dir>" >&2; exit 2 ;;
+    --) shift; break ;;
+    -*) refuse_leading_dash "role-position argument" ;;
+    *)  break ;;
+  esac
+done
+
 role="${1:-}"; wo="${2:-}"
-if [[ -z "$role" || -z "$wo" ]]; then echo "usage: new-worktree <role> <work-order-id>" >&2; exit 2; fi
+if [[ -z "$role" || -z "$wo" ]]; then
+  usage >&2; exit 2
+fi
+case "$role" in -*) refuse_leading_dash "<role> argument" ;; esac
 role="$(printf '%s' "$role" | tr -cd 'a-zA-Z0-9-')"
 wo="$(printf '%s' "$wo" | tr -cd 'a-zA-Z0-9-')"
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
-if [[ -z "$run_dir" ]]; then echo "no active run — run bin/new-run first" >&2; exit 1; fi
+# Explicit beats ambient, and the two failure paths keep DIFFERENT exit codes on purpose:
+#  - ambient (no --run) keeps this tool's historical rc 1 for "no active run", which is pre-change
+#    observable behavior (AC-006) and is pinned by tests/test-new-worktree.sh;
+#  - an explicit --run that does not validate exits 2 — firm-run-resolve's own status for a refused
+#    selector. That form had no prior behavior to preserve, so it reports the resolver's.
+# Either way firm-run-resolve has already printed a diagnostic naming the SPECIFIC violation
+# (AC-007); nothing is re-printed here, because a second, vaguer line on top of it is how "could not
+# resolve a run" replaces the reason.
+if [[ $run_given -eq 1 ]]; then
+  run_dir="$(firm_run_resolve --run "$run_sel")" || exit 2
+else
+  run_dir="$(firm_run_resolve)" || exit 1
+fi
 run_id="$(basename "$run_dir")"
+
+# Every path below this line is CWD-RELATIVE (and the printed ones are part of this tool's output
+# contract), so the CWD has to be the repository root for them to mean what they say. That used to be
+# enforced by accident: the ambient read was `.agent-firm/CURRENT_RUN`, relative, so from a
+# subdirectory it simply found nothing and the tool exited 1. firm-run-resolve anchors CURRENT_RUN at
+# the repository root instead — deliberately, so it works from a subdirectory — which would turn that
+# clean failure into a worktree created under the subdirectory. Assert the precondition rather than
+# inherit a silently-wrong location. The root is derived from the run directory firm-run-resolve
+# already validated as <repo>/.agent-firm/runs/<run-id>, so it cannot disagree with the answer the
+# resolver gave.
+repo_root="$(cd -P "$run_dir/../../.." && pwd -P)"
+if [[ "$(pwd -P)" != "$repo_root" ]]; then
+  echo "firm-new-worktree: run this from the repository root ($repo_root), not $(pwd -P)" >&2
+  exit 1
+fi
 
 branch="wt/${run_id}-${role}-${wo}"
 wt_dir=".agent-firm/worktrees/${run_id}-${role}-${wo}"
@@ -49,7 +153,10 @@ WORKTREE_PORT=$port
 WORKTREE_DB=$db
 EOF
 
-[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" worktree_created role="$role" work_order="$wo" branch="$branch" port="$port" || true
+# --run is threaded through: without it firm-ledger-log re-reads CURRENT_RUN itself, so a worktree
+# created for run A under an explicit selector would have recorded its worktree_created event in run
+# B's ledger — the same defect class as firm-integrate's unscoped ledger call (F3).
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" --run "$run_dir" worktree_created role="$role" work_order="$wo" branch="$branch" port="$port" || true
 
 echo "worktree: $wt_dir"
 echo "branch:   $branch"

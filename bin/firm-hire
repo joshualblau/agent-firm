@@ -1,19 +1,96 @@
 #!/usr/bin/env bash
-# firm-hire <role-name>
+# firm-hire [--run <run-dir>] <role-name>
 # Scaffolds a specialist job-spec skeleton into the current run for the Recruiter to fill in.
 # The spec conforms to agent-firm/schemas/job-spec.schema.json. Run from the project root with an
-# active run (firm-new-run first).
+# active run (firm-new-run first), or name the run explicitly with `--run <run-dir>` — which is
+# AUTHORITATIVE: .agent-firm/CURRENT_RUN is then not read at all, so neither the scaffolded spec nor
+# the hire_scaffolded ledger event can land in a different run than the one selected.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"   # resolve symlinks so ~/.local/bin/firm-* finds the repo
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 
+# THE one run resolver (bin/firm-run-resolve), sourced for the same reason firm-new-worktree sources
+# it: one definition of the containment validation rather than a local re-spelling of it.
+. "$SELF/firm-run-resolve"
+
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- bin/firm-new-run's shape, and the same one firm-new-worktree
+# uses, so the two sibling tools read alike.
+usage() {
+  cat <<'EOF'
+usage: firm-hire [--run <run-dir>] <role-name>
+
+Scaffold a job-spec skeleton (agent-firm/schemas/job-spec.schema.json) into one run's hires/
+directory for the Recruiter to fill in.
+
+  --run <run-dir>   the run the spec is written into and whose ledger records the hire.
+                    Authoritative. Goes BEFORE <role-name>, and is two words, not --run=<run-dir>.
+  <role-name>       e.g. data-engineer. Lower-cased and reduced to [a-z0-9-].
+  -h, --help        print this synopsis and exit 0; scaffolds nothing.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, so neither the scaffolded spec nor the hire_scaffolded ledger event can land in a
+different run than the one selected. With no --run, the ambient .agent-firm/CURRENT_RUN pointer is
+used and validated identically. Explicit beats ambient. Both go through bin/firm-run-resolve.
+
+Run this from the repository root: the path this tool prints is relative to it.
+EOF
+}
+
+# `-h|--help` is matched AHEAD of the `-*` catch-all so help is reachable the normal way. Before this,
+# `--help` fell into that catch-all, exited 2, and reported the run selector's spelling to somebody
+# who was asking what the selector MEANS -- leaving the precedence rule readable only in the source
+# (AC-010). The catch-all itself is unchanged and still refuses every other leading-dash argument.
+run_sel=""; run_given=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --run)
+      if [ $# -lt 2 ]; then echo "firm-hire: --run needs a run directory argument" >&2; exit 2; fi
+      run_sel="$2"; run_given=1; shift 2 ;;
+    --run=*)
+      echo "firm-hire: use \"--run <run-dir>\" (two words), not --run=<run-dir>" >&2; exit 2 ;;
+    --) shift; break ;;
+    -*)
+      # Same positional-first hazard firm-new-worktree refuses under F6, one severity lower (a
+      # junk-named job spec in the ambient run rather than a whole worktree on the wrong run): an old
+      # copy of this tool handed `--run <dir>` sanitizes "--run" into a ROLE NAME, since the tr
+      # pipeline below keeps hyphens. Refuse it here rather than scaffold hires/--run.job.yaml.
+      echo "firm-hire: unknown option $1 — the run selector is \"--run <run-dir>\" (two words), before <role-name>" >&2
+      usage >&2
+      exit 2 ;;
+    *)  break ;;
+  esac
+done
+
 role="${1:-}"
-if [[ -z "$role" ]]; then echo "usage: firm-hire <role-name>" >&2; exit 2; fi
+if [[ -z "$role" ]]; then usage >&2; exit 2; fi
 role="$(printf '%s' "$role" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
 
-run_dir=""; [[ -f .agent-firm/CURRENT_RUN ]] && run_dir="$(cat .agent-firm/CURRENT_RUN)"
-if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then echo "no active run — run firm-new-run first" >&2; exit 1; fi
+# Explicit beats ambient. The ambient failure keeps this tool's historical rc 1 (pre-change behavior,
+# AC-006, pinned by tests/test-policy-hire.sh); a refused explicit --run exits 2, firm-run-resolve's
+# own status for a selector it would not accept. The resolver has already named the specific
+# violation on stderr (AC-007), so nothing vaguer is printed over it.
+if [[ $run_given -eq 1 ]]; then
+  run_abs="$(firm_run_resolve --run "$run_sel")" || exit 2
+else
+  run_abs="$(firm_run_resolve)" || exit 1
+fi
+
+# Two spellings, ONE directory, and which is used where is deliberate:
+#  · $run_abs (absolute, canonical) is what the LEDGER gets, so the event cannot be reinterpreted
+#    against a different CWD by firm-ledger-log's own relative-path handling;
+#  · $run_dir (repo-relative) is what this tool WRITES and PRINTS, because the printed path is
+#    pre-change observable output and was repo-relative (AC-006). They name the same directory:
+#    firm-run-resolve guarantees $run_abs is exactly <repo>/.agent-firm/runs/<run-id>, and the check
+#    below guarantees the repo root is the CWD.
+repo_root="$(cd -P "$run_abs/../../.." && pwd -P)"
+if [[ "$(pwd -P)" != "$repo_root" ]]; then
+  echo "firm-hire: run this from the repository root ($repo_root), not $(pwd -P)" >&2
+  exit 1
+fi
+run_dir=".agent-firm/runs/$(basename "$run_abs")"
 
 mkdir -p "$run_dir/hires"
 out="$run_dir/hires/${role}.job.yaml"
@@ -37,6 +114,8 @@ mode: ephemeral                # ephemeral | durable_candidate
 domain_guardrails: []          # sensitive domains: legal/ethical boundary, provenance, PII, no irreversible action
 EOF
 
-[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" hire_scaffolded role="$role" file="$out" || true
+# --run is threaded through: without it firm-ledger-log re-reads CURRENT_RUN itself, so a hire
+# scaffolded into run A under an explicit selector would have recorded its event in run B's ledger.
+[[ -x "$SELF/firm-ledger-log" ]] && "$SELF/firm-ledger-log" --run "$run_abs" hire_scaffolded role="$role" file="$out" || true
 echo "$out"
 echo "Fill it in, then record it in $run_dir/04-staffing-plan.yaml. Ephemeral hires are dispatched via the 'specialist' agent and retired at end." >&2

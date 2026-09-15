@@ -1,47 +1,86 @@
 #!/usr/bin/env bash
-# firm-qa-checkout [branch]
-# Materialize and persist one detached, clean, full-SHA candidate generation for the active run.
+# firm-qa-checkout [--run <run-dir>] [branch]
+# Materialize and persist one detached, clean, full-SHA candidate generation for one run.
+#
+# RUN SELECTION. `--run <run-dir>` is authoritative and is resolved by bin/firm-run-resolve; with no
+# `--run`, that same resolver falls back to .agent-firm/CURRENT_RUN and validates it identically.
+# This tool had NO run selector at all before: it read the ambient pointer and nothing else, so two
+# runs sharing one working tree could not both produce their canonical QA artifacts, and the only
+# workaround was to hand-substitute the tool. `--run` closes that (AC-001).
+#
+# The containment validation that used to live inline here is NOT duplicated: it is one copy, in
+# bin/firm-run-resolve, which this calls. Restating it here would be the sixth copy and would defeat
+# the consolidation — see that file's header for the check set and for what it deliberately omits.
 set -euo pipefail
 __src="${BASH_SOURCE[0]}"
 while [ -L "$__src" ]; do __d="$(cd -P "$(dirname "$__src")" && pwd)"; __src="$(readlink "$__src")"; case $__src in /*) ;; *) __src="$__d/$__src";; esac; done
 SELF="$(cd -P "$(dirname "$__src")" && pwd)"
 . "$SELF/firm-python"   # one resolved interpreter for the whole firm; see bin/firm-python
+. "$SELF/firm-run-resolve"   # one resolved RUN for the whole firm; see bin/firm-run-resolve
+
+# ONE usage synopsis, two call sites: `usage` (stdout, exit 0, for --help) and `usage >&2` (stderr,
+# exit 2, for a refused invocation) -- the shape bin/firm-new-run already uses, adopted here for the
+# same reason: two hand-written copies of an interface description drift, and AC-010 is a promise
+# that this text is accurate enough to use INSTEAD OF reading the source.
+usage() {
+  cat <<'EOF'
+usage: firm-qa-checkout [--run <run-dir>] [branch]
+
+Materialize and persist one detached, clean, full-SHA candidate generation for one run.
+
+  --run <run-dir>   the run to capture a candidate for. Authoritative.
+  [branch]          the integration/* branch to capture. Default: integration/<run-id>.
+  -h, --help        print this synopsis and exit 0; captures nothing.
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all. With no --run, the ambient .agent-firm/CURRENT_RUN pointer is used and validated
+identically. Explicit beats ambient. Both go through bin/firm-run-resolve, whose --help states the
+validation this tool relies on.
+EOF
+}
+
+# `--run` is parsed ahead of the positional [branch], which keeps every pre-existing invocation form
+# working unchanged: `firm-qa-checkout`, `firm-qa-checkout <branch>`, and now
+# `firm-qa-checkout --run <run-dir> [branch]` (AC-006).
+#
+# `-h|--help` is matched AHEAD of the `-*` catch-all, so help is reachable the normal way rather
+# than only through the refusal path. That is the one deliberate parsing change in this file: before
+# it, `--help` fell into `-*` and exited 2 with "unknown option --help", which is a usable answer for
+# a typo and a useless one for somebody asking how the tool selects its run (AC-010).
+run_sel=""; have_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --run)
+      [[ $# -ge 2 ]] || { echo "firm-qa-checkout: --run needs a run directory argument" >&2; exit 2; }
+      run_sel="$2"; have_run=1; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "firm-qa-checkout: unknown option $1" >&2
+        usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[[ $# -le 1 ]] || { echo "firm-qa-checkout: unexpected argument $2" >&2; exit 2; }
 
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "firm-qa-checkout: current directory is not a git repository" >&2; exit 2;
 }
 repo="$(cd "$repo" && pwd -P)"
-current="$repo/.agent-firm/CURRENT_RUN"
-[[ -f "$current" && ! -L "$current" ]] || {
-  echo "firm-qa-checkout: no safe CURRENT_RUN; run firm-new-run first" >&2; exit 2;
-}
-run_text="$(cat "$current")"
-case "$run_text" in
-  /*) run_dir="$run_text" ;;
-  *) run_dir="$repo/$run_text" ;;
-esac
-run_dir="$(firm_python - "$repo" "$run_dir" <<'PY'
-import os, re, stat, sys
-repo = os.path.abspath(sys.argv[1])
-raw = sys.argv[2]
-if ".." in raw.replace("\\", "/").split("/"):
-    raise SystemExit(2)
-run = os.path.abspath(raw)
-if any(ord(c) < 32 or ord(c) == 127 for c in run):
-    raise SystemExit(2)
-if os.path.dirname(os.path.dirname(os.path.dirname(run))) != repo:
-    raise SystemExit(2)
-if os.path.basename(os.path.dirname(run)) != "runs" or os.path.basename(os.path.dirname(os.path.dirname(run))) != ".agent-firm":
-    raise SystemExit(2)
-if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", os.path.basename(run)):
-    raise SystemExit(2)
-for p in (repo, os.path.join(repo, ".agent-firm"), os.path.dirname(run), run):
-    s=os.lstat(p)
-    if stat.S_ISLNK(s.st_mode) or not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid():
-        raise SystemExit(2)
-print(run)
-PY
-)" || { echo "firm-qa-checkout: CURRENT_RUN is not a contained non-symlink run" >&2; exit 2; }
+
+# The resolver has already printed WHICH ambiguity it refused on (absent pointer, symlinked
+# component, foreign uid, unsafe id, out-of-tree selector...). This line says which TOOL stopped and
+# that it stopped before doing anything -- it must stay distinguishable from every other failure in
+# this script (branch not found, dirty checkout, stale candidate), which is why it names the run
+# selection specifically rather than reporting a generic error.
+if [[ $have_run -eq 1 ]]; then
+  run_dir="$(firm_run_resolve --run "$run_sel")" || {
+    echo "firm-qa-checkout: cannot resolve the run named by --run; nothing captured" >&2; exit 2;
+  }
+else
+  run_dir="$(firm_run_resolve)" || {
+    echo "firm-qa-checkout: no run resolvable (pass --run <run-dir>, or run firm-new-run first); nothing captured" >&2; exit 2;
+  }
+fi
 run_id="$(basename "$run_dir")"
 branch="${1:-integration/${run_id}}"
 case "$branch" in *[!A-Za-z0-9._/-]*|*..*|/*) echo "firm-qa-checkout: unsafe branch name" >&2; exit 2 ;; esac

@@ -258,8 +258,26 @@ def atomic_index(path, payload):
             pass
 
 
-parser = argparse.ArgumentParser(prog="firm-integration-summary")
-parser.add_argument("--run")
+# The epilog is the same run-selection statement firm-qa-checkout, firm-integrate and
+# bin/firm-run-resolve print, in the surface this tool already has (argparse -h/--help). Text only:
+# this tool's --run and its CURRENT_RUN fallback are unchanged by the run that added --run elsewhere,
+# and are described here so a producer can read the precedence off `--help` rather than the source
+# (AC-010). Note this resolver is NOT bin/firm-run-resolve -- it is this file's own, and it keeps one
+# check the shared one deliberately omits (it refuses a group- or other-writable component).
+parser = argparse.ArgumentParser(
+    prog="firm-integration-summary",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=(
+        "Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given,\n"
+        ".agent-firm/CURRENT_RUN is not read at all. With no --run, the ambient\n"
+        ".agent-firm/CURRENT_RUN pointer is used and validated identically.\n"
+        "Explicit beats ambient.\n"
+    ),
+)
+parser.add_argument("--run", metavar="<run-dir>",
+                    help="the run whose integration-summaries/ directory is written. Authoritative: "
+                         "it overrides the ambient .agent-firm/CURRENT_RUN pointer, which is then "
+                         "not read at all.")
 parser.add_argument("--stage", required=True)
 parser.add_argument("--source", required=True)
 args = parser.parse_args()

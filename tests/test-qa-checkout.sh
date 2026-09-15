@@ -130,4 +130,194 @@ assert_no_file "evidence redirect receives no candidate metadata" "$redirect5/ev
 rm "$run5/09-test-evidence"
 mv "$redirect5/evidence-target" "$run5/09-test-evidence"
 
+# ---------------------------------------------------------------------------
+# WO-2 · the explicit --run selector.
+#
+# Everything ABOVE this line is pre-existing and is deliberately unmodified: AC-006 is the claim
+# that adding a selector changed nothing about the forms that already worked, and a suite edited to
+# accommodate the change cannot make that claim.
+#
+# Everything BELOW is new. The defect being closed is not "wrong answer" but "no answer available":
+# this tool had no run selector at all, so when two runs shared one working tree the second one's
+# Lead had to hand-substitute the tool entirely. The assertions therefore care about BINDING —
+# which run's checkout, which run's candidate metadata, which run's ledger — rather than about exit
+# status, because every wrong-run failure mode here exits 0.
+# ---------------------------------------------------------------------------
+t_case "WO-2/AC-001 · --run alone captures a candidate with NO CURRENT_RUN present at all"
+repo6="$(mk_repo)"
+( cd "$repo6" && "$NEW_RUN" no-pointer fast_path >/dev/null )
+id6="$(basename "$(cat "$repo6/.agent-firm/CURRENT_RUN")")"
+( cd "$repo6" && git checkout -q -b "integration/$id6" && printf 'integrated\n' > r.txt && \
+  git add -A && git commit -qm int && git checkout -q main ) >/dev/null 2>&1
+sha6="$(sha_of "$repo6" "integration/$id6")"
+rm -f "$repo6/.agent-firm/CURRENT_RUN"
+assert_no_file "fixture precondition: there is no ambient pointer to fall back to" \
+  "$repo6/.agent-firm/CURRENT_RUN"
+assert_ok "the explicit selector alone is sufficient" \
+  sh -c "cd '$repo6' && '$QAC' --run .agent-firm/runs/$id6"
+assert_eq "the checkout is at that run's candidate SHA" \
+  "$sha6" "$(sha_of "$repo6/.agent-firm/qa-checkout/$id6" HEAD)"
+assert_file "the candidate metadata is in that run's evidence directory" \
+  "$repo6/.agent-firm/runs/$id6/09-test-evidence/qa-candidate.json"
+assert_ok "the qa_checkout event is in that run's ledger" \
+  sh -c "grep -q '\"event\":\"qa_checkout\"' '$repo6/.agent-firm/runs/$id6/run.jsonl'"
+assert_no_file "CURRENT_RUN was neither required nor created" "$repo6/.agent-firm/CURRENT_RUN"
+
+t_case "WO-2/AC-002 · --run names run A while CURRENT_RUN names run B: everything binds to A"
+repo7="$(mk_repo)"
+( cd "$repo7" && "$NEW_RUN" alpha fast_path >/dev/null )
+id_a="$(basename "$(cat "$repo7/.agent-firm/CURRENT_RUN")")"
+( cd "$repo7" && "$NEW_RUN" bravo fast_path >/dev/null )
+id_b="$(basename "$(cat "$repo7/.agent-firm/CURRENT_RUN")")"
+assert_ne "fixture precondition: the two runs really are distinct" "$id_a" "$id_b"
+assert_eq "fixture precondition: CURRENT_RUN names B, the run NOT being asked for" \
+  "$id_b" "$(basename "$(cat "$repo7/.agent-firm/CURRENT_RUN")")"
+# Distinct content per branch, so a checkout bound to the wrong run shows up as the wrong FILE and
+# not merely as a path that happens to differ.
+( cd "$repo7" && git checkout -q -b "integration/$id_a" && printf 'alpha\n' > alpha.txt && \
+  git add -A && git commit -qm a && git checkout -q main ) >/dev/null 2>&1
+( cd "$repo7" && git checkout -q -b "integration/$id_b" && printf 'bravo\n' > bravo.txt && \
+  git add -A && git commit -qm b && git checkout -q main ) >/dev/null 2>&1
+sha_a="$(sha_of "$repo7" "integration/$id_a")"
+assert_ok "captures with --run naming A" sh -c "cd '$repo7' && '$QAC' --run .agent-firm/runs/$id_a"
+assert_eq "the checkout is at A's candidate SHA, not B's" \
+  "$sha_a" "$(sha_of "$repo7/.agent-firm/qa-checkout/$id_a" HEAD)"
+assert_file "…and holds A's file"        "$repo7/.agent-firm/qa-checkout/$id_a/alpha.txt"
+assert_no_file "…and not B's"            "$repo7/.agent-firm/qa-checkout/$id_a/bravo.txt"
+assert_no_file "B got no QA checkout at all" "$repo7/.agent-firm/qa-checkout/$id_b"
+assert_file "A's candidate metadata was written" \
+  "$repo7/.agent-firm/runs/$id_a/09-test-evidence/qa-candidate.json"
+assert_no_file "B's run directory received no candidate metadata" \
+  "$repo7/.agent-firm/runs/$id_b/09-test-evidence/qa-candidate.json"
+assert_eq "the persisted candidate records A as its run" "$id_a" \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' \
+     "$repo7/.agent-firm/runs/$id_a/09-test-evidence/qa-candidate.json")"
+assert_ok "the qa_checkout event landed in A's ledger" \
+  sh -c "grep -q '\"event\":\"qa_checkout\"' '$repo7/.agent-firm/runs/$id_a/run.jsonl'"
+assert_ok "…and NOT in B's — a wrong-target ledger write is the silent half of this bug" \
+  sh -c "! grep -q '\"event\":\"qa_checkout\"' '$repo7/.agent-firm/runs/$id_b/run.jsonl'"
+assert_eq "CURRENT_RUN still names B: it was not consulted and not rewritten" \
+  "$id_b" "$(basename "$(cat "$repo7/.agent-firm/CURRENT_RUN")")"
+
+t_case "WO-2/AC-001 · --run does not merely OUTRANK the ambient pointer, it does not read it"
+# Outranking and not-reading are different claims and only the second one satisfies AC-001 ("does
+# not read, create, or require CURRENT_RUN"). An unreadable pointer is the cheapest way to tell them
+# apart: a tool that still reads it fails here, and a tool that does not cannot notice.
+if [ "$(id -u)" = "0" ]; then
+  t_skip "an unreadable CURRENT_RUN is not consulted" \
+    "running as uid 0, which can read a mode-000 file, so the distinction is not constructible here"
+else
+  chmod 000 "$repo7/.agent-firm/CURRENT_RUN"
+  assert_ok "a second capture succeeds with CURRENT_RUN unreadable" \
+    sh -c "cd '$repo7' && '$QAC' --run .agent-firm/runs/$id_a"
+  assert_eq "…and it was a real second capture (generation incremented)" 2 \
+    "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' \
+       "$repo7/.agent-firm/runs/$id_a/09-test-evidence/qa-candidate.json")"
+  chmod 644 "$repo7/.agent-firm/CURRENT_RUN"
+fi
+
+t_case "WO-2/AC-006 · the positional [branch] argument still works, with and without --run"
+repo8="$(mk_repo)"
+( cd "$repo8" && "$NEW_RUN" positional fast_path >/dev/null )
+id8="$(basename "$(cat "$repo8/.agent-firm/CURRENT_RUN")")"
+( cd "$repo8" && git checkout -q -b integration/other-name && printf 'other\n' > other.txt && \
+  git add -A && git commit -qm o && git checkout -q main ) >/dev/null 2>&1
+sha8="$(sha_of "$repo8" integration/other-name)"
+cand8="$repo8/.agent-firm/runs/$id8/09-test-evidence/qa-candidate.json"
+assert_ok "positional branch, no --run (the pre-existing form)" \
+  sh -c "cd '$repo8' && '$QAC' integration/other-name"
+assert_eq "…captured that branch" "$sha8" "$(sha_of "$repo8/.agent-firm/qa-checkout/$id8" HEAD)"
+assert_eq "…at generation 1" 1 \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$cand8")"
+assert_ok "the same positional branch AFTER --run" \
+  sh -c "cd '$repo8' && '$QAC' --run .agent-firm/runs/$id8 integration/other-name"
+assert_eq "…captured the same branch, bound to the run --run named" \
+  "$sha8" "$(sha_of "$repo8/.agent-firm/qa-checkout/$id8" HEAD)"
+assert_eq "…and really ran, rather than short-circuiting (generation 2)" 2 \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$cand8")"
+assert_eq "the default branch is still computed from the RESOLVED run id" \
+  "refs/heads/integration/other-name" \
+  "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_ref"])' "$cand8")"
+
+t_case "WO-2/AC-007 · an unresolvable --run stops the tool with its own distinguishable message"
+repo9="$(mk_repo)"
+( cd "$repo9" && "$NEW_RUN" fail-closed fast_path >/dev/null )
+id9="$(basename "$(cat "$repo9/.agent-firm/CURRENT_RUN")")"
+( cd "$repo9" && git branch "integration/$id9" )
+assert_rc "a --run naming a nonexistent run is refused" 2 \
+  sh -c "cd '$repo9' && '$QAC' --run .agent-firm/runs/never-created"
+assert_output "…the resolver names the specific violation" "does not exist" \
+  sh -c "cd '$repo9' && '$QAC' --run .agent-firm/runs/never-created 2>&1"
+assert_output "…and firm-qa-checkout says IT stopped, over run selection" \
+  "cannot resolve the run named by --run" \
+  sh -c "cd '$repo9' && '$QAC' --run .agent-firm/runs/never-created 2>&1"
+assert_no_file "nothing was materialized for a selector it refused" "$repo9/.agent-firm/qa-checkout"
+assert_rc "--run with no value is a usage error, not a silent fallback" 2 \
+  sh -c "cd '$repo9' && '$QAC' --run"
+assert_rc "an unknown option is refused" 2 sh -c "cd '$repo9' && '$QAC' --bogus"
+# The other failures in this script must NOT collapse into the run-selection one. This run resolves
+# perfectly; it is the BRANCH that is missing, and the message has to keep saying so.
+repo9b="$(mk_repo)"
+( cd "$repo9b" && "$NEW_RUN" branch-missing fast_path >/dev/null )
+assert_output "a missing integration branch is still its own failure" "run firm-integrate first" \
+  sh -c "cd '$repo9b' && '$QAC' 2>&1"
+assert_ok "…and is not reported as a run-resolution failure" \
+  sh -c "cd '$repo9b' && ! '$QAC' 2>&1 | grep -q 'resolve the run'"
+
+t_case "WO-2/AC-008 · containment is enforced on the EXPLICIT selector at this call site"
+# The hazard of adding a flag is a second front door that skips the lock the first one had. The
+# resolver holds the line (tests/test-run-resolve.sh proves the check set); this asserts that
+# firm-qa-checkout actually routes through it rather than around it.
+repo10="$(mk_repo)"
+( cd "$repo10" && "$NEW_RUN" containment fast_path >/dev/null )
+id10="$(basename "$(cat "$repo10/.agent-firm/CURRENT_RUN")")"
+( cd "$repo10" && git branch "integration/$id10" )
+elsewhere10="$(mktemp -d "${TMPDIR:-/tmp}/firm-qac-elsewhere.XXXXXX")"; t_track "$elsewhere10"
+printf 'sentinel\n' > "$elsewhere10/PRECIOUS.txt"
+ln -s "$elsewhere10" "$repo10/.agent-firm/runs/linked"
+assert_rc "a symlinked run selector is refused" 2 \
+  sh -c "cd '$repo10' && '$QAC' --run .agent-firm/runs/linked"
+assert_output "…naming the containment violation, not a generic error" "is a symlink" \
+  sh -c "cd '$repo10' && '$QAC' --run .agent-firm/runs/linked 2>&1"
+assert_rc "a traversal selector is refused" 2 \
+  sh -c "cd '$repo10' && '$QAC' --run .agent-firm/runs/../runs/$id10"
+assert_rc "a selector outside .agent-firm/runs/ is refused" 2 \
+  sh -c "cd '$repo10' && '$QAC' --run .agent-firm"
+other10="$(mk_repo)"
+( cd "$other10" && "$NEW_RUN" other-checkout fast_path >/dev/null )
+other_id10="$(basename "$(cat "$other10/.agent-firm/CURRENT_RUN")")"
+assert_rc "a well-formed run belonging to a DIFFERENT checkout is refused" 2 \
+  sh -c "cd '$repo10' && '$QAC' --run '$other10/.agent-firm/runs/$other_id10'"
+assert_no_file "no checkout was materialized by any of those refusals" \
+  "$repo10/.agent-firm/qa-checkout"
+assert_file "the symlink target is untouched" "$elsewhere10/PRECIOUS.txt"
+assert_no_file "…and received no checkout of its own" "$elsewhere10/$id10"
+
+# ---------------------------------------------------------------------------
+t_case "AC-010: --help states how the run is selected, on stdout, exit 0, materializing nothing"
+# --run arrived on this tool in this run; the statement of what it OUTRANKS did not, and `--help` fell
+# into the `-*` catch-all and exited 2 with "unknown option --help". A producer could therefore only
+# learn the precedence by reading the source, which is the condition AC-010 names.
+repo11="$(mk_repo)"
+( cd "$repo11" && "$NEW_RUN" qac-help fast_path >/dev/null )
+help11="$( (cd "$repo11" && "$QAC" --help) 2>/dev/null )"; rc11=$?
+assert_eq "--help exits 0" 0 "$rc11"
+assert_output "the synopsis is on stdout" "usage: firm-qa-checkout" printf '%s' "$help11"
+assert_output "it names the selector in the accepted two-word spelling" "--run <run-dir>" \
+  printf '%s' "$help11"
+assert_output "it says the explicit selector is authoritative" "AUTHORITATIVE" printf '%s' "$help11"
+assert_output "…and that the ambient pointer is then not read at all" "CURRENT_RUN is not" \
+  printf '%s' "$help11"
+assert_output "…naming the ambient pointer it beats" ".agent-firm/CURRENT_RUN" printf '%s' "$help11"
+assert_output "…in the wording shared across every in-scope tool" "Explicit beats ambient" \
+  printf '%s' "$help11"
+assert_no_file "--help materialized no QA checkout" "$repo11/.agent-firm/qa-checkout"
+help11b="$( (cd "$repo11" && "$QAC" -h) 2>/dev/null )"; rc11b=$?
+assert_eq "-h exits 0 too" 0 "$rc11b"
+assert_eq "-h prints the byte-identical synopsis" "$help11" "$help11b"
+assert_rc "an unrelated option is still refused, and rc 2 is still its status" 2 \
+  sh -c "cd '$repo11' && '$QAC' --bogus"
+assert_output "…and the refusal now carries the same run-selection statement" "Explicit beats ambient" \
+  sh -c "cd '$repo11' && '$QAC' --bogus 2>&1"
+
 t_summary

@@ -24,10 +24,34 @@ root = Path(sys.argv[1])
 self_dir = Path(sys.argv[2])
 argv = sys.argv[3:]
 
-parser = argparse.ArgumentParser(prog="firm-reviewer-common")
+# The epilog carries the same run-selection statement the run-scoped tools print, in the surface this
+# tool already has (argparse -h/--help). Text only -- this tool takes TWO spellings of a run selector
+# and neither is changed here; what was missing was any statement of how the three sources rank, which
+# a producer could previously only get from `run_arg = args.run_option or args.run_dir` in the source
+# (AC-010). This resolver is this file's own, not bin/firm-run-resolve; the precedence matches, the
+# implementation is separate.
+parser = argparse.ArgumentParser(
+    prog="firm-reviewer-common",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=(
+        "Run selection, highest precedence first: --run <run-dir>, then the positional\n"
+        "[run-dir], then the ambient .agent-firm/CURRENT_RUN pointer. A NON-EMPTY explicit\n"
+        "selector in either spelling is AUTHORITATIVE -- when one is given,\n"
+        ".agent-firm/CURRENT_RUN is not read at all. Explicit beats ambient.\n"
+        "\n"
+        "One sharp edge, stated rather than left to be discovered: an EMPTY selector is not\n"
+        "treated as explicit here. `--run \"\"` falls back to the positional and then to\n"
+        "CURRENT_RUN instead of being refused, which is what bin/firm-run-resolve does for\n"
+        "the tools that use it. Pre-existing and unchanged; pass a real path, or no flag.\n"
+    ),
+)
 parser.add_argument("provider", choices=("gpt", "claude"))
-parser.add_argument("run_dir", nargs="?")
-parser.add_argument("--run", dest="run_option")
+parser.add_argument("run_dir", nargs="?", metavar="run-dir",
+                    help="the run to review, as a positional. Explicit, so it overrides the ambient "
+                         ".agent-firm/CURRENT_RUN pointer; --run overrides it in turn.")
+parser.add_argument("--run", dest="run_option", metavar="<run-dir>",
+                    help="the run to review. Highest precedence: it beats the positional [run-dir] "
+                         "and the ambient .agent-firm/CURRENT_RUN pointer, which is then not read.")
 parser.add_argument("--discovery-timeout")
 parser.add_argument("--readiness-timeout")
 parser.add_argument("--judge-timeout")

@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# firm-run-resolve [--run <run-dir>]
+#
+# THE ONE place the firm decides which run directory a tool is acting for.
+#
+# Usage as a COMMAND (it is executable, so firm-link puts it on PATH):
+#   firm-run-resolve                 resolve from .agent-firm/CURRENT_RUN, print the run dir, exit 0
+#   firm-run-resolve --run <dir>     resolve <dir>; CURRENT_RUN is never consulted
+#   firm-run-resolve -h | --help     print this synopsis and exit 0
+#
+# Usage as a LIBRARY (this file is sourceable on purpose — one definition, not N copies; the same
+# idiom bin/firm-python uses and for the same reason):
+#   . "$SELF/firm-run-resolve"                       defines firm_run_resolve()
+#   run_dir="$(firm_run_resolve --run "$sel")" || exit 2
+#
+# THE INTERFACE, WHICH IS FROZEN (WO-1; WO-2/WO-3/WO-5 consume it without renegotiation)
+#   · `--run <run-dir>` — TWO words, not `--run=<run-dir>`, which is refused with a message naming
+#     the accepted spelling rather than a bare "unknown option".
+#   · With `--run`: that argument is AUTHORITATIVE. .agent-firm/CURRENT_RUN is not read at all, not
+#     even as a tiebreak, not even when the explicit selector turns out to be invalid.
+#   · With no `--run`: `<repo>/.agent-firm/CURRENT_RUN` is read and then run through the SAME
+#     validation as the explicit path — "explicit is authoritative, ambient is converted into the
+#     same fully validated target" (bin/firm-qa-clean-check's existing dual-mode shape).
+#   · SUCCESS: the resolved run directory on stdout, one line, exit 0. It is ABSOLUTE and CANONICAL
+#     — the physical spelling, every symlink already resolved — so a caller can compare it against
+#     another tool's answer without re-normalizing it.
+#   · FAILURE: nothing on stdout, a diagnostic on stderr NAMING the specific violation, exit 2.
+#     There is no third outcome: this tool never exits 0 having resolved nothing, and never picks a
+#     candidate when the answer is ambiguous (AC-007).
+#
+# RELATIVE SELECTORS resolve against different bases ON PURPOSE, matching the two precedents this
+# consolidates rather than inventing a third rule:
+#   · a relative `--run` resolves against $PWD — what somebody typing a path at a shell means, and
+#     what bin/firm-qa-clean-check, bin/firm-integration-summary and bin/firm-reviewer-common already
+#     do with their own `--run`;
+#   · CURRENT_RUN's CONTENTS resolve against the REPOSITORY ROOT, because that is what bin/firm-new-run
+#     writes into it (`.agent-firm/runs/<id>`, repo-relative) and what bin/firm-qa-checkout already
+#     assumed. Anchoring the pointer at the repo root rather than at $PWD is also why this works from
+#     a subdirectory, where the ambient read it replaces silently resolved nothing.
+# Either way the result goes through one identical validation, so the base only decides which path is
+# being judged, never how strictly.
+#
+# WHY THIS FILE EXISTS
+# The same containment validation existed in FIVE subtly different spellings — bin/firm-qa-checkout,
+# bin/firm-qa-clean-check, bin/firm-integration-summary, bin/firm-reviewer-common and
+# bin/firm-ledger-log each carried their own. Five copies of a security check is five chances for one
+# of them to be the weak one, and no way to fix all five at once. This is the same one-source-of-truth
+# discipline the repo already applies to SUPPORTED_P2_OS_ROWS and to the observation shapes
+# bin/firm-merge-guard reads statically rather than restating.
+#
+# WHAT IS VALIDATED, AND WHY EACH CLAUSE IS THERE (AC-008). The set below is the union of what
+# bin/firm-qa-checkout:23-44 and bin/firm-qa-clean-check:44-62 check, not a subset of either:
+#   1. the selector is non-empty and carries no control character (before AND after normalization);
+#   2. no ".." component LEXICALLY, judged before normalization — `os.path.abspath` collapses "..",
+#      so a check applied afterwards sees an innocent path (tests/test-qa-checkout.sh pins this for
+#      the tool this replaces);
+#   3. the path IS `<repo>/.agent-firm/runs/<run-id>` BY CONSTRUCTION — dirname, dirname(dirname) and
+#      dirname^3 are each compared, not a string prefix, because a prefix match accepts
+#      `<repo>/.agent-firm/runs-evil/x` and rejects nothing a symlink can do;
+#   4. dirname^3 RESOLVES to exactly the INVOKING working tree's own root, so a well-formed run
+#      belonging to a different checkout is refused rather than acted upon. Compared as directories,
+#      not as text, because macOS reaches /tmp and $TMPDIR through symlinks and two spellings of one
+#      directory are one directory. The path is then CANONICALIZED to the physical spelling and every
+#      check below runs on that, so a second spelling never becomes a second directory;
+#   5. the run id matches [A-Za-z0-9][A-Za-z0-9._-]{0,127}, the safe-id pattern used elsewhere;
+#   6. EVERY path component from the repository root down through the run directory lstats as a
+#      non-symlink directory owned by the invoking uid — lstat, so the check sees the link itself
+#      rather than what it points at;
+#   7. the run directory's realpath is itself. Redundant given (6) and stated anyway: it is the
+#      invariant (6) exists to produce, and it costs one syscall to assert rather than assume.
+#
+# ONE CHECK IS DELIBERATELY NOT HERE, AND SAYING SO IS THE POINT. bin/firm-integration-summary's own
+# resolver additionally refuses a group- or other-WRITABLE component (`S_IMODE & 0o022`). That copy
+# is not replaced by this file and keeps enforcing it, so nothing is weakened for its caller. It is
+# absent here because this resolver's callers (firm-qa-checkout, firm-integrate, firm-new-worktree,
+# firm-hire) accept such a directory today, and a consolidation that silently starts refusing a run
+# directory created under a 002 umask would be a compatibility break (AC-006) wearing a security
+# rationale. Adding it is a real hardening option; it needs its own criterion, not a smuggled one.
+#
+# NO WRITE AUTHORITY (AC-009). This tool resolves and validates. It creates nothing, chmods nothing,
+# opens nothing for writing, and reads exactly one file: the CURRENT_RUN pointer, and only in the
+# ambient mode where it is the input. Resolving a run the caller could not already read is not
+# something it can grant.
+#
+# bash 3.2 safe (macOS ships 3.2.57): no mapfile, no associative arrays, no process substitution.
+
+# ---- self-location ---------------------------------------------------------
+# `_frr_`-prefixed on purpose: this file is SOURCED, so a bare `__src`/`SELF` would clobber the
+# caller's own. bin/firm-qa-checkout sets both before it sources anything.
+_frr_src="${BASH_SOURCE[0]}"
+while [ -L "$_frr_src" ]; do
+  _frr_dir="$(cd -P "$(dirname "$_frr_src")" && pwd)"; _frr_src="$(readlink "$_frr_src")"
+  case $_frr_src in /*) ;; *) _frr_src="$_frr_dir/$_frr_src";; esac
+done
+FIRM_RUN_RESOLVE_SELF="$(cd -P "$(dirname "$_frr_src")" && pwd)"
+
+# One resolved interpreter for the whole firm; see bin/firm-python. Sourced CONDITIONALLY: a caller
+# that already sourced it (firm-qa-checkout, firm-qa-clean-check, tests/lib.sh) has already paid for
+# the probe, and re-sourcing would run every candidate a second time AND overwrite a caller that
+# deliberately resolved in trusted-only mode.
+if ! type firm_python >/dev/null 2>&1; then
+  . "$FIRM_RUN_RESOLVE_SELF/firm-python"
+fi
+
+# ---- the validator ---------------------------------------------------------
+# Read into a variable rather than fed through `firm_python - <<PY` inside a $(...) substitution.
+# Both work, but the heredoc-inside-$() form is the exact shape that made bin/firm-run-evals
+# unparseable under bash 3.2 on 2026-08-23 (an apostrophe in a comment terminated the quote early;
+# tests/test-bin-syntax.sh exists because of it). A security validator has to be free to explain
+# itself in prose, so it is kept out of that construct entirely.
+IFS= read -r -d '' _FIRM_RUN_RESOLVE_PY <<'PY' || true
+import os
+import re
+import stat
+import sys
+
+TOOL = "firm-run-resolve"
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def fail(message):
+    # Every refusal names the SPECIFIC violation. "could not resolve a run" is not a diagnostic; it
+    # is the absence of one, and AC-007 is written against exactly that.
+    sys.stderr.write(TOOL + ": " + message + "\n")
+    raise SystemExit(2)
+
+
+def has_control(text):
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
+
+
+repo, mode, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+uid = os.getuid()
+firm_root = os.path.join(repo, ".agent-firm")
+
+if mode == "ambient":
+    # The .agent-firm directory is judged BEFORE the pointer inside it is read. The component loop
+    # below would refuse a symlinked .agent-firm anyway, so this changes nothing about WHAT is
+    # accepted; it changes what is READ on the way to refusing, which is the half a containment
+    # check cannot do retroactively.
+    if not os.path.lexists(firm_root):
+        fail("no --run was given and " + firm_root + " does not exist"
+             " -- pass --run <run-dir>, or run firm-new-run first")
+    info = os.lstat(firm_root)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+        fail("no --run was given and " + firm_root + " is a symlink, not a directory, or not owned"
+             " by uid " + str(uid) + " -- refusing to read an ambient run pointer through it")
+    pointer = os.path.join(firm_root, "CURRENT_RUN")
+    if not os.path.lexists(pointer):
+        fail("no --run was given and " + pointer + " does not exist"
+             " -- pass --run <run-dir>, or run firm-new-run first")
+    pinfo = os.lstat(pointer)
+    if stat.S_ISLNK(pinfo.st_mode):
+        fail("no --run was given and " + pointer + " is a symlink -- refusing to follow it")
+    if not stat.S_ISREG(pinfo.st_mode):
+        fail("no --run was given and " + pointer + " is not a regular file")
+    try:
+        with open(pointer, encoding="utf-8") as handle:
+            raw = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        fail("no --run was given and " + pointer + " could not be read: " + str(exc))
+    raw = raw.strip()
+    if not raw:
+        fail("no --run was given and " + pointer + " is empty"
+             " -- pass --run <run-dir>, or run firm-new-run first")
+    origin = "CURRENT_RUN"
+    base = repo
+else:
+    # An explicit selector that is empty is a REFUSAL, never a fallback. "--run '' quietly became
+    # CURRENT_RUN" is precisely the silent-selection failure AC-007 forbids.
+    if not raw:
+        fail("--run was given an empty run directory -- refusing to fall back to CURRENT_RUN,"
+             " because an explicit selector was supplied")
+    origin = "--run"
+    base = os.getcwd()
+
+if has_control(raw):
+    fail("selector from " + origin + " contains a control character")
+# LEXICAL traversal check, before normalization: abspath() collapses "..", so a check applied after
+# it sees `.agent-firm/runs/../runs/<id>` as innocent.
+if ".." in raw.replace("\\", "/").split("/"):
+    fail("selector from " + origin + " contains a .. traversal component: " + raw)
+
+path = raw if os.path.isabs(raw) else os.path.join(base, raw)
+path = os.path.abspath(path)
+if has_control(path):
+    fail("selector from " + origin + " resolves to a path containing a control character")
+
+run_id = os.path.basename(path)
+runs_dir = os.path.dirname(path)
+firm_dir = os.path.dirname(runs_dir)
+derived_repo = os.path.dirname(firm_dir)
+
+# Containment BY CONSTRUCTION, component by component -- not a string prefix, which would accept
+# <repo>/.agent-firm/runs-elsewhere/x.
+if os.path.basename(runs_dir) != "runs" or os.path.basename(firm_dir) != ".agent-firm":
+    fail("selector from " + origin + " is not <repo>/.agent-firm/runs/<run-id>: " + path)
+# The repository identity is compared as DIRECTORIES, not as text. macOS reaches $TMPDIR and /tmp
+# through symlinks (/var -> /private/var, /tmp -> /private/tmp), so `--run /tmp/x/.agent-firm/runs/ID`
+# and the physical `/private/tmp/x/...` are two spellings of one directory and a textual comparison
+# refuses one of them for no reason a caller can act on. bin/firm-qa-clean-check already compares
+# realpaths here, so this matches the existing --run precedent rather than inventing a stricter one.
+#
+# It is not a loosening, because of the two lines below it: the path is then CANONICALIZED to the
+# physical spelling and every containment check runs on THAT. Accepting a second spelling of the same
+# directory is not the same as accepting a second directory -- a symlinked .agent-firm, runs, or run
+# component is still refused by the component loop, which sees the canonical path.
+if os.path.realpath(derived_repo) != repo:
+    fail("selector from " + origin + " is outside this working tree: " + path
+         + " -- a run must be under " + os.path.join(repo, ".agent-firm", "runs") + os.sep)
+if run_id in (".", "..") or not SAFE_ID.fullmatch(run_id):
+    fail("run id " + repr(run_id) + " from " + origin + " does not match the safe-id pattern"
+         " [A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+path = os.path.join(repo, ".agent-firm", "runs", run_id)
+runs_dir = os.path.dirname(path)
+firm_dir = os.path.dirname(runs_dir)
+
+for component, label in (
+    (repo, "repository root"),
+    (firm_dir, ".agent-firm directory"),
+    (runs_dir, "runs directory"),
+    (path, "run directory"),
+):
+    if not os.path.lexists(component):
+        fail(label + " " + component + " does not exist")
+    info = os.lstat(component)
+    if stat.S_ISLNK(info.st_mode):
+        fail(label + " " + component + " is a symlink -- refusing to resolve a run through a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        fail(label + " " + component + " is not a directory")
+    if info.st_uid != uid:
+        fail(label + " " + component + " is owned by uid " + str(info.st_uid)
+             + ", not the invoking uid " + str(uid))
+
+# The invariant the loop above exists to produce, asserted rather than assumed.
+real = os.path.realpath(path)
+if real != path:
+    fail("run directory " + path + " resolves to " + real + " -- refusing a redirected run path")
+
+sys.stdout.write(path + "\n")
+PY
+
+# ---- firm_run_resolve ------------------------------------------------------
+# rc 0 with the run directory on stdout, or rc 2 with a diagnostic on stderr. Never both, never
+# neither.
+firm_run_resolve() {
+  local _frr_sel="" _frr_mode="ambient" _frr_top _frr_repo
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run)
+        if [ $# -lt 2 ]; then
+          echo "firm-run-resolve: --run needs a run directory argument" >&2
+          return 2
+        fi
+        _frr_sel="$2"; _frr_mode="explicit"; shift 2 ;;
+      --run=*)
+        # Named rather than swept into "unknown option": the caller is asking for the right thing in
+        # the wrong spelling, and the frozen interface is the two-word form.
+        echo "firm-run-resolve: use \"--run <run-dir>\" (two words), not --run=<run-dir>" >&2
+        return 2 ;;
+      --) shift; break ;;
+      -*)
+        echo "firm-run-resolve: unknown option $1" >&2
+        echo "usage: firm-run-resolve [--run <run-dir>]" >&2
+        return 2 ;;
+      *)
+        echo "firm-run-resolve: unexpected argument $1" >&2
+        echo "usage: firm-run-resolve [--run <run-dir>]" >&2
+        return 2 ;;
+    esac
+  done
+  if [ $# -gt 0 ]; then
+    echo "firm-run-resolve: unexpected argument $1" >&2
+    echo "usage: firm-run-resolve [--run <run-dir>]" >&2
+    return 2
+  fi
+
+  _frr_top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "firm-run-resolve: current directory is not a git repository" >&2
+    return 2
+  }
+  if [ -z "$_frr_top" ]; then
+    echo "firm-run-resolve: current directory is not a git repository" >&2
+    return 2
+  fi
+  # Physical, so the repository root this validator compares against carries no symlink of its own.
+  _frr_repo="$(cd -P "$_frr_top" 2>/dev/null && pwd -P)" || {
+    echo "firm-run-resolve: repository root $_frr_top cannot be resolved" >&2
+    return 2
+  }
+
+  firm_python -c "$_FIRM_RUN_RESOLVE_PY" "$_frr_repo" "$_frr_mode" "$_frr_sel"
+}
+
+# ---- command mode ----------------------------------------------------------
+# Sourced files must not run the dispatcher and must not change the caller's shell options.
+# $0 is the outer script when sourced and this file when executed. (Same guard as bin/firm-python.)
+case "${BASH_SOURCE[0]:-$0}" in
+  "$0")
+    set -uo pipefail
+    case "${1:-}" in
+      -h|--help)
+        # The "Run selection:" paragraph below is the SHARED TEMPLATE every in-scope tool prints,
+        # near-verbatim, so a reader who has seen one tool's help recognizes the same statement in
+        # the next (AC-010). This file is where the sentence is true by construction rather than by
+        # convention: it is the resolver the other tools call, so its help and its behavior cannot
+        # drift apart the way a copied sentence in a sibling tool could.
+        cat <<'USAGE'
+usage: firm-run-resolve [--run <run-dir>]
+
+Resolve, validate and print the one run directory a firm tool is acting for.
+
+  --run <run-dir>   authoritative; .agent-firm/CURRENT_RUN is not consulted at all
+  (no --run)        fall back to <repo>/.agent-firm/CURRENT_RUN, validated identically
+  -h, --help        print this synopsis and exit 0; resolves nothing
+
+Run selection: --run <run-dir> is AUTHORITATIVE -- when it is given, .agent-firm/CURRENT_RUN is not
+read at all, not even as a tiebreak, not even if the explicit selector turns out to be invalid.
+With no --run, the ambient .agent-firm/CURRENT_RUN pointer is read and validated identically.
+Explicit beats ambient. Every firm tool that takes --run resolves it here, so this precedence is the
+same one firm-qa-checkout, firm-integrate, firm-new-worktree and firm-hire report in their own help.
+
+Prints the canonical absolute run directory on stdout and exits 0. On any failure it prints a
+diagnostic naming the specific violation on stderr and exits 2, having printed nothing on stdout.
+USAGE
+        exit 0 ;;
+    esac
+    firm_run_resolve "$@"
+    exit $?
+    ;;
+esac
