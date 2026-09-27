@@ -63,6 +63,7 @@ PY
 make_sealable_run() {
   _primary="${1:-claude}"
   _repo="${2:-}"
+  _trace_writer="${3:-}"
   [ -n "$_repo" ] || _repo="$(mk_repo)"
   _repo="$(cd "$_repo" && pwd -P)"
   _sha="$(sha_of "$_repo" main)"
@@ -71,6 +72,9 @@ make_sealable_run() {
   printf '%s\n' 'task_slug: seal-fixture' 'track: full_track' 'criteria: []' > "$_run/01-acceptance-criteria.yaml"
   printf '%s\n' 'schema_version: 2' 'task_slug: seal-fixture' 'candidate: {}' 'matrix: []' 'two_voice: {}' 'two_voice_diff: []' > "$_run/traceability.yaml"
   printf '%s\n' '{"artifacts":[],"commands_run":[],"verdict":"APPROVE"}' > "$_run/08-qa-verdict.json"
+  # An optional third argument names a function that rewrites traceability.yaml (and any evidence it
+  # cites) before the producer records are published, so the fixture's records match its final bytes.
+  if [ -n "$_trace_writer" ]; then "$_trace_writer" "$_run" "$_sha" || return 1; fi
   printf '%s\n' '# 10 · Handoff' '<!-- BEGIN COMPLETE LOCAL PR BODY -->' 'Title: sealed fixture' '' 'Body bytes remain exact.' '<!-- END COMPLETE LOCAL PR BODY -->' > "$_run/10-handoff.md"
   _common="$(git -C "$_repo" rev-parse --git-common-dir)"; case $_common in /*) ;; *) _common="$_repo/$_common";; esac
   _common="$(cd "$_common" && pwd -P)"
@@ -637,6 +641,70 @@ PY
         "$BIN/firm-check-assertions" "$matrix_assertions" "$matrix_repo"
     fi
   fi
+fi
+
+t_case "one artifact may re-declare a path consistently; conflicting or repeated declarations still fail"
+assert_ok "discovery collapses consistent re-declarations and rejects conflicts and repeats" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import json,os,sys
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+from evidence_seal import SealError,_discover_references as discover
+def refs(relative,value):
+    return discover(relative,json.dumps(value).encode(),value)
+def rejected(relative,value):
+    try:
+        refs(relative,value)
+    except SealError as exc:
+        assert exc.category=="DUPLICATE_DECLARATION",exc.category
+    else:
+        raise AssertionError(f"accepted: {value}")
+log="09-test-evidence/shared.log"
+# A captured log is both a primary artifact and the required commands_run artifact.
+assert refs("08-qa-verdict.json",{"artifacts":[log],"commands_run":[{"artifact":log}]})==[log]
+# Prose may name the same evidence token more than once.
+assert discover("10-handoff.md",f"evidence://run/{log} and again evidence://run/{log}".encode(),None)==[log]
+ref={"path":log,"candidate_sha":"a"*40,"sha256":"b"*64,"bytes":3,"producer":{"event_id":"evt-x","event":"evidence_produced"}}
+# One shared log proves two traceability rows, each with a complete evidenceRef.
+assert refs("traceability.yaml",{"matrix":[{"evidence":[ref]},{"evidence":[dict(ref)]}]})==[log]
+# Still fatal: two references to one path that disagree about its identity.
+rejected("traceability.yaml",{"matrix":[{"evidence":[ref]},{"evidence":[{**ref,"sha256":"c"*64}]}]})
+# Still fatal: one list naming the same path twice.
+rejected("traceability.yaml",{"matrix":[{"evidence":[ref,dict(ref)]}]})
+rejected("08-qa-verdict.json",{"artifacts":[log,log],"commands_run":[]})
+PY
+
+write_shared_log_traceability() {
+  local _twr_run="$1" _twr_sha="$2" _twr_log=09-test-evidence/shared-proof.log
+  printf 'shared proof\n' > "$_twr_run/$_twr_log"
+  t_python - "$_twr_run" "$_twr_sha" "$_twr_log" <<'PY'
+import hashlib,sys
+run,sha,log=sys.argv[1:]
+raw=open(f"{run}/{log}","rb").read()
+ref=(f"      - {{path: {log}, candidate_sha: '{sha}', sha256: '{hashlib.sha256(raw).hexdigest()}', "
+     f"bytes: {len(raw)}, producer: {{event_id: evt-shared-proof, event: evidence_produced}}}}\n")
+with open(f"{run}/traceability.yaml","w") as handle:
+    handle.write("schema_version: 2\ntask_slug: seal-fixture\ncandidate: {}\nmatrix:\n"
+                 "  - id: AC-001\n    evidence:\n" + ref +
+                 "  - id: AC-002\n    evidence:\n" + ref +
+                 "two_voice: {}\ntwo_voice_diff: []\n")
+PY
+}
+if t_p2_row_supported; then
+  shared_fixture="$(make_sealable_run claude "" write_shared_log_traceability)"; shared_rc=$?
+  shared_run="$(printf '%s\n' "$shared_fixture" | sed -n '2p')"
+  if [ "$shared_rc" -ne 0 ] || [ -z "$shared_run" ]; then
+    _t_no "shared-log fixture created" "rc=$shared_rc"
+  else
+    assert_ok "seal publishes when one log proves two traceability rows" seal_for_run "$shared_run"
+    assert_ok "the shared log is sealed exactly once" t_python - "$shared_run" <<'PY'
+import json,sys
+seal=json.load(open(f"{sys.argv[1]}/09-test-evidence/final-evidence/g1/seal.json"))
+paths=[entry["path"] for entry in seal["entries"]]
+assert paths.count("09-test-evidence/shared-proof.log")==1,paths
+PY
+  fi
+else
+  t_skip "shared-log seal publication" "requires a supported P2 ledger write host"
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"

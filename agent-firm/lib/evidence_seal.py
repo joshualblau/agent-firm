@@ -345,11 +345,23 @@ def _walk_strings(value):
 
 
 def _discover_references(relative, raw, value):
+    """Return the run-relative paths one artifact declares, each once.
+
+    One artifact may legitimately declare the same path from more than one place, and the contracts
+    that shape these artifacts require it: a captured command log is both one of the primary verdict's
+    `artifacts` and a required `commands_run[].artifact`, and one shared log that proves several
+    traceability rows must appear in each row as a complete evidenceRef (`additionalProperties:
+    false`, all five keys required).  Those are consistent re-declarations of one reference and
+    resolve to one sealed entry.  What stays fatal is a single list that names the same path twice,
+    and two structured references to one path that disagree about its identity.
+    """
     found = []
-    def declare(path, source):
-        if path in found:
-            raise SealError("DUPLICATE_DECLARATION", f"{relative}:{source}:{path}")
-        found.append(path)
+    identities = {}
+    def declare(path, source, identity=None):
+        if identity is not None and identities.setdefault(path, identity) != identity:
+            raise SealError("DUPLICATE_DECLARATION", f"{relative}:{source}:conflicting_identity:{path}")
+        if path not in found:
+            found.append(path)
     text = raw.decode("utf-8", "ignore")
     for match in re.finditer(r"evidence://run/([A-Za-z0-9._/-]+)", text):
         declare(match.group(1), "evidence_token")
@@ -357,6 +369,8 @@ def _discover_references(relative, raw, value):
         artifacts = value.get("artifacts", [])
         if not isinstance(artifacts, list):
             raise SealError("REFERENCE_INVALID", "primary artifacts is not a list")
+        if len(artifacts) != len({json.dumps(item) for item in artifacts}):
+            raise SealError("DUPLICATE_DECLARATION", f"{relative}:artifacts:repeated_entry")
         for item in artifacts:
             if not isinstance(item, str):
                 raise SealError("REFERENCE_INVALID", "primary artifact is not a path")
@@ -370,7 +384,9 @@ def _discover_references(relative, raw, value):
                 if {"path", "candidate_sha", "sha256", "bytes", "producer"}.issubset(item):
                     if not isinstance(item["path"], str):
                         raise SealError("REFERENCE_INVALID", relative)
-                    declare(item["path"], "structured_reference")
+                    identity = json.dumps({key: item[key] for key in ("candidate_sha", "sha256", "bytes", "producer")},
+                                          sort_keys=True, separators=(",", ":"))
+                    declare(item["path"], "structured_reference", identity)
                 for nested in item.values():
                     visit(nested)
             elif isinstance(item, list):
