@@ -1662,6 +1662,15 @@ elif op=="phantom": d["matrix"][1]["id"]="AC-999"
 elif op=="stale-evidence": d["matrix"][0]["evidence"][0]["candidate_sha"]="0"*40
 elif op=="missing-evidence": d["matrix"][0]["evidence"][0]["path"]="09-test-evidence/absent.log"
 elif op=="partial-no-gate": d["matrix"][0]["status"]="partial"; d["matrix"][0]["evidence"]=[]
+elif op=="relative-paths":
+ import json,os
+ c=json.load(open(os.path.join(os.path.dirname(p),"09-test-evidence/qa-candidate.json")))
+ root=c["repository_root"]
+ d["candidate"]["repository_root"]="."
+ d["candidate"]["git_common_dir"]=os.path.relpath(c["git_common_dir"],root)
+ d["candidate"]["checkout_path"]=os.path.relpath(c["checkout_path"],root)
+elif op=="relative-wrong-checkout": d["candidate"]["checkout_path"]=".agent-firm/qa-checkout/another-run"
+elif op=="relative-escape": d["candidate"]["repository_root"]="../"+__import__("os").path.basename(d["candidate"]["repository_root"])
 elif op=="uncovered-gate":
  d["matrix"][0]["status"]="uncovered"; d["matrix"][0]["evidence"]=[]
  d["matrix"][0]["gate_record"]={"path":"09-test-evidence/ac1-gate.yaml","candidate_sha":d["candidate"]["commit_sha"],"sha256":"0"*64,"bytes":0,"producer":{"event_id":"evt-placeholder","event":"gate_recorded"},"decision":"waive_uncovered"}
@@ -1677,10 +1686,14 @@ assert_rc "absent matrix cannot evaluate" 2 "$TC" --strict "$strict_run"
 cp "$strict_run/traceability.good" "$strict_run/traceability.yaml"
 printf 'matrix: [\n' > "$strict_run/traceability.yaml"
 assert_rc "malformed matrix cannot evaluate" 2 "$TC" --strict "$strict_run"
-for mutation in empty duplicate phantom stale-evidence missing-evidence partial-no-gate; do
+for mutation in empty duplicate phantom stale-evidence missing-evidence partial-no-gate relative-wrong-checkout relative-escape; do
   strict_reset; strict_mutate "$mutation"
   assert_fail "$mutation does not pass strict traceability" "$TC" --strict "$strict_run"
 done
+# The repository-relative form of the three path fields is the same identity, and is the only form
+# the evidence seal's privacy scan accepts in traceability.yaml on a /Users/<operator>/ repository.
+strict_reset; strict_mutate relative-paths
+assert_rc "repository-relative candidate paths pass strict traceability" 0 "$TC" --strict "$strict_run"
 
 t_case "strict partial/uncovered rows need exact current-SHA structured gate authority"
 strict_reset

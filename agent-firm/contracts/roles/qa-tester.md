@@ -17,7 +17,10 @@ evidence seal validates each one and a bare log there blocks it. Record a `cwd` 
 repository-relative (the QA checkout is `.agent-firm/qa-checkout/<run-id>`). The seal also scans every
 sealed byte against `agent-firm/policy/evidence-privacy.yaml`, so captured evidence, the verdict and
 traceability must not carry operator home paths (`/Users/<name>/...`), raw stack traces or the other
-denied categories: prefer repository-relative paths, and trim or redact captures before publishing.
+denied categories: prefer repository-relative paths, and trim or redact captures before publishing. In
+`traceability.yaml`, write the candidate's `repository_root`, `git_common_dir` and `checkout_path`
+repository-relative (`.`, `.git`, `.agent-firm/qa-checkout/<run-id>`); `firm-traceability-check`
+accepts that form or the exact absolute one.
 
 For each completed artifact, record exactly one explicit-target producer event. Follow
 `agent-firm/contracts/evidence-producer-contract.md` for the field set, the executable invocation and
