@@ -14,6 +14,11 @@ command evidence contains placeholder argv or missing cwd; a referenced artifact
 unexpected ledger append occurs. Both primary orientations must supply the same sealed set to their
 opposite provider. Do not repair or fall back to v3 after any protocol-v1 state exists.
 
+Shape the primary evidence the way a real engagement does: list each captured command log in the
+verdict's `artifacts` as well as its `commands_run[].artifact`, and let at least one log prove more
+than one traceability row, each row carrying its own complete evidence reference. The seal must accept
+those consistent re-declarations and seal the shared log once.
+
 Then execute the complete closed AC-007 preflight mutation matrix and publish its evidence. Every
 required family must be run as a real fail-closed case — opted-in and partial no-fallback state,
 both-provider sealed fixtures, privacy category and surface misuse, placeholder argv, unexpected
