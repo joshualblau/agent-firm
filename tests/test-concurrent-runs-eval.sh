@@ -23,6 +23,12 @@
 # firm-integrate or firm-qa-checkout is refactored so the line no longer matches, this file fails
 # loudly rather than mutating nothing and then reporting that a no-op mutant was "caught".
 #
+# UNSUPPORTED LEDGER HOSTS. Four of the check's assertions need a real ledger write (P1.9, P2.7, P3.1,
+# P3.7), and firm-ledger-log refuses every write outside a proven P2 row -- which includes the hosted
+# CI runners, by design. There the clean case requires exactly those four to fail, each for that
+# reason, and every other assertion to pass; the ledger-attribution mutant, which is only
+# distinguishable through a ledger write, is skipped. The full contract still runs on a P2 row.
+#
 # RUNTIME. The full check is ~22s (it parks a real process inside a real merge loop and drives
 # another to completion). The mutation cases use `--only` to run just the property each one targets,
 # so this file lands around a minute rather than two.
@@ -32,6 +38,14 @@ set -uo pipefail
 EVAL_DIR="$FIRM_ROOT/agent-firm/evals/concurrent-runs-one-checkout"
 CHECK="$EVAL_DIR/fixture/test/concurrent-runs-check.py"
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/firm-conc-out.XXXXXX")"; t_track "$OUT"
+
+# ledger_writes_supported — t_p2_row_supported, but also false under firm-ledger-log's own guarded
+# rejection seam, so the unsupported-host path can be exercised on a P2 host:
+#   FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux bash tests/test-concurrent-runs-eval.sh
+ledger_writes_supported() {
+  [ "${FIRM_LEDGER_TEST_GUARD:-}" = 1 ] && [ -n "${FIRM_LEDGER_P2_TEST_REJECT:-}" ] && return 1
+  t_p2_row_supported
+}
 
 # run_check <outfile> <firm-root> [args...] — run the golden check, capture everything, echo the rc
 # into the file so later assertions can read it from the same place as the output.
@@ -87,10 +101,20 @@ assert_output "assertions.yaml invokes that same command and no variant of it" \
 # ---------------------------------------------------------------------------
 t_case "the golden check PASSES against this checkout, and its pass includes the overlap evidence"
 run_check "$OUT/clean.txt" "$FIRM_ROOT"
-assert_output "it exits 0" "check-rc=0" cat "$OUT/clean.txt"
-assert_output "…and says so in its own words" "CONCURRENT-RUNS CHECK: PASS" cat "$OUT/clean.txt"
-assert_eq "no assertion failed" "0" "$(grep -c '^FAIL:' "$OUT/clean.txt")"
-assert_eq "all 36 assertions ran" "36" "$(grep -c '^ok  :' "$OUT/clean.txt")"
+if ledger_writes_supported; then
+  assert_output "it exits 0" "check-rc=0" cat "$OUT/clean.txt"
+  assert_output "…and says so in its own words" "CONCURRENT-RUNS CHECK: PASS" cat "$OUT/clean.txt"
+  assert_eq "no assertion failed" "0" "$(grep -c '^FAIL:' "$OUT/clean.txt")"
+  assert_eq "all 36 assertions ran" "36" "$(grep -c '^ok  :' "$OUT/clean.txt")"
+else
+  # Not a skip: the ledger must refuse, and it must be the ONLY thing that fails.
+  assert_output "it exits 1 on a host outside every P2 row" "check-rc=1" cat "$OUT/clean.txt"
+  assert_eq "exactly the four ledger-bound assertions fail" "P1.9 P2.7 P3.1 P3.7" \
+    "$(sed -n 's/^FAIL: \(P[0-9.]*\) .*/\1/p' "$OUT/clean.txt" | tr '\n' ' ' | sed 's/ $//')"
+  assert_output "…because the ledger refused the write, not for any other reason" \
+    "WRITE_CONFIGURATION_UNSUPPORTED: p2" cat "$OUT/clean.txt"
+  assert_eq "every other assertion passes" "32" "$(grep -c '^ok  :' "$OUT/clean.txt")"
+fi
 # A green run whose overlap assertions did not run would be the sequential fixture AC-012 forbids,
 # wearing a passing exit code. These three are the ones a sequential fixture cannot satisfy, so the
 # pass is only worth anything if they are among the passes.
@@ -145,7 +169,10 @@ m2="$(mk_mutant firm-integrate \
       '"$SELF/firm-ledger-log" --run "$run_dir" integrated' \
       '"$SELF/firm-ledger-log" integrated')"
 assert_ne "the mutant root was built" "" "$m2"
-if [ -n "$m2" ]; then
+if [ -n "$m2" ] && ! ledger_writes_supported; then
+  # With every ledger write refused, the correct tool and this mutant record the same nothing.
+  t_skip "ledger-attribution mutant" "requires a supported P2 ledger write host"
+elif [ -n "$m2" ]; then
   run_check "$OUT/m2.txt" "$m2" --only p1,p2
   assert_output "the check goes red" "check-rc=1" cat "$OUT/m2.txt"
   assert_output "…naming the ambient-pointer attribution under the zero-argument form" \
