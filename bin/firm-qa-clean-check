@@ -51,7 +51,7 @@ def emit(status, code, message, reason, run=None, candidate=None):
     print(f"firm-qa-clean-check: {status.upper()} -- {message}", file=sys.stderr if code else sys.stdout)
     if run is not None and candidate is not None:
         command = [os.path.join(self_dir, "firm-ledger-log"), "--run", run, "--strict", "qa_clean_check",
-                   f"status={status}", f"reason={reason}", f"dir={candidate.get('checkout_path','')}",
+                   f"status={status}", f"reason={reason}", f"dir={os.path.join('.agent-firm', 'qa-checkout', os.path.basename(run))}",
                    f"sha={candidate.get('candidate_sha','')}", f"generation={candidate.get('generation','')}"]
         done = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if done.returncode != 0:
@@ -127,7 +127,9 @@ try:
         events=[json.loads(line) for line in fh if line.strip()]
     matches=[event for event in events if event.get("event")=="qa_checkout"
              and event.get("sha")==sha and str(event.get("generation"))==str(generation)
-             and event.get("dir")==checkout and event.get("source_ref")==candidate.get("source_ref")
+             # Repository-relative since the seal privacy fix; absolute in older ledgers.
+             and event.get("dir") in (checkout, os.path.join(".agent-firm", "qa-checkout", run_id))
+             and event.get("source_ref")==candidate.get("source_ref")
              and event.get("base_sha")==candidate.get("base_sha")]
 except Exception as exc:
     emit("cannot_verify",2,f"target ledger cannot be read: {exc}","ledger",run,candidate)

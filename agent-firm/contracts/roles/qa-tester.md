@@ -11,6 +11,14 @@ Install from the lockfile; run the same unit, integration, e2e, and visual comma
 command, exit, duration, and logs under `09-test-evidence/`. Check every acceptance criterion, state
 untested risks, and run relevant secret/dependency checks.
 
+Every `commands_run[].artifact` is a command-result JSON (`agent-firm/schemas/command-result.schema.json`)
+binding the command's real argv, cwd, timestamps, exit status and hashed stdout/stderr files; the
+evidence seal validates each one and a bare log there blocks it. Record a `cwd` inside the repository
+repository-relative (the QA checkout is `.agent-firm/qa-checkout/<run-id>`). The seal also scans every
+sealed byte against `agent-firm/policy/evidence-privacy.yaml`, so captured evidence, the verdict and
+traceability must not carry operator home paths (`/Users/<name>/...`), raw stack traces or the other
+denied categories: prefer repository-relative paths, and trim or redact captures before publishing.
+
 For each completed artifact, record exactly one explicit-target producer event. Follow
 `agent-firm/contracts/evidence-producer-contract.md` for the field set, the executable invocation and
 every precondition the writer enforces; do not reconstruct a field list from this contract. Publish

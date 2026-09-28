@@ -88,7 +88,7 @@
           },
           "artifact": {
             "type": "string",
-            "description": "path to captured output under 09-test-evidence/"
+            "description": "path under 09-test-evidence/ to a command-result JSON (schemas/command-result.schema.json) that binds the captured stdout/stderr; the evidence seal validates it"
           }
         }
       }
