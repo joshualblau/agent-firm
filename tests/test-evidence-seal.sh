@@ -64,6 +64,7 @@ make_sealable_run() {
   _primary="${1:-claude}"
   _repo="${2:-}"
   _trace_writer="${3:-}"
+  _real_qa_tools="${4:-}"
   [ -n "$_repo" ] || _repo="$(mk_repo)"
   _repo="$(cd "$_repo" && pwd -P)"
   _sha="$(sha_of "$_repo" main)"
@@ -72,18 +73,25 @@ make_sealable_run() {
   printf '%s\n' 'task_slug: seal-fixture' 'track: full_track' 'criteria: []' > "$_run/01-acceptance-criteria.yaml"
   printf '%s\n' 'schema_version: 2' 'task_slug: seal-fixture' 'candidate: {}' 'matrix: []' 'two_voice: {}' 'two_voice_diff: []' > "$_run/traceability.yaml"
   printf '%s\n' '{"artifacts":[],"commands_run":[],"verdict":"APPROVE"}' > "$_run/08-qa-verdict.json"
-  # An optional third argument names a function that rewrites traceability.yaml (and any evidence it
-  # cites) before the producer records are published, so the fixture's records match its final bytes.
-  if [ -n "$_trace_writer" ]; then "$_trace_writer" "$_run" "$_sha" || return 1; fi
   printf '%s\n' '# 10 · Handoff' '<!-- BEGIN COMPLETE LOCAL PR BODY -->' 'Title: sealed fixture' '' 'Body bytes remain exact.' '<!-- END COMPLETE LOCAL PR BODY -->' > "$_run/10-handoff.md"
   _common="$(git -C "$_repo" rev-parse --git-common-dir)"; case $_common in /*) ;; *) _common="$_repo/$_common";; esac
   _common="$(cd "$_common" && pwd -P)"
   _checkout="$_repo/.agent-firm/qa-checkout/$(basename "$_run")"
-  mkdir -p "$(dirname "$_checkout")"
-  git -C "$_repo" worktree add -q --detach "$_checkout" "$_sha" || return 1
-  printf '{"schema_version":2,"run_id":"%s","repository_root":"%s","git_common_dir":"%s","checkout_path":"%s","source_ref":"refs/heads/integration/seal","source_ref_sha":"%s","base_sha":"%s","candidate_sha":"%s","generation":1}\n' \
-    "$(basename "$_run")" "$_repo" "$_common" "$_checkout" "$_sha" "$_sha" "$_sha" > "$_run/09-test-evidence/qa-candidate.json"
-  chmod 600 "$_run/09-test-evidence/qa-candidate.json"
+  if [ -n "$_real_qa_tools" ]; then
+    # A fourth argument captures the candidate with the real firm-qa-checkout, which writes its own
+    # qa-candidate.json and qa_checkout ledger event, exactly as a live engagement does.
+    git -C "$_repo" branch "integration/$(basename "$_run")" "$_sha" || return 1
+    (cd "$_repo" && "$BIN/firm-qa-checkout" --run "$_run") >/dev/null || return 1
+  else
+    mkdir -p "$(dirname "$_checkout")"
+    git -C "$_repo" worktree add -q --detach "$_checkout" "$_sha" || return 1
+    printf '{"schema_version":2,"run_id":"%s","repository_root":"%s","git_common_dir":"%s","checkout_path":"%s","source_ref":"refs/heads/integration/seal","source_ref_sha":"%s","base_sha":"%s","candidate_sha":"%s","generation":1}\n' \
+      "$(basename "$_run")" "$_repo" "$_common" "$_checkout" "$_sha" "$_sha" "$_sha" > "$_run/09-test-evidence/qa-candidate.json"
+    chmod 600 "$_run/09-test-evidence/qa-candidate.json"
+  fi
+  # An optional third argument names a function that rewrites traceability.yaml (and any evidence it
+  # cites) before the producer records are published, so the fixture's records match its final bytes.
+  if [ -n "$_trace_writer" ]; then "$_trace_writer" "$_run" "$_sha" || return 1; fi
   mkdir -p "$_run/role-contracts"
   printf '%s\n' '# fixture qa' > "$_run/role-contracts/Q-01-qa-tester.md"
   printf '%s\n' '# fixture packager' > "$_run/role-contracts/P-01-packager.md"
@@ -114,6 +122,9 @@ make_sealable_run() {
     "role_start_event_id=$_pack_start" >/dev/null || return 1
   "$BIN/firm-ledger-log" --run "$_run" --strict packaging_completed stage=package/P-01 role=packager \
     "role_start_event_id=$_pack_start" >/dev/null || return 1
+  if [ -n "$_real_qa_tools" ]; then
+    "$BIN/firm-qa-clean-check" --run "$_run" >/dev/null || return 1
+  fi
   printf '%s\n' "$_repo" "$_run" "$_sha"
 }
 
@@ -305,6 +316,30 @@ for mutate in ('extra_field','broad_operator_rule','wrong_version'):
  else: raise AssertionError(('broadened policy accepted',mutate))
 PY
 
+write_checkout_command_evidence() {
+  local _wce_run="$1"
+  t_python - "$_wce_run" <<'PY'
+import hashlib,json,os,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+out=run/'09-test-evidence/checkout-status.stdout'
+out.write_bytes(b'')
+os.chmod(out,0o600)
+result={"schema_version":1,"argv":["git","status","--porcelain"],
+        "cwd":".agent-firm/qa-checkout/"+run.name,
+        "started_at":"2026-09-28T00:00:00.000Z","finished_at":"2026-09-28T00:00:01.000Z",
+        "duration_ms":1000,"exit_code":0,"result":"pass","inputs":[],"outputs":[],
+        "stdout":{"kind":"retained","path":"09-test-evidence/checkout-status.stdout","bytes":0,
+                  "sha256":hashlib.sha256(b'').hexdigest(),"mode":"0600","sanitizer":"identity"},
+        "stderr":{"kind":"not_applicable","reason":"stream_not_emitted"}}
+(run/'09-test-evidence/checkout-status.json').write_text(json.dumps(result,indent=2)+"\n")
+verdict={"artifacts":["09-test-evidence/checkout-status.json"],
+         "commands_run":[{"cmd":"git status --porcelain","exit_code":0,"duration_s":1,
+                          "artifact":"09-test-evidence/checkout-status.json"}],
+         "verdict":"APPROVE"}
+(run/'08-qa-verdict.json').write_text(json.dumps(verdict)+"\n")
+PY
+}
+
 t_case "real macOS users hierarchy creates and independently verifies the five-field seal"
 if ! t_p2_row_supported; then
   t_skip "real users-hierarchy seal and independent verification" "requires a supported macOS P2 ledger write host"
@@ -386,6 +421,32 @@ assert privacy['command']['argv'][-1]=='.agent-firm/runs/'+run.name
 PY
       fi
     fi
+      # The live QA path on a /Users repository: the real firm-qa-checkout and firm-qa-clean-check
+      # write their own ledger events, and QA's command evidence runs inside the QA checkout. Before
+      # the fix both put /Users/<operator>/... into sealed bytes (the ledger prefix and the command
+      # result's cwd), so no real run on a macOS operator's repository could ever seal.
+      live_fixture="$(make_sealable_run claude "$users_repo" write_checkout_command_evidence real_qa_tools)"; live_rc=$?
+      live_run="$(printf '%s\n' "$live_fixture" | sed -n '2p')"
+      if [ "$live_rc" -ne 0 ] || [ -z "$live_run" ]; then
+        _t_no "live-QA-path users-hierarchy run created" "fixture setup failed"
+      else
+        _t_ok "live-QA-path users-hierarchy run created"
+        assert_output "the real checkout tool records the checkout repository-relative" \
+          "\"dir\":\".agent-firm/qa-checkout/$(basename "$live_run")\"" cat "$live_run/run.jsonl"
+        assert_ok "the real clean check still binds that relative checkout event" \
+          "$BIN/firm-qa-clean-check" --run "$live_run"
+        assert_ok "seal publishes with real checkout events and in-checkout command evidence" seal_for_run "$live_run"
+        assert_ok "independent verifier accepts it" seal_for_run "$live_run" --verify --phase publication
+        assert_ok "no operator-home path reaches the ledger prefix and the allowances stay at five" \
+          t_python - "$live_run" <<'PY'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+privacy=json.load(open(run/'09-test-evidence/final-evidence/g1/privacy.json'))
+assert privacy['allow_count']==5, privacy['allow_count']
+ledger=[scan for scan in privacy['inputs'] if scan['path']=='run.jsonl#prefix']
+assert len(ledger)==1 and ledger[0]['allowances']==[] and ledger[0]['matches']==[]
+PY
+      fi
     assert_ok "owned users-hierarchy fixture cleanup succeeds" cleanup_users_repo "$users_repo"
     assert_no_file "owned users-hierarchy fixture leaves no residue" "$users_repo"
     assert_eq "real source repository HEAD is unchanged" "$source_head_before" "$(git -C "$FIRM_ROOT" rev-parse HEAD)"
@@ -403,16 +464,20 @@ tmp=pathlib.Path(tempfile.mkdtemp()); (tmp/'in').write_bytes(b'in'); (tmp/'out')
 for p in (tmp/'in',tmp/'out'): os.chmod(p,0o600)
 ident=lambda p:{"path":p.name,"bytes":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest(),"mode":"0600","sanitizer":"identity"}
 valid={"schema_version":1,"argv":["tool","--check"],"cwd":os.path.realpath(tmp),"started_at":"2026-08-31T00:00:00.000Z","finished_at":"2026-08-31T00:00:01.000Z","duration_ms":1000,"exit_code":0,"result":"pass","inputs":[ident(tmp/'in')],"outputs":[ident(tmp/'out')],"stdout":{"kind":"not_applicable","reason":"stream_not_emitted"},"stderr":{"kind":"not_applicable","reason":"stream_not_emitted"}}
-e._validate_command_result(valid,'command.json',tmp)
+e._validate_command_result(valid,'command.json',tmp,tmp)
+# A repository-relative cwd is canonical when it names a real, non-symlinked directory in the repository.
+(tmp/'sub').mkdir(); os.symlink(tmp/'sub',tmp/'link')
+for cwd in ('.','sub'):
+ e._validate_command_result({**valid,'cwd':cwd},'command.json',tmp,tmp)
 mutations=[]
-for key,value in (("argv",["tool","<placeholder>"]),("cwd",str(tmp/'..')),("started_at","not-time"),("finished_at","2026-08-30T00:00:00Z"),("duration_ms",999),("exit_code",1),("result","timeout")):
+for key,value in (("argv",["tool","<placeholder>"]),("cwd",str(tmp/'..')),("cwd","../x"),("cwd","sub/../sub"),("cwd","./sub"),("cwd","missing"),("cwd","link"),("cwd",""),("started_at","not-time"),("finished_at","2026-08-30T00:00:00Z"),("duration_ms",999),("exit_code",1),("result","timeout")):
  d=copy.deepcopy(valid); d[key]=value; mutations.append(d)
 d=copy.deepcopy(valid); d["inputs"][0]["bytes"]+=1; mutations.append(d)
 d=copy.deepcopy(valid); d["extra"]=1; mutations.append(d)
 d=copy.deepcopy(valid); d["inputs"]*=2; mutations.append(d)
 d=copy.deepcopy(valid); d["outputs"]=[]; mutations.append(d)
 for d in mutations:
- try:e._validate_command_result(d,'command.json',tmp)
+ try:e._validate_command_result(d,'command.json',tmp,tmp)
  except e.SealError:pass
  else:raise AssertionError(('command mutation accepted',d))
 sha='a'*40; raw=b'x'; digest=hashlib.sha256(raw).hexdigest(); sid='evt-start'; base=[{"ts":"2026-08-31T00:00:00Z","event":"qa_started","event_id":sid,"stage":"test/Q","role":"qa-tester","contract":{},"authority":[],"activation":{}},{"ts":"2026-08-31T00:00:01Z","event":"evidence_produced","event_id":"evt-proof","run_id":"fixture","path":"x","sha256":digest,"bytes":"1","sha":sha,"generation":"1","stage":"test/Q","role":"qa-tester","role_start_event_id":sid},{"ts":"2026-08-31T00:00:02Z","event":"qa_completed","event_id":"evt-done","stage":"test/Q","role":"qa-tester","role_start_event_id":sid}]

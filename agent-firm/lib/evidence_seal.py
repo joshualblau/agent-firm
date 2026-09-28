@@ -441,7 +441,27 @@ def _integration_index_references(run, relative, raw, value):
     return references
 
 
-def _validate_command_result(value, expected_artifact, run):
+def _command_cwd_is_canonical(cwd, repo):
+    """A command's cwd is canonical absolute, or repository-relative inside the repository.
+
+    Repository-relative is the form an ordinary QA command needs: its cwd is the QA checkout under
+    the repository, and on a macOS host that absolute path lies beneath /Users/<operator>, which the
+    privacy scan denies in test evidence. This mirrors `_privacy_command_cwd`, which projects the
+    sealer's own cwd the same way. `.` is the repository root; `..` and symlinked components are not
+    accepted.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    if os.path.isabs(cwd):
+        return os.path.realpath(cwd) == cwd
+    if os.path.normpath(cwd) != cwd or cwd.split(os.sep)[0] == "..":
+        return False
+    real_repo = os.path.realpath(repo)
+    joined = real_repo if cwd == "." else os.path.join(real_repo, cwd)
+    return os.path.realpath(joined) == joined and os.path.isdir(joined)
+
+
+def _validate_command_result(value, expected_artifact, run, repo):
     _schema_validate(value, "command-result.schema.json", expected_artifact)
     argv = value.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
@@ -449,8 +469,7 @@ def _validate_command_result(value, expected_artifact, run):
     placeholder = re.compile(r"(?:<[^>]+>|\$\{?[A-Za-z_]|\.\.\.|\{\{[^}]+\}\})")
     if any(placeholder.search(item) or "\x00" in item or "\n" in item for item in argv):
         raise SealError("COMMAND_EVIDENCE", "argv contains a placeholder")
-    cwd = value.get("cwd")
-    if not isinstance(cwd, str) or not os.path.isabs(cwd) or os.path.realpath(cwd) != cwd:
+    if not _command_cwd_is_canonical(value.get("cwd"), repo):
         raise SealError("COMMAND_EVIDENCE", "cwd is not canonical")
     started = _parse_rfc3339_utc(value.get("started_at"), "command started_at")
     finished = _parse_rfc3339_utc(value.get("finished_at"), "command finished_at")
@@ -1090,7 +1109,7 @@ def _create_seal_in_place(run_path, policy_path, cli_argv, cwd):
             raise SealError("ORDINARY_OVERSIZE", "ordinary entry bytes exceed 8 MiB")
         value = _load_data(raw, relative)
         if relative in command_artifacts:
-            _validate_command_result(value, relative, run)
+            _validate_command_result(value, relative, run, repo)
         required_producer = relative in ("08-qa-verdict.json", "traceability.yaml", "10-handoff.md")
         producer = _producer(records, relative, raw, sha, generation, required_producer)
         entry = {

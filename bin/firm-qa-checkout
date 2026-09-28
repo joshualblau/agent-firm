@@ -248,6 +248,10 @@ print(generation)
 PY
   )" || exit $?
 
-"$SELF/firm-ledger-log" --run "$run_dir" --strict qa_checkout dir="$qa_dir" branch="$branch" source_ref="refs/heads/$branch" base_sha="$accepted_base" sha="$sha" generation="$generation" candidate="$candidate" >/dev/null
+# The ledger records the checkout repository-relative and the metadata run-relative. Both locations
+# are fixed by construction (<repo>/.agent-firm/qa-checkout/<run-id>, <run>/09-test-evidence/), and an
+# absolute path would put the operator's home directory into the ledger prefix, which the evidence
+# seal's privacy scan rejects.
+"$SELF/firm-ledger-log" --run "$run_dir" --strict qa_checkout dir=".agent-firm/qa-checkout/$run_id" branch="$branch" source_ref="refs/heads/$branch" base_sha="$accepted_base" sha="$sha" generation="$generation" candidate="09-test-evidence/qa-candidate.json" >/dev/null
 echo "clean QA checkout: $qa_dir  (detached candidate ${sha}, metadata $candidate)"
 echo "QA: run only read-only checks in this checkout and capture evidence for candidate ${sha}. Do NOT edit source."
