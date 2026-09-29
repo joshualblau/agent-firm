@@ -317,7 +317,27 @@ expected_trace_candidate = {key:candidate.get(key) for key in (
     "run_id", "repository_root", "git_common_dir", "checkout_path", "source_ref", "source_ref_sha", "base_sha"
 )}
 expected_trace_candidate.update({"commit_sha":sha, "generation":generation})
-if tc != expected_trace_candidate:
+
+def trace_path_matches(value, absolute):
+    """A traceability path field equals qa-candidate.json's value, or its repository-relative form.
+
+    The evidence seal scans traceability.yaml for operator home paths, and on a macOS repository all
+    three of these lie beneath /Users/<operator>/, so the absolute form can never be sealed there.
+    The relative form carries the same identity, anchored at qa-candidate.json's repository_root
+    (`.` for the root itself); it may not climb out of the repository.
+    """
+    if value == absolute:
+        return True
+    root = candidate.get("repository_root")
+    if not isinstance(value, str) or not isinstance(absolute, str) or not isinstance(root, str):
+        return False
+    relative = os.path.relpath(absolute, root)
+    return relative.split(os.sep)[0] != ".." and value == relative
+
+path_keys = ("repository_root", "git_common_dir", "checkout_path")
+if (not isinstance(tc, dict) or set(tc) != set(expected_trace_candidate)
+        or any(tc[key] != value for key, value in expected_trace_candidate.items() if key not in path_keys)
+        or not all(trace_path_matches(tc[key], expected_trace_candidate[key]) for key in path_keys)):
     inadequate("traceability candidate identity does not exactly match qa-candidate.json")
 
 if not isinstance(criteria_doc, dict) or not isinstance(criteria_doc.get("criteria"), list) or not criteria_doc["criteria"]:
