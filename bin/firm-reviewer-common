@@ -1467,6 +1467,7 @@ except Exception as exc:
     # could overwrite or delete a prior summary while leaving today's summary intact. Runs created
     # before the index contract retain their singleton compatibility path, but the presence of any
     # integration-summaries state opts the run into the strict indexed grammar and may not fall back.
+    integration_exclusions = []
     integration_dir = run / "integration-summaries"
     integration_index_origin = "integration-summaries/index.json"
     integration_index = run / integration_index_origin
@@ -1530,6 +1531,21 @@ except Exception as exc:
                 raise ValueError("current stage is not the final history entry")
         except Exception as exc:
             stop(f"integration summary history is malformed or stale: {exc}", 1)
+    elif (seal_receipt.get("state") == "sealed"
+          and not os.path.lexists(run / "integration-summary.md")
+          and not any(path == "integration-summary.md" or path.startswith("integration-summaries/")
+                      for path in seal_receipt["ordinary_paths"])):
+        # A sealed run with no integration stage (a closeout of an already-integrated candidate)
+        # has no summary, and its seal correctly holds none: the seal adds one as a fixed root only
+        # when it exists. The seal is the authority for what the judge must see, so the absence is
+        # DECLARED to the judge as an exclusion with its reason, never silently dropped. A summary
+        # that exists or that the seal holds is still required, and unsealed runs still require one.
+        integration_exclusions.append({
+            "origin_path": "integration-summary.md",
+            "referenced_by": "lifecycle:integrate",
+            "reason": "no_integration_stage_in_this_run_and_the_seal_holds_no_integration_summary",
+            "superseded_by": None,
+        })
     else:
         add_source("integration-summary.md")
     try:
@@ -1649,7 +1665,7 @@ except Exception as exc:
         "reviewer_timeout", "reviewer_unavailable",
     )
     unresolved_references = []
-    excluded_references = []
+    excluded_references = list(integration_exclusions)
     for item in ledger_records:
         if item.get("event") not in terminal_reviewer_events:
             continue

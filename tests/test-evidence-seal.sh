@@ -81,7 +81,7 @@ make_sealable_run() {
     # A fourth argument captures the candidate with the real firm-qa-checkout, which writes its own
     # qa-candidate.json and qa_checkout ledger event, exactly as a live engagement does.
     git -C "$_repo" branch "integration/$(basename "$_run")" "$_sha" || return 1
-    (cd "$_repo" && "$BIN/firm-qa-checkout" --run "$_run") >/dev/null || return 1
+    (cd "$_repo" && "$BIN/firm-qa-checkout" --run "$_run") >/dev/null 2>&1 || return 1
   else
     mkdir -p "$(dirname "$_checkout")"
     git -C "$_repo" worktree add -q --detach "$_checkout" "$_sha" || return 1
@@ -799,6 +799,43 @@ PY
   fi
 else
   t_skip "shared-log seal publication" "requires a supported P2 ledger write host"
+fi
+
+t_case "the judge wrapper follows the seal on a run with no integration stage"
+# A closeout of an already-integrated candidate has no integration summary, and the seal correctly
+# holds none. The wrapper used to stop at input assembly ("required judge input is missing:
+# integration-summary.md") before any provider phase, so such a run could never reach its judge.
+# Input assembly precedes provider discovery, so with no provider CLI on PATH a wrapper that gets
+# past assembly reports the provider unavailable instead.
+write_legacy_integration_summary() { printf '# Integration summary\n\nLegacy fixture.\n' > "$1/integration-summary.md"; }
+if t_p2_row_supported; then
+  judge_fixture="$(make_sealable_run claude "" "" real_qa_tools)"; judge_run="$(printf '%s\n' "$judge_fixture" | sed -n '2p')"
+  if [ -z "$judge_run" ]; then
+    _t_no "no-integration sealed run created" "fixture setup failed"
+  else
+    assert_ok "the no-integration run seals" seal_for_run "$judge_run"
+    judge_out="$(env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$judge_run" 2>&1)"; judge_rc=$?
+    assert_no_output_text() { case "$2" in *"$3"*) _t_no "$1" "found: $3";; *) _t_ok "$1";; esac; }
+    assert_no_output_text "input assembly no longer demands a summary the seal does not hold" \
+      "$judge_out" "required judge input is missing"
+    assert_eq "it reaches provider discovery and reports the absent CLI as unavailable" 3 "$judge_rc"
+  fi
+  held_fixture="$(make_sealable_run claude "" write_legacy_integration_summary real_qa_tools)"
+  held_run="$(printf '%s\n' "$held_fixture" | sed -n '2p')"
+  if [ -z "$held_run" ]; then
+    _t_no "summary-holding sealed run created" "fixture setup failed"
+  else
+    assert_ok "a run with a summary seals it" seal_for_run "$held_run"
+    rm "$held_run/integration-summary.md"
+    held_out="$(env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$held_run" 2>&1)"; held_rc=$?
+    assert_eq "a summary the seal holds is still required" 1 "$held_rc"
+    case "$held_out" in
+      *"ARTIFACT_MISSING: integration-summary.md"*|*"required judge input is missing: integration-summary.md"*) _t_ok "…and its absence is named";;
+      *) _t_no "…and its absence is named" "$(printf '%s' "$held_out" | tail -c 300)";;
+    esac
+  fi
+else
+  t_skip "judge wrapper on a sealed no-integration run" "requires a supported P2 ledger write host"
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"
