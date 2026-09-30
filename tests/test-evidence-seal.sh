@@ -340,6 +340,35 @@ verdict={"artifacts":["09-test-evidence/checkout-status.json"],
 PY
 }
 
+t_case "the known-fake fixture allowance covers one exact token on the source diff and nothing else"
+assert_ok "the fake password in a test comment is allowed only as that exact token, only in source_diff" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import os,sys
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+policy=e.parse_json_unique(open(os.path.join(sys.argv[1],"agent-firm","policy","evidence-privacy.yaml"),"rb").read())
+privacy=e._privacy_patterns(policy)
+diff="09-test-evidence/final-evidence/g1/candidate.diff"
+# The exact comment line from tests/test-judge-input-integrity.sh on the PR #12 candidate.
+line=b"+# THE REGRESSION THIS CASE EXISTS FOR. Textual redaction caught `password: hunter2` because the key\n"
+scan=e._scan(line,diff,privacy)
+assert [a["rule_id"] for a in scan["allowances"]]==["known_fake_secret_fixture_hunter2"],scan
+def blocked(raw,relative):
+    try:
+        e._scan(raw,relative,privacy)
+    except e.SealError as exc:
+        assert exc.category=="PRIVACY_MATCH",exc.category
+    else:
+        raise AssertionError(("allowed",raw,relative))
+# Same token on any other surface still blocks.
+for relative in ("10-handoff.md","08-qa-verdict.json","traceability.yaml","09-test-evidence/x.log"):
+    blocked(line,relative)
+# Any other value, key, spacing or a longer value still blocks on the source diff.
+for raw in (b"password: hunter3`", b"password: hunter2x`", b"password=hunter2`", b"password: hunter2",
+            b"passwd: hunter2`", b"password: hunter2`extra", b"api_key: hunter2`", b"password:  hunter2`"):
+    blocked(raw,diff)
+PY
+
 t_case "real macOS users hierarchy creates and independently verifies the five-field seal"
 if ! t_p2_row_supported; then
   t_skip "real users-hierarchy seal and independent verification" "requires a supported macOS P2 ledger write host"
