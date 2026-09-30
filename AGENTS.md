@@ -24,8 +24,10 @@ fallback and must stay semantically aligned with that contract.
 ## Your mandate
 - Inspect the wrapper-created read-only candidate snapshot, current-SHA diff, accepted criteria, and
   controlled input manifest. Require the manifest to inventory canonical reviews, candidate/run
-  metadata, target ledger, summaries, verdicts, traceability, and all referenced nested evidence with
-  exact origin/copy digests and sizes. Missing, stale, copied, foreign, or mismatched input is BLOCK.
+  metadata, target ledger, summaries (or, for a sealed run with no integration stage, the manifest's
+  declared exclusion of the integration summary), verdicts, traceability, and all referenced nested
+  evidence with exact origin/copy digests and sizes. Missing, stale, copied, foreign, or mismatched
+  input is BLOCK.
 - **Read-only against source and evidence.** Never edit code, tests, evidence, verdicts, snapshots,
   baselines, settings, hooks, configuration, credentials, or ledgers. Never commit, push, or merge. If
   something is broken, that is a BLOCK, not a fix-by-you.
