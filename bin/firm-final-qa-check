@@ -96,6 +96,29 @@ try:
 except BaseException as exc:
     cannot(f"validation prerequisites unavailable or broken: {type(exc).__name__}: {exc}")
 
+# The seal's own privacy scan, for the post-judge artifacts this check consumes and for the decision
+# state it writes. Neither is sealed, so without this nothing would hold them to the privacy policy
+# the sealed evidence meets -- and a decision state that failed the seal's scan would make every
+# later verification of this run fail.
+firm_root = policy_path.resolve().parents[2]
+sys.path.insert(0, str(firm_root / "agent-firm" / "lib"))
+try:
+    import evidence_seal
+    privacy_patterns = evidence_seal._privacy_patterns(evidence_seal.parse_json_unique(
+        (firm_root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
+except BaseException as exc:
+    cannot(f"privacy policy unavailable: {type(exc).__name__}: {exc}")
+
+def privacy_match(raw, relative):
+    """Return the seal's PRIVACY_MATCH detail for these bytes on this path's surface, or None."""
+    try:
+        evidence_seal._scan(raw, relative, privacy_patterns)
+    except evidence_seal.SealError as exc:
+        if exc.category == "PRIVACY_MATCH":
+            return exc.detail
+        cannot(f"privacy scan failed: {exc.category}: {exc.detail}")
+    return None
+
 def load_json(path, label):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -298,6 +321,9 @@ def require_decision_answered(event, label, answering):
     state_raw=safe_file(decision.get("path"),f"{label} decision state").read_bytes()
     if hashlib.sha256(state_raw).hexdigest()!=decision.get("sha256") or str(len(state_raw))!=str(decision.get("bytes")):
         block(f"{label} decision state changed after it was recorded")
+    leak=privacy_match(state_raw,decision.get("path"))
+    if leak is not None:
+        block(f"{label} decision state carries a privacy-policy match: {leak}")
     try:
         state=json.loads(state_raw)
     except Exception as exc:
@@ -326,6 +352,9 @@ def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
     if event.get("event")=="post_judge_artifact_published":
         if event.get("kind") not in post_judge_kinds or answering is None:
             block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
+        leak=privacy_match(raw,ref.get("path"))
+        if leak is not None:
+            block(f"{label} carries a privacy-policy match: {leak}")
         # Every post-judge artifact answers one attempt; it may answer only the CURRENT one.
         if event.get("secondary_attempt_id")!=answering.get("attempt_id"):
             block(f"{label} was published for attempt {event.get('secondary_attempt_id')}, "
@@ -395,6 +424,9 @@ def decision_required(kind, objections, permitted_record_types, secondary_attemp
            "secondary_attempt_id":secondary_attempt_id,
            "created_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
     payload=(json.dumps(state,indent=2,sort_keys=True)+"\n").encode("utf-8")
+    leak=privacy_match(payload,relative)
+    if leak is not None:
+        cannot(f"the decision state would carry a privacy-policy match ({leak}); nothing was written")
     atomic_write(path,payload)
     done=subprocess.run([str(ledger_writer),"--run",str(run),"--strict","--event-id",event_id,
                          "final_decision_required",f"path={relative}",f"sha={sha}",f"generation={generation}",
@@ -594,6 +626,9 @@ if published_dispositions:
     latest_raw=safe_file(latest_rel,"published two-voice dispositions").read_bytes()
     if hashlib.sha256(latest_raw).hexdigest()!=latest.get("sha256") or str(len(latest_raw))!=str(latest.get("bytes")):
         block("published two-voice dispositions changed after publication")
+    leak=privacy_match(latest_raw,latest_rel)
+    if leak is not None:
+        block(f"published two-voice dispositions carry a privacy-policy match: {leak}")
     try:
         published=json.loads(latest_raw)
     except Exception as exc:

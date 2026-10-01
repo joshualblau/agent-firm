@@ -10,7 +10,8 @@ run's CURRENT sealed generation, so a test names only the one dimension it is ch
                                  way bin/firm-final-qa-check does, then logs path/sha/generation/
                                  sha256/bytes/kind (kind defaults to secondary_objections). The state
                                  names the attempt it is about: the latest reviewer-state attempt, or
-                                 `state_attempt=<id>`, or none with `state_attempt=@none`.
+                                 `state_attempt=<id>`, or none with `state_attempt=@none`;
+                                 `state_objection=<text>` puts one objection text in it.
   final_gate_pending             logs sha/generation.
   post_judge_artifact_published  needs path=<run-relative file>, kind=<kind>, and
                                  secondary_attempt_id=<attempt>; logs the file's exact digest/size
@@ -83,6 +84,9 @@ if event == "final_decision_required":
              "created_at": "2026-10-01T00:00:00Z"}
     if state_attempt != "@none":
         state["secondary_attempt_id"] = state_attempt
+    state_objection = overrides.pop("state_objection", None)
+    if state_objection is not None:
+        state["objections"] = [{"id": "obj-fixture", "text": state_objection}]
     target = os.path.join(run, artifact)
     with open(target, "w") as handle:
         handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")

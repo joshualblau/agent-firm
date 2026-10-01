@@ -179,7 +179,9 @@ check's own `final_decision_required`, the Lead's `final_gate_pending`, native p
 `seal_event_id`, `seal_projection_sha256`). Every one is bound to the seal's candidate and
 generation; a post-judge artifact lies under `09-test-evidence/post-judge/g<N>/`, is published once
 with its exact digest and size, names the seal's publication event and projection, and names an
-attempt already terminal in that suffix. Primary QA's own kinds, `two_voice_dispositions` and
+attempt already terminal in that suffix. Post-judge artifacts and decision states are not sealed, so
+verification scans them with the seal's own privacy policy, and the Final check scans every one it
+consumes and refuses to write a decision state that would carry a privacy-policy match. Primary QA's own kinds, `two_voice_dispositions` and
 `disposition_evidence`, also carry `stage`, `role=qa-tester` and `role_start_event_id`, and must be
 published inside one native `qa-tester` window that was opened after the attempt they answer and is
 closed by its `qa_completed`; a `human_decision` is published by the Lead, carries no window, and

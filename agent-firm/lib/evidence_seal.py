@@ -1415,8 +1415,14 @@ def post_judge_root(generation):
     return f"09-test-evidence/post-judge/g{generation}/"
 
 
-def _post_judge_bytes(run, item):
-    """Read the artifact a post-judge event names and require the exact digest and size it states."""
+def _post_judge_bytes(run, item, privacy):
+    """Read the artifact a post-judge event names: exact digest and size, and the seal's privacy scan.
+
+    Post-judge artifacts are never sealed, so nothing else would hold them to the privacy policy the
+    sealed evidence meets; they are scanned with the same deny categories on their own surface.
+    """
+    if privacy is None:
+        raise SealError("PRIVACY_POLICY", "post-judge artifacts are verified only with the privacy policy")
     if (HEX64.fullmatch(str(item.get("sha256", ""))) is None
             or re.fullmatch(r"0|[1-9][0-9]*", str(item.get("bytes", ""))) is None):
         raise SealError("LEDGER_SUFFIX", f"{item.get('event')} digest/size is malformed")
@@ -1426,6 +1432,7 @@ def _post_judge_bytes(run, item):
         raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact is unreadable:{exc.category}") from exc
     if sha256(raw) != item["sha256"] or str(len(raw)) != item["bytes"]:
         raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact digest/size mismatch")
+    _scan(raw, item["path"], privacy)
     return raw
 
 
@@ -1449,7 +1456,7 @@ def _validate_qa_window_event(item, index, qa_windows):
 
 
 def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                         records=None, qa_windows=None, decisions=None):
+                         records=None, qa_windows=None, decisions=None, privacy=None):
     event = item.get("event")
     identity = seal["identity"]
     if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
@@ -1465,7 +1472,7 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
             raise SealError("LEDGER_SUFFIX", "final_decision_required field set is not closed")
         if item.get("path") != f"09-test-evidence/final-decision-required.{item.get('event_id')}.json":
             raise SealError("LEDGER_SUFFIX", "final_decision_required does not name its own decision state")
-        raw = _post_judge_bytes(run, item)
+        raw = _post_judge_bytes(run, item, privacy)
         try:
             state = parse_json_unique(raw, item["path"])
         except SealError as exc:
@@ -1519,11 +1526,12 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
                 or decision["attempt"] != item.get("secondary_attempt_id")):
             raise SealError("LEDGER_SUFFIX",
                             "human_decision does not answer an earlier final_decision_required for its attempt")
-    _post_judge_bytes(run, item)
+    _post_judge_bytes(run, item, privacy)
     published_paths.add(path)
 
 
-def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None):
+def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None,
+                     privacy=None):
     prefix_count = seal["ledger"]["prefix"]["record_count"]
     suffix = records[prefix_count:]
     if not suffix:
@@ -1546,7 +1554,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
                 _validate_qa_window_event(item, offset, qa_windows)
             else:
                 _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                                     records, qa_windows, decisions)
+                                     records, qa_windows, decisions, privacy)
             continue
         if event not in REVIEWER_SUFFIX_EVENTS:
             raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
@@ -1699,7 +1707,8 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
         expected_artifacts.append({"path": relative, "kind": kind, "bytes": len(raw), "sha256": sha256(raw)})
     expected_artifacts.sort(key=lambda item: item["path"])
     publication = {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
-    open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id)
+    open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id,
+                                    patterns)
     receipt = {
         "schema_version": 1, "state": "sealed", "manifest_version": 4,
         "run_id": run.name, "candidate_sha": candidate["candidate_sha"], "generation": generation,

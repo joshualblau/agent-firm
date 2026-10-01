@@ -316,6 +316,35 @@ PY
   assert_rc "the same dispositions published post-judge in an unsealed run are not authority" 1 "$FINAL" "$run"
 fi
 
+# A decision state is not sealed and is written from the judge's own objection text, so the Final
+# check scans it with the seal's privacy policy BEFORE writing it: a match writes nothing, records no
+# event, and cannot evaluate. (In a sealed run the seal would otherwise refuse every later
+# verification.) The leak is assembled at run time so this file's own source carries none.
+t_case "a decision state that would carry a privacy-policy match is never written"
+reset_case claude
+leak_text="$(printf 'secondary defect leaks %s%s=%s' pass word Leaked-value-1234)"
+wrapper_attempt gpt BLOCK "$leak_text" gpt-c1-a0801 yes
+t_python - "$run" "$producer_start" "$leak_text" <<'PY'
+import hashlib,json,os,secrets,sys,yaml
+run,producer_start,text=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p))
+sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
+raw=open(run+"/09-test-evidence/proof.log","rb").read(); eid="evt-leak-"+secrets.token_hex(8)
+event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":"09-test-evidence/proof.log","sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),"stage":"test/Q-01","role":"qa-tester","role_start_event_id":producer_start}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+ref={"path":"09-test-evidence/proof.log","candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":"evidence_produced"}}
+d["two_voice_diff"]=[{"secondary_blocker_id":"obj-secondary-defect","secondary_blocker":text,"primary_position":"positive evidence-based contrary reading","positive_dissent":True,
+ "affected_criteria":["AC-001"],"affected_paths":["result.txt"],"risk":"low","risk_reasons":["criterion:AC-001:functional","path:result.txt:benign"],
+ "bounded_resolution":{"attempted":True,"rounds":1,"rerun":"block","evidence":ref},"evidence":ref,"disposition":"human_decision"}]
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+leak_before="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+leak_events_before="$(grep -c '"event":"final_decision_required"' "$run/run.jsonl")"
+assert_rc "a decision state with a privacy-policy match cannot be evaluated" 2 "$FINAL" "$run"
+assert_output "…and says why" "would carry a privacy-policy match" "$FINAL" "$run"
+assert_eq "…and wrote no decision state" "$leak_before" \
+  "$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+assert_eq "…and recorded no decision event" "$leak_events_before" "$(grep -c '"event":"final_decision_required"' "$run/run.jsonl")"
+
 t_case "one decision_required artifact aggregates mixed benign and protected objections"
 reset_case claude
 wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0601 yes result.txt 'protected defect' auth/token.txt

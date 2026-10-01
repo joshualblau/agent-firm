@@ -1029,15 +1029,15 @@ else
         provider=gpt generation=1 "sha=$pj_sha" "attempt=$pj_open_rel" attempt_id=gpt-c1-a0900 \
         "seal_event_id=$pj_seal_event" "seal_projection_sha256=$pj_projection" >/dev/null
     }
-    pj_expect() { # <accept|refuse> <label> [phase] [needle] — a refusal must be the suffix grammar's own
-      local _pj_out _pj_rc _pj_needle="${4:-BLOCK LEDGER_SUFFIX}"
+    pj_expect() { # <accept|refuse> <label> [phase] [needle] [category] — a refusal must be the grammar's own
+      local _pj_out _pj_rc _pj_needle="${4:-BLOCK LEDGER_SUFFIX}" _pj_category="${5:-LEDGER_SUFFIX}"
       _pj_out="$(seal_for_run "$pj_run" --verify --phase "${3:-publication}" 2>&1)"; _pj_rc=$?
       if [ "$1" = accept ]; then
         if [ "$_pj_rc" -eq 0 ]; then _t_ok "$2"; else _t_no "$2" "rc=$_pj_rc $(_t_ctx "$_pj_out")"; fi
       else
         case "$_pj_rc:$_pj_out" in
           0:*) _t_no "$2" "accepted" ;;
-          *"BLOCK LEDGER_SUFFIX"*)
+          *"BLOCK $_pj_category"*)
             case "$_pj_out" in
               *"$_pj_needle"*) _t_ok "$2"; [ -n "${PJ_TRACE:-}" ] && printf '         %s\n' "$(_t_ctx "$_pj_out")" ;;
               *) _t_no "$2" "refused without naming '$_pj_needle': $(_t_ctx "$_pj_out")" ;;
@@ -1183,6 +1183,24 @@ PY
     pj_publish human.yaml human_decision decision_required_event_id=evt-pj-unavailable
     pj_expect refuse "a human_decision cannot answer a required-unavailable decision" publication \
       "does not answer an earlier final_decision_required"
+
+    # POST-JUDGE BYTES MEET THE SEAL'S PRIVACY POLICY. They are never sealed, so the verifier scans
+    # them itself with the same deny categories. The leaks are assembled at run time so this file's own
+    # source carries none of them.
+    pj_leak_secret="$(printf '%s%s=%s' pass word Leaked-value-1234)"
+    pj_leak_home="$(printf '/%s/operator/.ssh/id_ed25519' Users)"
+    printf 'primary QA notes: %s\n' "$pj_leak_secret" > "$pj_run/$pj_root/leak-secret.md"
+    printf 'see %s\n' "$pj_leak_home" > "$pj_run/$pj_root/leak-home.md"
+    chmod 600 "$pj_run/$pj_root/leak-secret.md" "$pj_run/$pj_root/leak-home.md"
+    pj_restore "$pj_judged"; pj_publish leak-secret.md disposition_evidence
+    pj_expect refuse "a post-judge artifact carrying a secret assignment is refused" publication \
+      "secret_assignment" PRIVACY_MATCH
+    pj_restore "$pj_judged"; pj_publish leak-home.md two_voice_dispositions
+    pj_expect refuse "a post-judge artifact carrying an operator home path is refused" publication \
+      "operator_home" PRIVACY_MATCH
+    pj_restore "$pj_judged"; pj final_decision_required "state_objection=$pj_leak_secret"
+    pj_expect refuse "a decision state carrying a secret assignment is refused" publication \
+      "secret_assignment" PRIVACY_MATCH
 
     # Everything outside the closed set is still refused after the judge.
     pj_restore "$pj_judged"; pj lead_note note=after-the-judge
@@ -1542,6 +1560,24 @@ PY
     fr_check 0 "proceed_with_primary from a primary-QA window with one bounded round passes"
     assert_ok "the seal verifies with the windowed primary-QA publications" \
       seal_for_run "$fr_run" --verify --phase publication
+
+    # Post-judge bytes meet the privacy policy: disposition evidence carrying a secret assignment
+    # (assembled at run time) cannot clear the BLOCK, whichever of the seal or the Final check sees it.
+    fr_before_leak="$fr_stub/before-leak"; mkdir -p "$fr_before_leak"; cp -p "$fr_run/run.jsonl" "$fr_before_leak/"
+    printf 'bounded round notes: %s\n' "$(printf '%s%s=%s' pass word Leaked-value-1234)" > "$fr_run/$fr_root/round-leak.md"
+    chmod 600 "$fr_run/$fr_root/round-leak.md"
+    fr_round_leak="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003)"
+    fr_dispositions two-voice-dispositions.14.json gpt-c1-a0003 disposition=proceed_with_primary \
+      "evidence=$fr_round_leak" "bounded=$fr_round_leak"
+    fr_publish two-voice-dispositions.14.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_leak_out="$("$BIN/firm-final-qa-check" "$fr_run" 2>&1)"; fr_leak_rc=$?
+    case "$fr_leak_rc:$fr_leak_out" in
+      0:*) _t_no "disposition evidence carrying a secret cannot clear the BLOCK" "passed" ;;
+      *secret_assignment*) _t_ok "disposition evidence carrying a secret cannot clear the BLOCK" ;;
+      *) _t_no "disposition evidence carrying a secret cannot clear the BLOCK" "$(_t_ctx "$fr_leak_out")" ;;
+    esac
+    cp -p "$fr_before_leak/run.jsonl" "$fr_run/run.jsonl"
+    fr_check 0 "…and the run is restored to its passing state"
   fi
 fi
 
