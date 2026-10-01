@@ -838,6 +838,131 @@ else
   t_skip "judge wrapper on a sealed no-integration run" "requires a supported P2 ledger write host"
 fi
 
+# ledger_writes_supported — t_p2_row_supported, but also false under firm-ledger-log's own guarded
+# rejection seam (the tests/test-concurrent-runs-eval.sh pattern), so the post-judge and generation
+# cases below are SKIPPED by name on a refused host rather than reported as fixture failures:
+#   FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux bash tests/test-evidence-seal.sh
+ledger_writes_supported() {
+  [ "${FIRM_LEDGER_TEST_GUARD:-}" = 1 ] && [ -n "${FIRM_LEDGER_P2_TEST_REJECT:-}" ] && return 1
+  t_p2_row_supported
+}
+
+# publish_generation_producers <run> <sha> <generation> <qa-stage> <packager-stage> — publish the
+# three fixed-root producers for one generation inside fresh QA and packager role windows, the way
+# make_sealable_run does for generation 1. Role windows are unique per stage, so a later generation
+# names new stages.
+publish_generation_producers() {
+  local _pg_run="$1" _pg_sha="$2" _pg_gen="$3" _pg_qa="$4" _pg_pack="$5" _pg_event _pg_authority _pg_start _pg_path
+  _pg_event="$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["event_id"])' "$_pg_run/run.jsonl")"
+  _pg_authority="$(t_python -c 'import json,sys; rid=sys.argv[1]; print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":sys.argv[2],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":sys.argv[3]}}}],separators=(",",":")))' \
+    "$(basename "$_pg_run")" "$_pg_event" "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$_pg_run/09-test-evidence/qa-candidate.json")")"
+  _pg_start="$("$BIN/firm-ledger-log" --run "$_pg_run" --strict --role-start --stage "$_pg_qa" --role qa-tester \
+    --contract role-contracts/Q-01-qa-tester.md --event qa_started --authority-json "$_pg_authority" \
+    --agent /root/seal_fixture_qa --activation-json "$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)" \
+    | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')" || return 1
+  for _pg_path in 08-qa-verdict.json traceability.yaml; do
+    "$BIN/firm-ledger-log" --run "$_pg_run" --strict evidence_produced "sha=$_pg_sha" "generation=$_pg_gen" \
+      "path=$_pg_path" "sha256=$(shasum -a 256 "$_pg_run/$_pg_path" | awk '{print $1}')" \
+      "bytes=$(wc -c < "$_pg_run/$_pg_path" | tr -d ' ')" "stage=$_pg_qa" role=qa-tester \
+      "role_start_event_id=$_pg_start" >/dev/null || return 1
+  done
+  "$BIN/firm-ledger-log" --run "$_pg_run" --strict qa_completed "stage=$_pg_qa" role=qa-tester \
+    "role_start_event_id=$_pg_start" >/dev/null || return 1
+  _pg_start="$("$BIN/firm-ledger-log" --run "$_pg_run" --strict --role-start --stage "$_pg_pack" --role packager \
+    --contract role-contracts/P-01-packager.md --event packaging_started --authority-json "$_pg_authority" \
+    --agent /root/seal_fixture_packager --activation-json "$("$BIN/firm-model-resolve" --provider codex --role packager --format activation)" \
+    | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')" || return 1
+  "$BIN/firm-ledger-log" --run "$_pg_run" --strict evidence_produced "sha=$_pg_sha" "generation=$_pg_gen" \
+    path=10-handoff.md "sha256=$(shasum -a 256 "$_pg_run/10-handoff.md" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$_pg_run/10-handoff.md" | tr -d ' ')" "stage=$_pg_pack" role=packager \
+    "role_start_event_id=$_pg_start" >/dev/null || return 1
+  "$BIN/firm-ledger-log" --run "$_pg_run" --strict packaging_completed "stage=$_pg_pack" role=packager \
+    "role_start_event_id=$_pg_start" >/dev/null
+}
+
+t_case "the seal's producer for a path is the row of the generation being sealed"
+assert_ok "producer selection is generation-scoped and still exact inside a generation" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import copy,hashlib,os,sys
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+raw=b'x'; digest=hashlib.sha256(raw).hexdigest(); sha1="a"*40; sha2="b"*40
+def window(gen,sha,stage,second):
+    sid=f"evt-start-{gen}"
+    return [{"ts":f"2026-10-01T00:00:{second:02d}Z","event":"qa_started","event_id":sid,"stage":stage,"role":"qa-tester","contract":{},"authority":[],"activation":{}},
+            {"ts":f"2026-10-01T00:00:{second+1:02d}Z","event":"evidence_produced","event_id":f"evt-proof-{gen}","run_id":"fixture","path":"x","sha256":digest,"bytes":"1","sha":sha,"generation":str(gen),"stage":stage,"role":"qa-tester","role_start_event_id":sid},
+            {"ts":f"2026-10-01T00:00:{second+2:02d}Z","event":"qa_completed","event_id":f"evt-done-{gen}","stage":stage,"role":"qa-tester","role_start_event_id":sid}]
+rows=window(1,sha1,"test/Q-01",0)+window(2,sha2,"test/Q-02",10)
+assert e._producer(rows,'x',raw,sha2,2,True)["event_id"]=="evt-proof-2"
+assert e._producer(rows,'x',raw,sha1,1,True)["event_id"]=="evt-proof-1"
+assert e._producer(rows,'x',raw,"c"*40,3,False) is None
+def refused(rows,sha,generation,category):
+    try: e._producer(rows,'x',raw,sha,generation,True)
+    except e.SealError as exc: assert exc.category==category,(exc.category,category)
+    else: raise AssertionError(("accepted",category))
+refused(rows,"c"*40,3,"PRODUCER_MISSING")
+twice=copy.deepcopy(rows); twice.insert(5,dict(twice[4],event_id="evt-proof-2b"))
+refused(twice,sha2,2,"PRODUCER_DUPLICATE")
+other=copy.deepcopy(rows); other[4]["sha"]="d"*40
+refused(other,sha2,2,"PRODUCER_STALE")
+PY
+
+t_case "a sealed and judged generation can be recaptured, republished, and sealed as generation 2"
+if ! ledger_writes_supported; then
+  t_skip "generation-2 recapture after a sealed judge attempt" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  g2_fixture="$(make_sealable_run claude "" "" real_qa_tools)"
+  g2_repo="$(printf '%s\n' "$g2_fixture" | sed -n '1p')"; g2_run="$(printf '%s\n' "$g2_fixture" | sed -n '2p')"
+  g2_sha1="$(printf '%s\n' "$g2_fixture" | sed -n '3p')"
+  if [ -z "$g2_run" ]; then
+    _t_no "generation-2 fixture created" "fixture setup failed"
+  else
+    _t_ok "generation-2 fixture created"
+    assert_ok "generation 1 seals" seal_for_run "$g2_run"
+    g2_judge_rc=0; env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$g2_run" >/dev/null 2>&1 || g2_judge_rc=$?
+    assert_eq "the generation-1 judge attempt reaches a terminal outcome" 3 "$g2_judge_rc"
+    ( cd "$g2_repo" && git checkout -q "integration/$(basename "$g2_run")" && printf 'generation two\n' > gen2.txt \
+      && git add gen2.txt && git commit -qm "generation two" && git checkout -q main ) >/dev/null 2>&1
+    g2_sha2="$(sha_of "$g2_repo" "integration/$(basename "$g2_run")")"
+    g2_out="$(cd "$g2_repo" && "$BIN/firm-qa-checkout" --run "$g2_run" 2>&1)"; g2_rc=$?
+    assert_eq "firm-qa-checkout captures generation 2 after a sealed judge attempt" 0 "$g2_rc"
+    case "$g2_out" in *unclassifiable*) _t_no "the recapture names no unclassifiable ledger" "$(_t_ctx "$g2_out")";; *) _t_ok "the recapture names no unclassifiable ledger";; esac
+    assert_eq "the candidate is now generation 2" 2 \
+      "$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$g2_run/09-test-evidence/qa-candidate.json")"
+    assert_rc "the two-generation ledger classifies" 0 \
+      "$BIN/firm-ledger-log" --classify-ledger-file "$(basename "$g2_run")" "$g2_run/run.jsonl"
+    g2_before="$(shasum -a 256 "$g2_run/run.jsonl" | awk '{print $1}')"
+    assert_rc "a new generation-1 era publication is refused once generation 2 exists" 1 \
+      "$BIN/firm-ledger-log" --run "$g2_run" --strict evidence_produced "sha=$g2_sha1" generation=1 \
+      path=08-qa-verdict.json "sha256=$(shasum -a 256 "$g2_run/08-qa-verdict.json" | awk '{print $1}')" \
+      "bytes=$(wc -c < "$g2_run/08-qa-verdict.json" | tr -d ' ')" stage=test/Q-01 role=qa-tester \
+      role_start_event_id=evt-not-a-window
+    assert_eq "the refused late publication leaves the ledger exact" "$g2_before" \
+      "$(shasum -a 256 "$g2_run/run.jsonl" | awk '{print $1}')"
+    assert_ok "generation 2 republishes its fixed-root producers" \
+      publish_generation_producers "$g2_run" "$g2_sha2" 2 test/Q-02 package/P-02
+    assert_ok "generation 2 seals with its own producer rows" seal_for_run "$g2_run"
+    assert_file "the generation-2 seal is its own bundle" "$g2_run/09-test-evidence/final-evidence/g2/seal.json"
+    assert_ok "the generation-2 seal verifies for publication" seal_for_run "$g2_run" --verify --phase publication
+    assert_ok "the generation-2 seal verifies for wrapper preflight" seal_for_run "$g2_run" --verify --phase wrapper-preflight
+    assert_ok "every generation-2 fixed-root producer is a generation-2 row" t_python - "$g2_run" "$g2_sha2" <<'PY'
+import json,sys
+run,sha=sys.argv[1:]
+seal=json.load(open(run+"/09-test-evidence/final-evidence/g2/seal.json"))
+rows={row.get("event_id"):row for row in map(json.loads,open(run+"/run.jsonl"))}
+entries={entry["path"]:entry for entry in seal["entries"]}
+for path in ("08-qa-verdict.json","traceability.yaml","10-handoff.md"):
+    row=rows[entries[path]["producer"]["event_id"]]
+    assert row["generation"]=="2" and row["sha"]==sha,(path,row)
+assert seal["identity"]["generation"]==2 and seal["identity"]["candidate_sha"]==sha
+PY
+    g2_wrapper_out="$(env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$g2_run" 2>&1)"; g2_wrapper_rc=$?
+    assert_eq "the real wrapper passes generation-2 preflight and reaches provider discovery" 3 "$g2_wrapper_rc"
+    assert_output "the generation-2 attempt is numbered for its own generation" "gpt-c2-a0001" \
+      cat "$g2_run/09-test-evidence/reviewer-state.gpt.json"
+  fi
+fi
+
 t_case "proven no-append publication failure removes the complete unpublished bundle"
 cleanup_fixture="$(make_sealable_run)"; cleanup_run="$(printf '%s\n' "$cleanup_fixture" | sed -n '2p')"
 if t_p2_row_supported; then

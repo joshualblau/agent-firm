@@ -739,7 +739,11 @@ def _producer(records, path, raw, sha, generation, required):
                 or not isinstance(item.get("stage"), str) or not item["stage"]
                 or not isinstance(item.get("role"), str) or not item["role"]):
             raise SealError("PRODUCER_SHAPE", str(item.get("path", "evidence"))[:160])
-    matches = [item for item in publications if item["path"] == path]
+    # Generation-scoped: a later generation republishes the same fixed roots, so the run-wide set of
+    # rows for one path is one row PER GENERATION. Only the generation being sealed or verified is
+    # its producer; within that generation a sha that is not this candidate's is still stale below.
+    matches = [item for item in publications
+               if item["path"] == path and str(item.get("generation")) == str(generation)]
     if not matches:
         if required:
             raise SealError("PRODUCER_MISSING", path)

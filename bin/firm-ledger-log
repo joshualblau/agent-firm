@@ -487,7 +487,52 @@ def legacy_evidence_shape(record):
     return True
 
 
-def validate_evidence_record(record, ledger_run_id, context):
+def checkout_history(records, ledger_run_id):
+    """Map each generation to the sha of this run's UNIQUE `qa_checkout` event for it.
+
+    `firm-qa-checkout` appends exactly one `qa_checkout` event per captured generation, carrying the
+    candidate `sha` and the `generation` it persisted. That event is the run's own record of which
+    candidate an earlier generation was, and it is what lets history stay classifiable after the
+    candidate metadata moves on. A generation named by no event, by more than one event, or by an
+    event whose sha or generation is not canonical has no entry: history for it binds to nothing.
+    """
+    seen = {}
+    for record in records:
+        if (not isinstance(record, dict) or record.get("event") != "qa_checkout"
+                or record.get("run_id") != ledger_run_id):
+            continue
+        generation = record.get("generation")
+        if not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation):
+            continue
+        seen.setdefault(generation, []).append(record.get("sha"))
+    return {
+        generation: shas[0] for generation, shas in seen.items()
+        if len(shas) == 1 and isinstance(shas[0], str) and re.fullmatch(r"[0-9a-f]{40}", shas[0])
+    }
+
+
+def historical_evidence_target(record, context, history):
+    """True when an EXISTING row belongs to an earlier generation of this same run.
+
+    Generation-scoped history: once `firm-qa-checkout` captures generation N+1 the candidate
+    metadata no longer describes generation N, so a rule that compared every existing row with the
+    live candidate made every generation-N row "stale" and the whole ledger unappendable -- including
+    the `qa_checkout` event that records N+1 itself. An earlier row is still valid when its
+    generation is LOWER than the current one and its sha is the sha of that generation's unique
+    `qa_checkout` event. This is only ever consulted while classifying rows that already exist; a new
+    publication is validated without `history` and must match the current candidate exactly.
+    """
+    if not history or not isinstance(context, dict):
+        return False
+    generation = record.get("generation")
+    current = context.get("generation")
+    if (not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation)
+            or not isinstance(current, str) or not re.fullmatch(r"[1-9][0-9]*", current)):
+        return False
+    return int(generation) < int(current) and history.get(generation) == record.get("sha")
+
+
+def validate_evidence_record(record, ledger_run_id, context, history=None):
     mode = context.get("mode") if isinstance(context, dict) else "invalid"
     if mode == "legacy":
         shaped = legacy_evidence_shape(record)
@@ -512,8 +557,9 @@ def validate_evidence_record(record, ledger_run_id, context):
         return
     if mode != "current" or context.get("candidate_sha") is None:
         raise LedgerError("current evidence identity unavailable")
-    if (record["sha"] != context["candidate_sha"]
-            or record["generation"] != context["generation"]):
+    if ((record["sha"] != context["candidate_sha"]
+            or record["generation"] != context["generation"])
+            and not historical_evidence_target(record, context, history)):
         raise LedgerError("stale evidence target")
     stage = record["stage"]
     role = record["role"]
@@ -527,7 +573,8 @@ def validate_evidence_record(record, ledger_run_id, context):
         raise LedgerError("invalid evidence role start")
 
 
-def classify_record(record, ledger_run_id, evidence_context=None):
+def classify_record(record, ledger_run_id, evidence_context=None, history=None):
+    """Classify one EXISTING ledger row. `history` is `checkout_history` of the ledger it came from."""
     if not isinstance(record, dict):
         raise LedgerError("ledger line is not an object")
     families = []
@@ -535,7 +582,7 @@ def classify_record(record, ledger_run_id, evidence_context=None):
         validate_seal_publish_record(record, ledger_run_id)
         families.append("evidence_seal_published")
     elif record.get("event") == "evidence_produced":
-        validate_evidence_record(record, ledger_run_id, evidence_context)
+        validate_evidence_record(record, ledger_run_id, evidence_context, history)
         families.append("evidence_produced")
     elif NATIVE_ONLY_FIELDS & set(record):
         validate_native_record(record, ledger_run_id)
@@ -600,9 +647,10 @@ def classify_ledger_file(argv):
     try:
         bound = bind_run(path.parents[3], path.parent)
         context = evidence_context_for_run(bound)
-        for line in raw.splitlines():
-            record = parse_json_unique(line.decode("utf-8", "strict"))
-            family = classify_record(record, argv[1], context)
+        records = [parse_json_unique(line.decode("utf-8", "strict")) for line in raw.splitlines()]
+        history = checkout_history(records, argv[1])
+        for record in records:
+            family = classify_record(record, argv[1], context, history)
             if family not in ("shell_observation", "merge_observation", "merge_permit_observation"):
                 event_id = record["event_id"]
                 if event_id in seen:
@@ -2317,8 +2365,12 @@ def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=(), evidence_c
     wanted = set(wanted_event_ids)
     matches = {}
     count = 0
-    for record in ledger_records(fd, copy_fd):
-        family = classify_record(record, ledger_run_id, evidence_context)
+    # Two passes over the SAME bytes: the generation history a row is judged against is derived from
+    # the ledger being classified, never from a second read of it.
+    records = list(ledger_records(fd, copy_fd))
+    history = checkout_history(records, ledger_run_id)
+    for record in records:
+        family = classify_record(record, ledger_run_id, evidence_context, history)
         count += 1
         if family not in (
             "ordinary", "native_role_start", "evidence_produced", "evidence_seal_published"
