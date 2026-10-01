@@ -8,7 +8,9 @@ run's CURRENT sealed generation, so a test names only the one dimension it is ch
 
   final_decision_required        writes 09-test-evidence/final-decision-required.<event-id>.json the
                                  way bin/firm-final-qa-check does, then logs path/sha/generation/
-                                 sha256/bytes/kind (kind defaults to secondary_objections).
+                                 sha256/bytes/kind (kind defaults to secondary_objections). The state
+                                 names the attempt it is about: the latest reviewer-state attempt, or
+                                 `state_attempt=<id>`, or none with `state_attempt=@none`.
   final_gate_pending             logs sha/generation.
   post_judge_artifact_published  needs path=<run-relative file>, kind=<kind>, and
                                  secondary_attempt_id=<attempt>; logs the file's exact digest/size
@@ -69,10 +71,18 @@ if event in ("final_decision_required", "final_gate_pending", "post_judge_artifa
 if event == "final_decision_required":
     kind = overrides.get("kind", "secondary_objections")
     artifact = overrides.get("path", f"09-test-evidence/final-decision-required.{event_id}.json")
+    state_attempt = overrides.pop("state_attempt", None)
+    if state_attempt is None:
+        for provider in ("gpt", "claude"):
+            state_path = os.path.join(run, "09-test-evidence", f"reviewer-state.{provider}.json")
+            if os.path.exists(state_path):
+                state_attempt = json.load(open(state_path))["attempt_id"]
     state = {"schema_version": 1, "status": "decision_required", "run_id": os.path.basename(run),
              "candidate_sha": sha, "generation": generation, "kind": kind, "objections": [],
              "permitted_record_types": ["human_decision"], "event_id": event_id,
              "created_at": "2026-10-01T00:00:00Z"}
+    if state_attempt != "@none":
+        state["secondary_attempt_id"] = state_attempt
     target = os.path.join(run, artifact)
     with open(target, "w") as handle:
         handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")

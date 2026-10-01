@@ -1404,6 +1404,9 @@ POST_JUDGE_PUBLICATION_FIELDS = LEDGER_COMMON_FIELDS | frozenset((
     "seal_event_id", "seal_projection_sha256",
 ))
 POST_JUDGE_WINDOW_FIELDS = frozenset(("stage", "role", "role_start_event_id"))
+# A Lead-published human decision answers one `final_decision_required` event, and through it one
+# terminal attempt; it names that event so a record made for another attempt cannot be reused.
+POST_JUDGE_DECISION_FIELDS = frozenset(("decision_required_event_id",))
 DECISION_REQUIRED_KINDS = frozenset(("secondary_objections", "required_secondary_unavailable"))
 
 
@@ -1446,7 +1449,7 @@ def _validate_qa_window_event(item, index, qa_windows):
 
 
 def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                         records=None, qa_windows=None):
+                         records=None, qa_windows=None, decisions=None):
     event = item.get("event")
     identity = seal["identity"]
     if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
@@ -1472,9 +1475,15 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
                 or state.get("generation") != identity["generation"]
                 or state.get("event_id") != item.get("event_id") or state.get("kind") != item.get("kind")):
             raise SealError("LEDGER_SUFFIX", "final_decision_required state does not describe its event")
+        if (not isinstance(state.get("secondary_attempt_id"), str)
+                or state["secondary_attempt_id"] not in terminal_attempts):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state does not name a terminal attempt in this suffix")
+        decisions[item["event_id"]] = {"attempt": state["secondary_attempt_id"], "kind": state["kind"]}
         return
     kind = item.get("kind")
-    expected = POST_JUDGE_PUBLICATION_FIELDS | (POST_JUDGE_WINDOW_FIELDS if kind in POST_JUDGE_QA_KINDS else set())
+    expected = POST_JUDGE_PUBLICATION_FIELDS | (
+        POST_JUDGE_WINDOW_FIELDS if kind in POST_JUDGE_QA_KINDS
+        else POST_JUDGE_DECISION_FIELDS if kind == "human_decision" else set())
     if set(item) != expected or kind not in POST_JUDGE_KINDS:
         raise SealError("LEDGER_SUFFIX", "post_judge_artifact_published field set is not closed")
     if (item.get("seal_event_id") != publication["event_id"]
@@ -1504,6 +1513,12 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
             _role_window(records, item, path)
         except SealError as exc:
             raise SealError("LEDGER_SUFFIX", f"{kind} role window:{exc.detail}") from exc
+    if kind == "human_decision":
+        decision = decisions.get(item.get("decision_required_event_id"))
+        if (decision is None or decision["kind"] != "secondary_objections"
+                or decision["attempt"] != item.get("secondary_attempt_id")):
+            raise SealError("LEDGER_SUFFIX",
+                            "human_decision does not answer an earlier final_decision_required for its attempt")
     _post_judge_bytes(run, item)
     published_paths.add(path)
 
@@ -1520,6 +1535,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
     terminal_attempts = {}      # attempt id -> ledger index of its terminal event
     published_paths = set()
     qa_windows = {}             # post-judge primary-QA role start id -> its indexes
+    decisions = {}              # final_decision_required event id -> the attempt and kind it states
     for offset, item in enumerate(suffix[1:], prefix_count + 1):
         event = item.get("event")
         if event in POST_JUDGE_EVENTS:
@@ -1530,7 +1546,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
                 _validate_qa_window_event(item, offset, qa_windows)
             else:
                 _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                                     records, qa_windows)
+                                     records, qa_windows, decisions)
             continue
         if event not in REVIEWER_SUFFIX_EVENTS:
             raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")

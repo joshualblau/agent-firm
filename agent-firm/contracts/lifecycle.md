@@ -182,7 +182,9 @@ with its exact digest and size, names the seal's publication event and projectio
 attempt already terminal in that suffix. Primary QA's own kinds, `two_voice_dispositions` and
 `disposition_evidence`, also carry `stage`, `role=qa-tester` and `role_start_event_id`, and must be
 published inside one native `qa-tester` window that was opened after the attempt they answer and is
-closed by its `qa_completed`; a `human_decision` is published by the Lead and carries no window. Any
+closed by its `qa_completed`; a `human_decision` is published by the Lead, carries no window, and
+names in `decision_required_event_id` the earlier `final_decision_required` it answers, whose decision
+state names the same attempt. Any
 other event after the seal still fails verification, and so does a post-judge event before the first
 terminal attempt or while an attempt is open.
 
@@ -269,7 +271,12 @@ text, derived risk, and permitted record type. If the human chooses a permitted 
 appends exactly one shared typed, digest-bound, current-run/current-full-SHA record naming every
 relevant producer id and text, references it from every relevant disposition, and then runs one fresh
 `firm-final-qa-check <run_dir>`. In a sealed run that record is a `human_decision` post-judge
-artifact, and the dispositions citing it are re-published as the next `two-voice-dispositions.<k>.json`.
+artifact published with `secondary_attempt_id=<current attempt>` and
+`decision_required_event_id=<the decision_required event it answers>`, and the dispositions citing it
+are re-published as the next `two-voice-dispositions.<k>.json`. Each decision state names the attempt
+it is about, and every post-judge record and evidence file answers exactly one attempt: after a
+further judge attempt, nothing published for an earlier attempt answers the new verdict, and a new
+BLOCK needs its own decision.
 Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
 wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
 manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.

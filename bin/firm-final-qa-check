@@ -286,6 +286,27 @@ def require_qa_window(event, label, answering):
             or not outcomes[0] < starts[0] < position[0] < completions[0]):
         block(f"{label} was not published inside a primary-QA window opened after the current judge attempt")
 
+def require_decision_answered(event, label, answering):
+    """A human record answers one earlier final_decision_required made for the CURRENT attempt."""
+    decision_id=event.get("decision_required_event_id")
+    decisions=[index for index,item in enumerate(events)
+               if item.get("event")=="final_decision_required" and item.get("event_id")==decision_id]
+    position=[index for index,item in enumerate(events) if item is event]
+    if len(decisions)!=1 or len(position)!=1 or not decisions[0] < position[0]:
+        block(f"{label} does not answer one earlier final_decision_required event")
+    decision=events[decisions[0]]
+    state_raw=safe_file(decision.get("path"),f"{label} decision state").read_bytes()
+    if hashlib.sha256(state_raw).hexdigest()!=decision.get("sha256") or str(len(state_raw))!=str(decision.get("bytes")):
+        block(f"{label} decision state changed after it was recorded")
+    try:
+        state=json.loads(state_raw)
+    except Exception as exc:
+        block(f"{label} decision state is malformed: {exc}")
+    if (not isinstance(state,dict) or state.get("status")!="decision_required" or state.get("kind")!="secondary_objections"
+            or state.get("event_id")!=decision_id or state.get("candidate_sha")!=sha or state.get("generation")!=generation
+            or state.get("secondary_attempt_id")!=answering.get("attempt_id")):
+        block(f"{label} answers a decision that was not required for the current secondary attempt")
+
 def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
     if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
         block(f"{label} is missing, stale, or bound to another SHA")
@@ -305,8 +326,14 @@ def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
     if event.get("event")=="post_judge_artifact_published":
         if event.get("kind") not in post_judge_kinds or answering is None:
             block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
+        # Every post-judge artifact answers one attempt; it may answer only the CURRENT one.
+        if event.get("secondary_attempt_id")!=answering.get("attempt_id"):
+            block(f"{label} was published for attempt {event.get('secondary_attempt_id')}, "
+                  f"not the current secondary attempt {answering.get('attempt_id')}")
         if event.get("kind")=="disposition_evidence":
             require_qa_window(event,label,answering)
+        if event.get("kind")=="human_decision":
+            require_decision_answered(event,label,answering)
     if event.get("sha")!=sha or str(event.get("generation"))!=str(generation) or origin not in (event.get("path"),event.get("verdict"),event.get("attempt")):
         block(f"{label} producer candidate/artifact identity mismatches")
     digest_field="verdict_sha256" if origin==event.get("verdict") else "sha256"
@@ -356,13 +383,16 @@ def bind_disposition(entry, objects, label):
             block(f"{label} contradicts producer field {object_key}")
     return objection
 
-def decision_required(kind, objections, permitted_record_types):
+def decision_required(kind, objections, permitted_record_types, secondary_attempt_id):
     event_id=f"evt-final-decision-required-g{generation}-{os.getpid()}-{os.urandom(6).hex()}"
     relative=f"09-test-evidence/final-decision-required.{event_id}.json"
     path=run/relative
+    # `secondary_attempt_id` names the attempt this decision is about, so a human record made in
+    # answer to it is bound to that attempt and cannot be replayed against a later one.
     state={"schema_version":1,"status":"decision_required","run_id":run_id,"candidate_sha":sha,
            "generation":generation,"kind":kind,"objections":objections,
            "permitted_record_types":permitted_record_types,"event_id":event_id,
+           "secondary_attempt_id":secondary_attempt_id,
            "created_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
     payload=(json.dumps(state,indent=2,sort_keys=True)+"\n").encode("utf-8")
     atomic_write(path,payload)
@@ -488,7 +518,7 @@ if not present:
                 "affected_criteria":sorted(criterion_types),"affected_paths":sorted(changed_set),
                 "risk":"high","risk_reasons":["required-secondary-unavailable"],
                 "permitted_record_types":["required_unavailable"]
-            }],["required_unavailable"])
+            }],["required_unavailable"],attempt["attempt_id"])
         waiver_path = evidence_ref(voice.get("unavailable_waiver"), "required-unavailable waiver")
         waiver = load_yaml(waiver_path, "required-unavailable waiver")
         needed = {
@@ -633,7 +663,7 @@ if human_entries:
         for entry,objection in human_entries:
             risk,reasons=derived_objection_risk(objection)
             structured.append({**objection,"risk":risk,"risk_reasons":reasons,"permitted_record_types":["human_decision"]})
-        decision_required("secondary_objections",structured,["human_decision"])
+        decision_required("secondary_objections",structured,["human_decision"],current_attempt.get("attempt_id"))
     record_refs=[entry["record"] for entry,_ in human_entries]
     if any(ref!=record_refs[0] for ref in record_refs[1:]):
         block("all human-decision objections must reference one exact shared record")

@@ -1052,13 +1052,18 @@ else
     pj_expect accept "final_decision_required is accepted after the judge"
     pj_restore "$pj_judged"; pj final_gate_pending
     pj_expect accept "final_gate_pending is accepted after the judge"
-    for pj_kind in two_voice_dispositions:two-voice-dispositions.1.json disposition_evidence:evidence.md human_decision:human.yaml; do
+    for pj_kind in two_voice_dispositions:two-voice-dispositions.1.json disposition_evidence:evidence.md; do
       pj_restore "$pj_judged"; pj_publish "${pj_kind#*:}" "${pj_kind%%:*}"
       pj_expect accept "a ${pj_kind%%:*} post-judge artifact is accepted after the judge"
     done
+    # A human decision answers an earlier final_decision_required made for the same attempt.
+    pj_restore "$pj_judged"; pj final_decision_required event_id=evt-pj-decision
+    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-decision
+    pj_expect accept "a human_decision answering an earlier decision for its attempt is accepted after the judge"
     pj_restore "$pj_judged"
-    pj_publish two-voice-dispositions.1.json two_voice_dispositions; pj final_decision_required
-    pj final_gate_pending; pj_publish human.yaml human_decision; pj_publish evidence.md disposition_evidence
+    pj_publish two-voice-dispositions.1.json two_voice_dispositions; pj final_decision_required event_id=evt-pj-decision
+    pj final_gate_pending; pj_publish human.yaml human_decision decision_required_event_id=evt-pj-decision
+    pj_publish evidence.md disposition_evidence
     pj_expect accept "the whole post-judge phase is accepted in sequence"
     pj_expect accept "…and by the wrapper's preflight" wrapper-preflight
     # Interleavable with a further reviewer attempt, and closed while that attempt is open.
@@ -1157,6 +1162,28 @@ PY
     pj_expect refuse "a QA window opened before any terminal attempt is refused" publication \
       "qa_started needs a terminal reviewer attempt"
 
+    # EACH RECORD ANSWERS ONE ATTEMPT. A decision state names the attempt it is about, and a human
+    # decision names the decision it answers, so neither can be replayed against another attempt.
+    for pj_spec in state_attempt=@none state_attempt=gpt-c1-a9999; do
+      pj_restore "$pj_judged"; pj final_decision_required "$pj_spec"
+      pj_expect refuse "final_decision_required whose state has ${pj_spec} is refused" publication \
+        "final_decision_required state does not name a terminal attempt"
+    done
+    pj_restore "$pj_judged"; pj_publish human.yaml human_decision
+    pj_expect refuse "a human_decision that names no decision is refused" publication \
+      "post_judge_artifact_published field set is not closed"
+    pj_restore "$pj_judged"; pj_publish human.yaml human_decision decision_required_event_id=evt-no-such-decision
+    pj_expect refuse "a human_decision naming a decision that does not exist is refused" publication \
+      "does not answer an earlier final_decision_required"
+    pj_restore "$pj_judged"; pj_publish human.yaml human_decision decision_required_event_id=evt-pj-late
+    pj final_decision_required event_id=evt-pj-late
+    pj_expect refuse "a human_decision recorded before its decision is refused" publication \
+      "does not answer an earlier final_decision_required"
+    pj_restore "$pj_judged"; pj final_decision_required event_id=evt-pj-unavailable kind=required_secondary_unavailable
+    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-unavailable
+    pj_expect refuse "a human_decision cannot answer a required-unavailable decision" publication \
+      "does not answer an earlier final_decision_required"
+
     # Everything outside the closed set is still refused after the judge.
     pj_restore "$pj_judged"; pj lead_note note=after-the-judge
     pj_expect refuse "an ordinary lead_note after the judge is still refused" publication "unexpected event lead_note"
@@ -1182,6 +1209,13 @@ PY
     qa_window_close "$pj_run" test/pj-straddle "$pj_w"
     pj_expect refuse "a window opened before the attempt it answers is refused" publication \
       "window opened after the attempt it answers"
+    pj_restore "$pj_straddle"; pj final_decision_required event_id=evt-pj-a0001 state_attempt=gpt-c1-a0001
+    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-a0001 secondary_attempt_id=gpt-c1-a0002
+    pj_expect refuse "a human_decision for one attempt cannot answer a decision made for another" publication \
+      "does not answer an earlier final_decision_required for its attempt"
+    pj_restore "$pj_straddle"; pj final_decision_required event_id=evt-pj-a0001 state_attempt=gpt-c1-a0001
+    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-a0001 secondary_attempt_id=gpt-c1-a0001
+    pj_expect accept "control: the same record answering its own attempt's decision is accepted"
   fi
 fi
 
@@ -1333,6 +1367,9 @@ open(path,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(pat
 PY
     }
     fr_decisions() { find "$fr_run/09-test-evidence" -maxdepth 1 -name 'final-decision-required.*.json' | wc -l | tr -d ' '; }
+    fr_last_decision() {
+      t_python -c 'import json,sys; print([r for r in map(json.loads,open(sys.argv[1])) if r.get("event")=="final_decision_required"][-1]["event_id"])' "$fr_run/run.jsonl"
+    }
 
     # One trusted-unavailable attempt (a0001), then the real wrapper's BLOCK (a0002).
     fr_rc=0; env PATH=/usr/bin:/bin CODEX_HOME="$fr_stub/codex-home" "$BIN/firm-gpt-qa" --run "$fr_run" >/dev/null 2>&1 || fr_rc=$?
@@ -1418,7 +1455,7 @@ open(path,"w").write(yaml.safe_dump({"schema_version":1,"type":"human_decision",
     "objection_ids":["obj-post-judge-fixture"],"objections":[text]},sort_keys=False))
 os.chmod(path,0o600)
 PY
-    fr_record="$(fr_publish human-decision.yaml human_decision gpt-c1-a0002)"
+    fr_record="$(fr_publish human-decision.yaml human_decision gpt-c1-a0002 "decision_required_event_id=$(fr_last_decision)")"
     assert_ok "the human decision is published as a post-judge record" test -n "$fr_record"
     # The wrong kind of post-judge artifact cannot stand in for the human record.
     cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-as-evidence.yaml"
@@ -1454,13 +1491,27 @@ PY
       cat "$fr_run/09-test-evidence/reviewer-state.gpt.json"
     assert_output "…whose BLOCK is the canonical verdict" '"attempt_id": "gpt-c1-a0003"' cat "$fr_run/08-qa-verdict.gpt.json"
     fr_check 1 "dispositions of the earlier attempt do not answer the new current BLOCK" "are ignored"
+    # Every post-judge record answers one attempt: what was published for a0002 cannot answer a0003.
     cp "$fr_run/$fr_root/primary-position.md" "$fr_run/$fr_root/primary-position.a0003.md"
-    cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-decision.a0003.yaml"
     fr_evidence3="$(fr_publish primary-position.a0003.md disposition_evidence gpt-c1-a0003)"
-    fr_record3="$(fr_publish human-decision.a0003.yaml human_decision gpt-c1-a0003)"
-    fr_dispositions two-voice-dispositions.7.json gpt-c1-a0003 "evidence=$fr_evidence3" "record=$fr_record3"
+    fr_dispositions two-voice-dispositions.7.json gpt-c1-a0003 "evidence=$fr_evidence" "record=$fr_record"
     fr_publish two-voice-dispositions.7.json two_voice_dispositions gpt-c1-a0003 >/dev/null
-    fr_check 0 "dispositions re-published for the new attempt pass a fresh check"
+    fr_check 1 "disposition evidence published for the earlier attempt cannot answer the new BLOCK" \
+      "not the current secondary attempt"
+    fr_dispositions two-voice-dispositions.8.json gpt-c1-a0003 "evidence=$fr_evidence3" "record=$fr_record"
+    fr_publish two-voice-dispositions.8.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 1 "a human decision recorded for the earlier attempt cannot answer the new BLOCK" \
+      "not the current secondary attempt"
+    fr_dispositions two-voice-dispositions.9.json gpt-c1-a0003 "evidence=$fr_evidence3"
+    fr_publish two-voice-dispositions.9.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 4 "the new BLOCK needs its own human decision" "DECISION REQUIRED"
+    assert_output "…whose decision state names the new attempt" '"secondary_attempt_id": "gpt-c1-a0003"' \
+      cat "$fr_run/$(t_python -c 'import json,sys; print([r for r in map(json.loads,open(sys.argv[1])) if r.get("event")=="final_decision_required"][-1]["path"])' "$fr_run/run.jsonl")"
+    cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-decision.a0003.yaml"
+    fr_record3="$(fr_publish human-decision.a0003.yaml human_decision gpt-c1-a0003 "decision_required_event_id=$(fr_last_decision)")"
+    fr_dispositions two-voice-dispositions.10.json gpt-c1-a0003 "evidence=$fr_evidence3" "record=$fr_record3"
+    fr_publish two-voice-dispositions.10.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 0 "dispositions re-published for the new attempt, citing its own decision, pass a fresh check"
     assert_ok "the seal verifies after the whole interleaved post-judge history" \
       seal_for_run "$fr_run" --verify --phase publication
 
@@ -1472,22 +1523,22 @@ PY
     fr_before_windowless="$fr_stub/before-windowless"; mkdir -p "$fr_before_windowless"
     cp -p "$fr_run/run.jsonl" "$fr_before_windowless/"
     fr_round_bare="$(fr_publish round.md disposition_evidence gpt-c1-a0003 @nowindow)"
-    fr_dispositions two-voice-dispositions.8.json gpt-c1-a0003 disposition=proceed_with_primary \
+    fr_dispositions two-voice-dispositions.11.json gpt-c1-a0003 disposition=proceed_with_primary \
       "evidence=$fr_round_bare" "bounded=$fr_round_bare"
-    fr_publish two-voice-dispositions.8.json two_voice_dispositions gpt-c1-a0003 @nowindow >/dev/null
+    fr_publish two-voice-dispositions.11.json two_voice_dispositions gpt-c1-a0003 @nowindow >/dev/null
     fr_check 2 "proceed_with_primary dispositions with no primary-QA window cannot clear the BLOCK" \
       "field set is not closed"
     cp -p "$fr_before_windowless/run.jsonl" "$fr_run/run.jsonl"
     assert_ok "…and the run is restored" seal_for_run "$fr_run" --verify --phase publication
     fr_round="$(fr_publish round.md disposition_evidence gpt-c1-a0003)"
-    fr_dispositions two-voice-dispositions.9.json gpt-c1-a0003 disposition=proceed_with_primary \
+    fr_dispositions two-voice-dispositions.12.json gpt-c1-a0003 disposition=proceed_with_primary \
       "evidence=$fr_round" "bounded=$fr_round" rounds=0
-    fr_publish two-voice-dispositions.9.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_publish two-voice-dispositions.12.json two_voice_dispositions gpt-c1-a0003 >/dev/null
     fr_check 1 "proceed_with_primary inside a window but without one bounded round still blocks" \
       "exactly one bounded resolution round"
-    fr_dispositions two-voice-dispositions.10.json gpt-c1-a0003 disposition=proceed_with_primary \
+    fr_dispositions two-voice-dispositions.13.json gpt-c1-a0003 disposition=proceed_with_primary \
       "evidence=$fr_round" "bounded=$fr_round"
-    fr_publish two-voice-dispositions.10.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_publish two-voice-dispositions.13.json two_voice_dispositions gpt-c1-a0003 >/dev/null
     fr_check 0 "proceed_with_primary from a primary-QA window with one bounded round passes"
     assert_ok "the seal verifies with the windowed primary-QA publications" \
       seal_for_run "$fr_run" --verify --phase publication
