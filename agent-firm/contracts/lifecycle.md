@@ -181,10 +181,13 @@ with its exact digest and size, names the seal's publication event and projectio
 attempt already terminal in that suffix. Any other event after the seal still fails verification, and
 so does a post-judge event before the first terminal attempt or while an attempt is open.
 
-A recapture starts the next generation. `firm-qa-checkout`'s `qa_checkout` event for a later
-generation ends generation N's suffix; what follows belongs to the new generation. Earlier rows stay
-valid history only while each is bound to its own generation's unique `qa_checkout` event, and a new
-evidence publication must match the current candidate exactly. The new generation republishes its
+A recapture starts the next generation. `firm-qa-checkout` rewrites `qa-candidate.json` before it
+appends its `qa_checkout` event, and verification always checks the seal of the live candidate's
+generation, so from that moment generation N+1's seal is the one verified and the event lies in its
+prefix. A `qa_checkout` inside a suffix that is being verified is therefore always refused; it never
+ends or shortens the suffix. Earlier rows stay valid history only while each is bound to its own
+generation's unique `qa_checkout` event, and a new evidence publication must match the current
+candidate exactly. The new generation republishes its
 fixed-root producers in fresh role windows and seals `final-evidence/g<N+1>/` before either wrapper
 runs again; each generation's seal counts only its own producer rows.
 

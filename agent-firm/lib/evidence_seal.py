@@ -1357,12 +1357,20 @@ def _validate_terminal_attempt(run, item, start):
 # ---------------------------------------------------------------------------------------------
 # The closed post-judge phase of the suffix grammar.  After the seal, the suffix used to admit only
 # reviewer events, but the lifecycle has four more things to record once a judge has answered: the
-# Final check's own `final_decision_required`, the Lead's `final_gate_pending`, primary QA's
-# post-judge dispositions and the evidence/human records they cite, and a recapture that starts the
-# next generation.  Each of those made `--verify --phase publication` fail, so every judge verdict
-# was terminal for the run.  They are admitted here as a CLOSED set, only once at least one reviewer
-# attempt is terminal and none is open, each bound to the seal's own candidate identity.  Post-judge
-# artifacts live under a directory the seal cannot contain, and each is bound to its exact bytes.
+# Final check's own `final_decision_required`, the Lead's `final_gate_pending`, and primary QA's
+# post-judge dispositions and the evidence/human records they cite.  Each of those made
+# `--verify --phase publication` fail, so every judge verdict was terminal for the run.  They are
+# admitted here as a CLOSED set, only once at least one reviewer attempt is terminal and none is
+# open, each bound to the seal's own candidate identity.  Post-judge artifacts live under a
+# directory the seal cannot contain, and each is bound to its exact bytes.
+#
+# A recapture is NOT part of this grammar. `firm-qa-checkout` rewrites qa-candidate.json before it
+# appends its `qa_checkout` event, and verification always checks the seal of the LIVE candidate's
+# generation, so a legitimate generation-N+1 capture never appears in a generation-N suffix that is
+# still being verified: from the moment it exists, generation N+1's seal is the one checked, and
+# that `qa_checkout` lies in its prefix. A `qa_checkout` inside a verified suffix is therefore
+# always a refusal. (An earlier revision let one end the suffix; a single forged event then switched
+# off checking of everything after it.)
 # ---------------------------------------------------------------------------------------------
 LEDGER_COMMON_FIELDS = frozenset(("ts", "event", "event_id", "run_id"))
 REVIEWER_SUFFIX_EVENTS = frozenset((
@@ -1372,27 +1380,11 @@ REVIEWER_SUFFIX_EVENTS = frozenset((
 POST_JUDGE_EVENTS = frozenset(("final_decision_required", "final_gate_pending", "post_judge_artifact_published"))
 POST_JUDGE_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence", "human_decision"))
 DECISION_REQUIRED_KINDS = frozenset(("secondary_objections", "required_secondary_unavailable"))
-# Exactly the event bin/firm-qa-checkout appends for each captured generation.
-QA_CHECKOUT_FIELDS = LEDGER_COMMON_FIELDS | frozenset((
-    "dir", "branch", "source_ref", "base_sha", "sha", "generation", "candidate",
-))
 
 
 def post_judge_root(generation):
     """The one directory a generation's post-judge artifacts may occupy."""
     return f"09-test-evidence/post-judge/g{generation}/"
-
-
-def _require_generation_boundary(item, seal):
-    """A `qa_checkout` in a generation-N suffix must start a LATER generation of this run."""
-    generation = item.get("generation")
-    if (set(item) != QA_CHECKOUT_FIELDS or not isinstance(generation, str)
-            or re.fullmatch(r"[1-9][0-9]*", generation) is None
-            or int(generation) <= seal["identity"]["generation"]
-            or HEX40.fullmatch(str(item.get("sha", ""))) is None
-            or item.get("base_sha") != seal["identity"]["accepted_base_sha"]
-            or item.get("candidate") != "09-test-evidence/qa-candidate.json"):
-        raise SealError("LEDGER_SUFFIX", "qa_checkout is not a later-generation boundary")
 
 
 def _post_judge_bytes(run, item):
@@ -1474,11 +1466,6 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
     published_paths = set()
     for item in suffix[1:]:
         event = item.get("event")
-        if event == "qa_checkout":
-            # A later generation's capture ends this generation's suffix. Everything from it onward
-            # belongs to that generation and is checked against ITS seal, not this one.
-            _require_generation_boundary(item, seal)
-            break
         if event in POST_JUDGE_EVENTS:
             if open_attempt is not None or not terminal_attempts:
                 raise SealError("LEDGER_SUFFIX",

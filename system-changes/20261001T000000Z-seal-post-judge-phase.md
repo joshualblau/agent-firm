@@ -67,9 +67,14 @@ exists**, a closed set of post-judge events, interleavable with further reviewer
    `seal_event_id`, `seal_projection_sha256`. The path must lie under
    `09-test-evidence/post-judge/g<N>/`, so it can never name a sealed path. The file must exist with
    that digest. `secondary_attempt_id` must name a terminal attempt in this suffix.
-4. **Generation boundary:** a `qa_checkout` event whose `generation` is greater than N ends the
-   generation-N suffix. Everything from it onward belongs to the next generation and is not checked
-   against seal N.
+4. **No generation boundary** *(amended after implementation review)*: a `qa_checkout` event inside
+   a verified suffix is refused like any other unexpected event. The original design let a
+   later-generation `qa_checkout` end the generation-N suffix, but no legitimate path ever needs it:
+   `firm-qa-checkout` rewrites `qa-candidate.json` before appending the event, and verification
+   always checks the live candidate's generation, so a real recapture is verified against the next
+   generation's seal, whose prefix contains the event. The reviewer showed that one forged
+   `qa_checkout` with the candidate still at generation N switched off checking of everything after
+   it, after which a fabricated `reviewer_approve` passed the seal and `firm-final-qa-check`.
 
 Anything else is still `unexpected event`. The tamper-evidence the seal exists for is unchanged:
 every sealed file is still verified by digest, nothing may precede the first terminal judge event
@@ -100,7 +105,8 @@ except reviewer events, and post-judge artifacts are confined to a directory the
 - A2: each post-judge event is accepted after a terminal judge event and refused before one, refused
   with the wrong `sha`/`generation`, refused with a path outside `post-judge/g<N>/` or a digest
   mismatch, and refused when an attempt is open. An ordinary event (e.g. `lead_note`) after the judge
-  is still refused. A `qa_checkout` boundary ends the suffix.
+  is still refused. A `qa_checkout` inside a verified suffix is refused, so it cannot end the suffix
+  or switch off checking of what follows it.
 - A3: a judge BLOCK, then published dispositions (`human_decision`), then `firm-final-qa-check` exits 4
   and writes `final_decision_required`; then a recorded human decision and a fresh check exits 0. A
   disposition set naming a different attempt or digest is ignored or blocked; no dispositions still

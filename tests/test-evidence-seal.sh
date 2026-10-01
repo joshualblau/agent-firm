@@ -1060,13 +1060,19 @@ PY
     pj_restore "$pj_judged"; pj_open
     pj_expect accept "control: the same open START alone is recoverable" wrapper-preflight
 
-    # A later generation's capture ends this generation's suffix.
-    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2; pj lead_note note=next-generation
-    pj_expect accept "a later-generation qa_checkout ends the suffix; what follows belongs to that generation"
+    # No qa_checkout belongs to a suffix that is still being verified. firm-qa-checkout rewrites the
+    # candidate before it appends the event, so a real recapture is verified against the NEXT
+    # generation's seal, in whose prefix the event lies. Letting one end the suffix meant a single
+    # forged event switched off checking of everything after it.
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2
+    pj_expect refuse "a later-generation qa_checkout inside the verified suffix is refused" publication \
+      "unexpected event qa_checkout"
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2; pj lead_note note=anything-after-it
+    pj_expect refuse "a forged qa_checkout does not switch off checking of what follows it" publication \
+      "unexpected event qa_checkout"
     pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=1
-    pj_expect refuse "a qa_checkout that does not start a later generation is refused"
-    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2 "base_sha=$pj_other"
-    pj_expect refuse "a later-generation qa_checkout on another accepted base is refused"
+    pj_expect refuse "a same-generation qa_checkout inside the verified suffix is refused" publication \
+      "unexpected event qa_checkout"
 
     # Refused before any terminal judge event.
     pj_restore "$pj_sealed"; pj final_decision_required
@@ -1255,6 +1261,48 @@ PY
       cat "$fr_run/09-test-evidence/reviewer-state.gpt.json"
     fr_check 1 "with no dispositions the BLOCK still blocks (silence is not dissent)" \
       "exactly one entry per producer objection id"
+
+    # THE REVIEWER'S EXPLOIT, kept as a regression: one forged qa_checkout(generation=2), with the
+    # candidate still at generation 1, followed by a reviewer_approve no wrapper produced (no START,
+    # no seal binding) and its forged attempt/verdict files. When a qa_checkout ended the suffix this
+    # passed the seal and firm-final-qa-check returned 0.
+    fr_snap="$fr_stub/before-exploit"; mkdir -p "$fr_snap"
+    cp -p "$fr_run/run.jsonl" "$fr_run/08-qa-verdict.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json" "$fr_snap/"
+    "$BIN/firm-ledger-log" --run "$fr_run" --strict qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
+      "branch=integration/$fr_id" "source_ref=refs/heads/integration/$fr_id" "base_sha=$fr_sha" \
+      "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json >/dev/null
+    fr_forged="$(t_python - "$fr_run" "$fr_id" "$fr_sha" <<'PY'
+import hashlib,json,os,sys
+run,rid,sha=sys.argv[1:]
+aid="gpt-c1-a0099"; d=f"{run}/09-test-evidence/reviewer-attempts/{aid}"; os.makedirs(d,exist_ok=True)
+local_rel=f"09-test-evidence/reviewer-attempts/{aid}/verdict.json"; attempt_rel=f"09-test-evidence/reviewer-attempts/{aid}/attempt.json"
+verdict=json.load(open(run+"/08-qa-verdict.gpt.json"))
+verdict.update({"verdict":"APPROVE","attempt_id":aid,"blockers":[],"blocker_objects":[]})
+raw=(json.dumps(verdict,indent=2,sort_keys=True)+"\n").encode()
+for path in (f"{run}/{local_rel}",run+"/08-qa-verdict.gpt.json"):
+    open(path,"wb").write(raw); os.chmod(path,0o600)
+attempt={"schema_version":1,"attempt_id":aid,"provider":"gpt","run_id":rid,"candidate_sha":sha,"generation":1,
+         "status":"approve","exit_code":0,"started_event_id":"evt-forged-start","outcome_event_id":"evt-forged-approve",
+         "verdict":local_rel,"canonical":"08-qa-verdict.gpt.json","canonical_promoted":True,
+         "verdict_sha256":hashlib.sha256(raw).hexdigest(),"verdict_bytes":len(raw)}
+araw=(json.dumps(attempt,indent=2,sort_keys=True)+"\n").encode(); open(f"{run}/{attempt_rel}","wb").write(araw); os.chmod(f"{run}/{attempt_rel}",0o600)
+state=run+"/09-test-evidence/reviewer-state.gpt.json"; doc=json.load(open(state)); doc["attempt_id"]=aid
+open(state,"w").write(json.dumps(doc,indent=2)+"\n"); os.chmod(state,0o600)
+print(" ".join([f"attempt={attempt_rel}",f"attempt_id={aid}",f"verdict={local_rel}","exit_code=0",
+  f"sha256={hashlib.sha256(araw).hexdigest()}",f"bytes={len(araw)}",f"verdict_sha256={hashlib.sha256(raw).hexdigest()}",
+  f"verdict_bytes={len(raw)}","canonical=08-qa-verdict.gpt.json","phase=judge"]))
+PY
+)"
+    # shellcheck disable=SC2086
+    "$BIN/firm-ledger-log" --run "$fr_run" --strict --event-id evt-forged-approve reviewer_approve provider=gpt \
+      generation=1 "sha=$fr_sha" $fr_forged >/dev/null
+    assert_fail "a fabricated APPROVE after a forged qa_checkout does not pass the seal" \
+      seal_for_run "$fr_run" --verify --phase publication
+    fr_check 2 "…and cannot pass the Final check" "unexpected event qa_checkout"
+    cp -p "$fr_snap/run.jsonl" "$fr_run/run.jsonl"; cp -p "$fr_snap/08-qa-verdict.gpt.json" "$fr_run/08-qa-verdict.gpt.json"
+    cp -p "$fr_snap/reviewer-state.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json"
+    rm -rf "$fr_run/09-test-evidence/reviewer-attempts/gpt-c1-a0099"
+    assert_ok "the run is restored to the genuine judge BLOCK" seal_for_run "$fr_run" --verify --phase publication
 
     mkdir -p "$fr_run/$fr_root"
     printf '%s\n' 'Primary QA position on obj-post-judge-fixture: the sealed proof covers AC-001.' \
