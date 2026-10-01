@@ -755,34 +755,46 @@ def _producer(records, path, raw, sha, generation, required):
             event.get("sha") != sha or str(event.get("generation")) != str(generation)):
         raise SealError("PRODUCER_STALE", path)
     start_id = event.get("role_start_event_id")
-    if not isinstance(start_id, str) or EVENT_ID.fullmatch(start_id) is None:
-        raise SealError("PRODUCER_WINDOW", f"{path}:missing role_start_event_id")
-    if start_id:
-        start_indexes = [i for i, item in enumerate(records)
-                         if item.get("event_id") == start_id and str(item.get("event", "")).endswith("_started")]
-        complete_indexes = [i for i, item in enumerate(records)
-                            if item.get("role_start_event_id") == start_id
-                            and str(item.get("event", "")).endswith("_completed")]
-        event_index = records.index(event)
-        if len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
-            raise SealError("PRODUCER_WINDOW", path)
-        start = records[start_indexes[0]]
-        complete = records[complete_indexes[0]]
-        if not {"contract", "authority", "activation"}.issubset(start):
-            raise SealError("PRODUCER_WINDOW", f"{path}:role start is not native")
-        stage = event.get("stage")
-        role = event.get("role")
-        if (not isinstance(stage, str) or not isinstance(role, str) or
-                start.get("stage") != stage or start.get("role") != role or
-                complete.get("stage") != stage or complete.get("role") != role):
-            raise SealError("PRODUCER_WINDOW", f"{path}:stage/role mismatch")
-        start_ts = _parse_rfc3339_utc(start.get("ts"), f"{path}:role start")
-        produced_ts = _parse_rfc3339_utc(event.get("ts"), f"{path}:producer")
-        complete_ts = _parse_rfc3339_utc(complete.get("ts"), f"{path}:role completion")
-        if not start_ts <= produced_ts <= complete_ts:
-            raise SealError("PRODUCER_WINDOW", f"{path}:back-stamped timestamp")
+    _role_window(records, event, path)
     return {"event_id": event["event_id"], "event": "evidence_produced",
             "role_start_event_id": start_id, "stage": event.get("stage"), "role": event.get("role")}
+
+
+def _role_window(records, event, path):
+    """Prove `event` was written inside its one native role window; return that window's indexes.
+
+    The window is the unique native `*_started` record `event["role_start_event_id"]` names and the
+    unique `*_completed` record that names it back; the event must lie strictly between them in the
+    ledger, with matching stage and role and non-decreasing timestamps. Shared by sealed-file
+    producers and post-judge publications, so both are held to the same producer identity.
+    """
+    start_id = event.get("role_start_event_id")
+    if not isinstance(start_id, str) or EVENT_ID.fullmatch(start_id) is None:
+        raise SealError("PRODUCER_WINDOW", f"{path}:missing role_start_event_id")
+    start_indexes = [i for i, item in enumerate(records)
+                     if item.get("event_id") == start_id and str(item.get("event", "")).endswith("_started")]
+    complete_indexes = [i for i, item in enumerate(records)
+                        if item.get("role_start_event_id") == start_id
+                        and str(item.get("event", "")).endswith("_completed")]
+    event_index = records.index(event)
+    if len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
+        raise SealError("PRODUCER_WINDOW", path)
+    start = records[start_indexes[0]]
+    complete = records[complete_indexes[0]]
+    if not {"contract", "authority", "activation"}.issubset(start):
+        raise SealError("PRODUCER_WINDOW", f"{path}:role start is not native")
+    stage = event.get("stage")
+    role = event.get("role")
+    if (not isinstance(stage, str) or not isinstance(role, str) or
+            start.get("stage") != stage or start.get("role") != role or
+            complete.get("stage") != stage or complete.get("role") != role):
+        raise SealError("PRODUCER_WINDOW", f"{path}:stage/role mismatch")
+    start_ts = _parse_rfc3339_utc(start.get("ts"), f"{path}:role start")
+    produced_ts = _parse_rfc3339_utc(event.get("ts"), f"{path}:producer")
+    complete_ts = _parse_rfc3339_utc(complete.get("ts"), f"{path}:role completion")
+    if not start_ts <= produced_ts <= complete_ts:
+        raise SealError("PRODUCER_WINDOW", f"{path}:back-stamped timestamp")
+    return start_indexes[0], complete_indexes[0]
 
 
 def validate_mutation_matrix(run, sha, generation, records):
@@ -1377,8 +1389,21 @@ REVIEWER_SUFFIX_EVENTS = frozenset((
     "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
     "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
 ))
-POST_JUDGE_EVENTS = frozenset(("final_decision_required", "final_gate_pending", "post_judge_artifact_published"))
+POST_JUDGE_EVENTS = frozenset((
+    "final_decision_required", "final_gate_pending", "post_judge_artifact_published",
+    "qa_started", "qa_completed",
+))
 POST_JUDGE_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence", "human_decision"))
+# Primary QA's own post-judge kinds. Each is produced inside a native primary-QA role window opened
+# after the terminal attempt it answers, exactly as a sealed file is produced inside its window, so
+# a disposition carries a producer identity rather than the word of whoever appended it.
+POST_JUDGE_QA_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence"))
+POST_JUDGE_QA_ROLE = "qa-tester"
+POST_JUDGE_PUBLICATION_FIELDS = LEDGER_COMMON_FIELDS | frozenset((
+    "path", "sha256", "bytes", "sha", "generation", "kind", "secondary_attempt_id",
+    "seal_event_id", "seal_projection_sha256",
+))
+POST_JUDGE_WINDOW_FIELDS = frozenset(("stage", "role", "role_start_event_id"))
 DECISION_REQUIRED_KINDS = frozenset(("secondary_objections", "required_secondary_unavailable"))
 
 
@@ -1401,7 +1426,27 @@ def _post_judge_bytes(run, item):
     return raw
 
 
-def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths):
+def _validate_qa_window_event(item, index, qa_windows):
+    """A native primary-QA role start, or its completion, inside the post-judge phase."""
+    event = item.get("event")
+    if event == "qa_started":
+        if not {"contract", "authority", "activation"}.issubset(item):
+            raise SealError("LEDGER_SUFFIX", "post-judge qa_started is not a native role start")
+        if item.get("role") != POST_JUDGE_QA_ROLE or not isinstance(item.get("stage"), str):
+            raise SealError("LEDGER_SUFFIX", f"post-judge role windows are {POST_JUDGE_QA_ROLE} only")
+        qa_windows[item.get("event_id")] = {"start": index, "stage": item["stage"], "complete": None}
+        return
+    if set(item) != LEDGER_COMMON_FIELDS | POST_JUDGE_WINDOW_FIELDS:
+        raise SealError("LEDGER_SUFFIX", "post-judge qa_completed field set is not closed")
+    window = qa_windows.get(item.get("role_start_event_id"))
+    if (window is None or window["complete"] is not None or item.get("role") != POST_JUDGE_QA_ROLE
+            or item.get("stage") != window["stage"]):
+        raise SealError("LEDGER_SUFFIX", "post-judge qa_completed does not close an open primary-QA window")
+    window["complete"] = index
+
+
+def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
+                         records=None, qa_windows=None):
     event = item.get("event")
     identity = seal["identity"]
     if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
@@ -1428,11 +1473,9 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
                 or state.get("event_id") != item.get("event_id") or state.get("kind") != item.get("kind")):
             raise SealError("LEDGER_SUFFIX", "final_decision_required state does not describe its event")
         return
-    expected = LEDGER_COMMON_FIELDS | {
-        "path", "sha256", "bytes", "sha", "generation", "kind", "secondary_attempt_id",
-        "seal_event_id", "seal_projection_sha256",
-    }
-    if set(item) != expected or item.get("kind") not in POST_JUDGE_KINDS:
+    kind = item.get("kind")
+    expected = POST_JUDGE_PUBLICATION_FIELDS | (POST_JUDGE_WINDOW_FIELDS if kind in POST_JUDGE_QA_KINDS else set())
+    if set(item) != expected or kind not in POST_JUDGE_KINDS:
         raise SealError("LEDGER_SUFFIX", "post_judge_artifact_published field set is not closed")
     if (item.get("seal_event_id") != publication["event_id"]
             or item.get("seal_projection_sha256") != seal["self"]["projection_sha256"]):
@@ -1449,6 +1492,18 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
         raise SealError("LEDGER_SUFFIX", "post-judge artifact path is published twice")
     if item.get("secondary_attempt_id") not in terminal_attempts:
         raise SealError("LEDGER_SUFFIX", "post-judge artifact does not name a terminal attempt in this suffix")
+    if kind in POST_JUDGE_QA_KINDS:
+        # Inside one native primary-QA window that was opened AFTER the terminal attempt it answers.
+        window = qa_windows.get(item.get("role_start_event_id"))
+        if (item.get("role") != POST_JUDGE_QA_ROLE or window is None or window["complete"] is not None
+                or window["start"] <= terminal_attempts[item["secondary_attempt_id"]]):
+            raise SealError("LEDGER_SUFFIX",
+                            f"{kind} is not published inside a {POST_JUDGE_QA_ROLE} window opened after "
+                            "the attempt it answers")
+        try:
+            _role_window(records, item, path)
+        except SealError as exc:
+            raise SealError("LEDGER_SUFFIX", f"{kind} role window:{exc.detail}") from exc
     _post_judge_bytes(run, item)
     published_paths.add(path)
 
@@ -1462,15 +1517,20 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
         raise SealError("LEDGER_SUFFIX", "publication is missing")
     _validate_publish_record(suffix[0], seal, seal_raw, publication)
     open_attempt = None
-    terminal_attempts = set()
+    terminal_attempts = {}      # attempt id -> ledger index of its terminal event
     published_paths = set()
-    for item in suffix[1:]:
+    qa_windows = {}             # post-judge primary-QA role start id -> its indexes
+    for offset, item in enumerate(suffix[1:], prefix_count + 1):
         event = item.get("event")
         if event in POST_JUDGE_EVENTS:
             if open_attempt is not None or not terminal_attempts:
                 raise SealError("LEDGER_SUFFIX",
                                 f"{event} needs a terminal reviewer attempt and no open attempt")
-            _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths)
+            if event in ("qa_started", "qa_completed"):
+                _validate_qa_window_event(item, offset, qa_windows)
+            else:
+                _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
+                                     records, qa_windows)
             continue
         if event not in REVIEWER_SUFFIX_EVENTS:
             raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
@@ -1518,7 +1578,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
             if event in ("reviewer_approve", "reviewer_block") and item.get("phase") != "judge":
                 raise SealError("LEDGER_SUFFIX", "reviewer verdict phase mismatch")
             _validate_terminal_attempt(run, item, open_attempt)
-            terminal_attempts.add(item["attempt_id"])
+            terminal_attempts[item["attempt_id"]] = offset
             open_attempt = None
             continue
         raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")

@@ -172,14 +172,19 @@ blocks; only genuinely markerless historical runs retain manifest v3 compatibili
 
 After the publication the suffix admits reviewer events and, only once at least one reviewer attempt
 is terminal and none is open, a closed post-judge phase interleavable with further attempts: the Final
-check's own `final_decision_required`, the Lead's `final_gate_pending`, and
+check's own `final_decision_required`, the Lead's `final_gate_pending`, native primary-QA
+(`qa-tester`) role windows (`qa_started` and its `qa_completed`), and
 `post_judge_artifact_published` (`path`, `sha256`, `bytes`, `sha`, `generation`, `kind` of
 `two_voice_dispositions`, `disposition_evidence`, or `human_decision`, `secondary_attempt_id`,
 `seal_event_id`, `seal_projection_sha256`). Every one is bound to the seal's candidate and
 generation; a post-judge artifact lies under `09-test-evidence/post-judge/g<N>/`, is published once
 with its exact digest and size, names the seal's publication event and projection, and names an
-attempt already terminal in that suffix. Any other event after the seal still fails verification, and
-so does a post-judge event before the first terminal attempt or while an attempt is open.
+attempt already terminal in that suffix. Primary QA's own kinds, `two_voice_dispositions` and
+`disposition_evidence`, also carry `stage`, `role=qa-tester` and `role_start_event_id`, and must be
+published inside one native `qa-tester` window that was opened after the attempt they answer and is
+closed by its `qa_completed`; a `human_decision` is published by the Lead and carries no window. Any
+other event after the seal still fails verification, and so does a post-judge event before the first
+terminal attempt or while an attempt is open.
 
 A recapture starts the next generation. `firm-qa-checkout` rewrites `qa-candidate.json` before it
 appends its `qa_checkout` event, and verification always checks the seal of the live candidate's
@@ -230,12 +235,16 @@ matching trusted availability-attempt record and an exact logged human waiver. P
 blocks.
 
 A sealed run's `traceability.yaml` is frozen before the judge, so primary QA answers a CURRENT
-secondary BLOCK after it: it writes `09-test-evidence/post-judge/g<N>/two-voice-dispositions.<k>.json`
-and publishes it with `firm-ledger-log --run <run_dir> --strict post_judge_artifact_published
-path=<that path> sha256=<digest> bytes=<size> sha=<candidate_sha> generation=<N>
-kind=two_voice_dispositions secondary_attempt_id=<current attempt> seal_event_id=<publication event>
+secondary BLOCK after it. It opens a fresh primary-QA window for the post-judge answer
+(`firm-ledger-log --run <run_dir> --strict --role-start --stage <new stage> --role qa-tester
+--event qa_started ...`), writes `09-test-evidence/post-judge/g<N>/two-voice-dispositions.<k>.json`
+and publishes it inside that window with `firm-ledger-log --run <run_dir> --strict
+post_judge_artifact_published path=<that path> sha256=<digest> bytes=<size> sha=<candidate_sha>
+generation=<N> kind=two_voice_dispositions secondary_attempt_id=<current attempt> stage=<the window's
+stage> role=qa-tester role_start_event_id=<the window's start> seal_event_id=<publication event>
 seal_projection_sha256=<projection>`, the last two being `publication_event_id` and `projection_sha256`
-from `firm-seal-qa-evidence --verify --run <run_dir>`. The document is JSON with
+from `firm-seal-qa-evidence --verify --run <run_dir>`, and then closes the window with `qa_completed`.
+Disposition evidence is published the same way. The document is JSON with
 exactly `schema_version` (1), `run_id`, `candidate_sha`, `generation`, `secondary_attempt_id`,
 `secondary_verdict_sha256` and `secondary_verdict_bytes` (the current attempt's immutable verdict,
 `verdict_sha256`/`verdict_bytes` on its terminal event), and `two_voice_diff`, whose entries have
@@ -243,7 +252,7 @@ exactly the traceability disposition shape. Evidence it cites may be a `disposit
 post-judge artifact and a human record a `human_decision` one; neither may stand in for the other.
 Every post-judge file is published once, so a revision is a new `<k>`. For a current BLOCK the Final
 check uses the LATEST such publication for the generation when it names the current canonical attempt
-and verdict digest; a latest publication naming anything else is ignored, never replaced by an older
+and verdict digest and comes from a primary-QA window opened after that attempt ended; a latest publication naming anything else is ignored, never replaced by an older
 one, and the check falls back to `traceability.yaml`. An unsealed run keeps its dispositions in
 `traceability.yaml`. An objection with no disposition still blocks: silence is not dissent.
 

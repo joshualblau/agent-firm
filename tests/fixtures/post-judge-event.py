@@ -17,7 +17,10 @@ run's CURRENT sealed generation, so a test names only the one dimension it is ch
 
 Overrides: `key=value` sets (or replaces) a field, `-key` removes one, and `@tamper` rewrites the
 artifact after the event is logged, so its bytes no longer match the digest the event states.
-The event id is printed on success; the writer's own exit status is returned.
+`@window` publishes inside a fresh native primary-QA role window (a `qa_started` role start for
+`qa-tester` on a new stage, then the event, then its `qa_completed`), which is how primary QA's own
+post-judge kinds must be produced; without it (or after a later `@nowindow`),
+`stage`/`role`/`role_start_event_id` are whatever the caller passes. The event id is printed on success; the writer's own exit status is returned.
 """
 import hashlib
 import json
@@ -36,9 +39,14 @@ generation = candidate["generation"]
 overrides = {}
 drops = set()
 tamper = False
+window = False
 for operation in operations:
     if operation == "@tamper":
         tamper = True
+    elif operation == "@window":
+        window = True
+    elif operation == "@nowindow":
+        window = False
     elif operation.startswith("-"):
         drops.add(operation[1:])
     else:
@@ -82,6 +90,31 @@ elif event == "post_judge_artifact_published":
     fields["secondary_attempt_id"] = overrides["secondary_attempt_id"]
     fields["seal_event_id"] = seal["ledger"]["publication"]["event_id"]
     fields["seal_projection_sha256"] = seal["self"]["projection_sha256"]
+def open_window():
+    """Open a fresh native qa-tester window through the writer's role-start mode."""
+    first = json.loads(open(os.path.join(run, "run.jsonl")).readline())
+    run_id = os.path.basename(run)
+    authority = json.dumps([{"source_run": ".agent-firm/runs/" + run_id, "event_id": first["event_id"],
+                             "expect": {"event": "run_started", "run_id": run_id,
+                                        "fields": {"base_sha": first["base_sha"]}}}], separators=(",", ":"))
+    activation = subprocess.run(
+        [os.path.join(root, "bin", "firm-model-resolve"), "--provider", "codex", "--role", "qa-tester",
+         "--format", "activation"], stdout=subprocess.PIPE, check=True, text=True).stdout.strip()
+    stage = "test/pj-" + secrets.token_hex(6)
+    started = subprocess.run(
+        [writer, "--run", run, "--strict", "--role-start", "--stage", stage, "--role", "qa-tester",
+         "--contract", "role-contracts/Q-01-qa-tester.md", "--event", "qa_started",
+         "--authority-json", authority, "--agent", "/root/post_judge_qa", "--activation-json", activation],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if started.returncode != 0:
+        sys.stderr.write(started.stderr)
+        raise SystemExit(started.returncode)
+    return stage, json.loads(started.stdout)["event_id"]
+
+
+if window:
+    stage, start_id = open_window()
+    fields.update({"stage": stage, "role": "qa-tester", "role_start_event_id": start_id})
 fields.update(overrides)
 for key in drops:
     fields.pop(key, None)
@@ -94,6 +127,13 @@ done = subprocess.run(
 if done.returncode != 0:
     sys.stderr.write(done.stderr)
     raise SystemExit(done.returncode)
+if window:
+    closed = subprocess.run(
+        [writer, "--run", run, "--strict", "qa_completed", f"stage={stage}", "role=qa-tester",
+         f"role_start_event_id={start_id}"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if closed.returncode != 0:
+        sys.stderr.write(closed.stderr)
+        raise SystemExit(closed.returncode)
 if tamper and artifact is not None:
     with open(os.path.join(run, artifact), "a") as handle:
         handle.write("tampered after publication\n")

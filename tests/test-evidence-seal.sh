@@ -847,6 +847,23 @@ ledger_writes_supported() {
   t_p2_row_supported
 }
 
+# FOCUS-HELPERS-BEGIN
+# qa_window_open <run> <stage> — open a native primary-QA (qa-tester) role window through the
+# writer's role-start mode and print its event id; qa_window_close <run> <stage> <id> closes it.
+qa_window_open() {
+  local _qw_run="$1" _qw_stage="$2" _qw_authority
+  _qw_authority="$(t_python -c 'import json,sys; run=sys.argv[1]; rid=run.rstrip("/").split("/")[-1]; first=json.loads(open(run+"/run.jsonl").readline()); print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":first["event_id"],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":first["base_sha"]}}}],separators=(",",":")))' "$_qw_run")"
+  "$BIN/firm-ledger-log" --run "$_qw_run" --strict --role-start --stage "$_qw_stage" --role "${3:-qa-tester}" \
+    --contract "${4:-role-contracts/Q-01-qa-tester.md}" --event qa_started --authority-json "$_qw_authority" \
+    --agent /root/post_judge_qa \
+    --activation-json "$("$BIN/firm-model-resolve" --provider codex --role "${3:-qa-tester}" --format activation)" \
+    | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])'
+}
+qa_window_close() {
+  "$BIN/firm-ledger-log" --run "$1" --strict qa_completed "stage=$2" role=qa-tester "role_start_event_id=$3" >/dev/null
+}
+# FOCUS-HELPERS-END
+
 # publish_generation_producers <run> <sha> <generation> <qa-stage> <packager-stage> — publish the
 # three fixed-root producers for one generation inside fresh QA and packager role windows, the way
 # make_sealable_run does for generation 1. Role windows are unique per stage, so a later generation
@@ -997,9 +1014,11 @@ else
     done
     pj_restore() { cp "$1" "$pj_run/run.jsonl"; chmod 600 "$pj_run/run.jsonl"; }
     pj() { t_python "$PJ_EVENT" "$FIRM_ROOT" "$pj_run" "$@" >/dev/null; }
-    pj_publish() { # <name under post-judge/g1> <kind> [override...]
-      local _pj_name="$1" _pj_kind="$2"; shift 2
-      pj post_judge_artifact_published "path=$pj_root/$_pj_name" "kind=$_pj_kind" "secondary_attempt_id=$pj_attempt" "$@"
+    pj_publish() { # <name under post-judge/g1> <kind> [override...] — primary QA's kinds in a fresh window
+      local _pj_name="$1" _pj_kind="$2" _pj_window=@nowindow; shift 2
+      case "$_pj_kind" in two_voice_dispositions|disposition_evidence) _pj_window=@window ;; esac
+      pj post_judge_artifact_published "path=$pj_root/$_pj_name" "kind=$_pj_kind" "secondary_attempt_id=$pj_attempt" \
+        "$_pj_window" "$@"
     }
     pj_checkout() {
       pj qa_checkout "dir=.agent-firm/qa-checkout/$pj_id" "branch=integration/$pj_id" \
@@ -1103,6 +1122,41 @@ PY
     pj_restore "$pj_judged"; pj_publish twice.json disposition_evidence; pj_publish twice.json disposition_evidence
     pj_expect refuse "one post-judge path published twice is refused"
 
+    # PRIMARY QA'S OWN KINDS CARRY A PRODUCER IDENTITY: a native qa-tester window opened after the
+    # attempt they answer, with the publication inside it. Without one, anybody who could append to
+    # the ledger could dispose of a judge objection.
+    for pj_kind in two_voice_dispositions:two-voice-dispositions.1.json disposition_evidence:evidence.md; do
+      pj_restore "$pj_judged"; pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow
+      pj_expect refuse "a ${pj_kind%%:*} publication with no primary-QA window is refused" publication \
+        "post_judge_artifact_published field set is not closed"
+      pj_restore "$pj_judged"
+      pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow stage=test/forged role=qa-tester role_start_event_id=evt-no-such-window
+      pj_expect refuse "a ${pj_kind%%:*} publication naming a window that does not exist is refused" publication \
+        "is not published inside a qa-tester window"
+    done
+    pj_restore "$pj_judged"; pj_publish human.yaml human_decision @window
+    pj_expect refuse "a Lead-published human_decision carries no QA window fields" publication \
+      "post_judge_artifact_published field set is not closed"
+    pj_q01="$(t_python -c 'import json,sys; print([r for r in map(json.loads,open(sys.argv[1])) if r.get("event")=="qa_started"][0]["event_id"])' "$pj_sealed")"
+    pj_restore "$pj_judged"; pj_publish evidence.md disposition_evidence @nowindow stage=test/Q-01 role=qa-tester "role_start_event_id=$pj_q01"
+    pj_expect refuse "the pre-seal QA window cannot produce a post-judge artifact" publication \
+      "is not published inside a qa-tester window"
+    pj_restore "$pj_judged"; pj_w="$(qa_window_open "$pj_run" test/pj-closed)"; qa_window_close "$pj_run" test/pj-closed "$pj_w"
+    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-closed role=qa-tester "role_start_event_id=$pj_w"
+    pj_expect refuse "a publication after its window closed is refused" publication "is not published inside a qa-tester window"
+    pj_restore "$pj_judged"; pj_w="$(qa_window_open "$pj_run" test/pj-unclosed)"
+    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-unclosed role=qa-tester "role_start_event_id=$pj_w"
+    pj_expect refuse "a publication in a window that never closes is refused" publication "role window"
+    pj_restore "$pj_judged"; qa_window_open "$pj_run" test/pj-packager packager role-contracts/P-01-packager.md >/dev/null
+    pj_expect refuse "a post-judge role window for any role but qa-tester is refused" publication \
+      "post-judge role windows are qa-tester only"
+    pj_restore "$pj_judged"; pj qa_completed stage=test/pj-none role=qa-tester role_start_event_id=evt-no-such-window
+    pj_expect refuse "a qa_completed that closes no post-judge window is refused" publication \
+      "does not close an open primary-QA window"
+    pj_restore "$pj_sealed"; qa_window_open "$pj_run" test/pj-early >/dev/null
+    pj_expect refuse "a QA window opened before any terminal attempt is refused" publication \
+      "qa_started needs a terminal reviewer attempt"
+
     # Everything outside the closed set is still refused after the judge.
     pj_restore "$pj_judged"; pj lead_note note=after-the-judge
     pj_expect refuse "an ordinary lead_note after the judge is still refused" publication "unexpected event lead_note"
@@ -1111,6 +1165,23 @@ PY
       "unexpected event human_decision_recorded"
     pj_restore "$pj_judged"
     pj_expect accept "the judged snapshot itself still verifies"
+
+    # A window answers only attempts that were terminal when it opened. Open one, let a second judge
+    # attempt finish (a0002, trusted unavailable), then publish inside the window: answering a0001 is
+    # accepted, answering a0002 is not.
+    pj_restore "$pj_judged"; pj_w="$(qa_window_open "$pj_run" test/pj-straddle)"
+    pj_judge_rc=0; env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$pj_run" >/dev/null 2>&1 || pj_judge_rc=$?
+    assert_eq "a second judge attempt runs while a QA window is open" 3 "$pj_judge_rc"
+    pj_straddle="$pj_run/.pj-straddle.jsonl"; cp "$pj_run/run.jsonl" "$pj_straddle"
+    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-straddle role=qa-tester "role_start_event_id=$pj_w"
+    qa_window_close "$pj_run" test/pj-straddle "$pj_w"
+    pj_expect accept "control: the window answers the attempt that was terminal when it opened"
+    pj_restore "$pj_straddle"
+    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-straddle role=qa-tester \
+      "role_start_event_id=$pj_w" secondary_attempt_id=gpt-c1-a0002
+    qa_window_close "$pj_run" test/pj-straddle "$pj_w"
+    pj_expect refuse "a window opened before the attempt it answers is refused" publication \
+      "window opened after the attempt it answers"
   fi
 fi
 
@@ -1214,15 +1285,23 @@ SH
       else _t_ok "$2"; fi
     }
     fr_event() { t_python "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" "$@"; }
-    fr_publish() { # <name under post-judge/g1> <kind> <attempt> — prints the producer event id
-      fr_event post_judge_artifact_published "path=$fr_root/$1" "kind=$2" "secondary_attempt_id=$3"
+    fr_publish() { # <name under post-judge/g1> <kind> <attempt> [override...] — prints the producer event id
+      local _fr_name="$1" _fr_kind="$2" _fr_attempt="$3" _fr_window=@nowindow; shift 3
+      # Primary QA's own kinds are produced inside a fresh native qa-tester window.
+      case "$_fr_kind" in two_voice_dispositions|disposition_evidence) _fr_window=@window ;; esac
+      fr_event post_judge_artifact_published "path=$fr_root/$_fr_name" "kind=$_fr_kind" \
+        "secondary_attempt_id=$_fr_attempt" "$_fr_window" "$@"
     }
-    # fr_dispositions <name> <attempt> <current|wrong> <evidence-event> [record-event] — write one
-    # two-voice-dispositions document whose entries have exactly the traceability disposition shape.
+    # fr_dispositions <name> <attempt> [digest=current|wrong|wrong-bytes] [evidence=<event>]
+    #   [record=<event>] [disposition=human_decision|proceed_with_primary] [bounded=<event>] [rounds=N]
+    # — write one two-voice-dispositions document whose entries have exactly the traceability
+    # disposition shape.
     fr_dispositions() {
       t_python - "$fr_run" "$@" <<'PY'
 import hashlib,json,os,sys
-run,name,attempt,digest_mode,evidence_id=sys.argv[1:6]; record_id=sys.argv[6] if len(sys.argv)>6 else ""
+run,name,attempt=sys.argv[1:4]; options=dict(item.split("=",1) for item in sys.argv[4:])
+digest_mode=options.get("digest","current"); evidence_id=options["evidence"]; record_id=options.get("record","")
+disposition=options.get("disposition","human_decision")
 c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
 canonical=json.load(open(run+"/08-qa-verdict.gpt.json"))
 local=open(f"{run}/09-test-evidence/reviewer-attempts/{canonical['attempt_id']}/verdict.json","rb").read()
@@ -1238,13 +1317,16 @@ for objection in canonical["blocker_objects"]:
            "positive_dissent":True,"affected_criteria":objection["affected_criteria"],
            "affected_paths":objection["affected_paths"],"risk":"low","risk_reasons":["criterion:AC-001:functional"],
            "bounded_resolution":{"attempted":False,"rounds":0,"rerun":"not_run","evidence":None},
-           "evidence":ref(evidence_id),"disposition":"human_decision"}
+           "evidence":ref(evidence_id),"disposition":disposition}
+    if "bounded" in options:
+        entry["bounded_resolution"]={"attempted":True,"rounds":int(options.get("rounds","1")),"rerun":"block",
+                                     "evidence":ref(options["bounded"])}
     if record_id: entry["record"]=ref(record_id)
     entries.append(entry)
 doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":gen,
      "secondary_attempt_id":attempt,
-     "secondary_verdict_sha256":hashlib.sha256(local).hexdigest() if digest_mode=="current" else "0"*64,
-     "secondary_verdict_bytes":len(local),"two_voice_diff":entries}
+     "secondary_verdict_sha256":hashlib.sha256(local).hexdigest() if digest_mode!="wrong" else "0"*64,
+     "secondary_verdict_bytes":len(local)+(1 if digest_mode=="wrong-bytes" else 0),"two_voice_diff":entries}
 path=f"{run}/09-test-evidence/post-judge/g{gen}/{name}"
 os.makedirs(os.path.dirname(path),exist_ok=True)
 open(path,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(path,0o600)
@@ -1310,15 +1392,15 @@ PY
     fr_evidence="$(fr_publish primary-position.md disposition_evidence gpt-c1-a0002)"
     assert_ok "primary QA publishes post-judge disposition evidence" test -n "$fr_evidence"
 
-    fr_dispositions two-voice-dispositions.1.json gpt-c1-a0001 current "$fr_evidence"
+    fr_dispositions two-voice-dispositions.1.json gpt-c1-a0001 "evidence=$fr_evidence"
     fr_publish two-voice-dispositions.1.json two_voice_dispositions gpt-c1-a0001 >/dev/null
     fr_check 1 "dispositions naming another attempt are ignored, so the BLOCK still blocks" "are ignored"
-    fr_dispositions two-voice-dispositions.2.json gpt-c1-a0002 wrong "$fr_evidence"
+    fr_dispositions two-voice-dispositions.2.json gpt-c1-a0002 digest=wrong "evidence=$fr_evidence"
     fr_publish two-voice-dispositions.2.json two_voice_dispositions gpt-c1-a0002 >/dev/null
     fr_check 1 "dispositions naming another verdict digest are ignored, so the BLOCK still blocks" "are ignored"
 
     fr_before="$(fr_decisions)"
-    fr_dispositions two-voice-dispositions.3.json gpt-c1-a0002 current "$fr_evidence"
+    fr_dispositions two-voice-dispositions.3.json gpt-c1-a0002 "evidence=$fr_evidence"
     fr_publish two-voice-dispositions.3.json two_voice_dispositions gpt-c1-a0002 >/dev/null
     fr_check 4 "current dispositions asking for a human decision return decision_required" "DECISION REQUIRED"
     assert_eq "the Final check wrote exactly one decision state" "$((fr_before + 1))" "$(fr_decisions)"
@@ -1341,11 +1423,11 @@ PY
     # The wrong kind of post-judge artifact cannot stand in for the human record.
     cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-as-evidence.yaml"
     fr_wrong_kind="$(fr_publish human-as-evidence.yaml disposition_evidence gpt-c1-a0002)"
-    fr_dispositions two-voice-dispositions.4.json gpt-c1-a0002 current "$fr_evidence" "$fr_wrong_kind"
+    fr_dispositions two-voice-dispositions.4.json gpt-c1-a0002 "evidence=$fr_evidence" "record=$fr_wrong_kind"
     fr_publish two-voice-dispositions.4.json two_voice_dispositions gpt-c1-a0002 >/dev/null
     fr_check 1 "a disposition_evidence artifact cannot stand in for the human record" "where it may not"
 
-    fr_dispositions two-voice-dispositions.5.json gpt-c1-a0002 current "$fr_evidence" "$fr_record"
+    fr_dispositions two-voice-dispositions.5.json gpt-c1-a0002 "evidence=$fr_evidence" "record=$fr_record"
     fr_publish two-voice-dispositions.5.json two_voice_dispositions gpt-c1-a0002 >/dev/null
     fr_check 0 "a recorded human decision cited from re-published dispositions passes a fresh check" \
       "every exact secondary objection has a typed current-SHA disposition"
@@ -1376,10 +1458,38 @@ PY
     cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-decision.a0003.yaml"
     fr_evidence3="$(fr_publish primary-position.a0003.md disposition_evidence gpt-c1-a0003)"
     fr_record3="$(fr_publish human-decision.a0003.yaml human_decision gpt-c1-a0003)"
-    fr_dispositions two-voice-dispositions.7.json gpt-c1-a0003 current "$fr_evidence3" "$fr_record3"
+    fr_dispositions two-voice-dispositions.7.json gpt-c1-a0003 "evidence=$fr_evidence3" "record=$fr_record3"
     fr_publish two-voice-dispositions.7.json two_voice_dispositions gpt-c1-a0003 >/dev/null
     fr_check 0 "dispositions re-published for the new attempt pass a fresh check"
     assert_ok "the seal verifies after the whole interleaved post-judge history" \
+      seal_for_run "$fr_run" --verify --phase publication
+
+    # PRIMARY QA'S DISPOSITIONS CARRY A PRODUCER IDENTITY. The reviewer cleared a current BLOCK with
+    # proceed_with_primary dispositions and disposition evidence appended by a caller with no role
+    # window at all. Both kinds must come from a native qa-tester window opened after the attempt.
+    printf '%s\n' 'One bounded resolution round: the judge re-ran and still blocked; primary QA keeps its reading.' \
+      > "$fr_run/$fr_root/round.md"; chmod 600 "$fr_run/$fr_root/round.md"
+    fr_before_windowless="$fr_stub/before-windowless"; mkdir -p "$fr_before_windowless"
+    cp -p "$fr_run/run.jsonl" "$fr_before_windowless/"
+    fr_round_bare="$(fr_publish round.md disposition_evidence gpt-c1-a0003 @nowindow)"
+    fr_dispositions two-voice-dispositions.8.json gpt-c1-a0003 disposition=proceed_with_primary \
+      "evidence=$fr_round_bare" "bounded=$fr_round_bare"
+    fr_publish two-voice-dispositions.8.json two_voice_dispositions gpt-c1-a0003 @nowindow >/dev/null
+    fr_check 2 "proceed_with_primary dispositions with no primary-QA window cannot clear the BLOCK" \
+      "field set is not closed"
+    cp -p "$fr_before_windowless/run.jsonl" "$fr_run/run.jsonl"
+    assert_ok "…and the run is restored" seal_for_run "$fr_run" --verify --phase publication
+    fr_round="$(fr_publish round.md disposition_evidence gpt-c1-a0003)"
+    fr_dispositions two-voice-dispositions.9.json gpt-c1-a0003 disposition=proceed_with_primary \
+      "evidence=$fr_round" "bounded=$fr_round" rounds=0
+    fr_publish two-voice-dispositions.9.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 1 "proceed_with_primary inside a window but without one bounded round still blocks" \
+      "exactly one bounded resolution round"
+    fr_dispositions two-voice-dispositions.10.json gpt-c1-a0003 disposition=proceed_with_primary \
+      "evidence=$fr_round" "bounded=$fr_round"
+    fr_publish two-voice-dispositions.10.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 0 "proceed_with_primary from a primary-QA window with one bounded round passes"
+    assert_ok "the seal verifies with the windowed primary-QA publications" \
       seal_for_run "$fr_run" --verify --phase publication
   fi
 fi

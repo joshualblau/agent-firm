@@ -261,7 +261,32 @@ def post_judge_published(kind):
             and event.get("seal_event_id")==current_seal.get("event_id")
             and event.get("seal_projection_sha256")==current_seal.get("projection_sha256")]
 
-def evidence_ref(ref, label, post_judge_kinds=()):
+def require_qa_window(event, label, answering):
+    """`event` was published inside one native primary-QA window opened after `answering` ended.
+
+    The seal's suffix grammar already proves every post-judge window is closed and well-formed; this
+    is the Final check's own requirement that the window answers the CURRENT attempt, so a set made
+    before the current judge verdict, or by a caller outside any QA window, cannot dispose of it.
+    """
+    start_id=event.get("role_start_event_id")
+    if event.get("role")!="qa-tester" or not isinstance(event.get("stage"),str) or not isinstance(start_id,str):
+        block(f"{label} was not published inside a primary-QA (qa-tester) role window")
+    position=[index for index,item in enumerate(events) if item is event]
+    starts=[index for index,item in enumerate(events) if item.get("event_id")==start_id]
+    completions=[index for index,item in enumerate(events)
+                 if item.get("event")=="qa_completed" and item.get("role_start_event_id")==start_id]
+    outcomes=[index for index,item in enumerate(events)
+              if item.get("event_id")==(answering or {}).get("outcome_event_id")]
+    if len(position)!=1 or len(starts)!=1 or len(completions)!=1 or len(outcomes)!=1:
+        block(f"{label} has no single closed primary-QA window answering the current judge attempt")
+    start=events[starts[0]]; completion=events[completions[0]]
+    if (start.get("event")!="qa_started" or start.get("role")!="qa-tester" or start.get("stage")!=event.get("stage")
+            or not {"contract","authority","activation"}.issubset(start)
+            or completion.get("role")!="qa-tester" or completion.get("stage")!=event.get("stage")
+            or not outcomes[0] < starts[0] < position[0] < completions[0]):
+        block(f"{label} was not published inside a primary-QA window opened after the current judge attempt")
+
+def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
     if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
         block(f"{label} is missing, stale, or bound to another SHA")
     path=safe_file(ref.get("path"), label)
@@ -277,8 +302,11 @@ def evidence_ref(ref, label, post_judge_kinds=()):
     event=matches[0]; origin=ref.get("path")
     # A post-judge artifact may stand only where its declared kind belongs: disposition evidence as
     # evidence, a human decision as the human record, and never the disposition set itself.
-    if event.get("event")=="post_judge_artifact_published" and event.get("kind") not in post_judge_kinds:
-        block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
+    if event.get("event")=="post_judge_artifact_published":
+        if event.get("kind") not in post_judge_kinds or answering is None:
+            block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
+        if event.get("kind")=="disposition_evidence":
+            require_qa_window(event,label,answering)
     if event.get("sha")!=sha or str(event.get("generation"))!=str(generation) or origin not in (event.get("path"),event.get("verdict"),event.get("attempt")):
         block(f"{label} producer candidate/artifact identity mismatches")
     digest_field="verdict_sha256" if origin==event.get("verdict") else "sha256"
@@ -491,7 +519,7 @@ if secondary.get("verdict") == "APPROVE":
     archived_docs={}
     for entry in diffs:
         label=entry.get("secondary_blocker")
-        evidence_ref(entry.get("evidence"),f"disposition evidence for {label}",("disposition_evidence",))
+        evidence_ref(entry.get("evidence"),f"disposition evidence for {label}")
         if entry.get("disposition") not in ("fixed","secondary_withdrew"):
             block(f"current APPROVE can retain only fixed/secondary_withdrew history: {label}")
         blocked_path=evidence_ref(entry.get("blocked_secondary_verdict"),f"archived secondary BLOCK for {label}")
@@ -555,6 +583,7 @@ if published_dispositions:
     if (published["secondary_attempt_id"]==current_attempt.get("attempt_id")
             and published["secondary_verdict_sha256"]==hashlib.sha256(current_local_raw).hexdigest()
             and published["secondary_verdict_bytes"]==len(current_local_raw)):
+        require_qa_window(latest,"published two-voice dispositions",current_attempt)
         for index,entry in enumerate(published["two_voice_diff"],1):
             try:
                 jsonschema.validate(entry,{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/disposition","$defs":trace_schema["$defs"]})
@@ -575,7 +604,7 @@ human_entries=[]
 for entry in diffs:
     label=entry["secondary_blocker"]
     objection=bind_disposition(entry,current_objects,f"disposition for {label}")
-    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}", ("disposition_evidence",))
+    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}", ("disposition_evidence",), current_attempt)
     disposition=entry.get("disposition")
     risk=entry.get("risk")
     derived_risk,derived_reasons=derived_objection_risk(objection)
@@ -589,7 +618,7 @@ for entry in diffs:
             block(f"proceed_with_primary needs positive, unambiguous low-risk dissent: {label}")
         if not isinstance(bounded,dict) or bounded.get("attempted") is not True or bounded.get("rounds") != 1:
             block(f"proceed_with_primary needs exactly one bounded resolution round: {label}")
-        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}", ("disposition_evidence",))
+        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}", ("disposition_evidence",), current_attempt)
         continue
     if disposition in ("fixed", "secondary_withdrew"):
         block(f"{disposition} requires a later wrapper APPROVE promoted as current canonical: {label}")
@@ -608,7 +637,7 @@ if human_entries:
     record_refs=[entry["record"] for entry,_ in human_entries]
     if any(ref!=record_refs[0] for ref in record_refs[1:]):
         block("all human-decision objections must reference one exact shared record")
-    record_path=evidence_ref(record_refs[0],"aggregate human decision",("human_decision",))
+    record_path=evidence_ref(record_refs[0],"aggregate human decision",("human_decision",),current_attempt)
     record=load_yaml(record_path,"aggregate human decision")
     needed={"schema_version":1,"type":"human_decision","run_id":run_id,"candidate_sha":sha,"decision":"proceed"}
     if not isinstance(record,dict) or any(record.get(k)!=v for k,v in needed.items()):
