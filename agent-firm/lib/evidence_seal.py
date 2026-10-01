@@ -1502,8 +1502,12 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
     except (SealError, UnicodeError) as exc:
         raise SealError("LEDGER_SUFFIX", "post-judge artifact path is not canonical") from exc
     root = post_judge_root(identity["generation"])
-    if not path.startswith(root) or path == root or path in {entry.get("path") for entry in seal["entries"]}:
+    if not path.startswith(root) or path == root:
         raise SealError("LEDGER_SUFFIX", f"post-judge artifact is outside {root}")
+    # The directory alone does not exclude a sealed path: a sealed file may itself have declared a
+    # path under post-judge/g<N>/ before the seal. A post-judge publication never names a sealed file.
+    if path in {entry.get("path") for entry in seal["entries"]}:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact names a sealed path")
     if path in published_paths:
         raise SealError("LEDGER_SUFFIX", "post-judge artifact path is published twice")
     if item.get("secondary_attempt_id") not in terminal_attempts:

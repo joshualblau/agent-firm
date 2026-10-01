@@ -986,11 +986,21 @@ fi
 # only after a terminal reviewer event with no attempt open, bound to the seal's own identity, and
 # every other event is still refused. Each case starts from one of two exact ledger snapshots.
 PJ_EVENT="$TESTS_DIR/fixtures/post-judge-event.py"
+# write_presealed_post_judge <run> <sha> — a make_sealable_run trace writer whose primary verdict
+# declares an artifact under 09-test-evidence/post-judge/g1/ BEFORE the seal, so the seal holds a path
+# inside the post-judge directory. A post-judge publication must still never name it.
+write_presealed_post_judge() {
+  mkdir -p "$1/09-test-evidence/post-judge/g1"
+  printf 'declared before the seal\n' > "$1/09-test-evidence/post-judge/g1/sealed-before.md"
+  chmod 600 "$1/09-test-evidence/post-judge/g1/sealed-before.md"
+  printf '%s\n' '{"artifacts":["09-test-evidence/post-judge/g1/sealed-before.md"],"commands_run":[],"verdict":"APPROVE"}' \
+    > "$1/08-qa-verdict.json"
+}
 t_case "the sealed suffix admits a closed post-judge phase and nothing else"
 if ! ledger_writes_supported; then
   t_skip "closed post-judge suffix grammar" "requires a supported P2 ledger write host and no refused-row seam"
 else
-  pj_fixture="$(make_sealable_run claude "" "" real_qa_tools)"
+  pj_fixture="$(make_sealable_run claude "" write_presealed_post_judge real_qa_tools)"
   pj_run="$(printf '%s\n' "$pj_fixture" | sed -n '2p')"; pj_sha="$(printf '%s\n' "$pj_fixture" | sed -n '3p')"
   if [ -z "$pj_run" ] || ! seal_for_run "$pj_run" >/dev/null 2>&1; then
     _t_no "sealed post-judge fixture created" "fixture setup or seal failed"
@@ -1126,6 +1136,11 @@ PY
     done
     pj_restore "$pj_judged"; pj_publish twice.json disposition_evidence; pj_publish twice.json disposition_evidence
     pj_expect refuse "one post-judge path published twice is refused"
+    assert_output "the fixture's seal holds a path inside the post-judge directory" \
+      '"path":"09-test-evidence/post-judge/g1/sealed-before.md"' cat "$pj_run/09-test-evidence/final-evidence/g1/seal.json"
+    pj_restore "$pj_judged"; pj_publish sealed-before.md disposition_evidence
+    pj_expect refuse "a post-judge publication of a sealed path inside the post-judge directory is refused" \
+      publication "post-judge artifact names a sealed path"
 
     # PRIMARY QA'S OWN KINDS CARRY A PRODUCER IDENTITY: a native qa-tester window opened after the
     # attempt they answer, with the publication inside it. Without one, anybody who could append to
@@ -1456,6 +1471,9 @@ PY
     fr_dispositions two-voice-dispositions.2.json gpt-c1-a0002 digest=wrong "evidence=$fr_evidence"
     fr_publish two-voice-dispositions.2.json two_voice_dispositions gpt-c1-a0002 >/dev/null
     fr_check 1 "dispositions naming another verdict digest are ignored, so the BLOCK still blocks" "are ignored"
+    fr_dispositions two-voice-dispositions.2b.json gpt-c1-a0002 digest=wrong-bytes "evidence=$fr_evidence"
+    fr_publish two-voice-dispositions.2b.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 1 "dispositions naming the right digest but another verdict size are ignored" "are ignored"
 
     fr_before="$(fr_decisions)"
     fr_dispositions two-voice-dispositions.3.json gpt-c1-a0002 "evidence=$fr_evidence"
@@ -1492,6 +1510,11 @@ PY
     assert_ok "the seal verifies for publication at the end of the post-judge phase" \
       seal_for_run "$fr_run" --verify --phase publication
     assert_ok "…and for the wrapper's preflight" seal_for_run "$fr_run" --verify --phase wrapper-preflight
+    # The LATEST publication governs. A later set naming another (older) terminal attempt is ignored and
+    # does NOT resurrect the earlier set that named the current attempt.
+    fr_dispositions two-voice-dispositions.5b.json gpt-c1-a0001 "evidence=$fr_evidence" "record=$fr_record"
+    fr_publish two-voice-dispositions.5b.json two_voice_dispositions gpt-c1-a0001 >/dev/null
+    fr_check 1 "a later set naming an older attempt does not resurrect the earlier current set" "are ignored"
 
     # The latest publication rules: a malformed one blocks rather than falling back to an older set.
     t_python - "$fr_run/$fr_root/two-voice-dispositions.5.json" "$fr_run/$fr_root/two-voice-dispositions.6.json" <<'PY'

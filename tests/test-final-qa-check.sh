@@ -306,11 +306,21 @@ doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"gene
 rel=f"09-test-evidence/post-judge/g{gen}/two-voice-dispositions.1.json"
 os.makedirs(os.path.dirname(run+"/"+rel),exist_ok=True)
 raw=(json.dumps(doc,indent=2,sort_keys=True)+"\n").encode(); open(run+"/"+rel,"wb").write(raw)
-event={"ts":"2026-10-01T00:00:00Z","event":"post_judge_artifact_published","event_id":"evt-unsealed-dispositions",
-       "run_id":os.path.basename(run),"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
+# Everything about the publication is well formed EXCEPT its seal binding: a native-shaped qa-tester
+# window opened after the attempt, the publication inside it, and its completion. So only the seal
+# binding separates "ignored" from "used".
+rid=os.path.basename(run)
+start={"ts":"2026-10-01T00:00:00Z","event":"qa_started","event_id":"evt-unsealed-window","run_id":rid,
+       "stage":"test/pj-unsealed","role":"qa-tester","agent":"/root/post_judge_qa","contract":{},"authority":[],"activation":{}}
+event={"ts":"2026-10-01T00:00:01Z","event":"post_judge_artifact_published","event_id":"evt-unsealed-dispositions",
+       "run_id":rid,"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
        "sha":sha,"generation":str(gen),"kind":"two_voice_dispositions","secondary_attempt_id":"gpt-c1-a0701",
+       "stage":"test/pj-unsealed","role":"qa-tester","role_start_event_id":"evt-unsealed-window",
        "seal_event_id":"evt-no-such-seal","seal_projection_sha256":"0"*64}
-with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+done={"ts":"2026-10-01T00:00:02Z","event":"qa_completed","event_id":"evt-unsealed-window-done","run_id":rid,
+      "stage":"test/pj-unsealed","role":"qa-tester","role_start_event_id":"evt-unsealed-window"}
+with open(run+"/run.jsonl","a") as fh:
+    for row in (start,event,done): fh.write(json.dumps(row,separators=(",",":"))+"\n")
 d["two_voice_diff"]=[]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
 PY
   assert_rc "the same dispositions published post-judge in an unsealed run are not authority" 1 "$FINAL" "$run"

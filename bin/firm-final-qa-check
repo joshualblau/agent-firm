@@ -275,14 +275,18 @@ seal_publications=[event for event in events if event.get("event")=="evidence_se
                    and event.get("sha")==sha and str(event.get("generation"))==str(generation)]
 current_seal=seal_publications[0] if len(seal_publications)==1 else None
 
+# The seal binding is the ONE mechanism that makes a post-judge publication count: without a seal
+# publication for this generation there is nothing to bind to, so nothing matches.
+current_seal_id=current_seal.get("event_id") if current_seal is not None else None
+current_seal_projection=current_seal.get("projection_sha256") if current_seal is not None else None
+
 def post_judge_published(kind):
-    if current_seal is None:
-        return []
     return [event for event in events if event.get("event")=="post_judge_artifact_published"
             and event.get("kind")==kind and event.get("sha")==sha
             and str(event.get("generation"))==str(generation)
-            and event.get("seal_event_id")==current_seal.get("event_id")
-            and event.get("seal_projection_sha256")==current_seal.get("projection_sha256")]
+            and isinstance(current_seal_id,str) and isinstance(current_seal_projection,str)
+            and event.get("seal_event_id")==current_seal_id
+            and event.get("seal_projection_sha256")==current_seal_projection]
 
 def require_qa_window(event, label, answering):
     """`event` was published inside one native primary-QA window opened after `answering` ended.
