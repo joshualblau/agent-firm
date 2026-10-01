@@ -1770,6 +1770,53 @@ except Exception as exc:
                      f"references it: {nested}", 1)
             add_payload(nested, nested_raw, os.lstat(nested_target).st_mode)
 
+    # POST-JUDGE PUBLICATIONS AND DECISION STATES, discovered from the target ledger exactly like the
+    # prior attempts above. After a judge verdict a sealed run records digest-named artifacts that no
+    # sealed file references: primary QA's post-judge dispositions and evidence, the Lead's human
+    # decisions (`post_judge_artifact_published`), and the Final check's decision states
+    # (`final_decision_required`). run.jsonl is in the manifest and names each with `sha256` and
+    # `bytes`, so a further judge attempt holding the ledger but not the files would hold digests it
+    # cannot check -- the omission its contract calls uncertainty. Each is inventoried, its digest
+    # and size checked against the event that names it (a mismatch is tampering and stops the run),
+    # and an absent or unreadable one is declared unresolved rather than dropped.
+    for item in ledger_records:
+        if item.get("event") not in ("post_judge_artifact_published", "final_decision_required"):
+            continue
+        origin = item.get("path")
+        if not isinstance(origin, str) or not origin:
+            unresolved_references.append({
+                "origin_path": "<missing path>", "referenced_by": str(item.get("event")),
+                "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
+                "declared_bytes": item.get("bytes"), "reason": "event_names_no_artifact_path",
+            })
+            continue
+        if origin in seen_origins:
+            continue
+        if any(part in ("", ".", "..") for part in Path(origin).parts) or os.path.isabs(origin):
+            stop(f"target ledger references an unsafe post-judge path: {origin!r}", 1)
+        target = run
+        try:
+            for part in Path(origin).parts:
+                target = target / part
+                if stat.S_ISLNK(os.lstat(target).st_mode):
+                    raise ValueError("a path component is a symlink")
+            if not stat.S_ISREG(os.lstat(target).st_mode):
+                raise ValueError("not a regular no-follow file")
+            raw = target.read_bytes()
+        except Exception as exc:                                   # noqa: BLE001
+            unresolved_references.append({
+                "origin_path": origin, "referenced_by": str(item.get("event")),
+                "event_id": item.get("event_id"),
+                "declared_sha256": item.get("sha256"), "declared_bytes": item.get("bytes"),
+                "reason": f"unreadable:{type(exc).__name__}",
+            })
+            continue
+        if (str(item.get("sha256")) != hashlib.sha256(raw).hexdigest()
+                or str(item.get("bytes")) != str(len(raw))):
+            stop(f"post-judge artifact digest/size does not match the ledger event that names it: "
+                 f"{origin}", 1)
+        add_payload(origin, raw, os.lstat(target).st_mode)
+
     # BOTH MECHANISMS ARE PRESENT, IN THIS ORDER, AND THE ORDER IS LOAD-BEARING. The block above
     # carries what the LEDGER attests (prior terminal reviewer attempts, digest-checked against the
     # event that referenced them); the block below carries what the PRIMARY VERDICT declares (its

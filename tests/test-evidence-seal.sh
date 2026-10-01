@@ -1319,12 +1319,15 @@ case "$*" in
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
+# Keep the controlled input manifest this judge was handed, so the suite can inspect what crossed.
+[ -n "${STUB_KEEP:-}" ] && cp "$FIRM_QA_INPUT_MANIFEST" "$STUB_KEEP/manifest-$FIRM_QA_ATTEMPT_ID.json"
 sed "s/__ATTEMPT__/$FIRM_QA_ATTEMPT_ID/" "$STUB_VERDICT" > "$out"
 SH
-    chmod +x "$fr_stub/bin/codex"
+    chmod +x "$fr_stub/bin/codex"; mkdir -p "$fr_stub/manifests"
     fr_model="$("$BIN/firm-model-resolve" --provider codex --role reviewer --format json | t_python -c 'import json,sys; print(json.load(sys.stdin)["model"])')"
     fr_judge() {
       env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$fr_stub/block.json" \
+        STUB_KEEP="$fr_stub/manifests" \
         CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
         FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$fr_run" >/dev/null 2>&1
     }
@@ -1508,6 +1511,26 @@ PY
     assert_output "…as a new promoted attempt, not a refused preflight" '"attempt_id": "gpt-c1-a0003"' \
       cat "$fr_run/09-test-evidence/reviewer-state.gpt.json"
     assert_output "…whose BLOCK is the canonical verdict" '"attempt_id": "gpt-c1-a0003"' cat "$fr_run/08-qa-verdict.gpt.json"
+    # That attempt's controlled input manifest holds every digest-named post-judge artifact and
+    # decision state the ledger it was handed names: inventoried with the event's digest, or declared.
+    assert_ok "the further attempt's manifest inventories every post-judge artifact the ledger names" \
+      t_python - "$fr_run" "$fr_stub/manifests/manifest-gpt-c1-a0003.json" <<'PY'
+import json,sys
+run,manifest_path=sys.argv[1:]
+rows=[json.loads(line) for line in open(run+"/run.jsonl")]
+start=[i for i,r in enumerate(rows) if r.get("event")=="reviewer_attempt_started" and r.get("attempt_id")=="gpt-c1-a0003"][0]
+named=[r for r in rows[:start] if r.get("event") in ("post_judge_artifact_published","final_decision_required")]
+assert len(named)>=8,len(named)
+manifest=json.load(open(manifest_path))
+entries={e["origin_path"]:e for e in manifest["entries"]}
+declared={e["origin_path"] for e in manifest["excluded_references"]+manifest["unresolved_references"]}
+missing=[r["path"] for r in named if not ((r["path"] in entries and entries[r["path"]]["source_sha256"]==r["sha256"]
+                                           and str(entries[r["path"]]["source_bytes"])==r["bytes"]) or r["path"] in declared)]
+assert not missing,missing
+paths={r["path"] for r in named}
+assert not [u for u in manifest["unresolved_references"] if u["origin_path"] in paths],manifest["unresolved_references"]
+assert all(r["path"] in entries for r in named)
+PY
     fr_check 1 "dispositions of the earlier attempt do not answer the new current BLOCK" "are ignored"
     # Every post-judge record answers one attempt: what was published for a0002 cannot answer a0003.
     cp "$fr_run/$fr_root/primary-position.md" "$fr_run/$fr_root/primary-position.a0003.md"
