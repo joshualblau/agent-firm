@@ -1354,6 +1354,113 @@ def _validate_terminal_attempt(run, item, start):
             raise SealError("LEDGER_SUFFIX", "terminal verdict identity mismatch")
 
 
+# ---------------------------------------------------------------------------------------------
+# The closed post-judge phase of the suffix grammar.  After the seal, the suffix used to admit only
+# reviewer events, but the lifecycle has four more things to record once a judge has answered: the
+# Final check's own `final_decision_required`, the Lead's `final_gate_pending`, primary QA's
+# post-judge dispositions and the evidence/human records they cite, and a recapture that starts the
+# next generation.  Each of those made `--verify --phase publication` fail, so every judge verdict
+# was terminal for the run.  They are admitted here as a CLOSED set, only once at least one reviewer
+# attempt is terminal and none is open, each bound to the seal's own candidate identity.  Post-judge
+# artifacts live under a directory the seal cannot contain, and each is bound to its exact bytes.
+# ---------------------------------------------------------------------------------------------
+LEDGER_COMMON_FIELDS = frozenset(("ts", "event", "event_id", "run_id"))
+REVIEWER_SUFFIX_EVENTS = frozenset((
+    "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
+    "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
+))
+POST_JUDGE_EVENTS = frozenset(("final_decision_required", "final_gate_pending", "post_judge_artifact_published"))
+POST_JUDGE_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence", "human_decision"))
+DECISION_REQUIRED_KINDS = frozenset(("secondary_objections", "required_secondary_unavailable"))
+# Exactly the event bin/firm-qa-checkout appends for each captured generation.
+QA_CHECKOUT_FIELDS = LEDGER_COMMON_FIELDS | frozenset((
+    "dir", "branch", "source_ref", "base_sha", "sha", "generation", "candidate",
+))
+
+
+def post_judge_root(generation):
+    """The one directory a generation's post-judge artifacts may occupy."""
+    return f"09-test-evidence/post-judge/g{generation}/"
+
+
+def _require_generation_boundary(item, seal):
+    """A `qa_checkout` in a generation-N suffix must start a LATER generation of this run."""
+    generation = item.get("generation")
+    if (set(item) != QA_CHECKOUT_FIELDS or not isinstance(generation, str)
+            or re.fullmatch(r"[1-9][0-9]*", generation) is None
+            or int(generation) <= seal["identity"]["generation"]
+            or HEX40.fullmatch(str(item.get("sha", ""))) is None
+            or item.get("base_sha") != seal["identity"]["accepted_base_sha"]
+            or item.get("candidate") != "09-test-evidence/qa-candidate.json"):
+        raise SealError("LEDGER_SUFFIX", "qa_checkout is not a later-generation boundary")
+
+
+def _post_judge_bytes(run, item):
+    """Read the artifact a post-judge event names and require the exact digest and size it states."""
+    if (HEX64.fullmatch(str(item.get("sha256", ""))) is None
+            or re.fullmatch(r"0|[1-9][0-9]*", str(item.get("bytes", ""))) is None):
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} digest/size is malformed")
+    try:
+        raw, _, _ = _safe_read(run, item.get("path"))
+    except SealError as exc:
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact is unreadable:{exc.category}") from exc
+    if sha256(raw) != item["sha256"] or str(len(raw)) != item["bytes"]:
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact digest/size mismatch")
+    return raw
+
+
+def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths):
+    event = item.get("event")
+    identity = seal["identity"]
+    if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
+        raise SealError("LEDGER_SUFFIX", f"{event} candidate/generation mismatch")
+    if event == "final_gate_pending":
+        if set(item) != LEDGER_COMMON_FIELDS | {"sha", "generation"}:
+            raise SealError("LEDGER_SUFFIX", "final_gate_pending field set is not closed")
+        return
+    if event == "final_decision_required":
+        # The shape bin/firm-final-qa-check writes, naming the decision state it wrote for itself.
+        if (set(item) != LEDGER_COMMON_FIELDS | {"path", "sha", "generation", "sha256", "bytes", "kind"}
+                or item.get("kind") not in DECISION_REQUIRED_KINDS):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required field set is not closed")
+        if item.get("path") != f"09-test-evidence/final-decision-required.{item.get('event_id')}.json":
+            raise SealError("LEDGER_SUFFIX", "final_decision_required does not name its own decision state")
+        raw = _post_judge_bytes(run, item)
+        try:
+            state = parse_json_unique(raw, item["path"])
+        except SealError as exc:
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state is malformed") from exc
+        if (not isinstance(state, dict) or state.get("status") != "decision_required"
+                or state.get("run_id") != run.name or state.get("candidate_sha") != identity["candidate_sha"]
+                or state.get("generation") != identity["generation"]
+                or state.get("event_id") != item.get("event_id") or state.get("kind") != item.get("kind")):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state does not describe its event")
+        return
+    expected = LEDGER_COMMON_FIELDS | {
+        "path", "sha256", "bytes", "sha", "generation", "kind", "secondary_attempt_id",
+        "seal_event_id", "seal_projection_sha256",
+    }
+    if set(item) != expected or item.get("kind") not in POST_JUDGE_KINDS:
+        raise SealError("LEDGER_SUFFIX", "post_judge_artifact_published field set is not closed")
+    if (item.get("seal_event_id") != publication["event_id"]
+            or item.get("seal_projection_sha256") != seal["self"]["projection_sha256"]):
+        raise SealError("LEDGER_SUFFIX", "post-judge seal identity mismatch")
+    path = item.get("path")
+    try:
+        _safe_relative(path)
+    except (SealError, UnicodeError) as exc:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact path is not canonical") from exc
+    root = post_judge_root(identity["generation"])
+    if not path.startswith(root) or path == root or path in {entry.get("path") for entry in seal["entries"]}:
+        raise SealError("LEDGER_SUFFIX", f"post-judge artifact is outside {root}")
+    if path in published_paths:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact path is published twice")
+    if item.get("secondary_attempt_id") not in terminal_attempts:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact does not name a terminal attempt in this suffix")
+    _post_judge_bytes(run, item)
+    published_paths.add(path)
+
+
 def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None):
     prefix_count = seal["ledger"]["prefix"]["record_count"]
     suffix = records[prefix_count:]
@@ -1363,8 +1470,23 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
         raise SealError("LEDGER_SUFFIX", "publication is missing")
     _validate_publish_record(suffix[0], seal, seal_raw, publication)
     open_attempt = None
+    terminal_attempts = set()
+    published_paths = set()
     for item in suffix[1:]:
         event = item.get("event")
+        if event == "qa_checkout":
+            # A later generation's capture ends this generation's suffix. Everything from it onward
+            # belongs to that generation and is checked against ITS seal, not this one.
+            _require_generation_boundary(item, seal)
+            break
+        if event in POST_JUDGE_EVENTS:
+            if open_attempt is not None or not terminal_attempts:
+                raise SealError("LEDGER_SUFFIX",
+                                f"{event} needs a terminal reviewer attempt and no open attempt")
+            _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths)
+            continue
+        if event not in REVIEWER_SUFFIX_EVENTS:
+            raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
         common = {"ts", "event", "event_id", "run_id", "provider", "generation", "sha", "attempt",
                   "attempt_id", "seal_event_id", "seal_projection_sha256"}
         if item.get("seal_event_id") != publication["event_id"] or item.get("seal_projection_sha256") != seal["self"]["projection_sha256"]:
@@ -1409,6 +1531,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
             if event in ("reviewer_approve", "reviewer_block") and item.get("phase") != "judge":
                 raise SealError("LEDGER_SUFFIX", "reviewer verdict phase mismatch")
             _validate_terminal_attempt(run, item, open_attempt)
+            terminal_attempts.add(item["attempt_id"])
             open_attempt = None
             continue
         raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")

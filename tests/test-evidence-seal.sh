@@ -963,6 +963,151 @@ PY
   fi
 fi
 
+# THE CLOSED POST-JUDGE PHASE. After the seal the suffix admitted only reviewer events, so the Final
+# check's own final_decision_required, the Lead's final_gate_pending, post-judge dispositions and
+# their records, and a recapture all made `--verify --phase publication` fail. Each is now admitted
+# only after a terminal reviewer event with no attempt open, bound to the seal's own identity, and
+# every other event is still refused. Each case starts from one of two exact ledger snapshots.
+PJ_EVENT="$TESTS_DIR/fixtures/post-judge-event.py"
+t_case "the sealed suffix admits a closed post-judge phase and nothing else"
+if ! ledger_writes_supported; then
+  t_skip "closed post-judge suffix grammar" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  pj_fixture="$(make_sealable_run claude "" "" real_qa_tools)"
+  pj_run="$(printf '%s\n' "$pj_fixture" | sed -n '2p')"; pj_sha="$(printf '%s\n' "$pj_fixture" | sed -n '3p')"
+  if [ -z "$pj_run" ] || ! seal_for_run "$pj_run" >/dev/null 2>&1; then
+    _t_no "sealed post-judge fixture created" "fixture setup or seal failed"
+  else
+    _t_ok "sealed post-judge fixture created"
+    pj_id="$(basename "$pj_run")"
+    pj_seal_event="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["ledger"]["publication"]["event_id"])' "$pj_run/09-test-evidence/final-evidence/g1/seal.json")"
+    pj_projection="$(t_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["self"]["projection_sha256"])' "$pj_run/09-test-evidence/final-evidence/g1/seal.json")"
+    pj_sealed="$pj_run/.pj-sealed.jsonl"; cp "$pj_run/run.jsonl" "$pj_sealed"
+    pj_judge_rc=0; env PATH=/usr/bin:/bin "$BIN/firm-gpt-qa" --run "$pj_run" >/dev/null 2>&1 || pj_judge_rc=$?
+    assert_eq "the judge attempt is terminal (trusted unavailable)" 3 "$pj_judge_rc"
+    pj_judged="$pj_run/.pj-judged.jsonl"; cp "$pj_run/run.jsonl" "$pj_judged"
+    pj_attempt=gpt-c1-a0001
+    pj_root=09-test-evidence/post-judge/g1
+    pj_other=2222222222222222222222222222222222222222
+    pj_zero64="$(printf '%064d' 0)"
+    mkdir -p "$pj_run/$pj_root" "$pj_run/09-test-evidence/post-judge/g2"
+    for pj_name in "$pj_root/two-voice-dispositions.1.json" "$pj_root/evidence.md" "$pj_root/human.yaml" \
+                   "$pj_root/twice.json" 09-test-evidence/stray.json 09-test-evidence/post-judge/g2/x.json; do
+      printf '%s\n' "post-judge fixture artifact $pj_name" > "$pj_run/$pj_name"; chmod 600 "$pj_run/$pj_name"
+    done
+    pj_restore() { cp "$1" "$pj_run/run.jsonl"; chmod 600 "$pj_run/run.jsonl"; }
+    pj() { t_python "$PJ_EVENT" "$FIRM_ROOT" "$pj_run" "$@" >/dev/null; }
+    pj_publish() { # <name under post-judge/g1> <kind> [override...]
+      local _pj_name="$1" _pj_kind="$2"; shift 2
+      pj post_judge_artifact_published "path=$pj_root/$_pj_name" "kind=$_pj_kind" "secondary_attempt_id=$pj_attempt" "$@"
+    }
+    pj_checkout() {
+      pj qa_checkout "dir=.agent-firm/qa-checkout/$pj_id" "branch=integration/$pj_id" \
+        "source_ref=refs/heads/integration/$pj_id" "base_sha=$pj_sha" candidate=09-test-evidence/qa-candidate.json "$@"
+    }
+    pj_open() {
+      "$BIN/firm-ledger-log" --run "$pj_run" --strict --event-id evt-pj-open reviewer_attempt_started \
+        provider=gpt generation=1 "sha=$pj_sha" "attempt=$pj_open_rel" attempt_id=gpt-c1-a0900 \
+        "seal_event_id=$pj_seal_event" "seal_projection_sha256=$pj_projection" >/dev/null
+    }
+    pj_expect() { # <accept|refuse> <label> [phase] [needle] — a refusal must be the suffix grammar's own
+      local _pj_out _pj_rc _pj_needle="${4:-BLOCK LEDGER_SUFFIX}"
+      _pj_out="$(seal_for_run "$pj_run" --verify --phase "${3:-publication}" 2>&1)"; _pj_rc=$?
+      if [ "$1" = accept ]; then
+        if [ "$_pj_rc" -eq 0 ]; then _t_ok "$2"; else _t_no "$2" "rc=$_pj_rc $(_t_ctx "$_pj_out")"; fi
+      else
+        case "$_pj_rc:$_pj_out" in
+          0:*) _t_no "$2" "accepted" ;;
+          *"BLOCK LEDGER_SUFFIX"*)
+            case "$_pj_out" in
+              *"$_pj_needle"*) _t_ok "$2"; [ -n "${PJ_TRACE:-}" ] && printf '         %s\n' "$(_t_ctx "$_pj_out")" ;;
+              *) _t_no "$2" "refused without naming '$_pj_needle': $(_t_ctx "$_pj_out")" ;;
+            esac ;;
+          *) _t_no "$2" "refused for another reason: $(_t_ctx "$_pj_out")" ;;
+        esac
+      fi
+    }
+
+    # Accepted after a terminal judge event, one at a time and then all together.
+    pj_restore "$pj_judged"; pj final_decision_required
+    pj_expect accept "final_decision_required is accepted after the judge"
+    pj_restore "$pj_judged"; pj final_gate_pending
+    pj_expect accept "final_gate_pending is accepted after the judge"
+    for pj_kind in two_voice_dispositions:two-voice-dispositions.1.json disposition_evidence:evidence.md human_decision:human.yaml; do
+      pj_restore "$pj_judged"; pj_publish "${pj_kind#*:}" "${pj_kind%%:*}"
+      pj_expect accept "a ${pj_kind%%:*} post-judge artifact is accepted after the judge"
+    done
+    pj_restore "$pj_judged"
+    pj_publish two-voice-dispositions.1.json two_voice_dispositions; pj final_decision_required
+    pj final_gate_pending; pj_publish human.yaml human_decision; pj_publish evidence.md disposition_evidence
+    pj_expect accept "the whole post-judge phase is accepted in sequence"
+    pj_expect accept "…and by the wrapper's preflight" wrapper-preflight
+    # Interleavable with a further reviewer attempt, and closed while that attempt is open.
+    pj_open_rel=09-test-evidence/reviewer-attempts/gpt-c1-a0900/attempt.json
+    mkdir -p "$pj_run/$(dirname "$pj_open_rel")"
+    t_python - "$pj_run/$pj_open_rel" "$pj_id" "$pj_sha" <<'PY'
+import json,os,sys
+path,run_id,sha=sys.argv[1:]
+json.dump({"schema_version":1,"attempt_id":"gpt-c1-a0900","provider":"gpt","run_id":run_id,"candidate_sha":sha,
+           "generation":1,"status":"started","exit_code":None,"started_event_id":"evt-pj-open",
+           "outcome_event_id":None},open(path,"w"),separators=(",",":"))
+os.chmod(path,0o600)
+PY
+    pj_open
+    pj_expect accept "a further reviewer START after the post-judge phase stays recoverable" wrapper-preflight
+    pj final_gate_pending
+    pj_expect refuse "a post-judge event while an attempt is open is refused" wrapper-preflight
+    pj_restore "$pj_judged"; pj_open
+    pj_expect accept "control: the same open START alone is recoverable" wrapper-preflight
+
+    # A later generation's capture ends this generation's suffix.
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2; pj lead_note note=next-generation
+    pj_expect accept "a later-generation qa_checkout ends the suffix; what follows belongs to that generation"
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=1
+    pj_expect refuse "a qa_checkout that does not start a later generation is refused"
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2 "base_sha=$pj_other"
+    pj_expect refuse "a later-generation qa_checkout on another accepted base is refused"
+
+    # Refused before any terminal judge event.
+    pj_restore "$pj_sealed"; pj final_decision_required
+    pj_expect refuse "final_decision_required before the judge is refused"
+    pj_restore "$pj_sealed"; pj final_gate_pending
+    pj_expect refuse "final_gate_pending before the judge is refused"
+    pj_restore "$pj_sealed"; pj_publish two-voice-dispositions.1.json two_voice_dispositions
+    pj_expect refuse "a post-judge artifact before the judge is refused"
+
+    # Refused with the wrong identity, shape, place, or bytes.
+    for pj_spec in "sha=$pj_other" generation=2 kind=bogus note=extra @tamper \
+                   path=09-test-evidence/decision-elsewhere.json; do
+      pj_restore "$pj_judged"; pj final_decision_required "$pj_spec"
+      pj_expect refuse "final_decision_required with ${pj_spec} is refused"
+    done
+    for pj_spec in "sha=$pj_other" generation=2 note=extra; do
+      pj_restore "$pj_judged"; pj final_gate_pending "$pj_spec"
+      pj_expect refuse "final_gate_pending with ${pj_spec} is refused"
+    done
+    for pj_spec in path=09-test-evidence/stray.json path=09-test-evidence/post-judge/g2/x.json \
+                   path=08-qa-verdict.json "sha256=$pj_zero64" @tamper seal_event_id=evt-another-seal \
+                   "seal_projection_sha256=$pj_zero64" secondary_attempt_id=gpt-c1-a9999 \
+                   secondary_attempt_id=gpt-c1-a0900 kind=bogus "sha=$pj_other" generation=2 note=extra \
+                   -secondary_attempt_id; do
+      pj_restore "$pj_judged"; pj_publish evidence.md disposition_evidence "$pj_spec"
+      pj_expect refuse "a post-judge artifact with ${pj_spec} is refused"
+    done
+    pj_restore "$pj_judged"; pj_publish twice.json disposition_evidence; pj_publish twice.json disposition_evidence
+    pj_expect refuse "one post-judge path published twice is refused"
+
+    # Everything outside the closed set is still refused after the judge.
+    pj_restore "$pj_judged"; pj lead_note note=after-the-judge
+    pj_expect refuse "an ordinary lead_note after the judge is still refused" publication "unexpected event lead_note"
+    pj_restore "$pj_judged"; pj human_decision_recorded "path=$pj_root/human.yaml" "sha=$pj_sha" generation=1
+    pj_expect refuse "an unsealed-style human_decision_recorded event is still refused after the seal" publication \
+      "unexpected event human_decision_recorded"
+    pj_restore "$pj_judged"
+    pj_expect accept "the judged snapshot itself still verifies"
+  fi
+fi
+
 t_case "proven no-append publication failure removes the complete unpublished bundle"
 cleanup_fixture="$(make_sealable_run)"; cleanup_run="$(printf '%s\n' "$cleanup_fixture" | sed -n '2p')"
 if t_p2_row_supported; then

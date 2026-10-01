@@ -147,7 +147,9 @@ work-orders to wide heavyweight fan-out.
 
 Ask only at gates in `firm-policy gate-matrix`, and ask once using:
 `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`.
-Immediately before the one Final interaction, run `firm-ledger-log final_gate_pending`. Present the
+Immediately before the one Final interaction, run
+`firm-ledger-log --run <run_dir> --strict final_gate_pending sha=<candidate_sha> generation=<N>` for the
+current candidate generation; a sealed run admits that event with exactly those fields. Present the
 draft handoff together with every exact objection from the current `decision_required` artifact and
 only its `permitted_record_types`; do not summarize objections into a broader authorization.
 
@@ -167,6 +169,24 @@ one complete local PR body between the canonical markers. The Lead runs
 the exact final primary bytes, privacy result, producer identities, ledger prefix, acyclic self
 projection, and closed reviewer suffix grammar. Present, declared, or required partial seal state
 blocks; only genuinely markerless historical runs retain manifest v3 compatibility.
+
+After the publication the suffix admits reviewer events and, only once at least one reviewer attempt
+is terminal and none is open, a closed post-judge phase interleavable with further attempts: the Final
+check's own `final_decision_required`, the Lead's `final_gate_pending`, and
+`post_judge_artifact_published` (`path`, `sha256`, `bytes`, `sha`, `generation`, `kind` of
+`two_voice_dispositions`, `disposition_evidence`, or `human_decision`, `secondary_attempt_id`,
+`seal_event_id`, `seal_projection_sha256`). Every one is bound to the seal's candidate and
+generation; a post-judge artifact lies under `09-test-evidence/post-judge/g<N>/`, is published once
+with its exact digest and size, names the seal's publication event and projection, and names an
+attempt already terminal in that suffix. Any other event after the seal still fails verification, and
+so does a post-judge event before the first terminal attempt or while an attempt is open.
+
+A recapture starts the next generation. `firm-qa-checkout`'s `qa_checkout` event for a later
+generation ends generation N's suffix; what follows belongs to the new generation. Earlier rows stay
+valid history only while each is bound to its own generation's unique `qa_checkout` event, and a new
+evidence publication must match the current candidate exactly. The new generation republishes its
+fixed-root producers in fresh role windows and seals `final-evidence/g<N+1>/` before either wrapper
+runs again; each generation's seal counts only its own producer rows.
 
 - Claude-primary run: call `firm-gpt-qa`; it writes `08-qa-verdict.gpt.json`.
 - Codex-primary run: call `firm-claude-qa`; it writes `08-qa-verdict.claude.json`.
