@@ -224,7 +224,27 @@ producer-authored object with a stable id, exact text, affected criteria, and af
 `two_voice_diff` entry must bind that id and repeat those fields exactly. Risk is derived from the
 producer object, never from disposition-authored affected fields. An unavailable required judge needs a
 matching trusted availability-attempt record and an exact logged human waiver. Primary QA BLOCK always
-blocks. Run `firm-final-qa-check <run_dir>` before the Final interaction:
+blocks.
+
+A sealed run's `traceability.yaml` is frozen before the judge, so primary QA answers a CURRENT
+secondary BLOCK after it: it writes `09-test-evidence/post-judge/g<N>/two-voice-dispositions.<k>.json`
+and publishes it with `firm-ledger-log --run <run_dir> --strict post_judge_artifact_published
+path=<that path> sha256=<digest> bytes=<size> sha=<candidate_sha> generation=<N>
+kind=two_voice_dispositions secondary_attempt_id=<current attempt> seal_event_id=<publication event>
+seal_projection_sha256=<projection>`, the last two being `publication_event_id` and `projection_sha256`
+from `firm-seal-qa-evidence --verify --run <run_dir>`. The document is JSON with
+exactly `schema_version` (1), `run_id`, `candidate_sha`, `generation`, `secondary_attempt_id`,
+`secondary_verdict_sha256` and `secondary_verdict_bytes` (the current attempt's immutable verdict,
+`verdict_sha256`/`verdict_bytes` on its terminal event), and `two_voice_diff`, whose entries have
+exactly the traceability disposition shape. Evidence it cites may be a `disposition_evidence`
+post-judge artifact and a human record a `human_decision` one; neither may stand in for the other.
+Every post-judge file is published once, so a revision is a new `<k>`. For a current BLOCK the Final
+check uses the LATEST such publication for the generation when it names the current canonical attempt
+and verdict digest; a latest publication naming anything else is ignored, never replaced by an older
+one, and the check falls back to `traceability.yaml`. An unsealed run keeps its dispositions in
+`traceability.yaml`. An objection with no disposition still blocks: silence is not dissent.
+
+Run `firm-final-qa-check <run_dir>` before the Final interaction:
 
 - exit 0 permits the Packager to present the draft handoff with the ordinary approve/reject Final
   choice once; after approval, the Packager finalizes it against that current passing result;
@@ -236,7 +256,9 @@ The decision-required artifact aggregates the complete relevant objection set an
 text, derived risk, and permitted record type. If the human chooses a permitted option, the Lead
 appends exactly one shared typed, digest-bound, current-run/current-full-SHA record naming every
 relevant producer id and text, references it from every relevant disposition, and then runs one fresh
-`firm-final-qa-check <run_dir>`. Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
+`firm-final-qa-check <run_dir>`. In a sealed run that record is a `human_decision` post-judge
+artifact, and the dispositions citing it are re-published as the next `two-voice-dispositions.<k>.json`.
+Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
 wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
 manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.
 

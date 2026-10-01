@@ -284,6 +284,38 @@ EOF
 add_record_ref 09-test-evidence/human.yaml human_decision_recorded record
 assert_rc "exact digest-bound human record permits fresh mechanical pass" 0 "$FINAL" "$run"
 
+# Post-judge dispositions count only when bound to THIS generation's seal publication. This corpus is
+# a markerless, unsealed run, so a post_judge_artifact_published event here must be ignored and the
+# dispositions must still come from traceability.yaml (tests/test-evidence-seal.sh drives the sealed
+# path end to end). The control moves the very same entries back into traceability.yaml.
+t_case "an unsealed run ignores post-judge dispositions and keeps traceability.yaml authoritative"
+if [ "${FIRM_LEDGER_TEST_GUARD:-}" = 1 ] && [ -n "${FIRM_LEDGER_P2_TEST_REJECT:-}" ]; then
+  t_skip "unsealed post-judge dispositions are ignored" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0701 yes
+  set_disposition proceed_with_primary low '' ''
+  assert_rc "control: the disposition in traceability.yaml passes" 0 "$FINAL" "$run"
+  t_python - "$run" <<'PY'
+import hashlib,json,os,sys,yaml
+run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p))
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+local=open(run+"/09-test-evidence/reviewer-attempts/gpt-c1-a0701/verdict.json","rb").read()
+doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":gen,
+     "secondary_attempt_id":"gpt-c1-a0701","secondary_verdict_sha256":hashlib.sha256(local).hexdigest(),
+     "secondary_verdict_bytes":len(local),"two_voice_diff":d["two_voice_diff"]}
+rel=f"09-test-evidence/post-judge/g{gen}/two-voice-dispositions.1.json"
+os.makedirs(os.path.dirname(run+"/"+rel),exist_ok=True)
+raw=(json.dumps(doc,indent=2,sort_keys=True)+"\n").encode(); open(run+"/"+rel,"wb").write(raw)
+event={"ts":"2026-10-01T00:00:00Z","event":"post_judge_artifact_published","event_id":"evt-unsealed-dispositions",
+       "run_id":os.path.basename(run),"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
+       "sha":sha,"generation":str(gen),"kind":"two_voice_dispositions","secondary_attempt_id":"gpt-c1-a0701",
+       "seal_event_id":"evt-no-such-seal","seal_projection_sha256":"0"*64}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+d["two_voice_diff"]=[]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "the same dispositions published post-judge in an unsealed run are not authority" 1 "$FINAL" "$run"
+fi
+
 t_case "one decision_required artifact aggregates mixed benign and protected objections"
 reset_case claude
 wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0601 yes result.txt 'protected defect' auth/token.txt

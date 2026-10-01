@@ -1108,6 +1108,234 @@ PY
   fi
 fi
 
+# write_final_ready_run <run> <sha> — a make_sealable_run trace writer whose sealed primary evidence
+# satisfies every firm-final-qa-check precondition: one functional criterion, a schema-valid primary
+# APPROVE, strict traceability with one digest-bound evidence row, and an available, not-required GPT
+# secondary with no dispositions (they cannot exist yet: traceability.yaml is sealed before the judge).
+write_final_ready_run() {
+  local _fr_run="$1" _fr_sha="$2"
+  printf 'final-ready proof\n' > "$_fr_run/09-test-evidence/proof.log"; chmod 600 "$_fr_run/09-test-evidence/proof.log"
+  "$BIN/firm-ledger-log" --run "$_fr_run" --strict --event-id evt-final-ready-proof evidence_captured \
+    path=09-test-evidence/proof.log "sha=$_fr_sha" generation=1 \
+    "sha256=$(shasum -a 256 "$_fr_run/09-test-evidence/proof.log" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$_fr_run/09-test-evidence/proof.log" | tr -d ' ')" >/dev/null || return 1
+  t_python - "$_fr_run" "$_fr_sha" <<'PY'
+import hashlib,json,os,sys,yaml
+run,sha=sys.argv[1:]; rid=os.path.basename(run)
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); gen=c["generation"]
+raw=open(run+"/09-test-evidence/proof.log","rb").read()
+proof={"path":"09-test-evidence/proof.log","candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
+       "producer":{"event_id":"evt-final-ready-proof","event":"evidence_captured"}}
+yaml.safe_dump({"task_slug":"seal-fixture","track":"full_track","criteria":[{"id":"AC-001","type":"functional",
+                "statement":"fixture","verification":"automated_test"}],"explicitly_out_of_scope":[]},
+               open(run+"/01-acceptance-criteria.yaml","w"),sort_keys=False)
+verdict={"verdict":"APPROVE","commit_sha":sha,"run_id":rid,"generation":gen,"provider":"primary","attempt_id":"primary-fixture",
+         "environment":"fixture","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+         "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+         "visual":{"status":"not_applicable","evidence":"none"},
+         "acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/proof.log"}],
+         "untested_risks":[],"blockers":[],"warnings":[],"artifacts":["09-test-evidence/proof.log"],"summary":"fixture"}
+json.dump(verdict,open(run+"/08-qa-verdict.json","w"),indent=2)
+rel=lambda path: os.path.relpath(path,c["repository_root"])
+trace={"schema_version":2,"task_slug":"seal-fixture",
+       "candidate":{"run_id":rid,"repository_root":".","git_common_dir":rel(c["git_common_dir"]),
+                    "checkout_path":rel(c["checkout_path"]),"source_ref":c["source_ref"],"source_ref_sha":c["source_ref_sha"],
+                    "base_sha":c["base_sha"],"commit_sha":sha,"generation":gen},
+       "matrix":[{"id":"AC-001","implementation_files":["seed.txt"],"tests":["fixture"],"manual_verification":"",
+                  "evidence":[proof],"status":"covered"}],
+       "two_voice":{"secondary_provider":"gpt","status":"available","required":False},"two_voice_diff":[]}
+yaml.safe_dump(trace,open(run+"/traceability.yaml","w"),sort_keys=False)
+PY
+}
+
+# THE POST-JUDGE PATH, END TO END. A sealed run, a real wrapper BLOCK from a stub provider, primary
+# QA's post-judge dispositions, a Final check that returns decision_required and records it, the
+# Lead's final_gate_pending, a recorded human decision cited from re-published dispositions, and a
+# fresh check that passes -- with the seal verifying at every step. Before this change the run was
+# terminal at the BLOCK: traceability.yaml is sealed before the judge, so the objection could never
+# be disposed, and every post-judge event made the seal verification the Final check runs fail.
+t_case "a sealed run proceeds past a judge BLOCK to decision_required and a recorded human decision"
+if ! ledger_writes_supported; then
+  t_skip "post-judge Final path on a sealed run" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  fr_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  fr_run="$(printf '%s\n' "$fr_fixture" | sed -n '2p')"; fr_sha="$(printf '%s\n' "$fr_fixture" | sed -n '3p')"
+  if [ -z "$fr_run" ] || ! seal_for_run "$fr_run" >/dev/null 2>&1; then
+    _t_no "sealed final-ready fixture created" "fixture setup or seal failed"
+  else
+    _t_ok "sealed final-ready fixture created"
+    fr_id="$(basename "$fr_run")"; fr_root=09-test-evidence/post-judge/g1
+    fr_stub="$(mktemp -d "${TMPDIR:-/tmp}/firm-post-judge-stub.XXXXXX")"; t_track "$fr_stub"
+    mkdir -p "$fr_stub/bin" "$fr_stub/codex-home"
+    fr_text="the post-judge fixture objection is not answered by the sealed evidence"
+    t_python - "$fr_stub/block.json" "$fr_id" "$fr_sha" "$fr_text" <<'PY'
+import json,sys
+path,rid,sha,text=sys.argv[1:]
+json.dump({"verdict":"BLOCK","commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":"__ATTEMPT__",
+           "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+           "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+           "visual":{"status":"not_applicable","evidence":"none"},
+           "acceptance_criteria_coverage":[{"id":"AC-001","covered":"partial","evidence":"09-test-evidence/proof.log"}],
+           "untested_risks":[],"blockers":[text],
+           "blocker_objects":[{"id":"obj-post-judge-fixture","text":text,"affected_criteria":["AC-001"],"affected_paths":[]}],
+           "warnings":[],"artifacts":[],"summary":"stub judge BLOCK"},open(path,"w"))
+PY
+    # A provider stub that answers exactly the surfaces the wrapper probes and returns the BLOCK.
+    cat > "$fr_stub/bin/codex" <<'SH'
+#!/bin/sh
+case "$*" in
+  "exec --help") echo '  --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config --ephemeral  -s, --sandbox   -m, --model   -c, --config   --output-schema  -o, --output-last-message'; exit 0 ;;
+  "doctor --json") printf '{"schemaVersion":1,"overallStatus":"ok","checks":{"auth.credentials":{"id":"auth.credentials","category":"auth","status":"ok","summary":"auth is configured"}}}\n'; exit 0 ;;
+  "debug models") printf '{"models":[{"slug":"%s","display_name":"Stub"}]}\n' "$STUB_MODEL"; exit 0 ;;
+esac
+out=""
+while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
+sed "s/__ATTEMPT__/$FIRM_QA_ATTEMPT_ID/" "$STUB_VERDICT" > "$out"
+SH
+    chmod +x "$fr_stub/bin/codex"
+    fr_model="$("$BIN/firm-model-resolve" --provider codex --role reviewer --format json | t_python -c 'import json,sys; print(json.load(sys.stdin)["model"])')"
+    fr_judge() {
+      env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$fr_stub/block.json" \
+        CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
+        FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$fr_run" >/dev/null 2>&1
+    }
+    fr_check() { # <expected rc> <label> [needle] — one fresh Final check
+      local _fr_out _fr_rc
+      _fr_out="$("$BIN/firm-final-qa-check" "$fr_run" 2>&1)"; _fr_rc=$?
+      if [ "$_fr_rc" -ne "$1" ]; then _t_no "$2" "expected rc=$1 got rc=$_fr_rc $(_t_ctx "$_fr_out")"
+      elif [ -n "${3:-}" ]; then
+        case "$_fr_out" in *"$3"*) _t_ok "$2";; *) _t_no "$2" "missing '$3' in: $(_t_ctx "$_fr_out")";; esac
+      else _t_ok "$2"; fi
+    }
+    fr_event() { t_python "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" "$@"; }
+    fr_publish() { # <name under post-judge/g1> <kind> <attempt> — prints the producer event id
+      fr_event post_judge_artifact_published "path=$fr_root/$1" "kind=$2" "secondary_attempt_id=$3"
+    }
+    # fr_dispositions <name> <attempt> <current|wrong> <evidence-event> [record-event] — write one
+    # two-voice-dispositions document whose entries have exactly the traceability disposition shape.
+    fr_dispositions() {
+      t_python - "$fr_run" "$@" <<'PY'
+import hashlib,json,os,sys
+run,name,attempt,digest_mode,evidence_id=sys.argv[1:6]; record_id=sys.argv[6] if len(sys.argv)>6 else ""
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+canonical=json.load(open(run+"/08-qa-verdict.gpt.json"))
+local=open(f"{run}/09-test-evidence/reviewer-attempts/{canonical['attempt_id']}/verdict.json","rb").read()
+events={row["event_id"]:row for row in map(json.loads,open(run+"/run.jsonl")) if "event_id" in row}
+def ref(event_id):
+    event=events[event_id]; raw=open(run+"/"+event["path"],"rb").read()
+    return {"path":event["path"],"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
+            "producer":{"event_id":event_id,"event":event["event"]}}
+entries=[]
+for objection in canonical["blocker_objects"]:
+    entry={"secondary_blocker_id":objection["id"],"secondary_blocker":objection["text"],
+           "primary_position":"primary QA reads the sealed evidence differently and asks for a human decision",
+           "positive_dissent":True,"affected_criteria":objection["affected_criteria"],
+           "affected_paths":objection["affected_paths"],"risk":"low","risk_reasons":["criterion:AC-001:functional"],
+           "bounded_resolution":{"attempted":False,"rounds":0,"rerun":"not_run","evidence":None},
+           "evidence":ref(evidence_id),"disposition":"human_decision"}
+    if record_id: entry["record"]=ref(record_id)
+    entries.append(entry)
+doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":gen,
+     "secondary_attempt_id":attempt,
+     "secondary_verdict_sha256":hashlib.sha256(local).hexdigest() if digest_mode=="current" else "0"*64,
+     "secondary_verdict_bytes":len(local),"two_voice_diff":entries}
+path=f"{run}/09-test-evidence/post-judge/g{gen}/{name}"
+os.makedirs(os.path.dirname(path),exist_ok=True)
+open(path,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(path,0o600)
+PY
+    }
+    fr_decisions() { find "$fr_run/09-test-evidence" -maxdepth 1 -name 'final-decision-required.*.json' | wc -l | tr -d ' '; }
+
+    # One trusted-unavailable attempt (a0001), then the real wrapper's BLOCK (a0002).
+    fr_rc=0; env PATH=/usr/bin:/bin CODEX_HOME="$fr_stub/codex-home" "$BIN/firm-gpt-qa" --run "$fr_run" >/dev/null 2>&1 || fr_rc=$?
+    assert_eq "a first judge attempt is trusted unavailable" 3 "$fr_rc"
+    fr_rc=0; fr_judge || fr_rc=$?
+    assert_eq "the real wrapper returns the stub judge's BLOCK" 1 "$fr_rc"
+    assert_output "the BLOCK is the current canonical secondary verdict" '"attempt_id": "gpt-c1-a0002"' \
+      cat "$fr_run/09-test-evidence/reviewer-state.gpt.json"
+    fr_check 1 "with no dispositions the BLOCK still blocks (silence is not dissent)" \
+      "exactly one entry per producer objection id"
+
+    mkdir -p "$fr_run/$fr_root"
+    printf '%s\n' 'Primary QA position on obj-post-judge-fixture: the sealed proof covers AC-001.' \
+      > "$fr_run/$fr_root/primary-position.md"; chmod 600 "$fr_run/$fr_root/primary-position.md"
+    fr_evidence="$(fr_publish primary-position.md disposition_evidence gpt-c1-a0002)"
+    assert_ok "primary QA publishes post-judge disposition evidence" test -n "$fr_evidence"
+
+    fr_dispositions two-voice-dispositions.1.json gpt-c1-a0001 current "$fr_evidence"
+    fr_publish two-voice-dispositions.1.json two_voice_dispositions gpt-c1-a0001 >/dev/null
+    fr_check 1 "dispositions naming another attempt are ignored, so the BLOCK still blocks" "are ignored"
+    fr_dispositions two-voice-dispositions.2.json gpt-c1-a0002 wrong "$fr_evidence"
+    fr_publish two-voice-dispositions.2.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 1 "dispositions naming another verdict digest are ignored, so the BLOCK still blocks" "are ignored"
+
+    fr_before="$(fr_decisions)"
+    fr_dispositions two-voice-dispositions.3.json gpt-c1-a0002 current "$fr_evidence"
+    fr_publish two-voice-dispositions.3.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 4 "current dispositions asking for a human decision return decision_required" "DECISION REQUIRED"
+    assert_eq "the Final check wrote exactly one decision state" "$((fr_before + 1))" "$(fr_decisions)"
+    assert_output "…and recorded it in the target ledger" '"event":"final_decision_required"' cat "$fr_run/run.jsonl"
+    assert_ok "the seal still verifies after the Final check's own event" seal_for_run "$fr_run" --verify --phase publication
+    assert_ok "the Lead logs final_gate_pending for the sealed candidate" \
+      "$BIN/firm-ledger-log" --run "$fr_run" --strict final_gate_pending "sha=$fr_sha" generation=1
+    assert_ok "the seal still verifies after final_gate_pending" seal_for_run "$fr_run" --verify --phase publication
+
+    t_python - "$fr_run/$fr_root/human-decision.yaml" "$fr_id" "$fr_sha" "$fr_text" <<'PY'
+import os,sys,yaml
+path,rid,sha,text=sys.argv[1:]
+open(path,"w").write(yaml.safe_dump({"schema_version":1,"type":"human_decision","actor":"human-fixture",
+    "occurred_at":"2026-10-01T00:00:00Z","run_id":rid,"candidate_sha":sha,"decision":"proceed",
+    "objection_ids":["obj-post-judge-fixture"],"objections":[text]},sort_keys=False))
+os.chmod(path,0o600)
+PY
+    fr_record="$(fr_publish human-decision.yaml human_decision gpt-c1-a0002)"
+    assert_ok "the human decision is published as a post-judge record" test -n "$fr_record"
+    # The wrong kind of post-judge artifact cannot stand in for the human record.
+    cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-as-evidence.yaml"
+    fr_wrong_kind="$(fr_publish human-as-evidence.yaml disposition_evidence gpt-c1-a0002)"
+    fr_dispositions two-voice-dispositions.4.json gpt-c1-a0002 current "$fr_evidence" "$fr_wrong_kind"
+    fr_publish two-voice-dispositions.4.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 1 "a disposition_evidence artifact cannot stand in for the human record" "where it may not"
+
+    fr_dispositions two-voice-dispositions.5.json gpt-c1-a0002 current "$fr_evidence" "$fr_record"
+    fr_publish two-voice-dispositions.5.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 0 "a recorded human decision cited from re-published dispositions passes a fresh check" \
+      "every exact secondary objection has a typed current-SHA disposition"
+    assert_ok "the seal verifies for publication at the end of the post-judge phase" \
+      seal_for_run "$fr_run" --verify --phase publication
+    assert_ok "…and for the wrapper's preflight" seal_for_run "$fr_run" --verify --phase wrapper-preflight
+
+    # The latest publication rules: a malformed one blocks rather than falling back to an older set.
+    t_python - "$fr_run/$fr_root/two-voice-dispositions.5.json" "$fr_run/$fr_root/two-voice-dispositions.6.json" <<'PY'
+import json,os,sys
+source,target=sys.argv[1:]
+doc=json.load(open(source)); doc["two_voice_diff"][0]["disposition"]="accepted_by_silence"
+open(target,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(target,0o600)
+PY
+    fr_publish two-voice-dispositions.6.json two_voice_dispositions gpt-c1-a0002 >/dev/null
+    fr_check 1 "a latest disposition outside the traceability disposition shape blocks" "is not a traceability disposition"
+
+    # A further judge attempt is interleavable: preflight accepts the post-judge phase, and once a new
+    # BLOCK is current the earlier dispositions no longer answer it.
+    fr_rc=0; fr_judge || fr_rc=$?
+    assert_eq "a further wrapper attempt runs after the post-judge phase and BLOCKs again" 1 "$fr_rc"
+    # rc 1 is also what a refused preflight returns, so prove the attempt really ran and was promoted.
+    assert_output "…as a new promoted attempt, not a refused preflight" '"attempt_id": "gpt-c1-a0003"' \
+      cat "$fr_run/09-test-evidence/reviewer-state.gpt.json"
+    assert_output "…whose BLOCK is the canonical verdict" '"attempt_id": "gpt-c1-a0003"' cat "$fr_run/08-qa-verdict.gpt.json"
+    fr_check 1 "dispositions of the earlier attempt do not answer the new current BLOCK" "are ignored"
+    cp "$fr_run/$fr_root/primary-position.md" "$fr_run/$fr_root/primary-position.a0003.md"
+    cp "$fr_run/$fr_root/human-decision.yaml" "$fr_run/$fr_root/human-decision.a0003.yaml"
+    fr_evidence3="$(fr_publish primary-position.a0003.md disposition_evidence gpt-c1-a0003)"
+    fr_record3="$(fr_publish human-decision.a0003.yaml human_decision gpt-c1-a0003)"
+    fr_dispositions two-voice-dispositions.7.json gpt-c1-a0003 current "$fr_evidence3" "$fr_record3"
+    fr_publish two-voice-dispositions.7.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_check 0 "dispositions re-published for the new attempt pass a fresh check"
+    assert_ok "the seal verifies after the whole interleaved post-judge history" \
+      seal_for_run "$fr_run" --verify --phase publication
+  fi
+fi
+
 t_case "proven no-append publication failure removes the complete unpublished bundle"
 cleanup_fixture="$(make_sealable_run)"; cleanup_run="$(printf '%s\n' "$cleanup_fixture" | sed -n '2p')"
 if t_p2_row_supported; then

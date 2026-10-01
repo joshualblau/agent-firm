@@ -241,7 +241,27 @@ def ledger_events():
 
 events = ledger_events()
 
-def evidence_ref(ref, label):
+# POST-JUDGE PUBLICATIONS. A sealed run's traceability.yaml is frozen before the judge runs, so a
+# CURRENT judge BLOCK could never be answered there. Primary QA instead publishes its dispositions,
+# and the evidence and human records they cite, as `post_judge_artifact_published` events under
+# 09-test-evidence/post-judge/g<N>/. The seal verification above has already proved every such event
+# in this generation's suffix is closed, digest-bound, and names a terminal attempt; here only the
+# ones bound to THIS generation's seal publication count, so an unsealed run has none.
+post_judge_root=f"09-test-evidence/post-judge/g{generation}/"
+seal_publications=[event for event in events if event.get("event")=="evidence_seal_published"
+                   and event.get("sha")==sha and str(event.get("generation"))==str(generation)]
+current_seal=seal_publications[0] if len(seal_publications)==1 else None
+
+def post_judge_published(kind):
+    if current_seal is None:
+        return []
+    return [event for event in events if event.get("event")=="post_judge_artifact_published"
+            and event.get("kind")==kind and event.get("sha")==sha
+            and str(event.get("generation"))==str(generation)
+            and event.get("seal_event_id")==current_seal.get("event_id")
+            and event.get("seal_projection_sha256")==current_seal.get("projection_sha256")]
+
+def evidence_ref(ref, label, post_judge_kinds=()):
     if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
         block(f"{label} is missing, stale, or bound to another SHA")
     path=safe_file(ref.get("path"), label)
@@ -255,6 +275,10 @@ def evidence_ref(ref, label):
     if len(matches)!=1 or matches[0].get("event")!=producer.get("event"):
         block(f"{label} producer event is missing or duplicated")
     event=matches[0]; origin=ref.get("path")
+    # A post-judge artifact may stand only where its declared kind belongs: disposition evidence as
+    # evidence, a human decision as the human record, and never the disposition set itself.
+    if event.get("event")=="post_judge_artifact_published" and event.get("kind") not in post_judge_kinds:
+        block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
     if event.get("sha")!=sha or str(event.get("generation"))!=str(generation) or origin not in (event.get("path"),event.get("verdict"),event.get("attempt")):
         block(f"{label} producer candidate/artifact identity mismatches")
     digest_field="verdict_sha256" if origin==event.get("verdict") else "sha256"
@@ -467,7 +491,7 @@ if secondary.get("verdict") == "APPROVE":
     archived_docs={}
     for entry in diffs:
         label=entry.get("secondary_blocker")
-        evidence_ref(entry.get("evidence"),f"disposition evidence for {label}")
+        evidence_ref(entry.get("evidence"),f"disposition evidence for {label}",("disposition_evidence",))
         if entry.get("disposition") not in ("fixed","secondary_withdrew"):
             block(f"current APPROVE can retain only fixed/secondary_withdrew history: {label}")
         blocked_path=evidence_ref(entry.get("blocked_secondary_verdict"),f"archived secondary BLOCK for {label}")
@@ -496,6 +520,53 @@ blockers = secondary.get("blockers")
 if not isinstance(blockers,list) or not blockers or not all(isinstance(item,str) and item.strip() for item in blockers):
     block("secondary BLOCK lacks an actionable blockers list")
 current_objects=blocker_objects(secondary,"secondary verdict")
+
+# The disposition set for a CURRENT BLOCK is the LATEST post-judge `two_voice_dispositions`
+# publication for this generation when it names the current canonical secondary attempt and its
+# immutable verdict digest. A latest publication naming another attempt or digest is ignored -- it
+# never resurrects an older one -- and the set falls back to traceability.yaml, which is where runs
+# that disposed before sealing, and unsealed runs, keep it. Silence is not dissent: with no matching
+# set, an objection with no disposition blocks below exactly as before.
+published_dispositions=post_judge_published("two_voice_dispositions")
+if published_dispositions:
+    latest=published_dispositions[-1]
+    latest_rel=latest.get("path")
+    if not isinstance(latest_rel,str) or not latest_rel.startswith(post_judge_root):
+        block("published two-voice dispositions lie outside this generation's post-judge directory")
+    latest_raw=safe_file(latest_rel,"published two-voice dispositions").read_bytes()
+    if hashlib.sha256(latest_raw).hexdigest()!=latest.get("sha256") or str(len(latest_raw))!=str(latest.get("bytes")):
+        block("published two-voice dispositions changed after publication")
+    try:
+        published=json.loads(latest_raw)
+    except Exception as exc:
+        block(f"published two-voice dispositions are malformed: {exc}")
+    published_keys={"schema_version","run_id","candidate_sha","generation","secondary_attempt_id",
+                    "secondary_verdict_sha256","secondary_verdict_bytes","two_voice_diff"}
+    if (not isinstance(published,dict) or set(published)!=published_keys
+            or published.get("schema_version")!=1 or published.get("run_id")!=run_id
+            or published.get("candidate_sha")!=sha or isinstance(published.get("generation"),bool)
+            or published.get("generation")!=generation
+            or published.get("secondary_attempt_id")!=latest.get("secondary_attempt_id")
+            or not isinstance(published.get("secondary_verdict_sha256"),str)
+            or isinstance(published.get("secondary_verdict_bytes"),bool)
+            or not isinstance(published.get("secondary_verdict_bytes"),int)
+            or not isinstance(published.get("two_voice_diff"),list)):
+        block("published two-voice dispositions are malformed or bound to another run, candidate, or attempt")
+    if (published["secondary_attempt_id"]==current_attempt.get("attempt_id")
+            and published["secondary_verdict_sha256"]==hashlib.sha256(current_local_raw).hexdigest()
+            and published["secondary_verdict_bytes"]==len(current_local_raw)):
+        for index,entry in enumerate(published["two_voice_diff"],1):
+            try:
+                jsonschema.validate(entry,{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/disposition","$defs":trace_schema["$defs"]})
+            except Exception as exc:
+                block(f"published disposition #{index} is not a traceability disposition: {type(exc).__name__}")
+        diffs=published["two_voice_diff"]
+        print(f"FINAL QA: NOTE -- dispositions from {latest_rel} (attempt {published['secondary_attempt_id']})",file=sys.stderr)
+    else:
+        print(f"FINAL QA: NOTE -- latest published dispositions {latest_rel} name attempt "
+              f"{published['secondary_attempt_id']} or a verdict digest that is not the current canonical "
+              f"secondary verdict; they are ignored and traceability.yaml applies",file=sys.stderr)
+
 disposition_ids=[item.get("secondary_blocker_id") for item in diffs if isinstance(item,dict)]
 if len(disposition_ids)!=len(diffs) or len(disposition_ids)!=len(set(disposition_ids)) or set(disposition_ids)!=set(current_objects):
     block("two_voice_diff must contain exactly one entry per producer objection id")
@@ -504,7 +575,7 @@ human_entries=[]
 for entry in diffs:
     label=entry["secondary_blocker"]
     objection=bind_disposition(entry,current_objects,f"disposition for {label}")
-    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}")
+    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}", ("disposition_evidence",))
     disposition=entry.get("disposition")
     risk=entry.get("risk")
     derived_risk,derived_reasons=derived_objection_risk(objection)
@@ -518,7 +589,7 @@ for entry in diffs:
             block(f"proceed_with_primary needs positive, unambiguous low-risk dissent: {label}")
         if not isinstance(bounded,dict) or bounded.get("attempted") is not True or bounded.get("rounds") != 1:
             block(f"proceed_with_primary needs exactly one bounded resolution round: {label}")
-        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}")
+        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}", ("disposition_evidence",))
         continue
     if disposition in ("fixed", "secondary_withdrew"):
         block(f"{disposition} requires a later wrapper APPROVE promoted as current canonical: {label}")
@@ -537,7 +608,7 @@ if human_entries:
     record_refs=[entry["record"] for entry,_ in human_entries]
     if any(ref!=record_refs[0] for ref in record_refs[1:]):
         block("all human-decision objections must reference one exact shared record")
-    record_path=evidence_ref(record_refs[0],"aggregate human decision")
+    record_path=evidence_ref(record_refs[0],"aggregate human decision",("human_decision",))
     record=load_yaml(record_path,"aggregate human decision")
     needed={"schema_version":1,"type":"human_decision","run_id":run_id,"candidate_sha":sha,"decision":"proceed"}
     if not isinstance(record,dict) or any(record.get(k)!=v for k,v in needed.items()):
