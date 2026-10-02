@@ -487,14 +487,21 @@ def legacy_evidence_shape(record):
     return True
 
 
+class AmbiguousCheckout:
+    """A generation that more than one `qa_checkout` event claims: history for it binds to nothing."""
+    def __init__(self, count):
+        self.count = count
+
+
 def checkout_history(records, ledger_run_id):
     """Map each generation to the sha of this run's UNIQUE `qa_checkout` event for it.
 
     `firm-qa-checkout` appends exactly one `qa_checkout` event per captured generation, carrying the
     candidate `sha` and the `generation` it persisted. That event is the run's own record of which
     candidate an earlier generation was, and it is what lets history stay classifiable after the
-    candidate metadata moves on. A generation named by no event, by more than one event, or by an
-    event whose sha or generation is not canonical has no entry: history for it binds to nothing.
+    candidate metadata moves on. A generation claimed by more than one event maps to
+    `AmbiguousCheckout`, so the refusal can say so; one named by no event, or by an event whose sha or
+    generation is not canonical, has no entry. Neither binds history.
     """
     seen = {}
     for record in records:
@@ -505,10 +512,13 @@ def checkout_history(records, ledger_run_id):
         if not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation):
             continue
         seen.setdefault(generation, []).append(record.get("sha"))
-    return {
-        generation: shas[0] for generation, shas in seen.items()
-        if len(shas) == 1 and isinstance(shas[0], str) and re.fullmatch(r"[0-9a-f]{40}", shas[0])
-    }
+    history = {}
+    for generation, shas in seen.items():
+        if len(shas) != 1:
+            history[generation] = AmbiguousCheckout(len(shas))
+        elif isinstance(shas[0], str) and re.fullmatch(r"[0-9a-f]{40}", shas[0]):
+            history[generation] = shas[0]
+    return history
 
 
 def historical_evidence_target(record, context, history):
@@ -521,15 +531,30 @@ def historical_evidence_target(record, context, history):
     generation is LOWER than the current one and its sha is the sha of that generation's unique
     `qa_checkout` event. This is only ever consulted while classifying rows that already exist; a new
     publication is validated without `history` and must match the current candidate exactly.
+
+    An earlier-generation row that history does NOT bind is refused with the reason (two checkout
+    events for its generation, none, or one naming another sha), because a ledger that cannot be
+    appended to again must at least say why. The refusal itself is unchanged: fail closed.
     """
-    if not history or not isinstance(context, dict):
+    if history is None or not isinstance(context, dict):
         return False
     generation = record.get("generation")
     current = context.get("generation")
     if (not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation)
             or not isinstance(current, str) or not re.fullmatch(r"[1-9][0-9]*", current)):
         return False
-    return int(generation) < int(current) and history.get(generation) == record.get("sha")
+    if int(generation) >= int(current):
+        return False
+    bound = history.get(generation)
+    if isinstance(bound, AmbiguousCheckout):
+        raise LedgerError(
+            f"ambiguous evidence history: generation {generation} has {bound.count} qa_checkout events"
+        )
+    if bound is None:
+        raise LedgerError(f"stale evidence target: no qa_checkout event binds generation {generation}")
+    if bound != record.get("sha"):
+        raise LedgerError(f"stale evidence target: generation {generation}'s qa_checkout names another sha")
+    return True
 
 
 def validate_evidence_record(record, ledger_run_id, context, history=None):
@@ -2902,11 +2927,11 @@ def ordinary_main(argv):
         ledger_barrier(run, "after_result_construction")
     except DuplicateEvent:
         ordinary_fail(strict, f"duplicate event id: {event_id}")
-    except LedgerError:
+    except LedgerError as exc:
         # The existing ledger content was refused, not this call's arguments: this run cannot be
-        # appended to again by anyone. Announce it even in best-effort mode.
+        # appended to again by anyone. Announce it even in best-effort mode, with the reason.
         ordinary_fail(
-            strict, "could not append target ledger: existing ledger content is unclassifiable",
+            strict, f"could not append target ledger: existing ledger content is unclassifiable: {exc}",
             announce=True,
         )
     except CommitError:

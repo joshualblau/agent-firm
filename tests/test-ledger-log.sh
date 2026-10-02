@@ -735,17 +735,27 @@ PY
     }
     for gen_mode in unbound wrong_sha duplicate not_lower future noncanonical; do
       gen_mutate "$gen_mode"
+      # The refusal names its cause (L3): an unappendable ledger must at least say why.
       case $gen_mode in
-        unbound) gen_label="an earlier row with no qa_checkout for its generation" ;;
-        wrong_sha) gen_label="an earlier row whose generation's checkout names another sha" ;;
-        duplicate) gen_label="an earlier row whose generation has two checkout events" ;;
-        not_lower) gen_label="a current-generation row bound only to a forged checkout of that generation" ;;
-        future) gen_label="a later-generation row bound to a forged later checkout" ;;
-        noncanonical) gen_label="an earlier row whose checkout generation is not canonical" ;;
+        unbound) gen_label="an earlier row with no qa_checkout for its generation"
+                 gen_cause="no qa_checkout event binds generation 1" ;;
+        wrong_sha) gen_label="an earlier row whose generation's checkout names another sha"
+                   gen_cause="generation 1's qa_checkout names another sha" ;;
+        duplicate) gen_label="an earlier row whose generation has two checkout events"
+                   gen_cause="ambiguous evidence history: generation 1 has 2 qa_checkout events" ;;
+        not_lower) gen_label="a current-generation row bound only to a forged checkout of that generation"
+                   gen_cause="stale evidence target" ;;
+        future) gen_label="a later-generation row bound to a forged later checkout"
+                gen_cause="stale evidence target" ;;
+        noncanonical) gen_label="an earlier row whose checkout generation is not canonical"
+                      gen_cause="no qa_checkout event binds generation 1" ;;
       esac
       assert_rc "$gen_label is refused" 1 gen_classify
+      assert_output "$gen_label: the classifier names the cause" "$gen_cause" gen_classify
       gen_mutated="$(sha_or_absent "$gen_run/run.jsonl")"
       assert_rc "$gen_label leaves the run unappendable" 1 \
+        "$LOG" --run "$gen_run" --strict ordinary_event note=after-mutation
+      assert_output "$gen_label: the refused append names the cause" "$gen_cause" \
         "$LOG" --run "$gen_run" --strict ordinary_event note=after-mutation
       assert_eq "$gen_label refusal leaves the ledger exact" "$gen_mutated" "$(sha_or_absent "$gen_run/run.jsonl")"
     done
