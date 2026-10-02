@@ -23,7 +23,9 @@ artifact after the event is logged, so its bytes no longer match the digest the 
 `@window` publishes inside a fresh native primary-QA role window (a `qa_started` role start for
 `qa-tester` on a new stage, then the event, then its `qa_completed`), which is how primary QA's own
 post-judge kinds must be produced; without it (or after a later `@nowindow`),
-`stage`/`role`/`role_start_event_id` are whatever the caller passes. The event id is printed on success; the writer's own exit status is returned.
+`stage`/`role`/`role_start_event_id` are whatever the caller passes. `@raw` appends the row straight
+to run.jsonl instead of through the writer. The event id is printed on success; the writer's own exit
+status is returned.
 """
 import hashlib
 import json
@@ -43,6 +45,7 @@ overrides = {}
 drops = set()
 tamper = False
 window = False
+raw_append = False
 for operation in operations:
     if operation == "@tamper":
         tamper = True
@@ -50,6 +53,8 @@ for operation in operations:
         window = True
     elif operation == "@nowindow":
         window = False
+    elif operation == "@raw":
+        raw_append = True
     elif operation.startswith("-"):
         drops.add(operation[1:])
     else:
@@ -133,14 +138,23 @@ fields.update(overrides)
 for key in drops:
     fields.pop(key, None)
 
-done = subprocess.run(
-    [writer, "--run", run, "--strict", "--event-id", event_id, event]
-    + [f"{key}={value}" for key, value in fields.items()],
-    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-)
-if done.returncode != 0:
-    sys.stderr.write(done.stderr)
-    raise SystemExit(done.returncode)
+if raw_append:
+    # Bypass the writer: the row lands exactly as given, the way a row the writer would refuse could
+    # still reach the file by another route. Only the verifier stands between it and trust.
+    import datetime
+    row = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "event": event, "event_id": event_id, "run_id": os.path.basename(run), **fields}
+    with open(os.path.join(run, "run.jsonl"), "a") as handle:
+        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+else:
+    done = subprocess.run(
+        [writer, "--run", run, "--strict", "--event-id", event_id, event]
+        + [f"{key}={value}" for key, value in fields.items()],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if done.returncode != 0:
+        sys.stderr.write(done.stderr)
+        raise SystemExit(done.returncode)
 if window:
     closed = subprocess.run(
         [writer, "--run", run, "--strict", "qa_completed", f"stage={stage}", "role=qa-tester",

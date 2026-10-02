@@ -1009,9 +1009,11 @@ def _privacy_command_argv(cli_argv, run, cwd):
     return projected
 
 
-def seal_state(run):
+def seal_state(run, ledger_raw=None):
+    """`ledger_raw`, when given, is the exact ledger bytes the caller read and will act on."""
     run = Path(run)
-    ledger_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
+    if ledger_raw is None:
+        ledger_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
     if not ledger_raw or not ledger_raw.endswith(b"\n"):
         raise SealError("LEDGER_PREFIX", "ledger is not newline-complete")
     records = []
@@ -1624,10 +1626,19 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
     return open_attempt
 
 
-def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None):
+def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None,
+                ledger_raw=None, pending=None):
+    """Verify the live generation's seal and its suffix.
+
+    `ledger_raw` makes the verification cover EXACTLY the ledger bytes a caller read and will act
+    on, so a row appended after the caller's read can never be trusted unverified: the classifier
+    must agree that the file still holds those bytes, and the suffix is checked over them alone.
+    `pending` is one record not yet in the ledger, checked as though appended after those bytes; the
+    writer uses it to refuse a post-judge row the grammar would refuse, before it can land.
+    """
     run, repo, metadata, candidate = _identity(run_path)
     identity_bindings = _operator_home_identity_bindings(metadata, candidate)
-    state = seal_state(run)
+    state = seal_state(run, ledger_raw)
     if not state["required"]:
         return {"schema_version": 1, "state": "legacy_unsealed", "manifest_version": 3,
                 "run_id": run.name}
@@ -1697,10 +1708,15 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
             raw, _, _ = _safe_read(run, entry["path"])
             _scan(raw, entry["path"], patterns, identity_bindings)
     prefix_bytes = seal["ledger"]["prefix"]["bytes"]
-    current_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
-    if current_raw[:prefix_bytes] != state["ledger_raw"][:prefix_bytes] or sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:
+    # ONE read: the bytes seal_state classified are the bytes the prefix and suffix are checked over.
+    current_raw = state["ledger_raw"]
+    if sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:
         raise SealError("LEDGER_PREFIX", "sealed prefix changed")
-    records = _ledger(current_raw, run.name, run / "run.jsonl")
+    records = list(state["records"])
+    if pending is not None:
+        if not isinstance(pending, dict) or pending.get("run_id") != run.name:
+            raise SealError("LEDGER_SUFFIX", "pending record is not a record of this run")
+        records.append(pending)
     bundle_rel = f"09-test-evidence/final-evidence/g{generation}"
     expected_artifacts = []
     for relative, kind in ((seal["pr_body"]["path"], "pr_body"),
@@ -1714,6 +1730,10 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
     open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id,
                                     patterns)
     receipt = {
+        # Exactly the ledger bytes this verification covered, so a caller can bind what it later
+        # acts on to them (post_judge_inputs does).
+        "verified_ledger": {"bytes": len(current_raw), "sha256": sha256(current_raw),
+                            "record_count": len(state["records"])},
         "schema_version": 1, "state": "sealed", "manifest_version": 4,
         "run_id": run.name, "candidate_sha": candidate["candidate_sha"], "generation": generation,
         "seal_path": seal_rel, "seal_sha256": sha256(seal_raw), "seal_bytes": len(seal_raw),
@@ -1727,6 +1747,90 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
             key: open_attempt[key] for key in ("event_id", "provider", "generation", "sha", "attempt", "attempt_id")
         }
     return receipt
+
+
+def post_judge_inputs(run, ledger_raw, receipt, privacy):
+    """Decide, for every post-judge row in the ledger, whether its artifact may cross into a judge.
+
+    A `post_judge_artifact_published` or `final_decision_required` row names a digest-bound run file
+    that no sealed file references. Only rows the seal verification itself grammar-checked may cross:
+    inside THIS generation's suffix (after its publication, within the exact ledger bytes the
+    verification covered, as `receipt["verified_ledger"]` states), for this candidate and generation,
+    bound to this seal (a publication) or naming its own decision state, under this generation's
+    post-judge root. Each is read no-follow with `_safe_read` and must pass the seal's own privacy
+    `_scan`. Pre-seal rows, earlier generations, rows appended after the verification, and anything
+    else are DECLARED with a reason and their content is never read.
+
+    Returns (inputs, excluded, unresolved): inputs are (origin, raw, mode) to copy; excluded and
+    unresolved are manifest-shaped declarations. Raises SealError when a bound artifact no longer has
+    the digest and size its event states: that is tampering after verification.
+    """
+    run = Path(run)
+    sealed = isinstance(receipt, dict) and receipt.get("state") == "sealed"
+    records = []
+    if sealed:
+        verified = receipt.get("verified_ledger") or {}
+        span = verified.get("bytes")
+        if (not isinstance(span, int) or isinstance(span, bool) or span > len(ledger_raw)
+                or sha256(ledger_raw[:span]) != verified.get("sha256")):
+            raise SealError("POST_JUDGE_INPUT", "ledger is not the one the seal verification covered")
+    for number, line in enumerate(ledger_raw.splitlines(), 1):
+        records.append(parse_json_unique(line, f"ledger line {number}"))
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1      # the first row after the publication
+        last = receipt["verified_ledger"]["record_count"]         # one past the last verified row
+        generation = receipt["generation"]
+        root = post_judge_root(generation)
+    inputs, excluded, unresolved = [], [], []
+    for index, item in enumerate(records):
+        event = item.get("event") if isinstance(item, dict) else None
+        if event not in ("post_judge_artifact_published", "final_decision_required"):
+            continue
+        origin = item.get("path")
+        shown = origin[:512] if isinstance(origin, str) and origin else "<missing path>"
+        referenced_by = f"{event}:{item.get('event_id')}"
+        if not sealed:
+            reason = "run_is_not_sealed_so_no_post_judge_row_is_grammar_checked"
+        elif index < first:
+            reason = "row_precedes_this_generations_seal_and_is_never_grammar_checked"
+        elif index >= last:
+            reason = "row_was_appended_after_the_seal_verification_this_input_is_bound_to"
+        elif item.get("sha") != receipt["candidate_sha"] or item.get("generation") != str(generation):
+            reason = "row_belongs_to_another_candidate_or_generation"
+        elif event == "post_judge_artifact_published" and (
+                item.get("seal_event_id") != receipt["publication_event_id"]
+                or item.get("seal_projection_sha256") != receipt["projection_sha256"]):
+            reason = "row_is_not_bound_to_this_generations_seal"
+        elif event == "post_judge_artifact_published" and not (
+                isinstance(origin, str) and origin.startswith(root) and origin != root):
+            reason = "artifact_is_outside_this_generations_post_judge_root"
+        elif event == "final_decision_required" and origin != (
+                f"09-test-evidence/final-decision-required.{item.get('event_id')}.json"):
+            reason = "decision_state_is_not_its_own_event_path"
+        else:
+            reason = None
+        if reason is not None:
+            excluded.append({"origin_path": shown, "referenced_by": referenced_by,
+                             "reason": reason, "superseded_by": None})
+            continue
+        try:
+            raw, mode, _ = _safe_read(run, origin)
+        except SealError as exc:
+            unresolved.append({"origin_path": shown, "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
+                               "declared_bytes": item.get("bytes"), "reason": f"unreadable:{exc.category}"})
+            continue
+        if sha256(raw) != item.get("sha256") or str(len(raw)) != str(item.get("bytes")):
+            raise SealError("POST_JUDGE_INPUT", f"artifact digest/size does not match its event: {origin}")
+        try:
+            _scan(raw, origin, privacy)
+        except SealError as exc:
+            unresolved.append({"origin_path": shown, "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
+                               "declared_bytes": item.get("bytes"), "reason": f"privacy:{exc.detail}"})
+            continue
+        inputs.append((origin, raw, mode))
+    return inputs, excluded, unresolved
 
 
 def manifest_v4_fields(receipt, seen_origins, provider):

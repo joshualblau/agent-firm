@@ -795,7 +795,10 @@ if args.print_capability_contract:
 # Capability/credential contract introspection above is intentionally standalone: several contract
 # mutation tests copy only this executable. Runtime seal verification begins only for a real run.
 sys.path.insert(0, str(root / "agent-firm" / "lib"))
-from evidence_seal import SealError, manifest_v4_fields, validate_schema, verify_seal  # noqa: E402
+from evidence_seal import (  # noqa: E402
+    SealError, _privacy_patterns, manifest_v4_fields, parse_json_unique, post_judge_inputs,
+    validate_schema, verify_seal,
+)
 
 def stop(message, code=1):
     print(f"{label}: {message}", file=sys.stderr)
@@ -1770,52 +1773,27 @@ except Exception as exc:
                      f"references it: {nested}", 1)
             add_payload(nested, nested_raw, os.lstat(nested_target).st_mode)
 
-    # POST-JUDGE PUBLICATIONS AND DECISION STATES, discovered from the target ledger exactly like the
-    # prior attempts above. After a judge verdict a sealed run records digest-named artifacts that no
-    # sealed file references: primary QA's post-judge dispositions and evidence, the Lead's human
-    # decisions (`post_judge_artifact_published`), and the Final check's decision states
-    # (`final_decision_required`). run.jsonl is in the manifest and names each with `sha256` and
-    # `bytes`, so a further judge attempt holding the ledger but not the files would hold digests it
-    # cannot check -- the omission its contract calls uncertainty. Each is inventoried, its digest
-    # and size checked against the event that names it (a mismatch is tampering and stops the run),
-    # and an absent or unreadable one is declared unresolved rather than dropped.
-    for item in ledger_records:
-        if item.get("event") not in ("post_judge_artifact_published", "final_decision_required"):
-            continue
-        origin = item.get("path")
-        if not isinstance(origin, str) or not origin:
-            unresolved_references.append({
-                "origin_path": "<missing path>", "referenced_by": str(item.get("event")),
-                "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
-                "declared_bytes": item.get("bytes"), "reason": "event_names_no_artifact_path",
-            })
-            continue
-        if origin in seen_origins:
-            continue
-        if any(part in ("", ".", "..") for part in Path(origin).parts) or os.path.isabs(origin):
-            stop(f"target ledger references an unsafe post-judge path: {origin!r}", 1)
-        target = run
-        try:
-            for part in Path(origin).parts:
-                target = target / part
-                if stat.S_ISLNK(os.lstat(target).st_mode):
-                    raise ValueError("a path component is a symlink")
-            if not stat.S_ISREG(os.lstat(target).st_mode):
-                raise ValueError("not a regular no-follow file")
-            raw = target.read_bytes()
-        except Exception as exc:                                   # noqa: BLE001
-            unresolved_references.append({
-                "origin_path": origin, "referenced_by": str(item.get("event")),
-                "event_id": item.get("event_id"),
-                "declared_sha256": item.get("sha256"), "declared_bytes": item.get("bytes"),
-                "reason": f"unreadable:{type(exc).__name__}",
-            })
-            continue
-        if (str(item.get("sha256")) != hashlib.sha256(raw).hexdigest()
-                or str(item.get("bytes")) != str(len(raw))):
-            stop(f"post-judge artifact digest/size does not match the ledger event that names it: "
-                 f"{origin}", 1)
-        add_payload(origin, raw, os.lstat(target).st_mode)
+    # POST-JUDGE PUBLICATIONS AND DECISION STATES. After a judge verdict a sealed run records
+    # digest-named artifacts no sealed file references -- primary QA's post-judge dispositions and
+    # evidence, the Lead's human decisions, the Final check's decision states -- and run.jsonl, which is
+    # in this manifest, names each one. Only rows the seal verification itself grammar-checked may
+    # cross, and the seal library alone decides which (post_judge_inputs): this generation's suffix,
+    # within exactly the ledger bytes the snapshot verification covered, bound to this seal, under
+    # this generation's post-judge root, read no-follow and passing the seal's own privacy scan. Every
+    # other post-judge row -- before the seal, from an earlier generation, appended since -- is
+    # DECLARED with its reason and its file is never read, so a row nobody verified cannot carry
+    # content into the judge. A bound artifact whose digest no longer matches is tampering and stops.
+    try:
+        post_judge_privacy = _privacy_patterns(parse_json_unique(
+            (root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
+        post_judge_copy, post_judge_excluded, post_judge_unresolved = post_judge_inputs(
+            run, ledger_source.read_bytes(), seal_receipt, post_judge_privacy)
+    except SealError as exc:
+        stop(f"post-judge judge input BLOCK {exc.category}: {exc.detail}", 1)
+    for origin, raw, mode in post_judge_copy:
+        add_payload(origin, raw, mode)
+    excluded_references.extend(item for item in post_judge_excluded if item["origin_path"] not in seen_origins)
+    unresolved_references.extend(post_judge_unresolved)
 
     # BOTH MECHANISMS ARE PRESENT, IN THIS ORDER, AND THE ORDER IS LOAD-BEARING. The block above
     # carries what the LEDGER attests (prior terminal reviewer attempts, digest-checked against the

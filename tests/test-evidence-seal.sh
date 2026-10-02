@@ -862,7 +862,6 @@ qa_window_open() {
 qa_window_close() {
   "$BIN/firm-ledger-log" --run "$1" --strict qa_completed "stage=$2" role=qa-tester "role_start_event_id=$3" >/dev/null
 }
-# FOCUS-HELPERS-END
 
 # publish_generation_producers <run> <sha> <generation> <qa-stage> <packager-stage> — publish the
 # three fixed-root producers for one generation inside fresh QA and packager role windows, the way
@@ -896,6 +895,7 @@ publish_generation_producers() {
   "$BIN/firm-ledger-log" --run "$_pg_run" --strict packaging_completed "stage=$_pg_pack" role=packager \
     "role_start_event_id=$_pg_start" >/dev/null
 }
+# FOCUS-HELPERS-END
 
 t_case "the seal's producer for a path is the row of the generation being sealed"
 assert_ok "producer selection is generation-scoped and still exact inside a generation" \
@@ -922,6 +922,73 @@ twice=copy.deepcopy(rows); twice.insert(5,dict(twice[4],event_id="evt-proof-2b")
 refused(twice,sha2,2,"PRODUCER_DUPLICATE")
 other=copy.deepcopy(rows); other[4]["sha"]="d"*40
 refused(other,sha2,2,"PRODUCER_STALE")
+PY
+
+t_case "post_judge_inputs copies only verified, bound, no-follow, privacy-clean artifacts"
+assert_ok "the judge-input selector binds, declares, refuses symlinks, and stops on a digest mismatch" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import hashlib,json,os,sys,tempfile
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+privacy=e._privacy_patterns(e.parse_json_unique(open(os.path.join(sys.argv[1],"agent-firm","policy","evidence-privacy.yaml"),"rb").read()))
+run=tempfile.mkdtemp(); outside=tempfile.mkdtemp()
+os.makedirs(run+"/09-test-evidence/post-judge/g1")
+def put(rel,data):
+    with open(os.path.join(run,rel),"wb") as h: h.write(data)
+    os.chmod(os.path.join(run,rel),0o600); return data
+sha="a"*40; seal_id="evt-seal"; projection="b"*64
+good=put("09-test-evidence/post-judge/g1/a.md",b"answer\n")
+open(outside+"/b.md","wb").write(b"outside the run\n")
+os.symlink(outside,run+"/09-test-evidence/post-judge/g1/lnk")
+leak=put("09-test-evidence/post-judge/g1/leak.md",b"see /"+b"Users/operator/x\n")
+def row(eid,path,data,**extra):
+    item={"ts":"2026-10-02T00:00:00Z","event":"post_judge_artifact_published","event_id":eid,"run_id":"r",
+          "path":path,"sha256":hashlib.sha256(data).hexdigest(),"bytes":str(len(data)),"sha":sha,"generation":"1",
+          "kind":"disposition_evidence","secondary_attempt_id":"gpt-c1-a0001","seal_event_id":seal_id,
+          "seal_projection_sha256":projection}
+    item.update(extra); return item
+rows=[{"ts":"2026-10-02T00:00:00Z","event":"run_started","event_id":"evt-start","run_id":"r"},
+      row("evt-pre","09-test-evidence/post-judge/g1/a.md",good),
+      {"ts":"2026-10-02T00:00:00Z","event":"evidence_seal_published","event_id":seal_id,"run_id":"r"},
+      row("evt-good","09-test-evidence/post-judge/g1/a.md",good),
+      row("evt-link","09-test-evidence/post-judge/g1/lnk/b.md",b"outside the run\n"),
+      row("evt-leak","09-test-evidence/post-judge/g1/leak.md",leak),
+      row("evt-other-gen","09-test-evidence/post-judge/g1/a.md",good,generation="2"),
+      row("evt-unbound","09-test-evidence/post-judge/g1/a.md",good,seal_event_id="evt-other-seal"),
+      row("evt-outside","09-test-evidence/a.md",good)]
+def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
+def receipt(raw,count):
+    return {"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
+            "ledger_prefix":{"record_count":2},"verified_ledger":{"bytes":len(ledger(rows[:count])),
+            "sha256":hashlib.sha256(ledger(rows[:count])).hexdigest(),"record_count":count}}
+late=row("evt-late","09-test-evidence/post-judge/g1/a.md",good)
+raw=ledger(rows+[late])
+inputs,excluded,unresolved=e.post_judge_inputs(run,raw,receipt(raw,len(rows)),privacy)
+assert [origin for origin,_,_ in inputs]==["09-test-evidence/post-judge/g1/a.md"],inputs
+reasons={item["referenced_by"].split(":",1)[1]:item["reason"] for item in excluded}
+assert reasons=={"evt-pre":"row_precedes_this_generations_seal_and_is_never_grammar_checked",
+                 "evt-other-gen":"row_belongs_to_another_candidate_or_generation",
+                 "evt-unbound":"row_is_not_bound_to_this_generations_seal",
+                 "evt-outside":"artifact_is_outside_this_generations_post_judge_root",
+                 "evt-late":"row_was_appended_after_the_seal_verification_this_input_is_bound_to"},reasons
+unread={item["event_id"]:item["reason"] for item in unresolved}
+assert unread["evt-link"]=="unreadable:ARTIFACT_SYMLINK",unread      # R3: a symlinked component is never followed
+assert unread["evt-leak"].startswith("privacy:"),unread               # the seal's own scan
+assert not any(b"outside the run" in data or b"/"+b"Users/" in data for _,data,_ in inputs)
+# R2: a bound artifact whose bytes no longer match its event is tampering, and stops the judge input.
+put("09-test-evidence/post-judge/g1/a.md",b"changed after verification\n")
+try: e.post_judge_inputs(run,raw,receipt(raw,len(rows)),privacy)
+except e.SealError as exc: assert exc.category=="POST_JUDGE_INPUT",exc.category
+else: raise AssertionError("a digest mismatch did not stop the judge input")
+put("09-test-evidence/post-judge/g1/a.md",good)
+# The ledger must still hold exactly the bytes the verification covered.
+tampered=raw.replace(b"evt-good",b"evt-gooX")
+try: e.post_judge_inputs(run,tampered,receipt(raw,len(rows)),privacy)
+except e.SealError as exc: assert exc.category=="POST_JUDGE_INPUT",exc.category
+else: raise AssertionError("a ledger that differs from the verified bytes was accepted")
+# An unsealed run carries no post-judge input at all.
+inputs,excluded,_=e.post_judge_inputs(run,raw,{"state":"legacy_unsealed"},privacy)
+assert not inputs and all(item["reason"].startswith("run_is_not_sealed") for item in excluded)
 PY
 
 t_case "a sealed and judged generation can be recaptured, republished, and sealed as generation 2"
@@ -1334,8 +1401,13 @@ case "$*" in
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; out="$1"; }; shift; done
-# Keep the controlled input manifest this judge was handed, so the suite can inspect what crossed.
-[ -n "${STUB_KEEP:-}" ] && cp "$FIRM_QA_INPUT_MANIFEST" "$STUB_KEEP/manifest-$FIRM_QA_ATTEMPT_ID.json"
+# Keep the controlled input manifest this judge was handed, and the whole controlled snapshot, so the
+# suite can inspect exactly what crossed into the judge.
+if [ -n "${STUB_KEEP:-}" ]; then
+  cp "$FIRM_QA_INPUT_MANIFEST" "$STUB_KEEP/manifest-$FIRM_QA_ATTEMPT_ID.json"
+  cp -R "$(dirname "$FIRM_QA_INPUT_MANIFEST")" "$STUB_KEEP/snapshot-$FIRM_QA_ATTEMPT_ID"
+  chmod -R u+w "$STUB_KEEP/snapshot-$FIRM_QA_ATTEMPT_ID"
+fi
 sed "s/__ATTEMPT__/$FIRM_QA_ATTEMPT_ID/" "$STUB_VERDICT" > "$out"
 SH
     chmod +x "$fr_stub/bin/codex"; mkdir -p "$fr_stub/manifests"
@@ -1715,6 +1787,103 @@ PY
   assert_eq "the BLOCK is not answered by the record staged before the seal" 1 "$st_final"
   case "$st_out" in *"not bound to this generation's seal"*) _t_ok "…and the check says why";;
     *) _t_no "…and the check says why" "$(_t_ctx "$st_out")";; esac
+fi
+
+# ONLY ROWS THE SEAL VERIFIED CROSS INTO A JUDGE'S INPUT. The reviewer inventory used to copy the file
+# named by EVERY post-judge row in the ledger, under only the wrapper's narrow redaction: a pre-seal row
+# (never grammar-checked) carried an unsealed run file holding a private-key header and an operator
+# home path into the judge snapshot; a pre-seal row with a wrong digest stopped every judge attempt;
+# and an earlier generation's never-verified post-judge file crossed into the next generation's judge.
+# Leaks are assembled at run time, so this file's own source carries none of them.
+t_case "only post-judge rows the seal verified cross into a judge's input"
+if ! ledger_writes_supported; then
+  t_skip "post-judge judge-input binding" "requires a supported P2 ledger write host and no refused-row seam"
+elif [ ! -x "${fr_stub:-}/bin/codex" ]; then
+  _t_no "judge-input fixture has the judge stub" "the end-to-end case did not create it"
+else
+  ji_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  ji_repo="$(printf '%s\n' "$ji_fixture" | sed -n '1p')"; ji_run="$(printf '%s\n' "$ji_fixture" | sed -n '2p')"
+  ji_sha="$(printf '%s\n' "$ji_fixture" | sed -n '3p')"; ji_id="$(basename "$ji_run")"
+  ji_keep="$fr_stub/keep-$ji_id"; mkdir -p "$ji_keep/g1" "$ji_keep/g2"
+  ji_header="$(printf -- '-----BEGIN %s PRIVATE KEY-----' OPENSSH)"; ji_home="$(printf '/%s/operator/projects' Users)"
+  mkdir -p "$ji_run/09-test-evidence/scratch"
+  printf '%s\nhome: %s\n' "$ji_header" "$ji_home" > "$ji_run/09-test-evidence/scratch/notes.txt"
+  printf 'pre-seal stray\n' > "$ji_run/09-test-evidence/x.txt"
+  chmod 600 "$ji_run/09-test-evidence/scratch/notes.txt" "$ji_run/09-test-evidence/x.txt"
+  "$BIN/firm-ledger-log" --run "$ji_run" --strict post_judge_artifact_published path=09-test-evidence/scratch/notes.txt \
+    "sha256=$(shasum -a 256 "$ji_run/09-test-evidence/scratch/notes.txt" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$ji_run/09-test-evidence/scratch/notes.txt" | tr -d ' ')" >/dev/null
+  "$BIN/firm-ledger-log" --run "$ji_run" --strict post_judge_artifact_published path=09-test-evidence/x.txt \
+    "sha256=$(printf '%064d' 0)" bytes=999 >/dev/null
+  assert_ok "the run seals with the two stray rows in its prefix" seal_for_run "$ji_run"
+  ji_verdict() { # <out> <sha> <generation>
+    t_python - "$1" "$ji_id" "$2" "$3" <<'PY'
+import json,sys
+path,rid,sha,generation=sys.argv[1:]
+text="the judge-input fixture objection"
+json.dump({"verdict":"BLOCK","commit_sha":sha,"run_id":rid,"generation":int(generation),"provider":"gpt","attempt_id":"__ATTEMPT__",
+           "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+           "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+           "visual":{"status":"not_applicable","evidence":"none"},
+           "acceptance_criteria_coverage":[{"id":"AC-001","covered":"partial","evidence":"09-test-evidence/proof.log"}],
+           "untested_risks":[],"blockers":[text],
+           "blocker_objects":[{"id":"obj-judge-input","text":text,"affected_criteria":["AC-001"],"affected_paths":[]}],
+           "warnings":[],"artifacts":[],"summary":"stub judge BLOCK"},open(path,"w"))
+PY
+  }
+  ji_judge() { # <verdict> <keep>
+    env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$1" STUB_KEEP="$2" \
+      CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
+      FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$ji_run" > "$2/judge.out" 2>&1
+  }
+  # ji_inputs <keep> <attempt> <origin> <reason-fragment> — the origin was declared, never copied
+  ji_inputs() {
+    t_python - "$1" "$2" "$3" "$4" "$ji_header" "$ji_home" <<'PY'
+import json,os,sys
+keep,attempt,origin,reason,header,home=sys.argv[1:]
+manifest=json.load(open(f"{keep}/manifest-{attempt}.json"))
+assert origin not in {e["origin_path"] for e in manifest["entries"]},("copied",origin)
+declared=[e for e in manifest["excluded_references"] if e["origin_path"]==origin]
+assert len(declared)==1 and reason in declared[0]["reason"],(origin,manifest["excluded_references"])
+for current,_,files in os.walk(f"{keep}/snapshot-{attempt}"):
+    for name in files:
+        raw=open(os.path.join(current,name),"rb").read()
+        assert header.encode() not in raw and home.encode() not in raw,("leaked into",os.path.join(current,name))
+PY
+  }
+  ji_verdict "$ji_keep/g1/block.json" "$ji_sha" 1
+  ji_rc=0; ji_judge "$ji_keep/g1/block.json" "$ji_keep/g1" || ji_rc=$?
+  assert_eq "a pre-seal row with a wrong digest does not stop the judge attempt" 1 "$ji_rc"
+  assert_output "…which ran and promoted its BLOCK" '"attempt_id": "gpt-c1-a0001"' cat "$ji_run/08-qa-verdict.gpt.json"
+  assert_ok "a pre-seal row's unsealed file is declared, never copied, and leaks nothing" \
+    ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/scratch/notes.txt row_precedes_this_generations_seal
+  assert_ok "the wrong-digest pre-seal row is declared, never read" \
+    ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/x.txt row_precedes_this_generations_seal
+
+  # Generation 1 gains a leaky post-judge file by a route the writer would refuse, never verifies,
+  # and the run is recaptured. The generation-2 judge must not receive generation 1's file.
+  mkdir -p "$ji_run/09-test-evidence/post-judge/g1"
+  printf 'QA log excerpt from %s\n%s\n' "$ji_home" "$(printf -- '-----BEGIN %s PRIVATE KEY-----' RSA)" \
+    > "$ji_run/09-test-evidence/post-judge/g1/log.md"; chmod 600 "$ji_run/09-test-evidence/post-judge/g1/log.md"
+  t_python "$PJ_EVENT" "$FIRM_ROOT" "$ji_run" post_judge_artifact_published path=09-test-evidence/post-judge/g1/log.md \
+    kind=disposition_evidence secondary_attempt_id=gpt-c1-a0001 @window @raw >/dev/null
+  assert_fail "the leaky generation-1 file never verifies" seal_for_run "$ji_run" --verify --phase publication
+  ( cd "$ji_repo" && git checkout -q "integration/$ji_id" && printf 'generation two\n' > gen2.txt \
+    && git add gen2.txt && git commit -qm "generation two" && git checkout -q main ) >/dev/null 2>&1
+  ji_sha2="$(sha_of "$ji_repo" "integration/$ji_id")"
+  assert_ok "generation 2 is captured" sh -c "cd '$ji_repo' && '$BIN/firm-qa-checkout' --run '$ji_run' >/dev/null 2>&1"
+  # Generation 2's own traceability cites no generation-1 evidence.
+  printf '%s\n' 'schema_version: 2' 'task_slug: seal-fixture' 'candidate: {}' 'matrix: []' 'two_voice: {}' \
+    'two_voice_diff: []' > "$ji_run/traceability.yaml"
+  assert_ok "generation 2 republishes its producers" publish_generation_producers "$ji_run" "$ji_sha2" 2 test/Q-02 package/P-02
+  assert_ok "generation 2 seals" seal_for_run "$ji_run"
+  ji_verdict "$ji_keep/g2/block.json" "$ji_sha2" 2
+  ji_rc=0; ji_judge "$ji_keep/g2/block.json" "$ji_keep/g2" || ji_rc=$?
+  assert_eq "the generation-2 judge runs" 1 "$ji_rc"
+  assert_output "…and promotes its own BLOCK, so it really assembled its input" '"attempt_id": "gpt-c2-a0001"' \
+    cat "$ji_run/08-qa-verdict.gpt.json"
+  assert_ok "generation 1's never-verified post-judge file is declared, never copied, and leaks nothing" \
+    ji_inputs "$ji_keep/g2" gpt-c2-a0001 09-test-evidence/post-judge/g1/log.md row_precedes_this_generations_seal
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"
