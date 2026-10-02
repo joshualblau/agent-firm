@@ -760,7 +760,7 @@ def _producer(records, path, raw, sha, generation, required):
             "role_start_event_id": start_id, "stage": event.get("stage"), "role": event.get("role")}
 
 
-def _role_window(records, event, path):
+def _role_window(records, event, path, allow_open=False):
     """Prove `event` was written inside its one native role window; return that window's indexes.
 
     The window is the unique native `*_started` record `event["role_start_event_id"]` names and the
@@ -777,10 +777,17 @@ def _role_window(records, event, path):
                         if item.get("role_start_event_id") == start_id
                         and str(item.get("event", "")).endswith("_completed")]
     event_index = records.index(event)
-    if len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
+    if allow_open and len(start_indexes) == 1 and not complete_indexes:
+        # An append-time check of a window that has not closed YET: the start must still be unique,
+        # native, earlier, and agree on stage, role and time; its closure is checked when it lands.
+        complete_indexes = [None]
+        if not start_indexes[0] < event_index:
+            raise SealError("PRODUCER_WINDOW", path)
+    elif len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
         raise SealError("PRODUCER_WINDOW", path)
     start = records[start_indexes[0]]
-    complete = records[complete_indexes[0]]
+    complete = records[complete_indexes[0]] if complete_indexes[0] is not None else {
+        "stage": event.get("stage"), "role": event.get("role"), "ts": event.get("ts")}
     if not {"contract", "authority", "activation"}.issubset(start):
         raise SealError("PRODUCER_WINDOW", f"{path}:role start is not native")
     stage = event.get("stage")
@@ -1458,7 +1465,7 @@ def _validate_qa_window_event(item, index, qa_windows):
 
 
 def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                         records=None, qa_windows=None, decisions=None, privacy=None):
+                         records=None, qa_windows=None, decisions=None, privacy=None, allow_open=False):
     event = item.get("event")
     identity = seal["identity"]
     if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
@@ -1523,7 +1530,7 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
                             f"{kind} is not published inside a {POST_JUDGE_QA_ROLE} window opened after "
                             "the attempt it answers")
         try:
-            _role_window(records, item, path)
+            _role_window(records, item, path, allow_open)
         except SealError as exc:
             raise SealError("LEDGER_SUFFIX", f"{kind} role window:{exc.detail}") from exc
     if kind == "human_decision":
@@ -1537,7 +1544,7 @@ def _validate_post_judge(run, item, seal, publication, terminal_attempts, publis
 
 
 def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None,
-                     privacy=None):
+                     privacy=None, allow_open_windows=False):
     prefix_count = seal["ledger"]["prefix"]["record_count"]
     suffix = records[prefix_count:]
     if not suffix:
@@ -1560,7 +1567,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
                 _validate_qa_window_event(item, offset, qa_windows)
             else:
                 _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
-                                     records, qa_windows, decisions, privacy)
+                                     records, qa_windows, decisions, privacy, allow_open_windows)
             continue
         if event not in REVIEWER_SUFFIX_EVENTS:
             raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
@@ -1728,7 +1735,7 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
     expected_artifacts.sort(key=lambda item: item["path"])
     publication = {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
     open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id,
-                                    patterns)
+                                    patterns, allow_open_windows=pending is not None)
     receipt = {
         # Exactly the ledger bytes this verification covered, so a caller can bind what it later
         # acts on to them (post_judge_inputs does).

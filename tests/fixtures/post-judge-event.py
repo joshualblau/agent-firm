@@ -155,7 +155,17 @@ else:
     if done.returncode != 0:
         sys.stderr.write(done.stderr)
         raise SystemExit(done.returncode)
-if window:
+if window and raw_append:
+    # The row above bypassed the writer, so the writer would rightly refuse anything after it; the
+    # window closes the same way it was written into.
+    import datetime
+    with open(os.path.join(run, "run.jsonl"), "a") as handle:
+        handle.write(json.dumps({
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event": "qa_completed", "event_id": f"evt-qa-completed-{secrets.token_hex(6)}",
+            "run_id": os.path.basename(run), "stage": stage, "role": "qa-tester",
+            "role_start_event_id": start_id}, separators=(",", ":")) + "\n")
+elif window:
     closed = subprocess.run(
         [writer, "--run", run, "--strict", "qa_completed", f"stage={stage}", "role=qa-tester",
          f"role_start_event_id={start_id}"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)

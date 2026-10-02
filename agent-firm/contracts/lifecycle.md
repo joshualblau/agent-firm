@@ -257,7 +257,14 @@ post-judge artifact and a human record a `human_decision` one; neither may stand
 each counts only when bound to this generation's seal, and a human record counts only when the
 decision it answers was required after the current judge verdict, so nothing staged before the seal
 can answer it.
-Every post-judge file is published once, so a revision is a new `<k>`. For a current BLOCK the Final
+Every post-judge file is published once, so a revision is a new `<k>`. In a sealed generation
+`firm-ledger-log` checks each post-judge row (`post_judge_artifact_published`, `final_gate_pending`,
+`final_decision_required`, `qa_completed`) against the seal's own verification before appending it,
+and refuses a row the verification would refuse (wrong field set, binding, path, digest, window,
+attempt, or a privacy-policy match), naming why; nothing is appended, so correct the file or command
+and publish again. A disposition must repeat the judge's objection text exactly, so if that text
+itself carries a privacy-policy match no disposition of it can be published: run a new judge attempt
+rather than editing around it. For a current BLOCK the Final
 check uses the LATEST such publication for the generation when it names the current canonical attempt
 and verdict digest and comes from a primary-QA window opened after that attempt ended; a latest publication naming anything else is ignored, never replaced by an older
 one, and the check falls back to `traceability.yaml`. An unsealed run keeps its dispositions in

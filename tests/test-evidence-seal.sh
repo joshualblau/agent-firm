@@ -1124,6 +1124,28 @@ else
       fi
     }
 
+    # pj_bad <label> <needle> <category> <fn> [args...] — a bad post-judge row is refused TWICE. The
+    # writer refuses it at append time, naming the cause, and the ledger does not change; and the same
+    # row appended raw (bypassing the writer) is still refused by the verifier. PJ_PHASE picks the
+    # verification phase (default publication). Runs from the current ledger state.
+    pj_bad() {
+      local _pj_label="$1" _pj_needle="$2" _pj_category="$3" _pj_fn="$4" _pj_snap _pj_out _pj_rc; shift 4
+      _pj_snap="$pj_run/.pj-bad.jsonl"; cp "$pj_run/run.jsonl" "$_pj_snap"
+      _pj_out="$("$_pj_fn" "$@" event_id=evt-pj-refused 2>&1)"; _pj_rc=$?
+      case "$_pj_rc:$_pj_out" in
+        0:*) _t_no "$_pj_label: the writer refuses it" "appended" ;;
+        *"post-judge event refused, nothing appended"*"$_pj_needle"*)
+          if grep -q '"event_id":"evt-pj-refused"' "$pj_run/run.jsonl"; then
+            _t_no "$_pj_label: the writer refuses it" "the refused row is in the ledger"
+          else _t_ok "$_pj_label: the writer refuses it"; fi ;;
+        *) _t_no "$_pj_label: the writer refuses it" "refused for another reason: $(_t_ctx "$_pj_out")" ;;
+      esac
+      pj_restore "$_pj_snap"
+      "$_pj_fn" "$@" @raw event_id=evt-pj-refused >/dev/null 2>&1
+      pj_expect refuse "$_pj_label: the verifier refuses the same row appended raw" "${PJ_PHASE:-publication}" \
+        "$_pj_needle" "$_pj_category"
+    }
+
     # Accepted after a terminal judge event, one at a time and then all together.
     pj_restore "$pj_judged"; pj final_decision_required
     pj_expect accept "final_decision_required is accepted after the judge"
@@ -1156,8 +1178,8 @@ os.chmod(path,0o600)
 PY
     pj_open
     pj_expect accept "a further reviewer START after the post-judge phase stays recoverable" wrapper-preflight
-    pj final_gate_pending
-    pj_expect refuse "a post-judge event while an attempt is open is refused" wrapper-preflight
+    PJ_PHASE=wrapper-preflight pj_bad "a post-judge event while an attempt is open is refused" \
+      "needs a terminal reviewer attempt and no open attempt" LEDGER_SUFFIX pj final_gate_pending
     pj_restore "$pj_judged"; pj_open
     pj_expect accept "control: the same open START alone is recoverable" wrapper-preflight
 
@@ -1176,70 +1198,84 @@ PY
       "unexpected event qa_checkout"
 
     # Refused before any terminal judge event.
-    pj_restore "$pj_sealed"; pj final_decision_required
-    pj_expect refuse "final_decision_required before the judge is refused"
-    pj_restore "$pj_sealed"; pj final_gate_pending
-    pj_expect refuse "final_gate_pending before the judge is refused"
-    pj_restore "$pj_sealed"; pj_publish two-voice-dispositions.1.json two_voice_dispositions
-    pj_expect refuse "a post-judge artifact before the judge is refused"
+    pj_restore "$pj_sealed"; pj_bad "final_decision_required before the judge is refused" \
+      "needs a terminal reviewer attempt" LEDGER_SUFFIX pj final_decision_required
+    pj_restore "$pj_sealed"; pj_bad "final_gate_pending before the judge is refused" \
+      "needs a terminal reviewer attempt" LEDGER_SUFFIX pj final_gate_pending
+    pj_restore "$pj_sealed"; pj_bad "a post-judge artifact before the judge is refused" \
+      "needs a terminal reviewer attempt" LEDGER_SUFFIX pj_publish two-voice-dispositions.1.json two_voice_dispositions
 
     # Refused with the wrong identity, shape, place, or bytes.
-    for pj_spec in "sha=$pj_other" generation=2 kind=bogus note=extra @tamper \
-                   path=09-test-evidence/decision-elsewhere.json; do
-      pj_restore "$pj_judged"; pj final_decision_required "$pj_spec"
-      pj_expect refuse "final_decision_required with ${pj_spec} is refused"
+    for pj_spec in "sha=$pj_other:candidate/generation mismatch" "generation=2:candidate/generation mismatch" \
+                   "kind=bogus:field set is not closed" "note=extra:field set is not closed" \
+                   "path=09-test-evidence/decision-elsewhere.json:does not name its own decision state"; do
+      pj_restore "$pj_judged"; pj_bad "final_decision_required with ${pj_spec%%:*} is refused" "${pj_spec#*:}" \
+        LEDGER_SUFFIX pj final_decision_required "${pj_spec%%:*}"
     done
-    for pj_spec in "sha=$pj_other" generation=2 note=extra; do
-      pj_restore "$pj_judged"; pj final_gate_pending "$pj_spec"
-      pj_expect refuse "final_gate_pending with ${pj_spec} is refused"
+    pj_restore "$pj_judged"; pj final_decision_required @tamper
+    pj_expect refuse "final_decision_required whose state changed after it was recorded is refused"
+    for pj_spec in "sha=$pj_other:candidate/generation mismatch" "generation=2:candidate/generation mismatch" \
+                   "note=extra:field set is not closed"; do
+      pj_restore "$pj_judged"; pj_bad "final_gate_pending with ${pj_spec%%:*} is refused" "${pj_spec#*:}" \
+        LEDGER_SUFFIX pj final_gate_pending "${pj_spec%%:*}"
     done
-    for pj_spec in path=09-test-evidence/stray.json path=09-test-evidence/post-judge/g2/x.json \
-                   path=08-qa-verdict.json "sha256=$pj_zero64" @tamper seal_event_id=evt-another-seal \
-                   "seal_projection_sha256=$pj_zero64" secondary_attempt_id=gpt-c1-a9999 \
-                   secondary_attempt_id=gpt-c1-a0900 kind=bogus "sha=$pj_other" generation=2 note=extra \
-                   -secondary_attempt_id; do
-      pj_restore "$pj_judged"; pj_publish evidence.md disposition_evidence "$pj_spec"
-      pj_expect refuse "a post-judge artifact with ${pj_spec} is refused"
+    for pj_spec in "path=09-test-evidence/stray.json:is outside" "path=09-test-evidence/post-judge/g2/x.json:is outside" \
+                   "path=08-qa-verdict.json:is outside" "sha256=$pj_zero64:digest/size mismatch" \
+                   "seal_event_id=evt-another-seal:seal identity mismatch" \
+                   "seal_projection_sha256=$pj_zero64:seal identity mismatch" \
+                   "secondary_attempt_id=gpt-c1-a9999:does not name a terminal attempt" \
+                   "secondary_attempt_id=gpt-c1-a0900:does not name a terminal attempt" \
+                   "kind=bogus:field set is not closed" "sha=$pj_other:candidate/generation mismatch" \
+                   "generation=2:candidate/generation mismatch" "note=extra:field set is not closed" \
+                   "-secondary_attempt_id:field set is not closed"; do
+      pj_restore "$pj_judged"; pj_bad "a post-judge artifact with ${pj_spec%%:*} is refused" "${pj_spec#*:}" \
+        LEDGER_SUFFIX pj_publish evidence.md disposition_evidence "${pj_spec%%:*}"
     done
-    pj_restore "$pj_judged"; pj_publish twice.json disposition_evidence; pj_publish twice.json disposition_evidence
-    pj_expect refuse "one post-judge path published twice is refused"
+    pj_restore "$pj_judged"; pj_publish evidence.md disposition_evidence @tamper
+    pj_expect refuse "a post-judge artifact changed after it was published is refused"
+    pj_restore "$pj_judged"; pj_publish twice.json disposition_evidence
+    pj_bad "one post-judge path published twice is refused" "published twice" LEDGER_SUFFIX \
+      pj_publish twice.json disposition_evidence
     assert_output "the fixture's seal holds a path inside the post-judge directory" \
       '"path":"09-test-evidence/post-judge/g1/sealed-before.md"' cat "$pj_run/09-test-evidence/final-evidence/g1/seal.json"
-    pj_restore "$pj_judged"; pj_publish sealed-before.md disposition_evidence
-    pj_expect refuse "a post-judge publication of a sealed path inside the post-judge directory is refused" \
-      publication "post-judge artifact names a sealed path"
+    pj_restore "$pj_judged"; pj_bad "a post-judge publication of a sealed path inside the post-judge directory is refused" \
+      "post-judge artifact names a sealed path" LEDGER_SUFFIX pj_publish sealed-before.md disposition_evidence
 
     # PRIMARY QA'S OWN KINDS CARRY A PRODUCER IDENTITY: a native qa-tester window opened after the
     # attempt they answer, with the publication inside it. Without one, anybody who could append to
     # the ledger could dispose of a judge objection.
     for pj_kind in two_voice_dispositions:two-voice-dispositions.1.json disposition_evidence:evidence.md; do
-      pj_restore "$pj_judged"; pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow
-      pj_expect refuse "a ${pj_kind%%:*} publication with no primary-QA window is refused" publication \
-        "post_judge_artifact_published field set is not closed"
-      pj_restore "$pj_judged"
-      pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow stage=test/forged role=qa-tester role_start_event_id=evt-no-such-window
-      pj_expect refuse "a ${pj_kind%%:*} publication naming a window that does not exist is refused" publication \
-        "is not published inside a qa-tester window"
+      pj_restore "$pj_judged"; pj_bad "a ${pj_kind%%:*} publication with no primary-QA window is refused" \
+        "post_judge_artifact_published field set is not closed" LEDGER_SUFFIX \
+        pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow
+      pj_restore "$pj_judged"; pj_bad "a ${pj_kind%%:*} publication naming a window that does not exist is refused" \
+        "is not published inside a qa-tester window" LEDGER_SUFFIX \
+        pj_publish "${pj_kind#*:}" "${pj_kind%%:*}" @nowindow stage=test/forged role=qa-tester role_start_event_id=evt-no-such-window
     done
-    pj_restore "$pj_judged"; pj_publish human.yaml human_decision @window
-    pj_expect refuse "a Lead-published human_decision carries no QA window fields" publication \
-      "post_judge_artifact_published field set is not closed"
+    pj_restore "$pj_judged"; pj_bad "a Lead-published human_decision carries no QA window fields" \
+      "post_judge_artifact_published field set is not closed" LEDGER_SUFFIX pj_publish human.yaml human_decision @window
     pj_q01="$(t_python -c 'import json,sys; print([r for r in map(json.loads,open(sys.argv[1])) if r.get("event")=="qa_started"][0]["event_id"])' "$pj_sealed")"
-    pj_restore "$pj_judged"; pj_publish evidence.md disposition_evidence @nowindow stage=test/Q-01 role=qa-tester "role_start_event_id=$pj_q01"
-    pj_expect refuse "the pre-seal QA window cannot produce a post-judge artifact" publication \
-      "is not published inside a qa-tester window"
+    pj_restore "$pj_judged"; pj_bad "the pre-seal QA window cannot produce a post-judge artifact" \
+      "is not published inside a qa-tester window" LEDGER_SUFFIX \
+      pj_publish evidence.md disposition_evidence @nowindow stage=test/Q-01 role=qa-tester "role_start_event_id=$pj_q01"
     pj_restore "$pj_judged"; pj_w="$(qa_window_open "$pj_run" test/pj-closed)"; qa_window_close "$pj_run" test/pj-closed "$pj_w"
-    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-closed role=qa-tester "role_start_event_id=$pj_w"
-    pj_expect refuse "a publication after its window closed is refused" publication "is not published inside a qa-tester window"
+    pj_bad "a publication after its window closed is refused" "is not published inside a qa-tester window" LEDGER_SUFFIX \
+      pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-closed role=qa-tester "role_start_event_id=$pj_w"
+    # At append time a window is legitimately still open; it must be closed by the time anything verifies.
     pj_restore "$pj_judged"; pj_w="$(qa_window_open "$pj_run" test/pj-unclosed)"
-    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-unclosed role=qa-tester "role_start_event_id=$pj_w"
-    pj_expect refuse "a publication in a window that never closes is refused" publication "role window"
+    assert_ok "the writer accepts a publication inside a window that is still open" \
+      pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-unclosed role=qa-tester "role_start_event_id=$pj_w"
+    assert_ok "…and a second publication inside the same open window" \
+      pj_publish human.yaml disposition_evidence @nowindow stage=test/pj-unclosed role=qa-tester "role_start_event_id=$pj_w"
+    pj_expect refuse "a publication in a window that never closes is refused when verified" publication "role window"
+    qa_window_close "$pj_run" test/pj-unclosed "$pj_w"
+    pj_expect accept "…and verifies once its window closes"
     pj_restore "$pj_judged"; qa_window_open "$pj_run" test/pj-packager packager role-contracts/P-01-packager.md >/dev/null
     pj_expect refuse "a post-judge role window for any role but qa-tester is refused" publication \
       "post-judge role windows are qa-tester only"
-    pj_restore "$pj_judged"; pj qa_completed stage=test/pj-none role=qa-tester role_start_event_id=evt-no-such-window
-    pj_expect refuse "a qa_completed that closes no post-judge window is refused" publication \
-      "does not close an open primary-QA window"
+    pj_restore "$pj_judged"; pj_bad "a qa_completed that closes no post-judge window is refused" \
+      "does not close an open primary-QA window" LEDGER_SUFFIX \
+      pj qa_completed stage=test/pj-none role=qa-tester role_start_event_id=evt-no-such-window
     pj_restore "$pj_sealed"; qa_window_open "$pj_run" test/pj-early >/dev/null
     pj_expect refuse "a QA window opened before any terminal attempt is refused" publication \
       "qa_started needs a terminal reviewer attempt"
@@ -1247,24 +1283,26 @@ PY
     # EACH RECORD ANSWERS ONE ATTEMPT. A decision state names the attempt it is about, and a human
     # decision names the decision it answers, so neither can be replayed against another attempt.
     for pj_spec in state_attempt=@none state_attempt=gpt-c1-a9999; do
-      pj_restore "$pj_judged"; pj final_decision_required "$pj_spec"
-      pj_expect refuse "final_decision_required whose state has ${pj_spec} is refused" publication \
-        "final_decision_required state does not name a terminal attempt"
+      pj_restore "$pj_judged"; pj_bad "final_decision_required whose state has ${pj_spec} is refused" \
+        "final_decision_required state does not name a terminal attempt" LEDGER_SUFFIX \
+        pj final_decision_required "$pj_spec"
     done
-    pj_restore "$pj_judged"; pj_publish human.yaml human_decision
-    pj_expect refuse "a human_decision that names no decision is refused" publication \
-      "post_judge_artifact_published field set is not closed"
-    pj_restore "$pj_judged"; pj_publish human.yaml human_decision decision_required_event_id=evt-no-such-decision
-    pj_expect refuse "a human_decision naming a decision that does not exist is refused" publication \
-      "does not answer an earlier final_decision_required"
-    pj_restore "$pj_judged"; pj_publish human.yaml human_decision decision_required_event_id=evt-pj-late
-    pj final_decision_required event_id=evt-pj-late
-    pj_expect refuse "a human_decision recorded before its decision is refused" publication \
+    pj_restore "$pj_judged"; pj_bad "a human_decision that names no decision is refused" \
+      "post_judge_artifact_published field set is not closed" LEDGER_SUFFIX pj_publish human.yaml human_decision
+    pj_restore "$pj_judged"; pj_bad "a human_decision naming a decision that does not exist is refused" \
+      "does not answer an earlier final_decision_required" LEDGER_SUFFIX \
+      pj_publish human.yaml human_decision decision_required_event_id=evt-no-such-decision
+    pj_restore "$pj_judged"; pj_bad "a human_decision recorded before its decision is refused" \
+      "does not answer an earlier final_decision_required" LEDGER_SUFFIX \
+      pj_publish human.yaml human_decision decision_required_event_id=evt-pj-late
+    pj_restore "$pj_judged"; pj_publish human.yaml human_decision decision_required_event_id=evt-pj-late @raw
+    pj final_decision_required event_id=evt-pj-late @raw
+    pj_expect refuse "…and a decision appended after it does not repair it" publication \
       "does not answer an earlier final_decision_required"
     pj_restore "$pj_judged"; pj final_decision_required event_id=evt-pj-unavailable kind=required_secondary_unavailable
-    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-unavailable
-    pj_expect refuse "a human_decision cannot answer a required-unavailable decision" publication \
-      "does not answer an earlier final_decision_required"
+    pj_bad "a human_decision cannot answer a required-unavailable decision" \
+      "does not answer an earlier final_decision_required" LEDGER_SUFFIX \
+      pj_publish human.yaml human_decision decision_required_event_id=evt-pj-unavailable
 
     # POST-JUDGE BYTES MEET THE SEAL'S PRIVACY POLICY. They are never sealed, so the verifier scans
     # them itself with the same deny categories. The leaks are assembled at run time so this file's own
@@ -1274,15 +1312,12 @@ PY
     printf 'primary QA notes: %s\n' "$pj_leak_assignment" > "$pj_run/$pj_root/leak-secret.md"
     printf 'see %s\n' "$pj_leak_home" > "$pj_run/$pj_root/leak-home.md"
     chmod 600 "$pj_run/$pj_root/leak-secret.md" "$pj_run/$pj_root/leak-home.md"
-    pj_restore "$pj_judged"; pj_publish leak-secret.md disposition_evidence
-    pj_expect refuse "a post-judge artifact carrying a secret assignment is refused" publication \
-      "secret_assignment" PRIVACY_MATCH
-    pj_restore "$pj_judged"; pj_publish leak-home.md two_voice_dispositions
-    pj_expect refuse "a post-judge artifact carrying an operator home path is refused" publication \
-      "operator_home" PRIVACY_MATCH
-    pj_restore "$pj_judged"; pj final_decision_required "state_objection=$pj_leak_assignment"
-    pj_expect refuse "a decision state carrying a secret assignment is refused" publication \
-      "secret_assignment" PRIVACY_MATCH
+    pj_restore "$pj_judged"; pj_bad "a post-judge artifact carrying a secret assignment is refused" \
+      "secret_assignment" PRIVACY_MATCH pj_publish leak-secret.md disposition_evidence
+    pj_restore "$pj_judged"; pj_bad "a post-judge artifact carrying an operator home path is refused" \
+      "operator_home" PRIVACY_MATCH pj_publish leak-home.md two_voice_dispositions
+    pj_restore "$pj_judged"; pj_bad "a decision state carrying a secret assignment is refused" \
+      "secret_assignment" PRIVACY_MATCH pj final_decision_required "state_objection=$pj_leak_assignment"
 
     # Everything outside the closed set is still refused after the judge.
     pj_restore "$pj_judged"; pj lead_note note=after-the-judge
@@ -1303,16 +1338,14 @@ PY
     pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-straddle role=qa-tester "role_start_event_id=$pj_w"
     qa_window_close "$pj_run" test/pj-straddle "$pj_w"
     pj_expect accept "control: the window answers the attempt that was terminal when it opened"
-    pj_restore "$pj_straddle"
-    pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-straddle role=qa-tester \
+    pj_restore "$pj_straddle"; pj_bad "a window opened before the attempt it answers is refused" \
+      "window opened after the attempt it answers" LEDGER_SUFFIX \
+      pj_publish evidence.md disposition_evidence @nowindow stage=test/pj-straddle role=qa-tester \
       "role_start_event_id=$pj_w" secondary_attempt_id=gpt-c1-a0002
-    qa_window_close "$pj_run" test/pj-straddle "$pj_w"
-    pj_expect refuse "a window opened before the attempt it answers is refused" publication \
-      "window opened after the attempt it answers"
     pj_restore "$pj_straddle"; pj final_decision_required event_id=evt-pj-a0001 state_attempt=gpt-c1-a0001
-    pj_publish human.yaml human_decision decision_required_event_id=evt-pj-a0001 secondary_attempt_id=gpt-c1-a0002
-    pj_expect refuse "a human_decision for one attempt cannot answer a decision made for another" publication \
-      "does not answer an earlier final_decision_required for its attempt"
+    pj_bad "a human_decision for one attempt cannot answer a decision made for another" \
+      "does not answer an earlier final_decision_required for its attempt" LEDGER_SUFFIX \
+      pj_publish human.yaml human_decision decision_required_event_id=evt-pj-a0001 secondary_attempt_id=gpt-c1-a0002
     pj_restore "$pj_straddle"; pj final_decision_required event_id=evt-pj-a0001 state_attempt=gpt-c1-a0001
     pj_publish human.yaml human_decision decision_required_event_id=evt-pj-a0001 secondary_attempt_id=gpt-c1-a0001
     pj_expect accept "control: the same record answering its own attempt's decision is accepted"
@@ -1658,10 +1691,17 @@ PY
       > "$fr_run/$fr_root/round.md"; chmod 600 "$fr_run/$fr_root/round.md"
     fr_before_windowless="$fr_stub/before-windowless"; mkdir -p "$fr_before_windowless"
     cp -p "$fr_run/run.jsonl" "$fr_before_windowless/"
-    fr_round_bare="$(fr_publish round.md disposition_evidence gpt-c1-a0003 @nowindow)"
+    # The writer refuses a window-less answer outright, so it never lands...
+    assert_fail "the writer refuses window-less disposition evidence" \
+      fr_publish round.md disposition_evidence gpt-c1-a0003 @nowindow
     fr_dispositions two-voice-dispositions.11.json gpt-c1-a0003 disposition=proceed_with_primary \
-      "evidence=$fr_round_bare" "bounded=$fr_round_bare"
-    fr_publish two-voice-dispositions.11.json two_voice_dispositions gpt-c1-a0003 @nowindow >/dev/null
+      "evidence=$fr_evidence3" "bounded=$fr_evidence3"
+    assert_fail "the writer refuses window-less proceed_with_primary dispositions" \
+      fr_publish two-voice-dispositions.11.json two_voice_dispositions gpt-c1-a0003 @nowindow
+    assert_eq "…and neither refused row reached the ledger" "$(shasum -a 256 < "$fr_before_windowless/run.jsonl")" \
+      "$(shasum -a 256 < "$fr_run/run.jsonl")"
+    # ...and the same rows appended by another route still cannot clear the BLOCK.
+    fr_publish two-voice-dispositions.11.json two_voice_dispositions gpt-c1-a0003 @nowindow @raw >/dev/null
     fr_check 2 "proceed_with_primary dispositions with no primary-QA window cannot clear the BLOCK" \
       "field set is not closed"
     cp -p "$fr_before_windowless/run.jsonl" "$fr_run/run.jsonl"
@@ -1684,15 +1724,21 @@ PY
     fr_before_leak="$fr_stub/before-leak"; mkdir -p "$fr_before_leak"; cp -p "$fr_run/run.jsonl" "$fr_before_leak/"
     printf 'bounded round notes: %s\n' "$(printf '%s%s=%s' pass word Leaked-value-1234)" > "$fr_run/$fr_root/round-leak.md"
     chmod 600 "$fr_run/$fr_root/round-leak.md"
-    fr_round_leak="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003)"
+    fr_leak_append="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003 2>&1)"; fr_leak_append_rc=$?
+    case "$fr_leak_append_rc:$fr_leak_append" in
+      0:*) _t_no "the writer refuses disposition evidence carrying a secret" "appended" ;;
+      *"post-judge event refused"*secret_assignment*) _t_ok "the writer refuses disposition evidence carrying a secret" ;;
+      *) _t_no "the writer refuses disposition evidence carrying a secret" "$(_t_ctx "$fr_leak_append")" ;;
+    esac
+    fr_round_leak="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003 @raw)"
     fr_dispositions two-voice-dispositions.14.json gpt-c1-a0003 disposition=proceed_with_primary \
       "evidence=$fr_round_leak" "bounded=$fr_round_leak"
-    fr_publish two-voice-dispositions.14.json two_voice_dispositions gpt-c1-a0003 >/dev/null
+    fr_publish two-voice-dispositions.14.json two_voice_dispositions gpt-c1-a0003 @raw >/dev/null
     fr_leak_out="$("$BIN/firm-final-qa-check" "$fr_run" 2>&1)"; fr_leak_rc=$?
     case "$fr_leak_rc:$fr_leak_out" in
-      0:*) _t_no "disposition evidence carrying a secret cannot clear the BLOCK" "passed" ;;
-      *secret_assignment*) _t_ok "disposition evidence carrying a secret cannot clear the BLOCK" ;;
-      *) _t_no "disposition evidence carrying a secret cannot clear the BLOCK" "$(_t_ctx "$fr_leak_out")" ;;
+      0:*) _t_no "disposition evidence carrying a secret, appended raw, cannot clear the BLOCK" "passed" ;;
+      *secret_assignment*) _t_ok "disposition evidence carrying a secret, appended raw, cannot clear the BLOCK" ;;
+      *) _t_no "disposition evidence carrying a secret, appended raw, cannot clear the BLOCK" "$(_t_ctx "$fr_leak_out")" ;;
     esac
     cp -p "$fr_before_leak/run.jsonl" "$fr_run/run.jsonl"
     fr_check 0 "…and the run is restored to its passing state"

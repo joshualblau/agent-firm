@@ -182,6 +182,10 @@ class ContractDrift(Exception):
     pass
 
 
+class PostJudgeRefused(Exception):
+    """A post-judge row the current generation's seal verification would refuse."""
+
+
 class CommitError(Exception):
     def __init__(self, phase):
         super().__init__(phase)
@@ -2816,6 +2820,72 @@ def atomic_commit(
                     pass
 
 
+# POST-JUDGE ROWS ARE CHECKED BEFORE THEY LAND. These are the rows of a sealed generation's
+# post-judge phase that arrive through this ordinary mode. Each used to be accepted unchecked and
+# validated only when the seal was next verified, so one digest typo, a window mistake, or an
+# artifact carrying a privacy-policy match made that verification fail for good: the Final check and
+# every further judge attempt then refused the generation. Under the lock, against the exact ledger
+# bytes the row would follow, the seal library now runs its own verification with the row as
+# pending, and a row it would refuse is not appended. Runs whose current generation has no published
+# seal are unaffected.
+POST_JUDGE_APPEND_EVENTS = frozenset((
+    "post_judge_artifact_published", "final_gate_pending", "final_decision_required", "qa_completed",
+))
+
+
+def post_judge_append_check(run, record):
+    verified = {}
+
+    def check():
+        fd, _ = open_ledger(run)
+        if fd is None:
+            return
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(fd, CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        raw = b"".join(chunks)
+        digest = hashlib.sha256(raw).hexdigest()
+        if verified.get("sha256") == digest:
+            return
+        context = evidence_context_for_run(run)
+        if context.get("mode") != "current" or context.get("candidate_sha") is None:
+            verified["sha256"] = digest
+            return
+        try:
+            rows = [json.loads(line) for line in raw.decode("utf-8", "strict").splitlines()]
+        except (UnicodeError, ValueError) as exc:
+            raise PostJudgeRefused("the ledger is not readable to check the row") from exc
+        sealed = any(
+            isinstance(row, dict) and row.get("event") == "evidence_seal_published"
+            and row.get("sha") == context["candidate_sha"]
+            and str(row.get("generation")) == context["generation"] for row in rows
+        )
+        if not sealed:
+            verified["sha256"] = digest
+            return
+        sys.path.insert(0, str(TOOL_ROOT / "agent-firm" / "lib"))
+        import evidence_seal
+        try:
+            evidence_seal.verify_seal(
+                str(run.path), TOOL_ROOT / "agent-firm" / "policy" / "evidence-privacy.yaml",
+                "wrapper-preflight", ledger_raw=raw, pending=record,
+            )
+        except evidence_seal.SealError as exc:
+            raise PostJudgeRefused(f"{exc.category}: {exc.detail}") from exc
+        except Exception as exc:  # anything the verification cannot finish is a refusal, not a pass
+            raise PostJudgeRefused(f"the seal verification could not run: {type(exc).__name__}") from exc
+        verified["sha256"] = digest
+
+    return check
+
+
 def ordinary_main(argv):
     target = None
     strict = False
@@ -2915,13 +2985,14 @@ def ordinary_main(argv):
         except (ValidationError, LedgerError, CommitError):
             run.close()
             ordinary_fail(strict, "invalid evidence publication")
+    post_judge_check = post_judge_append_check(run, record) if event in POST_JUDGE_APPEND_EVENTS else None
     held = []
     try:
         held = acquire_locks(run, [])
         ledger_barrier(run, "after_lock")
         atomic_commit(
             run, record, event_id, lock_check=lambda: prove_locks(held),
-            precommit_check=evidence_check,
+            precommit_check=evidence_check or post_judge_check,
         )
         result = event_id if print_event_id else None
         ledger_barrier(run, "after_result_construction")
@@ -2936,6 +3007,9 @@ def ordinary_main(argv):
         )
     except CommitError:
         ordinary_fail(strict, "could not append target ledger")
+    except PostJudgeRefused as exc:
+        # Refused because THIS row is wrong; the ledger is untouched and stays appendable.
+        ordinary_fail(strict, f"post-judge event refused, nothing appended: {exc}", announce=True)
     finally:
         for _, fd, _ in reversed(held):
             os.close(fd)
