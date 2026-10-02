@@ -1627,6 +1627,96 @@ PY
   fi
 fi
 
+# A HUMAN RECORD MUST BE MADE AFTER THE VERDICT IT ANSWERS. The ledger before the seal is only
+# classified, never held to the suffix grammar, so a decision state and a human decision staged there,
+# naming the predictable first attempt and an objection the judge then raises, used to answer that
+# BLOCK with no human decision ever required after it. Final now counts a post-judge record only when
+# it is bound to this generation's seal and answers a decision required after the current verdict.
+t_case "a human decision staged before the seal cannot answer a later judge BLOCK"
+if ! ledger_writes_supported; then
+  t_skip "pre-seal staged human decision" "requires a supported P2 ledger write host and no refused-row seam"
+elif [ ! -x "${fr_stub:-}/bin/codex" ]; then
+  _t_no "staged-record fixture has the judge stub" "the end-to-end case did not create it"
+else
+  st_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  st_run="$(printf '%s\n' "$st_fixture" | sed -n '2p')"; st_sha="$(printf '%s\n' "$st_fixture" | sed -n '3p')"
+  st_id="$(basename "$st_run")"; st_text="the staged fixture objection"
+  mkdir -p "$st_run/09-test-evidence/post-judge/g1"
+  t_python - "$st_run" "$st_id" "$st_sha" "$st_text" <<'PY'
+import json,os,sys,yaml
+run,rid,sha,text=sys.argv[1:]
+state={"schema_version":1,"status":"decision_required","run_id":rid,"candidate_sha":sha,"generation":1,
+       "kind":"secondary_objections","objections":[],"permitted_record_types":["human_decision"],
+       "event_id":"evt-staged-decision","secondary_attempt_id":"gpt-c1-a0001","created_at":"2026-10-01T00:00:00Z"}
+path=f"{run}/09-test-evidence/final-decision-required.evt-staged-decision.json"
+open(path,"w").write(json.dumps(state,indent=2,sort_keys=True)+"\n"); os.chmod(path,0o600)
+path=f"{run}/09-test-evidence/post-judge/g1/human.yaml"
+open(path,"w").write(yaml.safe_dump({"schema_version":1,"type":"human_decision","actor":"nobody",
+    "occurred_at":"2026-10-01T00:00:00Z","run_id":rid,"candidate_sha":sha,"decision":"proceed",
+    "objection_ids":["obj-staged"],"objections":[text]},sort_keys=False)); os.chmod(path,0o600)
+verdict={"verdict":"BLOCK","commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":"__ATTEMPT__",
+         "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+         "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+         "visual":{"status":"not_applicable","evidence":"none"},
+         "acceptance_criteria_coverage":[{"id":"AC-001","covered":"partial","evidence":"09-test-evidence/proof.log"}],
+         "untested_risks":[],"blockers":[text],
+         "blocker_objects":[{"id":"obj-staged","text":text,"affected_criteria":["AC-001"],"affected_paths":[]}],
+         "warnings":[],"artifacts":[],"summary":"stub judge BLOCK"}
+json.dump(verdict,open(run+"/.staged-block.json","w"))
+PY
+  st_digest() { shasum -a 256 "$st_run/$1" | awk '{print $1}'; }
+  st_size() { wc -c < "$st_run/$1" | tr -d ' '; }
+  st_decision=09-test-evidence/final-decision-required.evt-staged-decision.json
+  "$BIN/firm-ledger-log" --run "$st_run" --strict --event-id evt-staged-decision final_decision_required \
+    "path=$st_decision" "sha=$st_sha" generation=1 "sha256=$(st_digest "$st_decision")" "bytes=$(st_size "$st_decision")" \
+    kind=secondary_objections >/dev/null
+  st_human=09-test-evidence/post-judge/g1/human.yaml
+  "$BIN/firm-ledger-log" --run "$st_run" --strict --event-id evt-staged-record post_judge_artifact_published \
+    "path=$st_human" "sha256=$(st_digest "$st_human")" "bytes=$(st_size "$st_human")" "sha=$st_sha" generation=1 \
+    kind=human_decision secondary_attempt_id=gpt-c1-a0001 decision_required_event_id=evt-staged-decision \
+    seal_event_id=evt-staged-seal "seal_projection_sha256=$(printf '%064d' 0)" >/dev/null
+  assert_ok "the run seals with the staged events in its (only classified) prefix" seal_for_run "$st_run"
+  st_rc=0; env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$st_run/.staged-block.json" \
+    CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
+    FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$st_run" >/dev/null 2>&1 || st_rc=$?
+  assert_eq "the real wrapper BLOCKs with the predicted attempt and objection" 1 "$st_rc"
+  printf 'primary QA position\n' > "$st_run/09-test-evidence/post-judge/g1/position.md"
+  chmod 600 "$st_run/09-test-evidence/post-judge/g1/position.md"
+  st_evidence="$(t_python "$PJ_EVENT" "$FIRM_ROOT" "$st_run" post_judge_artifact_published \
+    path=09-test-evidence/post-judge/g1/position.md kind=disposition_evidence secondary_attempt_id=gpt-c1-a0001 @window)"
+  t_python - "$st_run" "$st_evidence" <<'PY'
+import hashlib,json,os,sys
+run,evidence=sys.argv[1:]
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]
+canonical=json.load(open(run+"/08-qa-verdict.gpt.json"))
+local=open(f"{run}/09-test-evidence/reviewer-attempts/{canonical['attempt_id']}/verdict.json","rb").read()
+events={r["event_id"]:r for r in map(json.loads,open(run+"/run.jsonl")) if "event_id" in r}
+def ref(event_id):
+    raw=open(run+"/"+events[event_id]["path"],"rb").read()
+    return {"path":events[event_id]["path"],"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
+            "producer":{"event_id":event_id,"event":events[event_id]["event"]}}
+entries=[{"secondary_blocker_id":o["id"],"secondary_blocker":o["text"],"primary_position":"asks for a human decision",
+          "positive_dissent":True,"affected_criteria":o["affected_criteria"],"affected_paths":o["affected_paths"],
+          "risk":"low","risk_reasons":["criterion:AC-001:functional"],
+          "bounded_resolution":{"attempted":False,"rounds":0,"rerun":"not_run","evidence":None},
+          "evidence":ref(evidence),"record":ref("evt-staged-record"),"disposition":"human_decision"}
+         for o in canonical["blocker_objects"]]
+doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":1,
+     "secondary_attempt_id":canonical["attempt_id"],"secondary_verdict_sha256":hashlib.sha256(local).hexdigest(),
+     "secondary_verdict_bytes":len(local),"two_voice_diff":entries}
+path=run+"/09-test-evidence/post-judge/g1/two-voice-dispositions.1.json"
+open(path,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(path,0o600)
+PY
+  t_python "$PJ_EVENT" "$FIRM_ROOT" "$st_run" post_judge_artifact_published \
+    path=09-test-evidence/post-judge/g1/two-voice-dispositions.1.json kind=two_voice_dispositions \
+    secondary_attempt_id=gpt-c1-a0001 @window >/dev/null
+  assert_ok "the seal verifies: every post-seal event is well formed" seal_for_run "$st_run" --verify --phase publication
+  st_out="$("$BIN/firm-final-qa-check" "$st_run" 2>&1)"; st_final=$?
+  assert_eq "the BLOCK is not answered by the record staged before the seal" 1 "$st_final"
+  case "$st_out" in *"not bound to this generation's seal"*) _t_ok "…and the check says why";;
+    *) _t_no "…and the check says why" "$(_t_ctx "$st_out")";; esac
+fi
+
 t_case "proven no-append publication failure removes the complete unpublished bundle"
 cleanup_fixture="$(make_sealable_run)"; cleanup_run="$(printf '%s\n' "$cleanup_fixture" | sed -n '2p')"
 if t_p2_row_supported; then

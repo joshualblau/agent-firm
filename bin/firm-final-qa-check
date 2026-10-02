@@ -319,8 +319,14 @@ def require_decision_answered(event, label, answering):
     decisions=[index for index,item in enumerate(events)
                if item.get("event")=="final_decision_required" and item.get("event_id")==decision_id]
     position=[index for index,item in enumerate(events) if item is event]
+    seal_positions=[index for index,item in enumerate(events) if item is current_seal]
+    outcomes=[index for index,item in enumerate(events) if item.get("event_id")==answering.get("outcome_event_id")]
     if len(decisions)!=1 or len(position)!=1 or not decisions[0] < position[0]:
         block(f"{label} does not answer one earlier final_decision_required event")
+    # The decision answered was required AFTER this generation's seal and after the current verdict.
+    if (len(seal_positions)!=1 or len(outcomes)!=1
+            or not seal_positions[0] < outcomes[0] < decisions[0]):
+        block(f"{label} answers a decision that was not required after the current judge verdict")
     decision=events[decisions[0]]
     state_raw=safe_file(decision.get("path"),f"{label} decision state").read_bytes()
     if hashlib.sha256(state_raw).hexdigest()!=decision.get("sha256") or str(len(state_raw))!=str(decision.get("bytes")):
@@ -359,6 +365,11 @@ def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
         leak=privacy_match(raw,ref.get("path"))
         if leak is not None:
             block(f"{label} carries a privacy-policy match: {leak}")
+        # Bound to THIS generation's seal, so it lies in the grammar-checked suffix: the pre-seal
+        # ledger is only classified, and a record staged there could otherwise answer a later verdict.
+        if (not isinstance(current_seal_id,str) or event.get("seal_event_id")!=current_seal_id
+                or event.get("seal_projection_sha256")!=current_seal_projection):
+            block(f"{label} is a post-judge artifact not bound to this generation's seal")
         # Every post-judge artifact answers one attempt; it may answer only the CURRENT one.
         if event.get("secondary_attempt_id")!=answering.get("attempt_id"):
             block(f"{label} was published for attempt {event.get('secondary_attempt_id')}, "

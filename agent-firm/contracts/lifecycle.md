@@ -253,7 +253,10 @@ exactly `schema_version` (1), `run_id`, `candidate_sha`, `generation`, `secondar
 `secondary_verdict_sha256` and `secondary_verdict_bytes` (the current attempt's immutable verdict,
 `verdict_sha256`/`verdict_bytes` on its terminal event), and `two_voice_diff`, whose entries have
 exactly the traceability disposition shape. Evidence it cites may be a `disposition_evidence`
-post-judge artifact and a human record a `human_decision` one; neither may stand in for the other.
+post-judge artifact and a human record a `human_decision` one; neither may stand in for the other,
+each counts only when bound to this generation's seal, and a human record counts only when the
+decision it answers was required after the current judge verdict, so nothing staged before the seal
+can answer it.
 Every post-judge file is published once, so a revision is a new `<k>`. For a current BLOCK the Final
 check uses the LATEST such publication for the generation when it names the current canonical attempt
 and verdict digest and comes from a primary-QA window opened after that attempt ended; a latest publication naming anything else is ignored, never replaced by an older
