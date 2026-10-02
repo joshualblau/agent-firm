@@ -1202,9 +1202,9 @@ PY
     # POST-JUDGE BYTES MEET THE SEAL'S PRIVACY POLICY. They are never sealed, so the verifier scans
     # them itself with the same deny categories. The leaks are assembled at run time so this file's own
     # source carries none of them.
-    pj_leak_secret="$(printf '%s%s=%s' pass word Leaked-value-1234)"
+    pj_leak_assignment="$(printf '%s%s=%s' pass word Leaked-value-1234)"
     pj_leak_home="$(printf '/%s/operator/.ssh/id_ed25519' Users)"
-    printf 'primary QA notes: %s\n' "$pj_leak_secret" > "$pj_run/$pj_root/leak-secret.md"
+    printf 'primary QA notes: %s\n' "$pj_leak_assignment" > "$pj_run/$pj_root/leak-secret.md"
     printf 'see %s\n' "$pj_leak_home" > "$pj_run/$pj_root/leak-home.md"
     chmod 600 "$pj_run/$pj_root/leak-secret.md" "$pj_run/$pj_root/leak-home.md"
     pj_restore "$pj_judged"; pj_publish leak-secret.md disposition_evidence
@@ -1213,7 +1213,7 @@ PY
     pj_restore "$pj_judged"; pj_publish leak-home.md two_voice_dispositions
     pj_expect refuse "a post-judge artifact carrying an operator home path is refused" publication \
       "operator_home" PRIVACY_MATCH
-    pj_restore "$pj_judged"; pj final_decision_required "state_objection=$pj_leak_secret"
+    pj_restore "$pj_judged"; pj final_decision_required "state_objection=$pj_leak_assignment"
     pj_expect refuse "a decision state carrying a secret assignment is refused" publication \
       "secret_assignment" PRIVACY_MATCH
 
