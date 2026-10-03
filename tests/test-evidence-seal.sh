@@ -1613,6 +1613,46 @@ PY
     cp -p "$fr_snap/reviewer-state.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json"
     rm -rf "$fr_run/09-test-evidence/reviewer-attempts/gpt-c1-a0098"
     assert_ok "…and the run is restored to the genuine judge BLOCK again" seal_for_run "$fr_run" --verify --phase publication
+    # The same window with rows that are VALID (a windowed, seal-bound dispositions set): the check must
+    # still decide on the bytes it verified, not on what it would find by reading the ledger again.
+    mkdir -p "$fr_run/$fr_root"
+    printf 'race-window position\n' > "$fr_run/$fr_root/race-position.md"; chmod 600 "$fr_run/$fr_root/race-position.md"
+    t_python - "$fr_run" "$fr_root/race-position.md" <<'PY'
+import hashlib,json,os,sys
+run,evidence=sys.argv[1:]
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]
+canonical=json.load(open(run+"/08-qa-verdict.gpt.json"))
+local=open(f"{run}/09-test-evidence/reviewer-attempts/{canonical['attempt_id']}/verdict.json","rb").read()
+raw=open(run+"/"+evidence,"rb").read()
+ref={"path":evidence,"candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
+     "producer":{"event_id":"evt-race-evidence","event":"post_judge_artifact_published"}}
+entries=[{"secondary_blocker_id":o["id"],"secondary_blocker":o["text"],"primary_position":"asks for a human decision",
+          "positive_dissent":True,"affected_criteria":o["affected_criteria"],"affected_paths":o["affected_paths"],
+          "risk":"low","risk_reasons":["criterion:AC-001:functional"],
+          "bounded_resolution":{"attempted":False,"rounds":0,"rerun":"not_run","evidence":None},
+          "evidence":ref,"disposition":"human_decision"} for o in canonical["blocker_objects"]]
+doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":1,
+     "secondary_attempt_id":canonical["attempt_id"],"secondary_verdict_sha256":hashlib.sha256(local).hexdigest(),
+     "secondary_verdict_bytes":len(local),"two_voice_diff":entries}
+path=run+"/09-test-evidence/post-judge/g1/race-dispositions.json"
+open(path,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n"); os.chmod(path,0o600)
+PY
+    fr_race_hook2="$fr_stub/after-verify-valid.sh"
+    printf '#!/bin/sh\n%q %q %q %q post_judge_artifact_published path=%q kind=disposition_evidence secondary_attempt_id=gpt-c1-a0002 @window event_id=evt-race-evidence >/dev/null\n%q %q %q %q post_judge_artifact_published path=%q kind=two_voice_dispositions secondary_attempt_id=gpt-c1-a0002 @window >/dev/null\n' \
+      "$BIN/firm-python" "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" "$fr_root/race-position.md" \
+      "$BIN/firm-python" "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" "$fr_root/race-dispositions.json" > "$fr_race_hook2"
+    chmod +x "$fr_race_hook2"
+    fr_race2_out="$(FIRM_FINAL_TEST_GUARD=1 FIRM_FINAL_AFTER_VERIFY_HOOK="$fr_race_hook2" "$BIN/firm-final-qa-check" "$fr_run" 2>&1)"
+    fr_race2_rc=$?
+    assert_output "the race hook appended a valid dispositions set after the verification" "race-dispositions.json" \
+      cat "$fr_run/run.jsonl"
+    case "$fr_race2_rc:$fr_race2_out" in
+      1:*"exactly one entry per producer objection id"*) _t_ok "the check decides on the bytes it verified, not on rows appended since" ;;
+      *) _t_no "the check decides on the bytes it verified, not on rows appended since" "rc=$fr_race2_rc $(_t_ctx "$fr_race2_out")" ;;
+    esac
+    fr_check 4 "…and a fresh check, which verifies them, sees them" "DECISION REQUIRED"
+    cp -p "$fr_snap/run.jsonl" "$fr_run/run.jsonl"
+    assert_ok "…and the run is restored to the genuine judge BLOCK once more" seal_for_run "$fr_run" --verify --phase publication
 
     mkdir -p "$fr_run/$fr_root"
     printf '%s\n' 'Primary QA position on obj-post-judge-fixture: the sealed proof covers AC-001.' \
