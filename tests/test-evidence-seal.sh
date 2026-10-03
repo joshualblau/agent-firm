@@ -1270,6 +1270,9 @@ PY
     pj_expect refuse "a publication in a window that never closes is refused when verified" publication "role window"
     qa_window_close "$pj_run" test/pj-unclosed "$pj_w"
     pj_expect accept "…and verifies once its window closes"
+    pj_restore "$pj_judged"; pj qa_started stage=test/pj-forged role=qa-tester
+    pj_expect refuse "a qa_started that is not a native role start opens no window" publication \
+      "post-judge qa_started is not a native role start"
     pj_restore "$pj_judged"; qa_window_open "$pj_run" test/pj-packager packager role-contracts/P-01-packager.md >/dev/null
     pj_expect refuse "a post-judge role window for any role but qa-tester is refused" publication \
       "post-judge role windows are qa-tester only"
