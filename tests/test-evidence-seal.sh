@@ -1146,6 +1146,34 @@ else
         "$_pj_needle" "$_pj_category"
     }
 
+    # pj_bad_start <label> <needle> <stage> [role] [contract] — a role-mode start the sealed suffix
+    # would refuse is refused by the writer (role mode's INPUT_INVALID, exit 2, nothing appended),
+    # and the same native start appended raw is refused by the verifier.
+    pj_bad_start() {
+      local _pj_label="$1" _pj_needle="$2" _pj_stage="$3" _pj_role="${4:-qa-tester}" _pj_contract="${5:-role-contracts/Q-01-qa-tester.md}"
+      local _pj_snap="$pj_run/.pj-bad-start.jsonl" _pj_out _pj_rc
+      cp "$pj_run/run.jsonl" "$_pj_snap"
+      _pj_out="$(qa_window_open "$pj_run" "$_pj_stage" "$_pj_role" "$_pj_contract" 2>&1)"; _pj_rc=$?
+      case "$_pj_out" in
+        *"role start refused, nothing appended"*"$_pj_needle"*"INPUT_INVALID: sealed-suffix"*)
+          if cmp -s "$_pj_snap" "$pj_run/run.jsonl"; then _t_ok "$_pj_label: the writer refuses the role start"
+          else _t_no "$_pj_label: the writer refuses the role start" "the ledger changed"; fi ;;
+        *) _t_no "$_pj_label: the writer refuses the role start" "rc=$_pj_rc $(_t_ctx "$_pj_out")" ;;
+      esac
+      pj_restore "$_pj_snap"
+      t_python - "$pj_run" "$pj_sealed" "$_pj_stage" "$_pj_role" \
+        "$("$BIN/firm-model-resolve" --provider codex --role "$_pj_role" --format activation)" <<'PY'
+import json,sys
+run,sealed,stage,role,activation=sys.argv[1:]
+native=[r for r in map(json.loads,open(sealed)) if r.get("event")=="qa_started"][0]
+row=dict(native,event_id="evt-pj-raw-start",stage=stage,role=role,ts="2026-10-04T00:00:00Z",
+         activation=json.loads(activation))
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(row,separators=(",",":"))+"\n")
+PY
+      pj_expect refuse "$_pj_label: the verifier refuses the same native start appended raw" \
+        "${PJ_PHASE:-publication}" "$_pj_needle"
+    }
+
     # Accepted after a terminal judge event, one at a time and then all together.
     pj_restore "$pj_judged"; pj final_decision_required
     pj_expect accept "final_decision_required is accepted after the judge"
@@ -1187,15 +1215,13 @@ PY
     # candidate before it appends the event, so a real recapture is verified against the NEXT
     # generation's seal, in whose prefix the event lies. Letting one end the suffix meant a single
     # forged event switched off checking of everything after it.
-    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2
-    pj_expect refuse "a later-generation qa_checkout inside the verified suffix is refused" publication \
-      "unexpected event qa_checkout"
-    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2; pj lead_note note=anything-after-it
+    pj_restore "$pj_judged"; pj_bad "a later-generation qa_checkout inside the verified suffix is refused" \
+      "unexpected event qa_checkout" LEDGER_SUFFIX pj_checkout "sha=$pj_sha" generation=2
+    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2 @raw; pj lead_note note=anything-after-it @raw
     pj_expect refuse "a forged qa_checkout does not switch off checking of what follows it" publication \
       "unexpected event qa_checkout"
-    pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=1
-    pj_expect refuse "a same-generation qa_checkout inside the verified suffix is refused" publication \
-      "unexpected event qa_checkout"
+    pj_restore "$pj_judged"; pj_bad "a same-generation qa_checkout inside the verified suffix is refused" \
+      "unexpected event qa_checkout" LEDGER_SUFFIX pj_checkout "sha=$pj_sha" generation=1
 
     # Refused before any terminal judge event.
     pj_restore "$pj_sealed"; pj_bad "final_decision_required before the judge is refused" \
@@ -1203,7 +1229,8 @@ PY
     pj_restore "$pj_sealed"; pj_bad "final_gate_pending before the judge is refused" \
       "needs a terminal reviewer attempt" LEDGER_SUFFIX pj final_gate_pending
     pj_restore "$pj_sealed"; pj_bad "a post-judge artifact before the judge is refused" \
-      "needs a terminal reviewer attempt" LEDGER_SUFFIX pj_publish two-voice-dispositions.1.json two_voice_dispositions
+      "needs a terminal reviewer attempt" LEDGER_SUFFIX \
+      pj_publish human.yaml human_decision decision_required_event_id=evt-pj-before-judge
 
     # Refused with the wrong identity, shape, place, or bytes.
     for pj_spec in "sha=$pj_other:candidate/generation mismatch" "generation=2:candidate/generation mismatch" \
@@ -1270,18 +1297,23 @@ PY
     pj_expect refuse "a publication in a window that never closes is refused when verified" publication "role window"
     qa_window_close "$pj_run" test/pj-unclosed "$pj_w"
     pj_expect accept "…and verifies once its window closes"
-    pj_restore "$pj_judged"; pj qa_started stage=test/pj-forged role=qa-tester
-    pj_expect refuse "a qa_started that is not a native role start opens no window" publication \
-      "post-judge qa_started is not a native role start"
-    pj_restore "$pj_judged"; qa_window_open "$pj_run" test/pj-packager packager role-contracts/P-01-packager.md >/dev/null
-    pj_expect refuse "a post-judge role window for any role but qa-tester is refused" publication \
-      "post-judge role windows are qa-tester only"
+    pj_restore "$pj_judged"; pj_bad "a qa_started that is not a native role start opens no window" \
+      "post-judge qa_started is not a native role start" LEDGER_SUFFIX pj qa_started stage=test/pj-forged role=qa-tester
+    pj_restore "$pj_judged"; pj_bad_start "a post-judge role window for any role but qa-tester is refused" \
+      "post-judge role windows are qa-tester only" test/pj-packager packager role-contracts/P-01-packager.md
     pj_restore "$pj_judged"; pj_bad "a qa_completed that closes no post-judge window is refused" \
       "does not close an open primary-QA window" LEDGER_SUFFIX \
       pj qa_completed stage=test/pj-none role=qa-tester role_start_event_id=evt-no-such-window
-    pj_restore "$pj_sealed"; qa_window_open "$pj_run" test/pj-early >/dev/null
-    pj_expect refuse "a QA window opened before any terminal attempt is refused" publication \
-      "qa_started needs a terminal reviewer attempt"
+    pj_restore "$pj_sealed"; pj_bad_start "a QA window opened before any terminal attempt is refused" \
+      "qa_started needs a terminal reviewer attempt" test/pj-early
+    # Scenario E: primary QA opens its post-judge window while a further judge attempt is still open.
+    # The role start used to land with rc 0 and every later verification and post-judge append failed.
+    pj_restore "$pj_judged"; pj_open
+    PJ_PHASE=wrapper-preflight pj_bad_start "a QA window opened while a judge attempt is open is refused" \
+      "qa_started needs a terminal reviewer attempt and no open attempt" test/pj-during-attempt
+    pj_restore "$pj_judged"; pj_open
+    qa_window_open "$pj_run" test/pj-during-attempt >/dev/null 2>&1
+    pj_expect accept "…and the run it was refused in still verifies" wrapper-preflight
 
     # EACH RECORD ANSWERS ONE ATTEMPT. A decision state names the attempt it is about, and a human
     # decision names the decision it answers, so neither can be replayed against another attempt.
@@ -1323,11 +1355,18 @@ PY
       "secret_assignment" PRIVACY_MATCH pj final_decision_required "state_objection=$pj_leak_assignment"
 
     # Everything outside the closed set is still refused after the judge.
-    pj_restore "$pj_judged"; pj lead_note note=after-the-judge
-    pj_expect refuse "an ordinary lead_note after the judge is still refused" publication "unexpected event lead_note"
-    pj_restore "$pj_judged"; pj human_decision_recorded "path=$pj_root/human.yaml" "sha=$pj_sha" generation=1
-    pj_expect refuse "an unsealed-style human_decision_recorded event is still refused after the seal" publication \
-      "unexpected event human_decision_recorded"
+    pj_restore "$pj_judged"; pj_bad "an ordinary lead_note after the judge is refused" \
+      "unexpected event lead_note" LEDGER_SUFFIX pj lead_note note=after-the-judge
+    pj_restore "$pj_judged"; pj_bad "an unsealed-style human_decision_recorded event is refused after the seal" \
+      "unexpected event human_decision_recorded" LEDGER_SUFFIX \
+      pj human_decision_recorded "path=$pj_root/human.yaml" "sha=$pj_sha" generation=1
+    pj_restore "$pj_sealed"; pj_bad "an ordinary event right after the seal is refused" \
+      "unexpected event lead_note" LEDGER_SUFFIX pj lead_note note=before-the-judge
+    # Reviewer events stay with the wrapper: the writer does not judge them, the verifier does.
+    pj_restore "$pj_judged"
+    assert_ok "the writer leaves reviewer events to the wrapper" "$BIN/firm-ledger-log" --run "$pj_run" --strict \
+      reviewer_invalid provider=gpt generation=1 "sha=$pj_sha" note=not-a-wrapper-row
+    pj_expect refuse "…and the verifier still refuses a malformed one" publication "reviewer seal identity mismatch"
     pj_restore "$pj_judged"
     pj_expect accept "the judged snapshot itself still verifies"
 
@@ -1531,9 +1570,15 @@ PY
     # passed the seal and firm-final-qa-check returned 0.
     fr_snap="$fr_stub/before-exploit"; mkdir -p "$fr_snap"
     cp -p "$fr_run/run.jsonl" "$fr_run/08-qa-verdict.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json" "$fr_snap/"
-    "$BIN/firm-ledger-log" --run "$fr_run" --strict qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
+    # The writer now refuses the forged qa_checkout outright (the live candidate is still generation 1)...
+    assert_fail "the writer refuses a qa_checkout that would land inside the sealed suffix" \
+      "$BIN/firm-ledger-log" --run "$fr_run" --strict qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
       "branch=integration/$fr_id" "source_ref=refs/heads/integration/$fr_id" "base_sha=$fr_sha" \
-      "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json >/dev/null
+      "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json
+    # ...so the exploit's row is appended raw, as by any other route, to keep the verifier honest.
+    t_python "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
+      "branch=integration/$fr_id" "source_ref=refs/heads/integration/$fr_id" "base_sha=$fr_sha" \
+      "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json @raw >/dev/null
     fr_forged="$(t_python - "$fr_run" "$fr_id" "$fr_sha" <<'PY'
 import hashlib,json,os,sys
 run,rid,sha=sys.argv[1:]

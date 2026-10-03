@@ -257,12 +257,15 @@ post-judge artifact and a human record a `human_decision` one; neither may stand
 each counts only when bound to this generation's seal, and a human record counts only when the
 decision it answers was required after the current judge verdict, so nothing staged before the seal
 can answer it.
-Every post-judge file is published once, so a revision is a new `<k>`. In a sealed generation
-`firm-ledger-log` checks each post-judge row (`post_judge_artifact_published`, `final_gate_pending`,
-`final_decision_required`, `qa_completed`) against the seal's own verification before appending it,
-and refuses a row the verification would refuse (wrong field set, binding, path, digest, window,
-attempt, or a privacy-policy match), naming why; nothing is appended, so correct the file or command
-and publish again. A disposition must repeat the judge's objection text exactly, so if that text
+Every post-judge file is published once, so a revision is a new `<k>`. Once the live candidate's
+generation has a published seal, `firm-ledger-log` checks every row except the reviewer wrapper's own
+against that seal's suffix grammar before appending it -- post-judge rows, role starts such as a
+primary-QA window, and any ordinary event -- and refuses a row the grammar would refuse (an event it
+does not admit, wrong field set, binding, path, digest, window, attempt, a window opened while a judge
+attempt is open, or a privacy-policy match), naming why; nothing is appended, so correct the file or
+command and publish again. A refused role start fails with `INPUT_INVALID: sealed-suffix`. A
+recapture is not affected: `firm-qa-checkout` moves the live candidate to the next generation before
+it appends, and that generation has no seal yet. A disposition must repeat the judge's objection text exactly, so if that text
 itself carries a privacy-policy match no disposition of it can be published: run a new judge attempt
 rather than editing around it. For a current BLOCK the Final
 check uses the LATEST such publication for the generation when it names the current canonical attempt

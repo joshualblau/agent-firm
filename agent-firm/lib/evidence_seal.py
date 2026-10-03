@@ -1633,15 +1633,70 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
     return open_attempt
 
 
+def _publication_identity(run, seal, seal_rel, bundle_rel):
+    """The publication record a seal's suffix must open with: its event id and bundle artifacts."""
+    expected_artifacts = []
+    for relative, kind in ((seal["pr_body"]["path"], "pr_body"),
+                           (bundle_rel + "/candidate.diff", "candidate_diff"),
+                           (bundle_rel + "/normalized-run-metadata.json", "normalized_metadata"),
+                           (seal["privacy"]["report_path"], "privacy"), (seal_rel, "seal")):
+        raw, _, _ = _safe_read(run, relative, 1024 * 1024 if relative.endswith((".json", ".md")) else MAX_FILE)
+        expected_artifacts.append({"path": relative, "kind": kind, "bytes": len(raw), "sha256": sha256(raw)})
+    expected_artifacts.sort(key=lambda item: item["path"])
+    return {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
+
+
+def check_pending_suffix(run_path, ledger_raw, pending, policy_path, candidate_sha, generation):
+    """Refuse ONE row not yet appended if it would break the live generation's suffix grammar.
+
+    The writer calls this, under its lock, for every non-reviewer append with the exact ledger bytes
+    the row would follow and the LIVE candidate's sha and generation. A recapture's `qa_checkout`
+    therefore belongs to the next generation (its candidate is rewritten first, and that generation
+    has no seal yet), and nothing is checked before the generation's seal is published.
+
+    It judges the suffix GRAMMAR, not the sealed files: a row is refused only when the suffix accepts
+    the ledger without it and refuses it with it. A suffix already broken by something else, or a
+    sealed file changed since, is not this row's doing, and verification refuses that run anyway. A
+    QA window that has not closed yet is allowed here; its closure is checked when it lands.
+    Returns None when nothing applies; raises SealError naming why the row is refused.
+    """
+    run = Path(os.path.realpath(os.path.abspath(run_path)))
+    records = []
+    for number, line in enumerate(ledger_raw.splitlines(), 1):
+        records.append(parse_json_unique(line, f"ledger line {number}"))
+    published = [item for item in records if isinstance(item, dict)
+                 and item.get("event") == "evidence_seal_published" and item.get("sha") == candidate_sha
+                 and str(item.get("generation")) == str(generation)]
+    if not published:
+        return None
+    if not isinstance(pending, dict) or pending.get("run_id") != run.name:
+        raise SealError("LEDGER_SUFFIX", "pending record is not a record of this run")
+    bundle_rel = f"09-test-evidence/final-evidence/g{generation}"
+    seal_rel = f"{bundle_rel}/seal.json"
+    seal_raw, _, _ = _safe_read(run, seal_rel, 1024 * 1024)
+    seal = parse_canonical_json(seal_raw, "final evidence seal")
+    if (seal.get("identity", {}).get("candidate_sha") != candidate_sha
+            or str(seal.get("identity", {}).get("generation")) != str(generation)):
+        raise SealError("SEAL_IDENTITY", "the live generation's seal names another candidate")
+    publication = _publication_identity(run, seal, seal_rel, bundle_rel)
+    privacy = _privacy_patterns(parse_json_unique(Path(policy_path).read_bytes(), "privacy policy"))
+    try:
+        _validate_suffix(run, records, seal, seal_raw, publication, "wrapper-preflight",
+                         privacy=privacy, allow_open_windows=True)
+    except SealError:
+        return None          # already broken by something else; this row cannot make it worse
+    _validate_suffix(run, records + [pending], seal, seal_raw, publication, "wrapper-preflight",
+                     privacy=privacy, allow_open_windows=True)
+    return None
+
+
 def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None,
-                ledger_raw=None, pending=None):
+                ledger_raw=None):
     """Verify the live generation's seal and its suffix.
 
     `ledger_raw` makes the verification cover EXACTLY the ledger bytes a caller read and will act
     on, so a row appended after the caller's read can never be trusted unverified: the classifier
     must agree that the file still holds those bytes, and the suffix is checked over them alone.
-    `pending` is one record not yet in the ledger, checked as though appended after those bytes; the
-    writer uses it to refuse a post-judge row the grammar would refuse, before it can land.
     """
     run, repo, metadata, candidate = _identity(run_path)
     identity_bindings = _operator_home_identity_bindings(metadata, candidate)
@@ -1720,22 +1775,10 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
     if sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:
         raise SealError("LEDGER_PREFIX", "sealed prefix changed")
     records = list(state["records"])
-    if pending is not None:
-        if not isinstance(pending, dict) or pending.get("run_id") != run.name:
-            raise SealError("LEDGER_SUFFIX", "pending record is not a record of this run")
-        records.append(pending)
     bundle_rel = f"09-test-evidence/final-evidence/g{generation}"
-    expected_artifacts = []
-    for relative, kind in ((seal["pr_body"]["path"], "pr_body"),
-                           (bundle_rel + "/candidate.diff", "candidate_diff"),
-                           (bundle_rel + "/normalized-run-metadata.json", "normalized_metadata"),
-                           (seal["privacy"]["report_path"], "privacy"), (seal_rel, "seal")):
-        raw, _, _ = _safe_read(run, relative, 1024 * 1024 if relative.endswith((".json", ".md")) else MAX_FILE)
-        expected_artifacts.append({"path": relative, "kind": kind, "bytes": len(raw), "sha256": sha256(raw)})
-    expected_artifacts.sort(key=lambda item: item["path"])
-    publication = {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
+    publication = _publication_identity(run, seal, seal_rel, bundle_rel)
     open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id,
-                                    patterns, allow_open_windows=pending is not None)
+                                    patterns)
     receipt = {
         # Exactly the ledger bytes this verification covered, so a caller can bind what it later
         # acts on to them (post_judge_inputs does).
