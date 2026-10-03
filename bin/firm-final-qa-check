@@ -33,9 +33,9 @@ if [[ -z "$run_dir" || ! -d "$run_dir" || -L "$run_dir" ]]; then
 fi
 primary="$run_dir/08-qa-verdict.json"
 [[ -f "$primary" && ! -L "$primary" ]] || { echo "FINAL QA: CANNOT EVALUATE -- missing primary verdict" >&2; exit 2; }
-seal_detail="$("$SELF/firm-seal-qa-evidence" --verify --run "$run_dir" --phase publication 2>&1)"
-seal_rc=$?
-[[ $seal_rc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- final evidence seal validation rc=$seal_rc: ${seal_detail//$'\n'/ }" >&2; exit 2; }
+# The final evidence seal is verified INSIDE the check below, over exactly the ledger bytes the check
+# then uses. It used to be a separate subprocess here, after which the check re-read run.jsonl, so a
+# row appended in between was trusted without ever being grammar-checked.
 "$SELF/firm-validate-verdict" "$primary" >/dev/null 2>&1
 pvalid=$?
 [[ $pvalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- primary verdict validation rc=$pvalid" >&2; exit 2; }
@@ -165,6 +165,26 @@ def utc(value):
     except ValueError:
         return False
 
+# ONE READ OF THE LEDGER. Verify the seal over exactly these bytes, in process, and use only them
+# afterwards: a row appended after this read is neither verified nor trusted.
+ledger_path = safe_file("run.jsonl", "target ledger")
+try:
+    ledger_raw = ledger_path.read_bytes()
+except OSError as exc:
+    cannot(f"target ledger is unreadable: {exc}")
+try:
+    seal_receipt = evidence_seal.verify_seal(
+        run, firm_root / "agent-firm" / "policy" / "evidence-privacy.yaml", "publication", ledger_raw=ledger_raw)
+except evidence_seal.SealError as exc:
+    cannot(f"final evidence seal validation rc=1: firm-seal-qa-evidence: BLOCK {exc.category}: {exc.detail}")
+except Exception as exc:
+    cannot(f"final evidence seal validation could not run: {type(exc).__name__}: {exc}")
+sealed_run = seal_receipt.get("state") == "sealed"
+# Guarded test seam: runs between the verification and every later use of the ledger, so a test can
+# prove that a row appended in that window is not trusted. Inert unless the guard is set.
+if os.environ.get("FIRM_FINAL_TEST_GUARD") == "1" and os.environ.get("FIRM_FINAL_AFTER_VERIFY_HOOK"):
+    subprocess.run([os.environ["FIRM_FINAL_AFTER_VERIFY_HOOK"]], check=False)
+
 evidence_parent = run / "09-test-evidence"
 try:
     evidence_info = os.lstat(evidence_parent)
@@ -249,15 +269,14 @@ if not isinstance(voice.get("required"), bool) or voice["required"] != derived_r
     block(f"supplied two_voice.required does not match derived value {str(derived_required).lower()}")
 
 def ledger_events():
+    """The ledger rows of the ONE read above, the bytes the seal verification covered."""
     events=[]
-    path=safe_file("run.jsonl", "target ledger")
     try:
-        with open(path, encoding="utf-8") as fh:
-            for number,line in enumerate(fh,1):
-                item=json.loads(line)
-                if not isinstance(item,dict):
-                    raise ValueError(f"line {number} is not an object")
-                events.append(item)
+        for number,line in enumerate(ledger_raw.decode("utf-8","strict").splitlines(),1):
+            item=json.loads(line)
+            if not isinstance(item,dict):
+                raise ValueError(f"line {number} is not an object")
+            events.append(item)
     except Exception as exc:
         cannot(f"target ledger is malformed: {exc}")
     return events
@@ -279,6 +298,17 @@ current_seal=seal_publications[0] if len(seal_publications)==1 else None
 # publication for this generation there is nothing to bind to, so nothing matches.
 current_seal_id=current_seal.get("event_id") if current_seal is not None else None
 current_seal_projection=current_seal.get("projection_sha256") if current_seal is not None else None
+if sealed_run and (current_seal_id!=seal_receipt.get("publication_event_id")
+                   or current_seal_projection!=seal_receipt.get("projection_sha256")):
+    cannot("the verified seal publication is not the ledger's seal publication for this generation")
+if not sealed_run:
+    current_seal_id=current_seal_projection=None
+
+def require_reviewer_seal_binding(event, label):
+    """In a sealed generation every reviewer event Final relies on carries this seal's binding."""
+    if sealed_run and (event.get("seal_event_id")!=seal_receipt.get("publication_event_id")
+                       or event.get("seal_projection_sha256")!=seal_receipt.get("projection_sha256")):
+        block(f"{label} reviewer event is not bound to this generation's seal")
 
 def post_judge_published(kind):
     return [event for event in events if event.get("event")=="post_judge_artifact_published"
@@ -486,6 +516,7 @@ def validate_attempt_verdict(verdict_path, verdict, label, current):
     if len(matches)!=1:
         block(f"{label} needs exactly one wrapper outcome event")
     event=matches[0]
+    require_reviewer_seal_binding(event,label)
     if any((event.get("event")!=event_name,event.get("provider")!=expected,
             str(event.get("generation"))!=str(generation),event.get("sha")!=sha,
             event.get("attempt")!=attempt_rel,event.get("attempt_id")!=attempt_id,
@@ -557,6 +588,7 @@ if not present:
     state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json","unavailable reviewer state"),"unavailable reviewer state")
     if len(matches)!=1 or matches[0].get("event")!="reviewer_unavailable" or matches[0].get("attempt")!=rel_attempt or str(matches[0].get("exit_code"))!="3" or state.get("attempt_id")!=attempt.get("attempt_id"):
         block("unavailable state needs the latest exact target-ledger exit-3 attempt")
+    require_reviewer_seal_binding(matches[0],"unavailable attempt")
     if derived_required:
         if not isinstance(voice.get("unavailable_waiver"),dict):
             decision_required("required_secondary_unavailable",[{

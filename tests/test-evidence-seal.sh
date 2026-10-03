@@ -1564,6 +1564,53 @@ PY
     rm -rf "$fr_run/09-test-evidence/reviewer-attempts/gpt-c1-a0099"
     assert_ok "the run is restored to the genuine judge BLOCK" seal_for_run "$fr_run" --verify --phase publication
 
+    # THE VERIFICATION WINDOW. The Final check used to verify the seal in a subprocess and then re-read
+    # run.jsonl, so a row appended in between was trusted unverified: a fabricated APPROVE appended
+    # there passed with rc 0. A guarded test seam now runs exactly in that window; the check must decide
+    # on the bytes it verified, and a fresh check must then refuse the appended row.
+    fr_race_hook="$fr_stub/after-verify.sh"
+    { printf '#!/bin/sh\n'
+      printf 'exec %q - %q %q %q <<'"'"'PY'"'"'\n' "$(command -v python3)" "$fr_run" "$fr_id" "$fr_sha"
+      cat <<'PY'
+import hashlib,json,os,sys
+run,rid,sha=sys.argv[1:]
+aid="gpt-c1-a0098"; d=f"{run}/09-test-evidence/reviewer-attempts/{aid}"; os.makedirs(d,exist_ok=True)
+local_rel=f"09-test-evidence/reviewer-attempts/{aid}/verdict.json"; attempt_rel=f"09-test-evidence/reviewer-attempts/{aid}/attempt.json"
+verdict=json.load(open(run+"/08-qa-verdict.gpt.json"))
+verdict.update({"verdict":"APPROVE","attempt_id":aid,"blockers":[],"blocker_objects":[]})
+raw=(json.dumps(verdict,indent=2,sort_keys=True)+"\n").encode()
+for path in (f"{run}/{local_rel}",run+"/08-qa-verdict.gpt.json"):
+    open(path,"wb").write(raw); os.chmod(path,0o600)
+attempt={"schema_version":1,"attempt_id":aid,"provider":"gpt","run_id":rid,"candidate_sha":sha,"generation":1,
+         "status":"approve","exit_code":0,"started_event_id":"evt-race-start","outcome_event_id":"evt-race-approve",
+         "verdict":local_rel,"canonical":"08-qa-verdict.gpt.json","canonical_promoted":True,
+         "verdict_sha256":hashlib.sha256(raw).hexdigest(),"verdict_bytes":len(raw)}
+araw=(json.dumps(attempt,indent=2,sort_keys=True)+"\n").encode(); open(f"{run}/{attempt_rel}","wb").write(araw)
+os.chmod(f"{run}/{attempt_rel}",0o600)
+state=run+"/09-test-evidence/reviewer-state.gpt.json"; doc=json.load(open(state)); doc["attempt_id"]=aid
+open(state,"w").write(json.dumps(doc,indent=2)+"\n"); os.chmod(state,0o600)
+row={"ts":"2026-10-02T00:00:00Z","event":"reviewer_approve","event_id":"evt-race-approve","run_id":rid,"provider":"gpt",
+     "generation":"1","sha":sha,"attempt":attempt_rel,"attempt_id":aid,"exit_code":"0","verdict":local_rel,
+     "canonical":"08-qa-verdict.gpt.json","phase":"judge","sha256":hashlib.sha256(araw).hexdigest(),"bytes":str(len(araw)),
+     "verdict_sha256":hashlib.sha256(raw).hexdigest(),"verdict_bytes":str(len(raw))}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(row,separators=(",",":"))+"\n")
+PY
+      printf 'PY\n'; } > "$fr_race_hook"
+    chmod +x "$fr_race_hook"
+    fr_race_out="$(FIRM_FINAL_TEST_GUARD=1 FIRM_FINAL_AFTER_VERIFY_HOOK="$fr_race_hook" "$BIN/firm-final-qa-check" "$fr_run" 2>&1)"
+    fr_race_rc=$?
+    assert_output "the race hook really appended a fabricated APPROVE after the verification" '"event_id":"evt-race-approve"' \
+      cat "$fr_run/run.jsonl"
+    case "$fr_race_rc" in
+      0) _t_no "a row appended after the Final check's verification is not trusted" "passed: $(_t_ctx "$fr_race_out")" ;;
+      *) _t_ok "a row appended after the Final check's verification is not trusted" ;;
+    esac
+    fr_check 2 "…and a fresh check refuses the unverified row" "BLOCK LEDGER_SUFFIX"
+    cp -p "$fr_snap/run.jsonl" "$fr_run/run.jsonl"; cp -p "$fr_snap/08-qa-verdict.gpt.json" "$fr_run/08-qa-verdict.gpt.json"
+    cp -p "$fr_snap/reviewer-state.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json"
+    rm -rf "$fr_run/09-test-evidence/reviewer-attempts/gpt-c1-a0098"
+    assert_ok "…and the run is restored to the genuine judge BLOCK again" seal_for_run "$fr_run" --verify --phase publication
+
     mkdir -p "$fr_run/$fr_root"
     printf '%s\n' 'Primary QA position on obj-post-judge-fixture: the sealed proof covers AC-001.' \
       > "$fr_run/$fr_root/primary-position.md"; chmod 600 "$fr_run/$fr_root/primary-position.md"
@@ -1833,6 +1880,54 @@ PY
   assert_eq "the BLOCK is not answered by the record staged before the seal" 1 "$st_final"
   case "$st_out" in *"not bound to this generation's seal"*) _t_ok "…and the check says why";;
     *) _t_no "…and the check says why" "$(_t_ctx "$st_out")";; esac
+fi
+
+# A JUDGE VERDICT STAGED BEFORE THE SEAL IS NOT A JUDGE VERDICT. The pre-seal ledger is only
+# classified, so a reviewer_approve row written there with planted attempt and verdict files, and no
+# judge ever run, used to satisfy the Final check. In a sealed generation every reviewer event the
+# check relies on must now carry this seal's binding.
+t_case "a reviewer verdict staged before the seal cannot pass the Final check"
+if ! ledger_writes_supported; then
+  t_skip "pre-seal staged reviewer verdict" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  sv_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  sv_run="$(printf '%s\n' "$sv_fixture" | sed -n '2p')"; sv_sha="$(printf '%s\n' "$sv_fixture" | sed -n '3p')"
+  sv_fields="$(t_python - "$sv_run" "$(basename "$sv_run")" "$sv_sha" <<'PY'
+import hashlib,json,os,sys
+run,rid,sha=sys.argv[1:]
+aid="gpt-c1-a0001"; d=f"{run}/09-test-evidence/reviewer-attempts/{aid}"; os.makedirs(d,exist_ok=True)
+local_rel=f"09-test-evidence/reviewer-attempts/{aid}/verdict.json"; attempt_rel=f"09-test-evidence/reviewer-attempts/{aid}/attempt.json"
+verdict={"verdict":"APPROVE","commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":aid,
+         "environment":"staged","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+         "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+         "visual":{"status":"not_applicable","evidence":"none"},
+         "acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/proof.log"}],
+         "untested_risks":[],"blockers":[],"blocker_objects":[],"warnings":[],"artifacts":[],"summary":"staged"}
+raw=(json.dumps(verdict,indent=2,sort_keys=True)+"\n").encode()
+for path in (f"{run}/{local_rel}",run+"/08-qa-verdict.gpt.json"):
+    open(path,"wb").write(raw); os.chmod(path,0o600)
+attempt={"schema_version":1,"attempt_id":aid,"provider":"gpt","run_id":rid,"candidate_sha":sha,"generation":1,
+         "status":"approve","exit_code":0,"started_event_id":"evt-staged-start","outcome_event_id":"evt-staged-approve",
+         "verdict":local_rel,"canonical":"08-qa-verdict.gpt.json","canonical_promoted":True,
+         "verdict_sha256":hashlib.sha256(raw).hexdigest(),"verdict_bytes":len(raw)}
+araw=(json.dumps(attempt,indent=2,sort_keys=True)+"\n").encode(); open(f"{run}/{attempt_rel}","wb").write(araw)
+os.chmod(f"{run}/{attempt_rel}",0o600)
+state=run+"/09-test-evidence/reviewer-state.gpt.json"
+open(state,"w").write(json.dumps({"schema_version":1,"provider":"gpt","candidate_sha":sha,"generation":1,
+                                  "last_attempt":1,"attempt_id":aid},indent=2)+"\n"); os.chmod(state,0o600)
+print(" ".join([f"attempt={attempt_rel}",f"attempt_id={aid}",f"verdict={local_rel}","exit_code=0",
+  f"sha256={hashlib.sha256(araw).hexdigest()}",f"bytes={len(araw)}",f"verdict_sha256={hashlib.sha256(raw).hexdigest()}",
+  f"verdict_bytes={len(raw)}","canonical=08-qa-verdict.gpt.json","phase=judge"]))
+PY
+)"
+  # shellcheck disable=SC2086
+  "$BIN/firm-ledger-log" --run "$sv_run" --strict --event-id evt-staged-approve reviewer_approve provider=gpt \
+    generation=1 "sha=$sv_sha" $sv_fields >/dev/null
+  assert_ok "the run seals with the staged reviewer event in its (only classified) prefix" seal_for_run "$sv_run"
+  sv_out="$("$BIN/firm-final-qa-check" "$sv_run" 2>&1)"; sv_rc=$?
+  assert_eq "a verdict no judge produced after the seal does not pass" 1 "$sv_rc"
+  case "$sv_out" in *"reviewer event is not bound to this generation's seal"*) _t_ok "…and the check says why";;
+    *) _t_no "…and the check says why" "$(_t_ctx "$sv_out")";; esac
 fi
 
 # ONLY ROWS THE SEAL VERIFIED CROSS INTO A JUDGE'S INPUT. The reviewer inventory used to copy the file
