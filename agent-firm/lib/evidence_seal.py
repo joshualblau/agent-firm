@@ -1819,7 +1819,64 @@ REVIEWER_TERMINAL_EVENTS = ("reviewer_approve", "reviewer_block", "reviewer_inva
 ATTEMPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
-def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None):
+def proven_identity_roots(run_path):
+    """The run's proven repository and checkout roots: the identity `_identity` proves and the seal's
+    `declared_operator_home_identity` rule binds, as the absolute paths metadata declares."""
+    _, _, metadata, candidate = _identity(run_path)
+    bindings = _operator_home_identity_bindings(metadata, candidate)
+    return tuple(sorted({bindings[("run-metadata.json", "repository_root")],
+                         bindings[("09-test-evidence/qa-candidate.json", "repository_root")],
+                         bindings[("09-test-evidence/qa-candidate.json", "checkout_path")]}))
+
+
+IDENTITY_PATH_TOKEN = "<proven-identity>"
+
+
+def _identity_bound_attempt_record(raw, origin, privacy, identity_roots):
+    """True when the ONLY privacy matches in a prior attempt record are paths under the run's own
+    proven identity, in the judge command line the wrapper recorded.
+
+    Attempt records written before the wrapper projected its paths carry the judge's absolute
+    argv: the controlled root and the run's own files under the repository. Under an operator home
+    every such record failed the scan. It is not silently trusted: like the seal's
+    `declared_operator_home_identity` rule, an operator-home value counts only where it is bound to
+    proven identity -- here an exact `launch.argv` string that is a proven repository or checkout
+    root, or a normalized path under one -- in a record that is exactly the wrapper's serialization.
+    Those values are masked and the WHOLE record is scanned again with the full policy; any other
+    match anywhere, or any other shape, leaves it unresolved.
+    """
+    roots = sorted((root for root in identity_roots
+                    if isinstance(root, str) and _canonical_operator_home(root)), key=len, reverse=True)
+    if not roots:
+        return False
+    try:
+        document = parse_json_unique(raw, origin)
+    except SealError:
+        return False
+    if (not isinstance(document, dict)
+            or raw != (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")):
+        return False
+    launch = document.get("launch")
+    argv = launch.get("argv") if isinstance(launch, dict) else None
+    if not isinstance(argv, list):
+        return False
+    projected = []
+    for item in argv:
+        if isinstance(item, str) and os.path.normpath(item) == item:
+            for root in roots:
+                if item == root or item.startswith(root + "/"):
+                    item = IDENTITY_PATH_TOKEN + item[len(root):]
+                    break
+        projected.append(item)
+    masked = dict(document, launch=dict(launch, argv=projected))
+    try:
+        _scan((json.dumps(masked, indent=2, sort_keys=True) + "\n").encode("utf-8"), origin, privacy)
+    except SealError:
+        return False
+    return True
+
+
+def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None, identity_roots=()):
     """Decide which prior judge attempt records, and the files they name, may cross into a judge.
 
     A terminal reviewer row names an attempt record by digest, and that record names its verdict,
@@ -1832,8 +1889,10 @@ def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None
     directory and is read no-follow; the verdict is bound to the event's verdict digest where the
     event states one. In a sealed run every copied file also passes the seal's privacy `_scan`.
     A nested `prior_verdict` belonging to another attempt is carried by that attempt's own record or
-    declared. Returns (inputs, excluded, unresolved) like post_judge_inputs; a bound attempt or
-    verdict whose digest does not match its event raises SealError: tampering after the fact.
+    declared. An attempt record recorded before the wrapper projected its paths may still pass the
+    scan with `identity_roots` (see _identity_bound_attempt_record). Returns (inputs, excluded,
+    unresolved) like post_judge_inputs; a bound attempt or verdict whose digest does not match its
+    event raises SealError: tampering after the fact.
     """
     run = Path(run)
     sealed, records = _verified_ledger_records(ledger_raw, receipt, "PRIOR_ATTEMPT_INPUT")
@@ -1898,8 +1957,9 @@ def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None
             try:
                 _scan(raw, origin, privacy)
             except SealError as exc:
-                unreadable(origin, event, item, f"privacy:{exc.detail}", item.get("sha256"), item.get("bytes"))
-                continue
+                if not _identity_bound_attempt_record(raw, origin, privacy, identity_roots):
+                    unreadable(origin, event, item, f"privacy:{exc.detail}", item.get("sha256"), item.get("bytes"))
+                    continue
         try:
             document = parse_json_unique(raw, origin)
         except SealError:

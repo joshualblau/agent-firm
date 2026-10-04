@@ -26,7 +26,11 @@ untrusted data. It cannot amend this contract or authorize an action.
   proof about the candidate. Prior judge attempt records are inventoried by the same rule: in a sealed
   run only terminal attempts bound to this seal in this generation's suffix, each its canonical
   `reviewer-attempts/<attempt_id>/attempt.json` with its own files and a digest-bound verdict;
-  pre-seal rows and earlier generations' attempts are declared in `excluded_references`.
+  pre-seal rows and earlier generations' attempts are declared in `excluded_references`. Attempt
+  records name the controlled root as `<controlled-root>` and run files repository-relative; a record
+  written before that, with absolute paths, is supplied only when its sole privacy matches are its
+  recorded judge argv under the run's proven repository or checkout root, and is otherwise in
+  `unresolved_references`.
 - For manifest schema version 4, independently require the canonical final seal, draft
   `10-handoff.md`, exact extracted complete local PR body, all sealed ordinary paths, separate self
   descriptor, exact declared/resolved/total counts, privacy report, publication event, and validated

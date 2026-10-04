@@ -797,7 +797,7 @@ if args.print_capability_contract:
 sys.path.insert(0, str(root / "agent-firm" / "lib"))
 from evidence_seal import (  # noqa: E402
     SealError, _privacy_patterns, current_judge_attempt, manifest_v4_fields, parse_json_unique,
-    post_judge_inputs, prior_attempt_inputs, validate_schema, verify_seal,
+    post_judge_inputs, prior_attempt_inputs, proven_identity_roots, validate_schema, verify_seal,
 )
 
 def stop(message, code=1):
@@ -950,6 +950,40 @@ def resolve_run(raw):
 
 run_arg = args.run_option or args.run_dir
 repo, run = resolve_run(run_arg)
+
+# ATTEMPT RECORDS NAME NO ABSOLUTE LOCAL PATH. A later judge attempt receives this run's earlier
+# attempt records, and in a sealed run each one passes the seal's privacy scan first. The judge's
+# command line named the disposable controlled root and the run's own files by absolute path, so in a
+# repository under an operator home (/Users/<operator>/...) every record failed that scan, was
+# declared unresolved with its verdict and diagnostic, and the next judge was told to BLOCK on the
+# omission. Records are written projected the way the seal's privacy report projects argv and cwd:
+# the controlled root becomes `<controlled-root>`, anything else inside the repository becomes
+# repository-relative. The process itself still receives the absolute paths.
+CONTROLLED_ROOT_TOKEN = "<controlled-root>"
+local_path_roots = [(repo, "", ".")]         # (absolute root, prefix for what lies under it, itself)
+
+
+def _replace_local_root(text, root, inside, itself):
+    for form in sorted({str(root), os.path.realpath(root)}, key=len, reverse=True):
+        text = re.sub(r"(?<![A-Za-z0-9._/-])" + re.escape(form) + r"(/|(?![A-Za-z0-9._/-]))",
+                      lambda match: inside if match.group(1) == "/" else itself, text)
+    return text
+
+
+def project_local_paths(value):
+    if isinstance(value, str):
+        for root, inside, itself in local_path_roots:
+            value = _replace_local_root(value, root, inside, itself)
+        return value
+    if isinstance(value, list):
+        return [project_local_paths(item) for item in value]
+    if isinstance(value, dict):
+        return {key: project_local_paths(item) for key, item in value.items()}
+    return value
+
+
+def attempt_bytes():
+    return json_bytes(project_local_paths(attempt))
 evidence = safe_dir(run / "09-test-evidence", 0o700, create=True)
 if os.path.realpath(evidence) != os.path.join(os.path.realpath(run), "09-test-evidence"):
     stop("09-test-evidence parent is redirected", 2)
@@ -1148,7 +1182,7 @@ def update_attempt(status, exit_code, **fields):
     attempt["exit_code"] = exit_code
     attempt["finished_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     attempt.update(fields)
-    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    atomic_write(attempt_path, attempt_bytes(), 0o600)
 
 def finalize_attempt(status, exit_code, event, ledger_fields=None, **fields):
     outcome_event_id = make_event_id(event)
@@ -1258,7 +1292,7 @@ try:
         "prior_verdict":str(prior_verdict.relative_to(run)) if prior_verdict else None,
         "private_raw":None,"raw_expires_epoch":None
     }
-    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    atomic_write(attempt_path, attempt_bytes(), 0o600)
     ledger("reviewer_attempt_started", event_id=started_event_id, provider=provider, generation=generation, sha=sha, attempt=attempt_rel, attempt_id=attempt_id)
     if seal_receipt.get("state") == "sealed":
         try:
@@ -1271,6 +1305,7 @@ try:
 
     control = private_run / attempt_id
     os.mkdir(control, 0o700)
+    local_path_roots.insert(0, (control, CONTROLLED_ROOT_TOKEN + "/", CONTROLLED_ROOT_TOKEN))
     failure_marker = private_run / f"cleanup-failure.{attempt_id}.json"
     guardian_code = r'''
 import json,os,pathlib,shutil,signal,stat,subprocess,sys,time
@@ -1708,8 +1743,11 @@ except Exception as exc:
         judge_ledger_raw = ledger_source.read_bytes()
         judge_input_privacy = _privacy_patterns(parse_json_unique(
             (root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
+        # Records written before attempt paths were projected may name the run's own proven
+        # repository or checkout under an operator home, and nothing else.
+        judge_identity_roots = proven_identity_roots(run) if seal_receipt.get("state") == "sealed" else ()
         prior_copy, prior_excluded, prior_unresolved = prior_attempt_inputs(
-            run, judge_ledger_raw, seal_receipt, judge_input_privacy, attempt_rel)
+            run, judge_ledger_raw, seal_receipt, judge_input_privacy, attempt_rel, judge_identity_roots)
     except SealError as exc:
         stop(f"prior attempt judge input BLOCK {exc.category}: {exc.detail}", 1)
     for origin, raw, mode in prior_copy:
@@ -2093,7 +2131,7 @@ except Exception as exc:
         "imported": sum(1 for row in credential_artifact_rows if row["imported"]),
         "artifacts": credential_artifact_rows,
     }
-    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    atomic_write(attempt_path, attempt_bytes(), 0o600)
     if credential_record["seal_escapes"]:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase": "credential_seal"},
                          diagnostic=str(diagnostic_path.relative_to(run)))
@@ -2158,7 +2196,7 @@ except Exception as exc:
             "turn_count":result.get("turn_count"), "parser_status":result.get("parser_status"),
             "parser_peak_bytes":result.get("parser_peak_bytes")
         })
-        atomic_write(attempt_path, json_bytes(attempt), 0o600)
+        atomic_write(attempt_path, attempt_bytes(), 0o600)
         diagnostic_payload = json_bytes(diagnostics)
         if len(diagnostic_payload) > diagnostics["cap_bytes"]:
             stop("diagnostic metadata exceeds its hard 16 KiB retention cap", 1)
@@ -2295,7 +2333,7 @@ except Exception as exc:
         _reason = MODEL_CATALOG_CONTRACT[provider].get("reason", "no_structured_catalog")
         attempt["model_readiness"] = {"surface":None, "established":False, "reason":_reason}
         diagnostics["model_readiness"] = "not_established:" + _reason
-        atomic_write(attempt_path, json_bytes(attempt), 0o600)
+        atomic_write(attempt_path, attempt_bytes(), 0o600)
     else:
         rc, result, raw = run_phase("model", readiness_timeout, model_surface, readiness_output_cap)
     def structured_models(payload):
@@ -2332,7 +2370,7 @@ except Exception as exc:
             finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"model"}, diagnostic=str(diagnostic_path.relative_to(run)))
             stop("model readiness was not trusted structured data; BLOCK", 1)
         attempt["model_readiness"] = {"surface":" ".join(model_surface[1:]), "established":True, "reason":None}
-        atomic_write(attempt_path, json_bytes(attempt), 0o600)
+        atomic_write(attempt_path, attempt_bytes(), 0o600)
 
 
     # `schema_text` stays CANONICAL — it is what jsonschema.validate() enforces below. The provider
@@ -2370,7 +2408,7 @@ except Exception as exc:
                                empty_mcp, schema_path, transport_schema_text, candidate_verdict)
     attempt["launch"] = {"provider":provider, "model":model, "display":model_display, "effort":model_effort,
                          "argv":command[1:]}
-    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    atomic_write(attempt_path, attempt_bytes(), 0o600)
     rc, result, raw = run_phase("judge", judge_timeout, command)
     snapshot_write = snapshot / "write-sentinel"
     attempt["candidate_snapshot_write_detected"] = snapshot_write.exists() or snapshot_write.is_symlink()
@@ -2390,7 +2428,7 @@ except Exception as exc:
         except Exception as exc:
             finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"behavior_probe"}, diagnostic=str(diagnostic_path.relative_to(run)), failure=str(exc))
             stop(f"behavior sentinel was unsafe or malformed; BLOCK: {exc}", 1)
-    atomic_write(attempt_path, json_bytes(attempt), 0o600)
+    atomic_write(attempt_path, attempt_bytes(), 0o600)
     if attempt["candidate_snapshot_write_detected"]:
         finalize_attempt("invalid", 1, "reviewer_invalid", {"phase":"behavior_probe"}, diagnostic=str(diagnostic_path.relative_to(run)))
         stop("provider wrote the controlled candidate snapshot; BLOCK", 1)

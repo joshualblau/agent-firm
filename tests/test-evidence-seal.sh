@@ -1095,6 +1095,70 @@ assert f"{A}/gpt-c1-a0001/attempt.json" in copied and "09-test-evidence/scratch/
 assert not any(key in data for _,data,_ in inputs)
 PY
 
+# AN ATTEMPT RECORD WRITTEN BEFORE PATHS WERE PROJECTED. It carries the judge's absolute argv, and in a
+# repository under an operator home it fails the scan. It crosses only when every match is an exact
+# launch.argv path under the run's proven repository or checkout root, in the wrapper's own
+# serialization, with nothing else matching once those are masked; otherwise it stays unresolved.
+t_case "a prior attempt record with absolute paths crosses only on the run's proven identity"
+assert_ok "identity-bound legacy records cross; any other operator-home or privacy match stays unresolved" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import hashlib,json,os,sys,tempfile
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+privacy=e._privacy_patterns(e.parse_json_unique(open(os.path.join(sys.argv[1],"agent-firm","policy","evidence-privacy.yaml"),"rb").read()))
+run=tempfile.mkdtemp(); A="09-test-evidence/reviewer-attempts"
+home="/"+"Users"+"/operator"; repo=home+"/projects/app"; checkout=repo+"/.agent-firm/qa-checkout/r"
+sha="a"*40; seal_id="evt-seal"; projection="b"*64
+def put(rel,data):
+    os.makedirs(os.path.dirname(os.path.join(run,rel)),exist_ok=True)
+    with open(os.path.join(run,rel),"wb") as h: h.write(data)
+    return data
+def serial(doc): return (json.dumps(doc,indent=2,sort_keys=True)+"\n").encode()
+def argv(aid,root=repo):
+    return ["exec","--output-schema",f"{root}/.agent-firm/private-reviewer-control/r/{aid}/root/schema.json",
+            "-o",f"{root}/.agent-firm/runs/r/{A}/{aid}/candidate-verdict.json","the judge prompt"]
+rows=[{"event":"run_started","event_id":"evt-start","run_id":"r"},
+      {"event":"evidence_seal_published","event_id":seal_id,"run_id":"r"}]
+def legacy(aid,launch_argv,serializer=serial,**extra):
+    verdict=put(f"{A}/{aid}/verdict.json",b'{"verdict":"BLOCK"}\n'); put(f"{A}/{aid}/diagnostic.json",b'{"phases":[]}\n')
+    doc={"schema_version":1,"attempt_id":aid,"provider":"gpt","launch":{"argv":launch_argv},
+         "verdict":f"{A}/{aid}/verdict.json","diagnostic":f"{A}/{aid}/diagnostic.json"}
+    doc.update(extra); raw=put(f"{A}/{aid}/attempt.json",serializer(doc))
+    rows.append({"event":"reviewer_block","event_id":"evt-"+aid,"run_id":"r","provider":"gpt","generation":"1",
+                 "sha":sha,"attempt":f"{A}/{aid}/attempt.json","attempt_id":aid,
+                 "sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
+                 "verdict_sha256":hashlib.sha256(verdict).hexdigest(),"verdict_bytes":str(len(verdict)),
+                 "seal_event_id":seal_id,"seal_projection_sha256":projection})
+legacy("gpt-c1-a0001",argv("gpt-c1-a0001"))                                         # bound to the repository
+legacy("gpt-c1-a0002",argv("gpt-c1-a0002",checkout))                                # bound to the checkout
+legacy("gpt-c1-a0003",argv("gpt-c1-a0003",home+"/elsewhere"))                       # another operator path
+legacy("gpt-c1-a0004",argv("gpt-c1-a0004"),failure=f"{repo}/.agent-firm/x")          # outside launch.argv
+legacy("gpt-c1-a0005",argv("gpt-c1-a0005")+[f"{repo}/../../etc/x"])                  # not normalized
+legacy("gpt-c1-a0006",argv("gpt-c1-a0006"),serializer=lambda d:json.dumps(d).encode()+b"\n")  # not the wrapper's bytes
+legacy("gpt-c1-a0007",argv("gpt-c1-a0007")+["pass"+"word="+"abcdefgh"])             # another category entirely
+legacy("gpt-c1-a0008",argv("gpt-c1-a0008")+[repo+"-sibling/x"])                     # a sibling, not under the root
+def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
+raw=ledger(rows)
+receipt={"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
+         "ledger_prefix":{"record_count":1},"verified_ledger":{"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"record_count":len(rows)}}
+inputs,excluded,unresolved=e.prior_attempt_inputs(run,raw,receipt,privacy,None,(repo,checkout))
+copied={o for o,_,_ in inputs}
+for aid in ("gpt-c1-a0001","gpt-c1-a0002"):
+    for name in ("attempt.json","verdict.json","diagnostic.json"):
+        assert f"{A}/{aid}/{name}" in copied,(aid,name,sorted(copied),unresolved)
+unread={u["origin_path"]:u["reason"] for u in unresolved}
+for aid,category in (("gpt-c1-a0003","operator_home"),("gpt-c1-a0004","operator_home"),("gpt-c1-a0005","operator_home"),
+                     ("gpt-c1-a0006","operator_home"),("gpt-c1-a0007","secret_assignment"),("gpt-c1-a0008","operator_home")):
+    origin=f"{A}/{aid}/attempt.json"
+    assert origin not in copied and unread.get(origin,"").startswith("privacy:") and category in unread[origin],(aid,unread)
+    assert f"{A}/{aid}/verdict.json" not in copied
+# No proven identity, or one that is not a canonical operator-home path (a trailing separator, a
+# relative path, the bare operator home): nothing is allowed.
+for roots in ((),(repo+"/",),("relative/app",),(home,)):
+    inputs,_,unresolved=e.prior_attempt_inputs(run,raw,receipt,privacy,None,roots)
+    assert f"{A}/gpt-c1-a0001/attempt.json" not in {o for o,_,_ in inputs},roots
+PY
+
 # THE CURRENT JUDGE ATTEMPT IS THE LEDGER'S. current_judge_attempt reads it from the verified rows only:
 # this generation's suffix, this provider, candidate and generation, bound to this seal, within the
 # verified bytes; and it reports an attempt started after the last terminal one.
@@ -2506,6 +2570,94 @@ PY
        | grep -c '"event":"\(packaging_started\|packaging_completed\|handoff_finalized\|run_closed\)"')"
   assert_fail "as documented, a finalized run no longer verifies against its seal" \
     seal_for_run "$pf_run" --verify --phase publication
+fi
+
+# A RETRY'S JUDGE RECEIVES THE PRIOR ATTEMPT UNDER AN OPERATOR HOME. The wrapper recorded the judge's
+# absolute argv -- the controlled root and run files under <repo> -- in every attempt record, so in a
+# repository under /Users/<operator>/ each record failed the prior-attempt privacy scan, was declared
+# unresolved with its verdict and diagnostic, and the next judge was told to BLOCK on the omission.
+# Fixtures under /private/var never showed it. Attempt 1 here is written by the wrapper as it was
+# (a copy whose records are unprojected), attempts 2 and 3 by the wrapper as it is.
+t_case "in a repository under the operator's home, a retry's judge receives every prior attempt"
+uh_repo=""
+if ! ledger_writes_supported; then
+  t_skip "prior attempt input under an operator home" "requires a supported P2 ledger write host and no refused-row seam"
+elif [ ! -x "${fr_stub:-}/bin/codex" ]; then
+  _t_no "operator-home fixture has the judge stub" "the end-to-end case did not create it"
+elif ! uh_repo="$(make_users_repo)" || [ -z "$uh_repo" ]; then
+  t_skip "prior attempt input under an operator home" "HOME is not a /Users/<operator> directory"
+else
+  uh_fixture="$(make_sealable_run claude "$uh_repo" write_final_ready_run real_qa_tools)"
+  uh_run="$(printf '%s\n' "$uh_fixture" | sed -n '2p')"; uh_sha="$(printf '%s\n' "$uh_fixture" | sed -n '3p')"
+  uh_id="$(basename "$uh_run")"; uh_keep="$fr_stub/keep-$uh_id"; mkdir -p "$uh_keep"
+  assert_ok "the operator-home fixture seals" seal_for_run "$uh_run"
+  t_python - "$uh_keep/block.json" "$uh_id" "$uh_sha" <<'PY'
+import json,sys
+path,rid,sha=sys.argv[1:]
+text="the operator-home fixture objection"
+json.dump({"verdict":"BLOCK","commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":"__ATTEMPT__",
+           "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+           "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+           "visual":{"status":"not_applicable","evidence":"none"},
+           "acceptance_criteria_coverage":[{"id":"AC-001","covered":"partial","evidence":"09-test-evidence/proof.log"}],
+           "untested_risks":[],"blockers":[text],
+           "blocker_objects":[{"id":"obj-operator-home","text":text,"affected_criteria":["AC-001"],"affected_paths":[]}],
+           "warnings":[],"artifacts":[],"summary":"stub judge BLOCK"},open(path,"w"))
+PY
+  uh_judge() { # <firm bin dir>
+    env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$uh_keep/block.json" STUB_KEEP="$uh_keep" \
+      CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
+      FIRM_GPT_QA_TIMEOUT=60 "$1/firm-gpt-qa" --run "$uh_run" > "$uh_keep/judge.out" 2>&1
+  }
+  # The wrapper as it was: the same tool tree, recording the attempt unprojected.
+  uh_legacy="$(mktemp -d "${TMPDIR:-/tmp}/firm-legacy-wrapper.XXXXXX")"; t_track "$uh_legacy"
+  cp -R "$FIRM_ROOT/bin" "$FIRM_ROOT/agent-firm" "$uh_legacy/"
+  t_python - "$uh_legacy/bin/firm-reviewer-common" <<'PY'
+import sys
+path=sys.argv[1]; text=open(path).read()
+old="    return json_bytes(project_local_paths(attempt))\n"
+assert text.count(old)==1, "legacy-wrapper anchor moved; update this test"
+open(path,"w").write(text.replace(old,"    return json_bytes(attempt)\n"))
+PY
+  uh_rc=0; uh_judge "$uh_legacy/bin" || uh_rc=$?
+  assert_eq "attempt 1 (the wrapper as it was) blocks" 1 "$uh_rc"
+  uh_home_prefix="$(printf '/%s/' Users)"
+  assert_ok "…and its record names the repository under the operator home, as such records do" \
+    grep -q "\"$uh_home_prefix" "$uh_run/09-test-evidence/reviewer-attempts/gpt-c1-a0001/attempt.json"
+  uh_rc=0; uh_judge "$BIN" || uh_rc=$?
+  assert_eq "attempt 2 blocks" 1 "$uh_rc"
+  uh_rc=0; uh_judge "$BIN" || uh_rc=$?
+  assert_eq "attempt 3 blocks" 1 "$uh_rc"
+  # uh_inputs <attempt> <prior attempt...> — each prior attempt's record, verdict and diagnostic crossed
+  # into this attempt's judge, and nothing was declared unresolved for privacy.
+  uh_inputs() {
+    t_python - "$uh_keep/manifest-$1.json" "${@:2}" <<'PY'
+import json,sys
+manifest=json.load(open(sys.argv[1])); copied={e["origin_path"] for e in manifest["entries"]}
+for aid in sys.argv[2:]:
+    for name in ("attempt.json","verdict.json","diagnostic.json"):
+        origin=f"09-test-evidence/reviewer-attempts/{aid}/{name}"
+        assert origin in copied,(origin,sorted(o for o in copied if "reviewer-attempts" in o),manifest["unresolved_references"])
+bad=[u for u in manifest["unresolved_references"] if str(u.get("reason","")).startswith("privacy:")]
+assert not bad,bad
+PY
+  }
+  assert_ok "attempt 2's judge receives attempt 1's record, verdict and diagnostic" uh_inputs gpt-c1-a0002 gpt-c1-a0001
+  assert_ok "attempt 3's judge receives attempts 1 and 2, nothing unresolved for privacy" \
+    uh_inputs gpt-c1-a0003 gpt-c1-a0001 gpt-c1-a0002
+  assert_ok "a record written now names no operator-home path" \
+    sh -c "! grep -q '$uh_home_prefix' '$uh_run/09-test-evidence/reviewer-attempts/gpt-c1-a0002/attempt.json'"
+  assert_ok "…its judge command line names the controlled root by token and run files repository-relative" \
+    t_python - "$uh_run/09-test-evidence/reviewer-attempts/gpt-c1-a0002/attempt.json" "$uh_id" <<'PY'
+import json,sys
+argv=json.load(open(sys.argv[1]))["launch"]["argv"]; rid=sys.argv[2]
+assert "<controlled-root>/root/qa-verdict.generation-schema.json" in argv,argv
+assert f".agent-firm/runs/{rid}/09-test-evidence/reviewer-attempts/gpt-c1-a0002/candidate-verdict.json" in argv,argv
+assert not any(isinstance(item,str) and item.startswith("/") for item in argv),argv
+PY
+fi
+if [ -n "$uh_repo" ] && [ -d "$uh_repo" ]; then
+  assert_ok "owned operator-home fixture cleanup succeeds" cleanup_users_repo "$uh_repo"
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"
