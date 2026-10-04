@@ -796,8 +796,8 @@ if args.print_capability_contract:
 # mutation tests copy only this executable. Runtime seal verification begins only for a real run.
 sys.path.insert(0, str(root / "agent-firm" / "lib"))
 from evidence_seal import (  # noqa: E402
-    SealError, _privacy_patterns, manifest_v4_fields, parse_json_unique, post_judge_inputs,
-    prior_attempt_inputs, validate_schema, verify_seal,
+    SealError, _privacy_patterns, current_judge_attempt, manifest_v4_fields, parse_json_unique,
+    post_judge_inputs, prior_attempt_inputs, validate_schema, verify_seal,
 )
 
 def stop(message, code=1):
@@ -1187,6 +1187,37 @@ try:
         pass
     except Exception:
         stop(f"reviewer state for {provider} is malformed", 1)
+    canonical = run / f"08-qa-verdict.{provider}.json"
+    if seal_receipt.get("state") == "sealed":
+        # The canonical verdict is a mutable pointer; the verified ledger decides which attempt is
+        # current. Once this generation has an attempt, the canonical may only be the verdict of its
+        # latest one: every start removes it and only an approve/block promotes it back. An earlier
+        # verdict restored over a later one is refused before this attempt creates anything, so it is
+        # never archived as this attempt's prior verdict. (A restored reviewer-state.<p>.json already
+        # stops below: its counter names an attempt directory that exists.)
+        try:
+            descriptor = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            descriptor = None
+        except OSError:
+            descriptor = None       # not a regular no-follow target: refused below
+        if descriptor is not None:
+            with os.fdopen(descriptor, "rb") as handle:
+                canonical_raw = handle.read()
+            try:
+                canonical_id = json.loads(canonical_raw).get("attempt_id")
+                ledger_terminal, ledger_later_start = current_judge_attempt(
+                    (run / "run.jsonl").read_bytes(), seal_receipt, provider, sha, generation)
+            except Exception as exc:
+                stop(f"canonical {provider} verdict cannot be checked against the verified ledger: {exc}", 1)
+            if (ledger_terminal is not None or ledger_later_start is not None) and (
+                    ledger_later_start is not None
+                    or ledger_terminal.get("attempt_id") != canonical_id
+                    or ledger_terminal.get("verdict_sha256") != hashlib.sha256(canonical_raw).hexdigest()
+                    or str(ledger_terminal.get("verdict_bytes")) != str(len(canonical_raw))):
+                stop(f"canonical {provider} verdict ({canonical_id}) is not the verdict of the verified "
+                     f"ledger's latest {provider} attempt in this generation; the pointer files do not "
+                     f"match the ledger", 1)
     attempt_id = f"{provider}-c{generation}-a{counter:04d}"
     attempt_dir = attempts_dir / attempt_id
     try:
@@ -1196,7 +1227,6 @@ try:
     attempt_path = attempt_dir / "attempt.json"
     diagnostic_path = attempt_dir / "diagnostic.json"
     attempt_rel = str(attempt_path.relative_to(run))
-    canonical = run / f"08-qa-verdict.{provider}.json"
     prior_verdict = None
     try:
         existing = os.lstat(canonical)

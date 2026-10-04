@@ -266,6 +266,11 @@ objections: [required secondary unavailable]
 EOF
 add_record_ref 09-test-evidence/waiver.yaml waiver_recorded waiver
 assert_rc "exact digest-bound waiver passes" 0 "$FINAL" "$run"
+# The unavailable attempt must be the ledger's current one: a later terminal attempt supersedes it.
+wrapper_attempt claude BLOCK 'secondary defect' claude-c1-a0402 no
+assert_output "an unavailable state a later attempt superseded does not pass" \
+  "the verified ledger's current claude attempt is claude-c1-a0402 (reviewer_block); the pointer files do not match the ledger" \
+  "$FINAL" "$run"
 
 reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0501 yes auth/token.txt
 set_disposition human_decision high '' ''
@@ -385,5 +390,33 @@ objections: [secondary defect, protected defect]
 EOF
 add_record_ref 09-test-evidence/human-mixed.yaml human_decision_recorded record
 assert_rc "one shared exact record permits one fresh mechanical rerun" 0 "$FINAL" "$run"
+
+# THE CURRENT SECONDARY ATTEMPT IS THE LEDGER'S. Final used to read "current" from the mutable pointer
+# files, so restoring an earlier APPROVE's 08-qa-verdict.<p>.json and reviewer-state.<p>.json over a
+# later BLOCK passed. It is the last terminal row for this candidate and generation (in a sealed run,
+# its generation's verified suffix: tests/test-evidence-seal.sh), and no attempt may follow it.
+t_case "the current secondary attempt is the ledger's last terminal one, not the pointer files'"
+reset_case claude; wrapper_attempt gpt APPROVE '' gpt-c1-a0801 yes
+assert_rc "control: the current APPROVE passes" 0 "$FINAL" "$run"
+pointers="$(mktemp -d "${TMPDIR:-/tmp}/firm-final-pointers.XXXXXX")"; t_track "$pointers"
+cp -p "$run/08-qa-verdict.gpt.json" "$run/09-test-evidence/reviewer-state.gpt.json" "$run/run.jsonl" "$pointers/"
+t_python - "$run" <<'PY'
+import json,os,sys
+run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json"))
+row={"ts":"2026-08-10T00:00:02Z","event":"reviewer_attempt_started","event_id":"evt-start-gpt-c1-a0802","run_id":os.path.basename(run),
+     "provider":"gpt","generation":str(c["generation"]),"sha":c["candidate_sha"],
+     "attempt":"09-test-evidence/reviewer-attempts/gpt-c1-a0802/attempt.json","attempt_id":"gpt-c1-a0802"}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(row,separators=(",",":"))+"\n")
+PY
+assert_output "an attempt started after the last terminal one leaves no verdict current" \
+  "gpt attempt gpt-c1-a0802 started after the last terminal one and has no verdict" "$FINAL" "$run"
+cp -p "$pointers/run.jsonl" "$run/run.jsonl"
+wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0802 yes
+cp -p "$pointers/08-qa-verdict.gpt.json" "$run/08-qa-verdict.gpt.json"
+cp -p "$pointers/reviewer-state.gpt.json" "$run/09-test-evidence/reviewer-state.gpt.json"
+assert_rc "an earlier APPROVE's restored pointer files do not pass" 1 "$FINAL" "$run"
+assert_output "…and the check names the ledger's current attempt" \
+  "the verified ledger's current gpt attempt is gpt-c1-a0802 (reviewer_block); the pointer files do not match the ledger" \
+  "$FINAL" "$run"
 
 t_summary

@@ -1944,6 +1944,44 @@ def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None
     return inputs, excluded, unresolved
 
 
+def current_judge_attempt(ledger_raw, receipt, provider, candidate_sha, generation):
+    """Which judge attempt for `provider` is CURRENT, read from the ledger rather than pointer files.
+
+    The pointer files -- 08-qa-verdict.<provider>.json and reviewer-state.<provider>.json -- are
+    mutable: copying an earlier APPROVE's pair back over a later BLOCK used to make the APPROVE
+    current again while the seal still verified. The ledger records the order of attempts and is what
+    the verification covers, so it decides. Returns (terminal, later_start):
+
+      terminal     the LAST terminal reviewer row (approve/block/invalid/timeout/unavailable) for
+                   `provider` -- in a sealed run inside this generation's verified suffix and bound to
+                   this seal, otherwise anywhere in the ledger for this candidate and generation;
+      later_start  the start row of an attempt begun after that terminal row (open, or abandoned by
+                   a dead wrapper), or None. Every attempt start removes the canonical verdict, so
+                   while one is set no verdict is current.
+
+    Both are None when the provider has no attempt in scope. Rows past the verified bytes are ignored.
+    """
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "CURRENT_ATTEMPT")
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1
+        last = receipt["verified_ledger"]["record_count"]
+        candidate_sha, generation = receipt["candidate_sha"], receipt["generation"]
+    else:
+        first, last = 0, len(records)
+    terminal = later_start = None
+    for item in records[first:last]:
+        if not (isinstance(item, dict) and item.get("provider") == provider
+                and item.get("sha") == candidate_sha and str(item.get("generation")) == str(generation)
+                and (not sealed or (item.get("seal_event_id") == receipt["publication_event_id"]
+                                    and item.get("seal_projection_sha256") == receipt["projection_sha256"]))):
+            continue
+        if item.get("event") in REVIEWER_TERMINAL_EVENTS:
+            terminal, later_start = item, None
+        elif item.get("event") == "reviewer_attempt_started":
+            later_start = item
+    return terminal, later_start
+
+
 def post_judge_inputs(run, ledger_raw, receipt, privacy):
     """Decide, for every post-judge row in the ledger, whether its artifact may cross into a judge.
 

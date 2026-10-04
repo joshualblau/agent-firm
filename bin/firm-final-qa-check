@@ -310,6 +310,30 @@ def require_reviewer_seal_binding(event, label):
                        or event.get("seal_projection_sha256")!=seal_receipt.get("projection_sha256")):
         block(f"{label} reviewer event is not bound to this generation's seal")
 
+# THE CURRENT SECONDARY ATTEMPT IS THE LEDGER'S, NOT THE POINTER FILES'. 08-qa-verdict.<p>.json and
+# reviewer-state.<p>.json are mutable copies: restoring an earlier APPROVE's pair over a later BLOCK
+# used to make the APPROVE current again while the seal still verified. The current attempt is the
+# last terminal attempt for the secondary provider in the verified ledger (in a sealed run, this
+# generation's suffix, bound to this seal); no attempt may have started after it, and the pointers
+# must name exactly it.
+try:
+    ledger_terminal,ledger_later_start=evidence_seal.current_judge_attempt(ledger_raw,seal_receipt,expected,sha,generation)
+except evidence_seal.SealError as exc:
+    cannot(f"current judge attempt cannot be read from the verified ledger: {exc.category}: {exc.detail}")
+
+def require_ledger_current(event, label):
+    """`event` -- the terminal row the pointer files lead to -- is the ledger's current attempt."""
+    if ledger_terminal is None:
+        block(f"{label}: the verified ledger has no terminal {expected} attempt for this candidate")
+    if ledger_later_start is not None:
+        block(f"{label}: {expected} attempt {ledger_later_start.get('attempt_id')} started after the last "
+              f"terminal one and has no verdict, so no {expected} verdict is current")
+    if (event.get("event_id")!=ledger_terminal.get("event_id")
+            or event.get("attempt_id")!=ledger_terminal.get("attempt_id")):
+        block(f"{label} names attempt {event.get('attempt_id')}, but the verified ledger's current {expected} "
+              f"attempt is {ledger_terminal.get('attempt_id')} ({ledger_terminal.get('event')}); "
+              "the pointer files do not match the ledger")
+
 def post_judge_published(kind):
     return [event for event in events if event.get("event")=="post_judge_artifact_published"
             and event.get("kind")==kind and event.get("sha")==sha
@@ -527,6 +551,11 @@ def validate_attempt_verdict(verdict_path, verdict, label, current):
             str(event.get("verdict_bytes"))!=str(len(local_raw)))):
         block(f"{label} attempt/event/verdict chain is inconsistent")
     if current:
+        require_ledger_current(event,label)
+        canonical_raw=safe_file(str(secondary_path.relative_to(run)),label).read_bytes()
+        if (ledger_terminal.get("verdict_sha256")!=hashlib.sha256(canonical_raw).hexdigest()
+                or str(ledger_terminal.get("verdict_bytes"))!=str(len(canonical_raw))):
+            block(f"{label} is not byte-for-byte the verdict of the verified ledger's current {expected} attempt")
         state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json",f"{label} reviewer state"),f"{label} reviewer state")
         if state.get("candidate_sha")!=sha or state.get("generation")!=generation or state.get("attempt_id")!=attempt_id:
             block(f"{label} is not the latest serialized attempt")
@@ -589,6 +618,7 @@ if not present:
     if len(matches)!=1 or matches[0].get("event")!="reviewer_unavailable" or matches[0].get("attempt")!=rel_attempt or str(matches[0].get("exit_code"))!="3" or state.get("attempt_id")!=attempt.get("attempt_id"):
         block("unavailable state needs the latest exact target-ledger exit-3 attempt")
     require_reviewer_seal_binding(matches[0],"unavailable attempt")
+    require_ledger_current(matches[0],"unavailable attempt")
     if derived_required:
         if not isinstance(voice.get("unavailable_waiver"),dict):
             decision_required("required_secondary_unavailable",[{

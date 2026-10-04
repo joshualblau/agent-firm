@@ -1076,6 +1076,65 @@ assert f"{A}/gpt-c1-a0001/attempt.json" in copied and "09-test-evidence/scratch/
 assert not any(key in data for _,data,_ in inputs)
 PY
 
+# THE CURRENT JUDGE ATTEMPT IS THE LEDGER'S. current_judge_attempt reads it from the verified rows only:
+# this generation's suffix, this provider, candidate and generation, bound to this seal, within the
+# verified bytes; and it reports an attempt started after the last terminal one.
+t_case "current_judge_attempt reads the current attempt from the verified suffix only"
+assert_ok "the last bound terminal row is current, and a later start leaves no verdict current" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import hashlib,json,os,sys
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+sha="a"*40; seal_id="evt-seal"; projection="b"*64
+def row(eid,event,aid,**extra):
+    item={"ts":"2026-10-04T00:00:00Z","event":event,"event_id":eid,"run_id":"r","provider":"gpt","generation":"1",
+          "sha":sha,"attempt_id":aid,"seal_event_id":seal_id,"seal_projection_sha256":projection}
+    item.update(extra); return item
+def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
+def receipt(raw,count,prefix=2):
+    return {"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
+            "ledger_prefix":{"record_count":prefix},
+            "verified_ledger":{"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"record_count":count}}
+rows=[{"event":"run_started","event_id":"evt-start","run_id":"r"},
+      row("evt-pre","reviewer_approve","gpt-c1-a0009"),                       # pre-seal: never current
+      {"event":"evidence_seal_published","event_id":seal_id,"run_id":"r"},
+      row("evt-s1","reviewer_attempt_started","gpt-c1-a0001"),
+      row("evt-a1","reviewer_approve","gpt-c1-a0001"),
+      row("evt-s2","reviewer_attempt_started","gpt-c1-a0002"),
+      row("evt-b2","reviewer_block","gpt-c1-a0002"),
+      row("evt-other-provider","reviewer_approve","claude-c1-a0001",provider="claude"),
+      row("evt-other-sha","reviewer_approve","gpt-c1-a0003",sha="c"*40),
+      row("evt-other-gen","reviewer_approve","gpt-c1-a0003",generation="2"),
+      row("evt-unbound","reviewer_approve","gpt-c1-a0003",seal_event_id="evt-other"),
+      row("evt-unprojected","reviewer_approve","gpt-c1-a0003",seal_projection_sha256="d"*64)]
+raw=ledger(rows)
+terminal,later=e.current_judge_attempt(raw,receipt(raw,len(rows)),"gpt",sha,1)
+assert terminal["event_id"]=="evt-b2" and later is None,(terminal,later)
+# Rows appended after the verification do not count, even well-formed ones.
+more=raw+ledger([row("evt-s3","reviewer_attempt_started","gpt-c1-a0003"),row("evt-a3","reviewer_approve","gpt-c1-a0003")])
+terminal,later=e.current_judge_attempt(more,receipt(raw,len(rows)),"gpt",sha,1)
+assert terminal["event_id"]=="evt-b2" and later is None,(terminal,later)
+# A start after the last terminal row -- open, or abandoned by a dead wrapper -- leaves no verdict current.
+for tail in ([row("evt-s3","reviewer_attempt_started","gpt-c1-a0003")],
+             [row("evt-s3","reviewer_attempt_started","gpt-c1-a0003"),
+              row("evt-x3","reviewer_attempt_abandoned","gpt-c1-a0003")]):
+    opened=raw+ledger(tail)
+    terminal,later=e.current_judge_attempt(opened,receipt(opened,len(rows)+len(tail)),"gpt",sha,1)
+    assert terminal["event_id"]=="evt-b2" and later["event_id"]=="evt-s3",(terminal,later)
+# Nothing in this generation's suffix: nothing is current, whatever the prefix holds.
+bare=ledger(rows[:3])
+assert e.current_judge_attempt(bare,receipt(bare,3),"gpt",sha,1)==(None,None)
+# Only the verified ledger counts.
+try: e.current_judge_attempt(raw.replace(b"evt-b2",b"evt-bX"),receipt(raw,len(rows)),"gpt",sha,1)
+except e.SealError as exc: assert exc.category=="CURRENT_ATTEMPT",exc.category
+else: raise AssertionError("an unverified ledger was accepted")
+# An unsealed run: the last terminal row for this candidate and generation anywhere in the ledger.
+terminal,later=e.current_judge_attempt(raw,{"state":"legacy_unsealed"},"gpt",sha,1)
+assert terminal["event_id"]=="evt-unprojected" and later is None,terminal
+terminal,_=e.current_judge_attempt(raw,{"state":"legacy_unsealed"},"gpt",sha,2)
+assert terminal["event_id"]=="evt-other-gen",terminal
+PY
+
 t_case "a sealed and judged generation can be recaptured, republished, and sealed as generation 2"
 if ! ledger_writes_supported; then
   t_skip "generation-2 recapture after a sealed judge attempt" "requires a supported P2 ledger write host and no refused-row seam"
@@ -2217,6 +2276,97 @@ PY
     cat "$ji_run/08-qa-verdict.gpt.json"
   assert_ok "generation 1's never-verified post-judge file is declared, never copied, and leaks nothing" \
     ji_inputs "$ji_keep/g2" gpt-c2-a0001 09-test-evidence/post-judge/g1/log.md row_precedes_this_generations_seal
+fi
+
+# A ROLLED-BACK POINTER PAIR IS NOT CURRENT. Attempt 1 APPROVEs, attempt 2 BLOCKs, and attempt 1's
+# 08-qa-verdict.gpt.json and reviewer-state.gpt.json are copied back. The seal still verifies -- those
+# files are mutable projections it does not cover -- and the Final check used to read "current" from
+# them, so it passed on the superseded APPROVE. The current attempt is the ledger's last terminal one.
+t_case "restoring an earlier APPROVE's pointer files over a later BLOCK does not make it current"
+if ! ledger_writes_supported; then
+  t_skip "pointer rollback" "requires a supported P2 ledger write host and no refused-row seam"
+elif [ ! -x "${fr_stub:-}/bin/codex" ]; then
+  _t_no "rollback fixture has the judge stub" "the end-to-end case did not create it"
+else
+  rb_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  rb_run="$(printf '%s\n' "$rb_fixture" | sed -n '2p')"; rb_sha="$(printf '%s\n' "$rb_fixture" | sed -n '3p')"
+  rb_id="$(basename "$rb_run")"; rb_keep="$fr_stub/keep-$rb_id"; mkdir -p "$rb_keep/approved"
+  assert_ok "the rollback fixture seals" seal_for_run "$rb_run"
+  rb_verdict() { # <out> <APPROVE|BLOCK>
+    t_python - "$1" "$rb_id" "$rb_sha" "$2" <<'PY'
+import json,sys
+path,rid,sha,word=sys.argv[1:]
+text="the rollback fixture objection"
+doc={"verdict":word,"commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":"__ATTEMPT__",
+     "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+     "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+     "visual":{"status":"not_applicable","evidence":"none"},
+     "acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes" if word=="APPROVE" else "partial",
+                                      "evidence":"09-test-evidence/proof.log"}],
+     "untested_risks":[],"blockers":[] if word=="APPROVE" else [text],
+     "warnings":[],"artifacts":[],"summary":f"stub judge {word}"}
+if word=="BLOCK":
+    doc["blocker_objects"]=[{"id":"obj-rollback","text":text,"affected_criteria":["AC-001"],"affected_paths":[]}]
+json.dump(doc,open(path,"w"))
+PY
+  }
+  rb_judge() { # <verdict>
+    env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$1" STUB_KEEP="$rb_keep" \
+      CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 FIRM_GPT_QA_READINESS_TIMEOUT=20 \
+      FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$rb_run" > "$rb_keep/judge.out" 2>&1
+  }
+  rb_pointers() { # <from-dir> — copy a saved pointer pair over the run's
+    cp -p "$1/08-qa-verdict.gpt.json" "$rb_run/08-qa-verdict.gpt.json"
+    cp -p "$1/reviewer-state.gpt.json" "$rb_run/09-test-evidence/reviewer-state.gpt.json"
+  }
+  rb_verdict "$rb_keep/approve.json" APPROVE; rb_verdict "$rb_keep/block.json" BLOCK
+  rb_rc=0; rb_judge "$rb_keep/approve.json" || rb_rc=$?
+  assert_eq "attempt 1 approves" 0 "$rb_rc"
+  assert_output "…and the Final check passes on it" "both current candidate-bound provider verdicts approve" \
+    "$BIN/firm-final-qa-check" "$rb_run"
+  cp -p "$rb_run/08-qa-verdict.gpt.json" "$rb_run/09-test-evidence/reviewer-state.gpt.json" "$rb_keep/approved/"
+  rb_rc=0; rb_judge "$rb_keep/block.json" || rb_rc=$?
+  assert_eq "attempt 2 blocks" 1 "$rb_rc"
+  mkdir -p "$rb_keep/blocked"
+  cp -p "$rb_run/08-qa-verdict.gpt.json" "$rb_run/09-test-evidence/reviewer-state.gpt.json" "$rb_keep/blocked/"
+
+  rb_pointers "$rb_keep/approved"
+  assert_ok "with attempt 1's pointer pair restored the seal still verifies" \
+    seal_for_run "$rb_run" --verify --phase publication
+  rb_out="$("$BIN/firm-final-qa-check" "$rb_run" 2>&1)"; rb_rc=$?
+  assert_eq "the restored APPROVE does not pass the Final check" 1 "$rb_rc"
+  case "$rb_out" in *"current gpt attempt is gpt-c1-a0002 (reviewer_block); the pointer files do not match the ledger"*)
+    _t_ok "…which names the ledger's current attempt";; *) _t_no "…which names the ledger's current attempt" "$(_t_ctx "$rb_out")";; esac
+
+  # Only the verdict restored (the state still counts on): the wrapper refuses to start an attempt
+  # that would archive the superseded APPROVE as its prior verdict, and creates nothing.
+  cp -p "$rb_keep/blocked/reviewer-state.gpt.json" "$rb_run/09-test-evidence/reviewer-state.gpt.json"
+  rb_lines="$(wc -l < "$rb_run/run.jsonl" | tr -d ' ')"
+  rb_rc=0; rb_judge "$rb_keep/approve.json" || rb_rc=$?
+  assert_eq "a judge attempt over a restored verdict stops" 1 "$rb_rc"
+  assert_output "…naming the mismatch" "is not the verdict of the verified ledger's latest gpt attempt" cat "$rb_keep/judge.out"
+  assert_eq "…without appending to the ledger" "$rb_lines" "$(wc -l < "$rb_run/run.jsonl" | tr -d ' ')"
+  assert_no_file "…or creating an attempt directory" "$rb_run/09-test-evidence/reviewer-attempts/gpt-c1-a0003"
+
+  # Restoring the canonical over the right attempt's verdict with other bytes is also refused.
+  rb_pointers "$rb_keep/blocked"
+  t_python - "$rb_run/08-qa-verdict.gpt.json" <<'PY'
+import json,sys
+doc=json.load(open(sys.argv[1])); open(sys.argv[1],"w").write(json.dumps(doc,indent=4)+"\n")
+PY
+  assert_output "a re-serialised current verdict is not the ledger's bytes" \
+    "is not byte-for-byte the verdict of the verified ledger's current gpt attempt" "$BIN/firm-final-qa-check" "$rb_run"
+
+  # The honest pointers: attempt 2's BLOCK is current, a third attempt runs over it, and its APPROVE
+  # becomes current.
+  rb_pointers "$rb_keep/blocked"
+  rb_rc=0; rb_judge "$rb_keep/approve.json" || rb_rc=$?
+  assert_eq "attempt 3 runs over the ledger's own current verdict" 0 "$rb_rc"
+  assert_output "…archiving attempt 2's BLOCK as its prior verdict" \
+    '"prior_verdict": "09-test-evidence/reviewer-attempts/gpt-c1-a0002/verdict.json"' \
+    cat "$rb_run/09-test-evidence/reviewer-attempts/gpt-c1-a0003/attempt.json"
+  assert_output "…and the Final check passes on attempt 3" "both current candidate-bound provider verdicts approve" \
+    "$BIN/firm-final-qa-check" "$rb_run"
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"

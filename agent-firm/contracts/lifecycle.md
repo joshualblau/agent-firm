@@ -226,6 +226,18 @@ before provider execution. Transient raw bytes exist only below the package-excl
 normal exit or wrapper death; any cleanup failure is visibly marked mode 0600 and makes the wrapper
 BLOCK. They do not install, authenticate, upgrade, deploy, push, or otherwise change external state.
 
+Which judge attempt is current comes from the ledger, never from the pointer files.
+`08-qa-verdict.<provider>.json` and `reviewer-state.<provider>.json` are mutable projections that the
+seal does not cover. The current secondary attempt is the last terminal attempt for the secondary
+provider in the verified ledger: in a sealed run, the live generation's suffix, bound to its seal;
+otherwise, the last terminal row for this candidate and generation. No attempt may have started after
+it. The Final check blocks unless the canonical verdict is byte-for-byte that attempt's verdict (the
+`verdict_sha256`/`verdict_bytes` on its terminal event) and both pointer files name that attempt.
+An unavailable state must be that attempt. In a sealed run the wrapper refuses to start a new attempt
+while the canonical verdict is not the verdict of the generation's latest attempt, so a superseded
+verdict copied back is never archived as a prior verdict. To repair, restore the pointer files from the
+ledger's current attempt's own records.
+
 The secondary provider's BLOCK binds unless primary QA positively dissents on that exact point.
 High-risk state is derived from accepted security/privacy criteria and the committed candidate diff
 matched against `high-risk-paths.yaml`; ambiguity is high-risk. High-risk disagreement remains
