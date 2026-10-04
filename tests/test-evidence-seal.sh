@@ -991,6 +991,91 @@ inputs,excluded,_=e.post_judge_inputs(run,raw,{"state":"legacy_unsealed"},privac
 assert not inputs and all(item["reason"].startswith("run_is_not_sealed") for item in excluded)
 PY
 
+t_case "prior_attempt_inputs copies only bound, canonical, confined, no-follow attempt records"
+assert_ok "the prior-attempt selector binds, confines, refuses symlinks, and stops on a digest mismatch" \
+  t_python - "$FIRM_ROOT" <<'PY'
+import hashlib,json,os,sys,tempfile
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+privacy=e._privacy_patterns(e.parse_json_unique(open(os.path.join(sys.argv[1],"agent-firm","policy","evidence-privacy.yaml"),"rb").read()))
+run=tempfile.mkdtemp(); outside=tempfile.mkdtemp()
+A="09-test-evidence/reviewer-attempts"
+def put(rel,data):
+    os.makedirs(os.path.dirname(os.path.join(run,rel)),exist_ok=True)
+    with open(os.path.join(run,rel),"wb") as h: h.write(data)
+    os.chmod(os.path.join(run,rel),0o600); return data
+key=(b"-----BEGIN OPENSSH "+b"PRIVATE KEY-----\n")
+put("09-test-evidence/scratch/notes.txt",key)
+sha="a"*40; seal_id="evt-seal"; projection="b"*64
+def attempt(aid,**extra):
+    doc={"schema_version":1,"attempt_id":aid,"provider":"gpt","verdict":f"{A}/{aid}/verdict.json",
+         "diagnostic":f"{A}/{aid}/diagnostic.json","canonical":"08-qa-verdict.gpt.json"}
+    doc.update(extra); return put(f"{A}/{aid}/attempt.json",json.dumps(doc).encode())
+verdict1=put(f"{A}/gpt-c1-a0001/verdict.json",b'{"verdict":"BLOCK"}\n'); put(f"{A}/gpt-c1-a0001/diagnostic.json",b"{}\n")
+a1=attempt("gpt-c1-a0001")
+verdict2=put(f"{A}/gpt-c1-a0002/verdict.json",b'{"verdict":"APPROVE"}\n')
+a2=attempt("gpt-c1-a0002",prior_verdict=f"{A}/gpt-c1-a0001/verdict.json",diagnostic="09-test-evidence/scratch/notes.txt")
+put(f"{A}/gpt-c1-a0003/diagnostic.json",b"see /"+b"Users/operator/x\n")
+a3=attempt("gpt-c1-a0003",verdict=None)
+os.makedirs(outside+"/a"); open(outside+"/a/attempt.json","w").write(json.dumps({"attempt_id":"gpt-c1-a0004","provider":"gpt"}))
+os.symlink(outside+"/a",os.path.join(run,A,"gpt-c1-a0004"))
+a4=open(outside+"/a/attempt.json","rb").read()
+a5=attempt("gpt-c1-a0005",provider="claude")
+def row(eid,aid,data,event="reviewer_block",path=None,**extra):
+    item={"ts":"2026-10-04T00:00:00Z","event":event,"event_id":eid,"run_id":"r","provider":"gpt","generation":"1",
+          "sha":sha,"attempt":path or f"{A}/{aid}/attempt.json","attempt_id":aid,"exit_code":"1",
+          "sha256":hashlib.sha256(data).hexdigest(),"bytes":str(len(data)),"seal_event_id":seal_id,
+          "seal_projection_sha256":projection}
+    item.update(extra); return item
+rows=[{"ts":"2026-10-04T00:00:00Z","event":"run_started","event_id":"evt-start","run_id":"r"},
+      row("evt-pre",None,key,path="09-test-evidence/scratch/notes.txt"),
+      {"ts":"2026-10-04T00:00:00Z","event":"evidence_seal_published","event_id":seal_id,"run_id":"r"},
+      row("evt-a1","gpt-c1-a0001",a1,verdict=f"{A}/gpt-c1-a0001/verdict.json",
+          verdict_sha256=hashlib.sha256(verdict1).hexdigest(),verdict_bytes=str(len(verdict1))),
+      row("evt-a2","gpt-c1-a0002",a2,event="reviewer_approve",verdict=f"{A}/gpt-c1-a0002/verdict.json",
+          verdict_sha256=hashlib.sha256(verdict2).hexdigest(),verdict_bytes=str(len(verdict2))),
+      row("evt-a3","gpt-c1-a0003",a3,event="reviewer_invalid"),
+      row("evt-a4","gpt-c1-a0004",a4),
+      row("evt-a5","gpt-c1-a0005",a5),
+      row("evt-noncanonical","gpt-c1-a0001",key,path="09-test-evidence/scratch/other-attempt.json"),
+      row("evt-old-gen","gpt-c1-a0001",a1,generation="2"),
+      row("evt-unbound","gpt-c1-a0001",a1,seal_event_id="evt-other")]
+def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
+raw=ledger(rows)
+receipt={"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
+         "ledger_prefix":{"record_count":2},"verified_ledger":{"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"record_count":len(rows)}}
+inputs,excluded,unresolved=e.prior_attempt_inputs(run,raw,receipt,privacy,f"{A}/gpt-c1-a0099/attempt.json")
+copied=[o for o,_,_ in inputs]
+assert copied==[f"{A}/gpt-c1-a0001/attempt.json",f"{A}/gpt-c1-a0001/verdict.json",f"{A}/gpt-c1-a0001/diagnostic.json",
+                f"{A}/gpt-c1-a0002/attempt.json",f"{A}/gpt-c1-a0002/verdict.json",f"{A}/gpt-c1-a0003/attempt.json"],copied
+reasons={(x["origin_path"],x["referenced_by"]):x["reason"] for x in excluded}
+assert reasons[("09-test-evidence/scratch/notes.txt","reviewer_block")]=="row_precedes_this_generations_seal_and_is_never_grammar_checked",reasons
+assert reasons[("09-test-evidence/scratch/notes.txt",f"{A}/gpt-c1-a0002/attempt.json:diagnostic")]=="nested_path_outside_its_own_attempt_directory"
+assert ("08-qa-verdict.gpt.json",f"{A}/gpt-c1-a0001/attempt.json:canonical") in reasons
+assert reasons[(f"{A}/gpt-c1-a0001/attempt.json","reviewer_block")] in ("attempt_belongs_to_another_candidate_or_generation","row_is_not_bound_to_this_generations_seal")
+assert reasons[("09-test-evidence/scratch/other-attempt.json","reviewer_block")]=="attempt_path_is_not_its_canonical_attempt_record",reasons
+unread={x["origin_path"]:x["reason"] for x in unresolved}
+assert unread[f"{A}/gpt-c1-a0004/attempt.json"]=="unreadable:ARTIFACT_SYMLINK",unread         # no symlinked component
+assert unread[f"{A}/gpt-c1-a0005/attempt.json"]=="attempt_record_does_not_describe_its_event"  # checked before copied
+assert unread[f"{A}/gpt-c1-a0003/diagnostic.json"].startswith("privacy:"),unread               # the seal's own scan
+assert not any(key in data or b"outside" in data for _,data,_ in inputs)
+# A verdict whose bytes no longer match the terminal event is tampering.
+put(f"{A}/gpt-c1-a0001/verdict.json",b'{"verdict":"APPROVE"}\n')
+try: e.prior_attempt_inputs(run,raw,receipt,privacy)
+except e.SealError as exc: assert exc.category=="PRIOR_ATTEMPT_INPUT",exc.category
+else: raise AssertionError("a verdict digest mismatch was accepted")
+put(f"{A}/gpt-c1-a0001/verdict.json",verdict1)
+# Only the verified ledger counts.
+try: e.prior_attempt_inputs(run,raw.replace(b"evt-a1",b"evt-aX"),receipt,privacy)
+except e.SealError as exc: assert exc.category=="PRIOR_ATTEMPT_INPUT"
+else: raise AssertionError("an unverified ledger was accepted")
+# An unsealed run keeps its prior attempts, with the same path, read, and confinement rules.
+inputs,excluded,_=e.prior_attempt_inputs(run,raw,{"state":"legacy_unsealed"},privacy)
+copied=[o for o,_,_ in inputs]
+assert f"{A}/gpt-c1-a0001/attempt.json" in copied and "09-test-evidence/scratch/notes.txt" not in copied,copied
+assert not any(key in data for _,data,_ in inputs)
+PY
+
 t_case "a sealed and judged generation can be recaptured, republished, and sealed as generation 2"
 if ! ledger_writes_supported; then
   t_skip "generation-2 recapture after a sealed judge attempt" "requires a supported P2 ledger write host and no refused-row seam"
@@ -2044,6 +2129,19 @@ else
     "bytes=$(wc -c < "$ji_run/09-test-evidence/scratch/notes.txt" | tr -d ' ')" >/dev/null
   "$BIN/firm-ledger-log" --run "$ji_run" --strict post_judge_artifact_published path=09-test-evidence/x.txt \
     "sha256=$(printf '%064d' 0)" bytes=999 >/dev/null
+  # Scenario B (gap 2): pre-seal terminal reviewer rows naming a private-key run file, and an attempt
+  # record reached through a symlinked directory outside the run.
+  printf '%s\n' "$ji_header" > "$ji_run/09-test-evidence/scratch/key.txt"; chmod 600 "$ji_run/09-test-evidence/scratch/key.txt"
+  ji_outside="$(mktemp -d "${TMPDIR:-/tmp}/firm-outside.XXXXXX")"; t_track "$ji_outside"
+  printf '{"attempt_id":"gpt-c1-a7777","provider":"gpt","diagnostic":"09-test-evidence/lnk/secret.txt"}\n' > "$ji_outside/fake-attempt.json"
+  printf 'outside-the-run-sentinel\n' > "$ji_outside/secret.txt"
+  ln -s "$ji_outside" "$ji_run/09-test-evidence/lnk"
+  "$BIN/firm-ledger-log" --run "$ji_run" --strict reviewer_block attempt=09-test-evidence/scratch/key.txt \
+    "sha256=$(shasum -a 256 "$ji_run/09-test-evidence/scratch/key.txt" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$ji_run/09-test-evidence/scratch/key.txt" | tr -d ' ')" >/dev/null
+  "$BIN/firm-ledger-log" --run "$ji_run" --strict reviewer_block attempt=09-test-evidence/lnk/fake-attempt.json \
+    "sha256=$(shasum -a 256 "$ji_outside/fake-attempt.json" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$ji_outside/fake-attempt.json" | tr -d ' ')" >/dev/null
   assert_ok "the run seals with the two stray rows in its prefix" seal_for_run "$ji_run"
   ji_verdict() { # <out> <sha> <generation>
     t_python - "$1" "$ji_id" "$2" "$3" <<'PY'
@@ -2088,6 +2186,12 @@ PY
     ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/scratch/notes.txt row_precedes_this_generations_seal
   assert_ok "the wrong-digest pre-seal row is declared, never read" \
     ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/x.txt row_precedes_this_generations_seal
+  assert_ok "a pre-seal reviewer row naming a private-key file is declared, never copied" \
+    ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/scratch/key.txt row_precedes_this_generations_seal
+  assert_ok "a pre-seal reviewer row naming an attempt through a symlinked directory is declared, never copied" \
+    ji_inputs "$ji_keep/g1" gpt-c1-a0001 09-test-evidence/lnk/fake-attempt.json row_precedes_this_generations_seal
+  assert_ok "…and nothing from outside the run reached the snapshot" \
+    sh -c "! grep -rq 'outside-the-run-sentinel' '$ji_keep/g1/snapshot-gpt-c1-a0001'"
 
   # Generation 1 gains a leaky post-judge file by a route the writer would refuse, never verifies,
   # and the run is recaptured. The generation-2 judge must not receive generation 1's file.

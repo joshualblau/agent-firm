@@ -797,7 +797,7 @@ if args.print_capability_contract:
 sys.path.insert(0, str(root / "agent-firm" / "lib"))
 from evidence_seal import (  # noqa: E402
     SealError, _privacy_patterns, manifest_v4_fields, parse_json_unique, post_judge_inputs,
-    validate_schema, verify_seal,
+    prior_attempt_inputs, validate_schema, verify_seal,
 )
 
 def stop(message, code=1):
@@ -1663,115 +1663,29 @@ except Exception as exc:
     #     stopping the run or vanishing. Pruning an old attempt directory is plausible housekeeping
     #     and must not brick review of the run; silently dropping it is what caused this finding.
     #     Declaring it lets the judge weigh a gap it can see instead of one it cannot.
-    terminal_reviewer_events = (
-        "reviewer_approve", "reviewer_block", "reviewer_invalid",
-        "reviewer_timeout", "reviewer_unavailable",
-    )
+    #
+    # WHICH prior attempts may cross is decided by the seal library (prior_attempt_inputs), the same
+    # way post-judge artifacts are. In a sealed run only terminal rows the seal verification
+    # grammar-checked count -- this generation's suffix, bound to this seal -- so a pre-seal row or an
+    # earlier generation's attempt is declared and never read. In every run the attempt must be its
+    # canonical record, read no-follow (no symlinked component) and checked to describe its event
+    # BEFORE it is copied; nested files must lie in that attempt's own directory, and the verdict is
+    # bound to the event's verdict digest. In a sealed run every copied file passes the seal's
+    # privacy scan. Everything else is declared with a reason.
     unresolved_references = []
     excluded_references = list(integration_exclusions)
-    for item in ledger_records:
-        if item.get("event") not in terminal_reviewer_events:
-            continue
-        origin = item.get("attempt")
-        if not isinstance(origin, str) or not origin or origin == attempt_rel:
-            continue
-        if origin in seen_origins:
-            continue
-        if any(part in ("", ".", "..") for part in Path(origin).parts) or os.path.isabs(origin):
-            stop(f"target ledger references an unsafe attempt path: {origin!r}", 1)
-        target = run / origin
-        try:
-            info = os.lstat(target)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise ValueError("not a regular no-follow file")
-            raw = target.read_bytes()
-        except Exception as exc:                                   # noqa: BLE001
-            unresolved_references.append({
-                "origin_path": origin, "referenced_by": item.get("event"),
-                "event_id": item.get("event_id"),
-                "declared_sha256": item.get("sha256"), "declared_bytes": item.get("bytes"),
-                "reason": f"unreadable:{type(exc).__name__}",
-            })
-            continue
-        if (str(item.get("sha256")) != hashlib.sha256(raw).hexdigest()
-                or str(item.get("bytes")) != str(len(raw))):
-            stop(f"prior reviewer attempt digest/size does not match the ledger event that "
-                 f"references it: {origin}", 1)
-        add_payload(origin, raw, os.lstat(target).st_mode)
-
-        # ONE LEVEL DEEPER: the artifacts that attempt record itself names. Inventorying the record
-        # and not its verdict recreates exactly the gap that record was added to close — a judge
-        # holding a reference it cannot resolve — one level down. Reported by the generation-2 GPT
-        # judge against gpt-c1-a0003/verdict.json and gpt-c1-a0004/verdict.json.
-        #
-        # `canonical` is deliberately NOT followed, and is now DECLARED rather than dropped. It
-        # points at 08-qa-verdict.<provider>.json, a MUTABLE pointer this very run unlinks before it
-        # starts; the immutable artifact is the attempt-local verdict.json, written from the same
-        # bytes, which the wrapper already requires a canonical verdict to be backed by. Following a
-        # moving target would manufacture an unresolved reference on every run and teach the reader
-        # to ignore the list.
-        #
-        # But not following it was never the complaint. BOTH live judges raised the same thing
-        # independently — GPT: "neither inventoried nor declared unresolved"; Claude: "omits a
-        # referenced nested evidence file while asserting that nothing is unresolved" — and they were
-        # right. The manifest claimed a clean bill while quietly omitting a path its own inventoried
-        # records name. The exclusion stands; the SILENCE does not. Each exclusion is emitted with
-        # the reason and the artifact that supersedes it, so a reader can weigh the decision instead
-        # of discovering the omission.
-        try:
-            attempt_doc = json.loads(raw.decode("utf-8", "strict"))
-        except Exception:                                          # noqa: BLE001
-            attempt_doc = None
-        if not isinstance(attempt_doc, dict):
-            unresolved_references.append({
-                "origin_path": origin, "referenced_by": item.get("event"),
-                "event_id": item.get("event_id"), "declared_sha256": None, "declared_bytes": None,
-                "reason": "attempt_record_is_not_a_json_object_so_its_artifacts_cannot_be_followed",
-            })
-            continue
-        canonical_reference = attempt_doc.get("canonical")
-        if isinstance(canonical_reference, str) and canonical_reference:
-            excluded_references.append({
-                "origin_path": canonical_reference,
-                "referenced_by": f"{origin}:canonical",
-                "reason": "mutable_pointer_superseded_by_immutable_attempt_local_verdict",
-                "superseded_by": attempt_doc.get("verdict"),
-            })
-
-        # Digest attestation exists only for the verdict; the ledger event carries verdict_sha256 /
-        # verdict_bytes. The others are inventoried with the digest the manifest itself computes,
-        # which is a weaker claim and is not dressed up as a stronger one.
-        for field, declared_digest, declared_size in (
-            ("verdict", item.get("verdict_sha256"), item.get("verdict_bytes")),
-            ("prior_verdict", None, None),
-            ("diagnostic", None, None),
-            ("behavior_sentinel", None, None),
-        ):
-            nested = attempt_doc.get(field)
-            if not isinstance(nested, str) or not nested or nested in seen_origins:
-                continue
-            if any(part in ("", ".", "..") for part in Path(nested).parts) or os.path.isabs(nested):
-                stop(f"prior reviewer attempt references an unsafe artifact path: {nested!r}", 1)
-            nested_target = run / nested
-            try:
-                nested_info = os.lstat(nested_target)
-                if stat.S_ISLNK(nested_info.st_mode) or not stat.S_ISREG(nested_info.st_mode):
-                    raise ValueError("not a regular no-follow file")
-                nested_raw = nested_target.read_bytes()
-            except Exception as exc:                               # noqa: BLE001
-                unresolved_references.append({
-                    "origin_path": nested, "referenced_by": f"{origin}:{field}",
-                    "event_id": item.get("event_id"),
-                    "declared_sha256": declared_digest, "declared_bytes": declared_size,
-                    "reason": f"unreadable:{type(exc).__name__}",
-                })
-                continue
-            if declared_digest is not None and (
-                    str(declared_digest) != hashlib.sha256(nested_raw).hexdigest()
-                    or str(declared_size) != str(len(nested_raw))):
-                stop(f"prior reviewer verdict digest/size does not match the ledger event that "
-                     f"references it: {nested}", 1)
-            add_payload(nested, nested_raw, os.lstat(nested_target).st_mode)
+    try:
+        judge_ledger_raw = ledger_source.read_bytes()
+        judge_input_privacy = _privacy_patterns(parse_json_unique(
+            (root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
+        prior_copy, prior_excluded, prior_unresolved = prior_attempt_inputs(
+            run, judge_ledger_raw, seal_receipt, judge_input_privacy, attempt_rel)
+    except SealError as exc:
+        stop(f"prior attempt judge input BLOCK {exc.category}: {exc.detail}", 1)
+    for origin, raw, mode in prior_copy:
+        add_payload(origin, raw, mode)
+    excluded_references.extend(item for item in prior_excluded if item["origin_path"] not in seen_origins)
+    unresolved_references.extend(prior_unresolved)
 
     # POST-JUDGE PUBLICATIONS AND DECISION STATES. After a judge verdict a sealed run records
     # digest-named artifacts no sealed file references -- primary QA's post-judge dispositions and
@@ -1784,10 +1698,8 @@ except Exception as exc:
     # DECLARED with its reason and its file is never read, so a row nobody verified cannot carry
     # content into the judge. A bound artifact whose digest no longer matches is tampering and stops.
     try:
-        post_judge_privacy = _privacy_patterns(parse_json_unique(
-            (root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
         post_judge_copy, post_judge_excluded, post_judge_unresolved = post_judge_inputs(
-            run, ledger_source.read_bytes(), seal_receipt, post_judge_privacy)
+            run, judge_ledger_raw, seal_receipt, judge_input_privacy)
     except SealError as exc:
         stop(f"post-judge judge input BLOCK {exc.category}: {exc.detail}", 1)
     for origin, raw, mode in post_judge_copy:

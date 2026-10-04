@@ -1799,6 +1799,151 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
     return receipt
 
 
+def _verified_ledger_records(ledger_raw, receipt, category):
+    """Parse `ledger_raw`; for a sealed receipt, require it to begin with exactly the verified bytes."""
+    sealed = isinstance(receipt, dict) and receipt.get("state") == "sealed"
+    if sealed:
+        verified = receipt.get("verified_ledger") or {}
+        span = verified.get("bytes")
+        if (not isinstance(span, int) or isinstance(span, bool) or span > len(ledger_raw)
+                or sha256(ledger_raw[:span]) != verified.get("sha256")):
+            raise SealError(category, "ledger is not the one the seal verification covered")
+    records = []
+    for number, line in enumerate(ledger_raw.splitlines(), 1):
+        records.append(parse_json_unique(line, f"ledger line {number}"))
+    return sealed, records
+
+
+REVIEWER_TERMINAL_EVENTS = ("reviewer_approve", "reviewer_block", "reviewer_invalid",
+                            "reviewer_timeout", "reviewer_unavailable")
+ATTEMPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None):
+    """Decide which prior judge attempt records, and the files they name, may cross into a judge.
+
+    A terminal reviewer row names an attempt record by digest, and that record names its verdict,
+    diagnostic, behavior sentinel and prior verdict. In a SEALED run only rows the seal verification
+    grammar-checked may cross: this generation's suffix, within the verified ledger bytes, for this
+    candidate and generation, bound to this seal. Earlier generations' attempts, pre-seal rows, and
+    rows appended since are declared, never read. In every run the attempt must be its canonical
+    record `09-test-evidence/reviewer-attempts/<attempt_id>/attempt.json`, is read no-follow and must
+    describe its own event before it is copied, and a nested file must lie in that attempt's own
+    directory and is read no-follow; the verdict is bound to the event's verdict digest where the
+    event states one. In a sealed run every copied file also passes the seal's privacy `_scan`.
+    A nested `prior_verdict` belonging to another attempt is carried by that attempt's own record or
+    declared. Returns (inputs, excluded, unresolved) like post_judge_inputs; a bound attempt or
+    verdict whose digest does not match its event raises SealError: tampering after the fact.
+    """
+    run = Path(run)
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "PRIOR_ATTEMPT_INPUT")
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1
+        last = receipt["verified_ledger"]["record_count"]
+        generation = str(receipt["generation"])
+    inputs, excluded, unresolved, taken, declared = [], [], [], set(), set()
+
+    def exclude(origin, referenced_by, reason, superseded_by=None):
+        if (origin, referenced_by) not in declared:
+            declared.add((origin, referenced_by))
+            excluded.append({"origin_path": origin[:512], "referenced_by": referenced_by,
+                             "reason": reason, "superseded_by": superseded_by})
+
+    def unreadable(origin, referenced_by, item, reason, digest=None, size=None):
+        if (origin, referenced_by) not in declared:
+            declared.add((origin, referenced_by))
+            unresolved.append({"origin_path": origin[:512], "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": digest,
+                               "declared_bytes": size, "reason": reason})
+
+    for index, item in enumerate(records):
+        event = item.get("event") if isinstance(item, dict) else None
+        if event not in REVIEWER_TERMINAL_EVENTS:
+            continue
+        origin = item.get("attempt")
+        attempt_id = item.get("attempt_id")
+        if not isinstance(origin, str) or not origin or origin == current_attempt:
+            continue
+        if sealed and index < first:
+            reason = ("attempt_belongs_to_an_earlier_generation"
+                      if item.get("generation") not in (None, generation)
+                      else "row_precedes_this_generations_seal_and_is_never_grammar_checked")
+        elif sealed and (item.get("sha") != receipt["candidate_sha"] or str(item.get("generation")) != generation):
+            reason = "attempt_belongs_to_another_candidate_or_generation"
+        elif sealed and index >= last:
+            reason = "row_was_appended_after_the_seal_verification_this_input_is_bound_to"
+        elif sealed and (item.get("seal_event_id") != receipt["publication_event_id"]
+                         or item.get("seal_projection_sha256") != receipt["projection_sha256"]):
+            reason = "row_is_not_bound_to_this_generations_seal"
+        elif not (isinstance(attempt_id, str) and ATTEMPT_ID.fullmatch(attempt_id)
+                  and origin == f"09-test-evidence/reviewer-attempts/{attempt_id}/attempt.json"):
+            reason = "attempt_path_is_not_its_canonical_attempt_record"
+        else:
+            reason = None
+        if reason is not None:
+            exclude(origin, event, reason)
+            continue
+        if origin in taken:
+            continue
+        taken.add(origin)
+        try:
+            raw, mode, _ = _safe_read(run, origin)
+        except SealError as exc:
+            unreadable(origin, event, item, f"unreadable:{exc.category}", item.get("sha256"), item.get("bytes"))
+            continue
+        if sha256(raw) != item.get("sha256") or str(len(raw)) != str(item.get("bytes")):
+            raise SealError("PRIOR_ATTEMPT_INPUT",
+                            f"prior reviewer attempt digest/size does not match the ledger event that references it: {origin}")
+        if sealed:
+            try:
+                _scan(raw, origin, privacy)
+            except SealError as exc:
+                unreadable(origin, event, item, f"privacy:{exc.detail}", item.get("sha256"), item.get("bytes"))
+                continue
+        try:
+            document = parse_json_unique(raw, origin)
+        except SealError:
+            document = None
+        if (not isinstance(document, dict) or document.get("attempt_id") != attempt_id
+                or document.get("provider") != item.get("provider")):
+            unreadable(origin, event, item, "attempt_record_does_not_describe_its_event",
+                       item.get("sha256"), item.get("bytes"))
+            continue
+        inputs.append((origin, raw, mode))
+        canonical = document.get("canonical")
+        if isinstance(canonical, str) and canonical:
+            exclude(canonical, f"{origin}:canonical",
+                    "mutable_pointer_superseded_by_immutable_attempt_local_verdict", document.get("verdict"))
+        own = f"09-test-evidence/reviewer-attempts/{attempt_id}/"
+        for field, digest, size in (("verdict", item.get("verdict_sha256"), item.get("verdict_bytes")),
+                                    ("prior_verdict", None, None), ("diagnostic", None, None),
+                                    ("behavior_sentinel", None, None)):
+            nested = document.get(field)
+            if not isinstance(nested, str) or not nested or nested in taken:
+                continue
+            referenced_by = f"{origin}:{field}"
+            if not nested.startswith(own) or nested == own:
+                exclude(nested, referenced_by, "nested_path_outside_its_own_attempt_directory")
+                continue
+            try:
+                nested_raw, nested_mode, _ = _safe_read(run, nested)
+            except SealError as exc:
+                unreadable(nested, referenced_by, item, f"unreadable:{exc.category}", digest, size)
+                continue
+            if digest is not None and (sha256(nested_raw) != digest or str(len(nested_raw)) != str(size)):
+                raise SealError("PRIOR_ATTEMPT_INPUT",
+                                f"prior reviewer verdict digest/size does not match the ledger event that references it: {nested}")
+            if sealed:
+                try:
+                    _scan(nested_raw, nested, privacy)
+                except SealError as exc:
+                    unreadable(nested, referenced_by, item, f"privacy:{exc.detail}", digest, size)
+                    continue
+            taken.add(nested)
+            inputs.append((nested, nested_raw, nested_mode))
+    return inputs, excluded, unresolved
+
+
 def post_judge_inputs(run, ledger_raw, receipt, privacy):
     """Decide, for every post-judge row in the ledger, whether its artifact may cross into a judge.
 
@@ -1816,16 +1961,7 @@ def post_judge_inputs(run, ledger_raw, receipt, privacy):
     the digest and size its event states: that is tampering after verification.
     """
     run = Path(run)
-    sealed = isinstance(receipt, dict) and receipt.get("state") == "sealed"
-    records = []
-    if sealed:
-        verified = receipt.get("verified_ledger") or {}
-        span = verified.get("bytes")
-        if (not isinstance(span, int) or isinstance(span, bool) or span > len(ledger_raw)
-                or sha256(ledger_raw[:span]) != verified.get("sha256")):
-            raise SealError("POST_JUDGE_INPUT", "ledger is not the one the seal verification covered")
-    for number, line in enumerate(ledger_raw.splitlines(), 1):
-        records.append(parse_json_unique(line, f"ledger line {number}"))
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "POST_JUDGE_INPUT")
     if sealed:
         first = receipt["ledger_prefix"]["record_count"] + 1      # the first row after the publication
         last = receipt["verified_ledger"]["record_count"]         # one past the last verified row
