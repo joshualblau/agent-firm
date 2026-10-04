@@ -941,6 +941,7 @@ good=put("09-test-evidence/post-judge/g1/a.md",b"answer\n")
 open(outside+"/b.md","wb").write(b"outside the run\n")
 os.symlink(outside,run+"/09-test-evidence/post-judge/g1/lnk")
 leak=put("09-test-evidence/post-judge/g1/leak.md",b"see /"+b"Users/operator/x\n")
+decision=put("09-test-evidence/final-decision-required.evt-decision.json",b'{"status":"decision_required"}\n')
 def row(eid,path,data,**extra):
     item={"ts":"2026-10-02T00:00:00Z","event":"post_judge_artifact_published","event_id":eid,"run_id":"r",
           "path":path,"sha256":hashlib.sha256(data).hexdigest(),"bytes":str(len(data)),"sha":sha,"generation":"1",
@@ -955,7 +956,10 @@ rows=[{"ts":"2026-10-02T00:00:00Z","event":"run_started","event_id":"evt-start",
       row("evt-leak","09-test-evidence/post-judge/g1/leak.md",leak),
       row("evt-other-gen","09-test-evidence/post-judge/g1/a.md",good,generation="2"),
       row("evt-unbound","09-test-evidence/post-judge/g1/a.md",good,seal_event_id="evt-other-seal"),
-      row("evt-outside","09-test-evidence/a.md",good)]
+      row("evt-outside","09-test-evidence/a.md",good),
+      # A decision state crosses only from its own event path.
+      row("evt-decision","09-test-evidence/final-decision-required.evt-decision.json",decision,event="final_decision_required"),
+      row("evt-decision-elsewhere","09-test-evidence/post-judge/g1/a.md",good,event="final_decision_required")]
 def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
 def receipt(raw,count):
     return {"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
@@ -964,12 +968,14 @@ def receipt(raw,count):
 late=row("evt-late","09-test-evidence/post-judge/g1/a.md",good)
 raw=ledger(rows+[late])
 inputs,excluded,unresolved=e.post_judge_inputs(run,raw,receipt(raw,len(rows)),privacy)
-assert [origin for origin,_,_ in inputs]==["09-test-evidence/post-judge/g1/a.md"],inputs
+assert [origin for origin,_,_ in inputs]==["09-test-evidence/post-judge/g1/a.md",
+                                          "09-test-evidence/final-decision-required.evt-decision.json"],inputs
 reasons={item["referenced_by"].split(":",1)[1]:item["reason"] for item in excluded}
 assert reasons=={"evt-pre":"row_precedes_this_generations_seal_and_is_never_grammar_checked",
                  "evt-other-gen":"row_belongs_to_another_candidate_or_generation",
                  "evt-unbound":"row_is_not_bound_to_this_generations_seal",
                  "evt-outside":"artifact_is_outside_this_generations_post_judge_root",
+                 "evt-decision-elsewhere":"decision_state_is_not_its_own_event_path",
                  "evt-late":"row_was_appended_after_the_seal_verification_this_input_is_bound_to"},reasons
 unread={item["event_id"]:item["reason"] for item in unresolved}
 assert unread["evt-link"]=="unreadable:ARTIFACT_SYMLINK",unread      # R3: a symlinked component is never followed
@@ -2356,6 +2362,12 @@ doc=json.load(open(sys.argv[1])); open(sys.argv[1],"w").write(json.dumps(doc,ind
 PY
   assert_output "a re-serialised current verdict is not the ledger's bytes" \
     "is not byte-for-byte the verdict of the verified ledger's current gpt attempt" "$BIN/firm-final-qa-check" "$rb_run"
+  rb_lines="$(wc -l < "$rb_run/run.jsonl" | tr -d ' ')"
+  rb_rc=0; rb_judge "$rb_keep/approve.json" || rb_rc=$?
+  assert_eq "…and the wrapper will not start an attempt over it" 1 "$rb_rc"
+  assert_output "…naming the ledger mismatch" "is not the verdict of the verified ledger's latest gpt attempt" cat "$rb_keep/judge.out"
+  assert_eq "…without appending to the ledger" "$rb_lines" "$(wc -l < "$rb_run/run.jsonl" | tr -d ' ')"
+  assert_no_file "…or creating an attempt directory" "$rb_run/09-test-evidence/reviewer-attempts/gpt-c1-a0003"
 
   # The honest pointers: attempt 2's BLOCK is current, a third attempt runs over it, and its APPROVE
   # becomes current.
