@@ -1649,16 +1649,16 @@ def _publication_identity(run, seal, seal_rel, bundle_rel):
 def check_pending_suffix(run_path, ledger_raw, pending, policy_path, candidate_sha, generation):
     """Refuse ONE row not yet appended if it would break the live generation's suffix grammar.
 
-    The writer calls this, under its lock, for every non-reviewer append with the exact ledger bytes
-    the row would follow and the LIVE candidate's sha and generation. A recapture's `qa_checkout`
-    therefore belongs to the next generation (its candidate is rewritten first, and that generation
-    has no seal yet), and nothing is checked before the generation's seal is published.
+    The writer calls this, under its lock, for each row the post-judge phase governs (its own events
+    and primary-QA role starts) with the exact ledger bytes the row would follow and the LIVE
+    candidate's sha and generation, so nothing is checked before that generation's seal is published.
 
     It judges the suffix GRAMMAR, not the sealed files: a row is refused only when the suffix accepts
     the ledger without it and refuses it with it. A suffix already broken by something else, or a
     sealed file changed since, is not this row's doing, and verification refuses that run anyway. A
     QA window that has not closed yet is allowed here; its closure is checked when it lands.
-    Returns None when nothing applies; raises SealError naming why the row is refused.
+    Returns None when the row is fine, or a description of the breakage the suffix already had
+    without it (the writer appends the row and warns); raises SealError naming why it is refused.
     """
     run = Path(os.path.realpath(os.path.abspath(run_path)))
     records = []
@@ -1683,8 +1683,8 @@ def check_pending_suffix(run_path, ledger_raw, pending, policy_path, candidate_s
     try:
         _validate_suffix(run, records, seal, seal_raw, publication, "wrapper-preflight",
                          privacy=privacy, allow_open_windows=True)
-    except SealError:
-        return None          # already broken by something else; this row cannot make it worse
+    except SealError as exc:
+        return f"{exc.category}: {exc.detail}"   # broken by something else; this row cannot make it worse
     _validate_suffix(run, records + [pending], seal, seal_raw, publication, "wrapper-preflight",
                      privacy=privacy, allow_open_windows=True)
     return None

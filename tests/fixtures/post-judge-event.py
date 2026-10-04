@@ -152,8 +152,8 @@ else:
         + [f"{key}={value}" for key, value in fields.items()],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
+    sys.stderr.write(done.stderr)        # a refusal, or a warning on success
     if done.returncode != 0:
-        sys.stderr.write(done.stderr)
         raise SystemExit(done.returncode)
 if window and raw_append:
     # The row above bypassed the writer, so the writer would rightly refuse anything after it; the

@@ -270,14 +270,18 @@ each counts only when bound to this generation's seal, and a human record counts
 decision it answers was required after the current judge verdict, so nothing staged before the seal
 can answer it.
 Every post-judge file is published once, so a revision is a new `<k>`. Once the live candidate's
-generation has a published seal, `firm-ledger-log` checks every row except the reviewer wrapper's own
-against that seal's suffix grammar before appending it -- post-judge rows, role starts such as a
-primary-QA window, and any ordinary event -- and refuses a row the grammar would refuse (an event it
-does not admit, wrong field set, binding, path, digest, window, attempt, a window opened while a judge
-attempt is open, or a privacy-policy match), naming why; nothing is appended, so correct the file or
-command and publish again. A refused role start fails with `INPUT_INVALID: sealed-suffix`. A
-recapture is not affected: `firm-qa-checkout` moves the live candidate to the next generation before
-it appends, and that generation has no seal yet. A disposition must repeat the judge's objection text exactly, so if that text
+generation has a published seal, `firm-ledger-log` checks the post-judge phase's own rows against that
+seal's suffix grammar before appending them: `post_judge_artifact_published`, `final_gate_pending`,
+`final_decision_required`, `qa_started`/`qa_completed`, and every `qa-tester` role start. It refuses a
+row the grammar would refuse (an event it does not admit, wrong field set, binding, path, digest,
+window, attempt, a window opened while a judge attempt is open, or a privacy-policy match), naming why;
+nothing is appended, so correct the file or command and publish again. A refused role start fails with
+`INPUT_INVALID: sealed-suffix`. The check judges the row, not the run: if the suffix was already
+broken by something else, a well-formed row is appended with a warning that names the existing
+breakage, and verification still refuses the run until that is repaired. Every other row -- Lead
+milestones, the Packager's finalize window, `handoff_finalized`, `run_closed`, a `lead_note` -- is not
+gated and lands as it always did. A recapture is not affected: `firm-qa-checkout` moves the live
+candidate to the next generation before it appends, and that generation has no seal yet. A disposition must repeat the judge's objection text exactly, so if that text
 itself carries a privacy-policy match no disposition of it can be published: run a new judge attempt
 rather than editing around it. For a current BLOCK the Final
 check uses the LATEST such publication for the generation when it names the current canonical attempt
@@ -307,6 +311,13 @@ BLOCK needs its own decision.
 Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
 wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
 manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.
+
+Rows written after a passing Final check -- the Packager's finalize window, `handoff_finalized`, the
+Close stage's milestones -- are not part of the sealed grammar. Seal verification of a finalized or
+closed run is therefore expected to refuse ("unexpected event ..."); the run's decision was taken at
+Final, by the check that passed. A designed post-Final phase is a known follow-up: it must admit those
+rows, and it must account for finalizing `10-handoff.md`, which changes a file the seal covers (a
+second `evidence_produced` for it in the same generation is a duplicate the writer refuses).
 
 ## Completion
 

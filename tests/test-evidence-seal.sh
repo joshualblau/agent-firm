@@ -1337,6 +1337,17 @@ PY
         "${PJ_PHASE:-publication}" "$_pj_needle"
     }
 
+    # pj_lands <label> <needle> <fn> [args...] — a row outside the post-judge phase's own set is not
+    # gated by the writer: it lands, as it always did, and the verifier refuses the run it is in.
+    pj_lands() {
+      local _pj_label="$1" _pj_needle="$2" _pj_fn="$3" _pj_out _pj_rc; shift 3
+      _pj_out="$("$_pj_fn" "$@" event_id=evt-pj-lands 2>&1)"; _pj_rc=$?
+      if [ "$_pj_rc" -eq 0 ] && grep -q '"event_id":"evt-pj-lands"' "$pj_run/run.jsonl"; then
+        _t_ok "$_pj_label: the writer appends it"
+      else _t_no "$_pj_label: the writer appends it" "rc=$_pj_rc $(_t_ctx "$_pj_out")"; fi
+      pj_expect refuse "$_pj_label: the verifier refuses the run" "${PJ_PHASE:-publication}" "$_pj_needle"
+    }
+
     # Accepted after a terminal judge event, one at a time and then all together.
     pj_restore "$pj_judged"; pj final_decision_required
     pj_expect accept "final_decision_required is accepted after the judge"
@@ -1378,13 +1389,13 @@ PY
     # candidate before it appends the event, so a real recapture is verified against the NEXT
     # generation's seal, in whose prefix the event lies. Letting one end the suffix meant a single
     # forged event switched off checking of everything after it.
-    pj_restore "$pj_judged"; pj_bad "a later-generation qa_checkout inside the verified suffix is refused" \
-      "unexpected event qa_checkout" LEDGER_SUFFIX pj_checkout "sha=$pj_sha" generation=2
+    pj_restore "$pj_judged"; pj_lands "a later-generation qa_checkout inside the verified suffix" \
+      "unexpected event qa_checkout" pj_checkout "sha=$pj_sha" generation=2
     pj_restore "$pj_judged"; pj_checkout "sha=$pj_sha" generation=2 @raw; pj lead_note note=anything-after-it @raw
     pj_expect refuse "a forged qa_checkout does not switch off checking of what follows it" publication \
       "unexpected event qa_checkout"
-    pj_restore "$pj_judged"; pj_bad "a same-generation qa_checkout inside the verified suffix is refused" \
-      "unexpected event qa_checkout" LEDGER_SUFFIX pj_checkout "sha=$pj_sha" generation=1
+    pj_restore "$pj_judged"; pj_lands "a same-generation qa_checkout inside the verified suffix" \
+      "unexpected event qa_checkout" pj_checkout "sha=$pj_sha" generation=1
 
     # Refused before any terminal judge event.
     pj_restore "$pj_sealed"; pj_bad "final_decision_required before the judge is refused" \
@@ -1464,6 +1475,18 @@ PY
       "post-judge qa_started is not a native role start" LEDGER_SUFFIX pj qa_started stage=test/pj-forged role=qa-tester
     pj_restore "$pj_judged"; pj_bad_start "a post-judge role window for any role but qa-tester is refused" \
       "post-judge role windows are qa-tester only" test/pj-packager packager role-contracts/P-01-packager.md
+    # Every qa-tester role start is the post-judge phase's own, whatever start event it names.
+    pj_restore "$pj_judged"
+    pj_out="$("$BIN/firm-ledger-log" --run "$pj_run" --strict --role-start --stage test/pj-retest --role qa-tester \
+      --contract role-contracts/Q-01-qa-tester.md --event qa_retest_started \
+      --authority-json "$(t_python -c 'import json,sys; run=sys.argv[1]; rid=run.rstrip("/").split("/")[-1]; first=json.loads(open(run+"/run.jsonl").readline()); print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":first["event_id"],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":first["base_sha"]}}}],separators=(",",":")))' "$pj_run")" \
+      --agent /root/post_judge_qa --activation-json "$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)" 2>&1)"
+    case "$pj_out" in
+      *"role start refused, nothing appended"*"unexpected event qa_retest_started"*"INPUT_INVALID: sealed-suffix"*)
+        if cmp -s "$pj_judged" "$pj_run/run.jsonl"; then _t_ok "a qa-tester role start under any start event is gated"
+        else _t_no "a qa-tester role start under any start event is gated" "the ledger changed"; fi ;;
+      *) _t_no "a qa-tester role start under any start event is gated" "$(_t_ctx "$pj_out")" ;;
+    esac
     pj_restore "$pj_judged"; pj_bad "a qa_completed that closes no post-judge window is refused" \
       "does not close an open primary-QA window" LEDGER_SUFFIX \
       pj qa_completed stage=test/pj-none role=qa-tester role_start_event_id=evt-no-such-window
@@ -1517,14 +1540,15 @@ PY
     pj_restore "$pj_judged"; pj_bad "a decision state carrying a secret assignment is refused" \
       "secret_assignment" PRIVACY_MATCH pj final_decision_required "state_objection=$pj_leak_assignment"
 
-    # Everything outside the closed set is still refused after the judge.
-    pj_restore "$pj_judged"; pj_bad "an ordinary lead_note after the judge is refused" \
-      "unexpected event lead_note" LEDGER_SUFFIX pj lead_note note=after-the-judge
-    pj_restore "$pj_judged"; pj_bad "an unsealed-style human_decision_recorded event is refused after the seal" \
-      "unexpected event human_decision_recorded" LEDGER_SUFFIX \
+    # Everything outside the closed set is still refused by verification after the judge. The writer
+    # gates only the post-judge phase's own rows, so these land, as they did before the gate existed.
+    pj_restore "$pj_judged"; pj_lands "an ordinary lead_note after the judge" \
+      "unexpected event lead_note" pj lead_note note=after-the-judge
+    pj_restore "$pj_judged"; pj_lands "an unsealed-style human_decision_recorded event after the seal" \
+      "unexpected event human_decision_recorded" \
       pj human_decision_recorded "path=$pj_root/human.yaml" "sha=$pj_sha" generation=1
-    pj_restore "$pj_sealed"; pj_bad "an ordinary event right after the seal is refused" \
-      "unexpected event lead_note" LEDGER_SUFFIX pj lead_note note=before-the-judge
+    pj_restore "$pj_sealed"; pj_lands "an ordinary event right after the seal" \
+      "unexpected event lead_note" pj lead_note note=before-the-judge
     # Reviewer events stay with the wrapper: the writer does not judge them, the verifier does.
     pj_restore "$pj_judged"
     assert_ok "the writer leaves reviewer events to the wrapper" "$BIN/firm-ledger-log" --run "$pj_run" --strict \
@@ -1533,13 +1557,20 @@ PY
     pj_restore "$pj_judged"
     pj_expect accept "the judged snapshot itself still verifies"
 
-    # The writer judges the ROW, not the run. A suffix something else already broke (here a raw row the
-    # writer would have refused) is not the next row's doing: the writer appends it, and verification
-    # still refuses the run.
+    # The writer judges the ROW, not the run. A suffix something else already broke (here a raw row
+    # outside the grammar) is not the next row's doing: the writer appends a well-formed post-judge
+    # row, warns that the suffix was already broken and how, and verification still refuses the run.
     pj_restore "$pj_judged"; pj lead_note note=raw-break @raw
-    assert_ok "after a raw row broke the suffix, the writer does not blame the next row" \
-      "$BIN/firm-ledger-log" --run "$pj_run" --strict lead_note note=after-the-break
+    pj_out="$(pj final_gate_pending 2>&1)"; pj_rc=$?
+    assert_eq "after a raw row broke the suffix, the writer does not blame the next row" 0 "$pj_rc"
+    case "$pj_out" in
+      *"warning: appended, but the live generation's sealed suffix was already broken before this row"*"unexpected event lead_note"*)
+        _t_ok "…and warns, naming the existing breakage";;
+      *) _t_no "…and warns, naming the existing breakage" "$(_t_ctx "$pj_out")";; esac
     pj_expect refuse "…and the verifier still refuses the run" publication "unexpected event lead_note"
+    pj_restore "$pj_judged"; pj_out="$(pj final_gate_pending 2>&1)"
+    case "$pj_out" in *warning*) _t_no "a row appended to an intact suffix carries no warning" "$(_t_ctx "$pj_out")";;
+      *) _t_ok "a row appended to an intact suffix carries no warning";; esac
     # A check that cannot finish is a refusal, not a pass: here the live seal names no publication.
     pj_restore "$pj_judged"; pj_seal_keep="$pj_run/.pj-seal.json"
     cp -p "$pj_run/09-test-evidence/final-evidence/g1/seal.json" "$pj_seal_keep"
@@ -1759,15 +1790,12 @@ PY
     # passed the seal and firm-final-qa-check returned 0.
     fr_snap="$fr_stub/before-exploit"; mkdir -p "$fr_snap"
     cp -p "$fr_run/run.jsonl" "$fr_run/08-qa-verdict.gpt.json" "$fr_run/09-test-evidence/reviewer-state.gpt.json" "$fr_snap/"
-    # The writer now refuses the forged qa_checkout outright (the live candidate is still generation 1)...
-    assert_fail "the writer refuses a qa_checkout that would land inside the sealed suffix" \
+    # The writer gates only the post-judge phase's own rows, so the forged qa_checkout lands as any
+    # ordinary row does: only the verifier stands between it and trust.
+    assert_ok "the forged qa_checkout lands through the writer (it is not a post-judge row)" \
       "$BIN/firm-ledger-log" --run "$fr_run" --strict qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
       "branch=integration/$fr_id" "source_ref=refs/heads/integration/$fr_id" "base_sha=$fr_sha" \
       "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json
-    # ...so the exploit's row is appended raw, as by any other route, to keep the verifier honest.
-    t_python "$PJ_EVENT" "$FIRM_ROOT" "$fr_run" qa_checkout "dir=.agent-firm/qa-checkout/$fr_id" \
-      "branch=integration/$fr_id" "source_ref=refs/heads/integration/$fr_id" "base_sha=$fr_sha" \
-      "sha=$fr_sha" generation=2 candidate=09-test-evidence/qa-candidate.json @raw >/dev/null
     fr_forged="$(t_python - "$fr_run" "$fr_id" "$fr_sha" <<'PY'
 import hashlib,json,os,sys
 run,rid,sha=sys.argv[1:]
@@ -2418,6 +2446,66 @@ PY
     cat "$rb_run/09-test-evidence/reviewer-attempts/gpt-c1-a0003/attempt.json"
   assert_output "…and the Final check passes on attempt 3" "both current candidate-bound provider verdicts approve" \
     "$BIN/firm-final-qa-check" "$rb_run"
+fi
+
+# PACKAGE AND CLOSE STILL LAND AFTER FINAL. The writer's sealed-suffix gate once judged every row, so
+# after a passing Final check the Packager's finalize window, its finalized-handoff evidence, and the
+# Lead's Close milestones were all refused in every sealed run. The gate covers only the post-judge
+# phase's own rows; post-Final rows are not part of the sealed grammar, so verification of a
+# finalized run refuses -- the run's decision was taken at Final.
+t_case "after a passing Final check the Package and Close stages land"
+if ! ledger_writes_supported; then
+  t_skip "post-Final Package and Close" "requires a supported P2 ledger write host and no refused-row seam"
+elif [ ! -x "${fr_stub:-}/bin/codex" ]; then
+  _t_no "post-Final fixture has the judge stub" "the end-to-end case did not create it"
+else
+  pf_fixture="$(make_sealable_run claude "" write_final_ready_run real_qa_tools)"
+  pf_run="$(printf '%s\n' "$pf_fixture" | sed -n '2p')"; pf_sha="$(printf '%s\n' "$pf_fixture" | sed -n '3p')"
+  pf_id="$(basename "$pf_run")"; pf_keep="$fr_stub/keep-$pf_id"; mkdir -p "$pf_keep"
+  assert_ok "the post-Final fixture seals" seal_for_run "$pf_run"
+  t_python - "$pf_keep/approve.json" "$pf_id" "$pf_sha" <<'PY'
+import json,sys
+path,rid,sha=sys.argv[1:]
+json.dump({"verdict":"APPROVE","commit_sha":sha,"run_id":rid,"generation":1,"provider":"gpt","attempt_id":"__ATTEMPT__",
+           "environment":"stub","commands_run":[],"unit":{"status":"pass","evidence":"09-test-evidence/proof.log"},
+           "integration":{"status":"not_applicable","evidence":"none"},"e2e":{"status":"not_applicable","evidence":"none"},
+           "visual":{"status":"not_applicable","evidence":"none"},
+           "acceptance_criteria_coverage":[{"id":"AC-001","covered":"yes","evidence":"09-test-evidence/proof.log"}],
+           "untested_risks":[],"blockers":[],"warnings":[],"artifacts":[],"summary":"stub judge APPROVE"},open(path,"w"))
+PY
+  pf_rc=0; env PATH="$fr_stub/bin:/usr/bin:/bin" STUB_MODEL="$fr_model" STUB_VERDICT="$pf_keep/approve.json" \
+    STUB_KEEP="$pf_keep" CODEX_HOME="$fr_stub/codex-home" FIRM_GPT_QA_DISCOVERY_TIMEOUT=20 \
+    FIRM_GPT_QA_READINESS_TIMEOUT=20 FIRM_GPT_QA_TIMEOUT=60 "$BIN/firm-gpt-qa" --run "$pf_run" >/dev/null 2>&1 || pf_rc=$?
+  assert_eq "the judge approves" 0 "$pf_rc"
+  assert_output "the Final check passes" "both current candidate-bound provider verdicts approve" \
+    "$BIN/firm-final-qa-check" "$pf_run"
+  assert_ok "the Lead records final_gate_pending" "$BIN/firm-ledger-log" --run "$pf_run" --strict \
+    final_gate_pending "sha=$pf_sha" generation=1
+  # The human approves at Final; the Packager finalizes 10-handoff.md in its own window.
+  pf_authority="$(t_python -c 'import json,sys; run=sys.argv[1]; rid=run.rstrip("/").split("/")[-1]; first=json.loads(open(run+"/run.jsonl").readline()); print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":first["event_id"],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":first["base_sha"]}}}],separators=(",",":")))' "$pf_run")"
+  pf_out="$("$BIN/firm-ledger-log" --run "$pf_run" --strict --role-start --stage package/P-02 --role packager \
+    --contract role-contracts/P-01-packager.md --event packaging_started --authority-json "$pf_authority" \
+    --agent /root/finalize --activation-json "$("$BIN/firm-model-resolve" --provider codex --role packager --format activation)" 2>&1)"
+  pf_rc=$?
+  assert_eq "the Packager's finalize window opens" 0 "$pf_rc"
+  pf_start="$(printf '%s' "$pf_out" | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])' 2>/dev/null)"
+  printf '%s\n' '# 10 · Handoff' '<!-- BEGIN COMPLETE LOCAL PR BODY -->' 'Title: sealed fixture' '' \
+    'Body bytes remain exact.' '<!-- END COMPLETE LOCAL PR BODY -->' '' 'Finalized after Final.' > "$pf_run/10-handoff.md"
+  assert_ok "the finalize window closes" "$BIN/firm-ledger-log" --run "$pf_run" --strict packaging_completed \
+    stage=package/P-02 role=packager "role_start_event_id=$pf_start"
+  # The finalized handoff's evidence: the Lead's milestone names its exact bytes. (A second
+  # evidence_produced for 10-handoff.md in the same generation is a duplicate publication the writer
+  # refuses regardless of the seal; a designed post-Final phase is a known follow-up.)
+  assert_ok "the Lead's handoff_finalized milestone lands with the finalized handoff's digest" \
+    "$BIN/firm-ledger-log" --run "$pf_run" --strict handoff_finalized "sha=$pf_sha" generation=1 \
+    path=10-handoff.md "sha256=$(shasum -a 256 "$pf_run/10-handoff.md" | awk '{print $1}')" \
+    "bytes=$(wc -c < "$pf_run/10-handoff.md" | tr -d ' ')"
+  assert_ok "the Close stage's run_closed milestone lands" "$BIN/firm-ledger-log" --run "$pf_run" --strict run_closed
+  assert_eq "every post-Final row is in the ledger" 4 \
+    "$(sed -n "$(grep -n '"event":"final_gate_pending"' "$pf_run/run.jsonl" | cut -d: -f1),\$p" "$pf_run/run.jsonl" \
+       | grep -c '"event":"\(packaging_started\|packaging_completed\|handoff_finalized\|run_closed\)"')"
+  assert_fail "as documented, a finalized run no longer verifies against its seal" \
+    seal_for_run "$pf_run" --verify --phase publication
 fi
 
 t_case "proven no-append publication failure removes the complete unpublished bundle"

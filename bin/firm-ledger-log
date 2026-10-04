@@ -2817,16 +2817,31 @@ def atomic_commit(
                     pass
 
 
-# A SEALED GENERATION'S SUFFIX IS CHECKED BEFORE A ROW LANDS. Once the live candidate's generation
-# has a published seal, verification admits only the closed suffix grammar after it. A row it would
-# refuse -- a post-judge row with a digest typo, a window mistake, or a privacy match; a primary-QA
-# window opened while a judge attempt is open; an ordinary `lead_note` -- used to land unchecked, and
-# then every later verification of that generation failed for good: the Final check and every
-# further judge attempt refused it. Under the lock, against the exact ledger bytes the row would
-# follow, the seal library now checks the row as pending and a row the grammar would refuse is not
-# appended. Reviewer events stay with the reviewer wrapper, which verifies the seal itself. The live
-# candidate's generation decides: a recapture's `qa_checkout` follows the rewrite to generation N+1,
-# which has no seal yet, so it is never judged against generation N.
+# THE POST-JUDGE PHASE'S OWN ROWS ARE CHECKED BEFORE THEY LAND. Once the live candidate's generation
+# has a published seal, verification admits only the closed suffix grammar after it. A post-judge
+# row it would refuse -- a digest typo, a window mistake, a privacy match, a primary-QA window opened
+# while a judge attempt is open -- used to land unchecked, and then every later verification of that
+# generation failed for good: the Final check and every further judge attempt refused it. Under the
+# lock, against the exact ledger bytes the row would follow, the seal library checks such a row as
+# pending, and a row the grammar would refuse is not appended.
+#
+# Only the rows that phase governs are gated: its own events, and role starts for the primary-QA
+# window. Every other row -- Lead milestones, the Packager's finalize window, `handoff_finalized`,
+# `run_closed`, a `lead_note` -- lands as it always did. Those come AFTER the run's decision was
+# taken at Final and are not part of the sealed grammar; refusing them refused the lifecycle's
+# Package and Close stages in every sealed run. Reviewer events stay with the reviewer wrapper,
+# which verifies the seal itself. The live candidate's generation decides: a recapture follows the
+# rewrite to generation N+1, which has no seal yet.
+SEALED_SUFFIX_GATED_EVENTS = frozenset((
+    "post_judge_artifact_published", "final_gate_pending", "final_decision_required",
+    "qa_started", "qa_completed",
+))
+
+
+def sealed_suffix_gated(record, role_start):
+    if record.get("event") in SEALED_SUFFIX_GATED_EVENTS:
+        return True
+    return role_start and record.get("role") == "qa-tester"
 
 
 class SealedSuffixRefused(Exception):
@@ -2834,11 +2849,14 @@ class SealedSuffixRefused(Exception):
 
 
 
-def sealed_suffix_append_check(run, record):
+def sealed_suffix_append_check(run, record, role_start=False):
+    """A pre-commit check for one row. After it ran, `check.warning` names a breakage the suffix
+    already had without this row: the row is judged, not the run, so it is appended anyway and the
+    caller says so."""
     verified = {}
 
     def check():
-        if record.get("event") in SEALED_SUFFIX_EXEMPT_EVENTS:
+        if not sealed_suffix_gated(record, role_start):
             return
         fd, _ = open_ledger(run)
         if fd is None:
@@ -2864,7 +2882,7 @@ def sealed_suffix_append_check(run, record):
         sys.path.insert(0, str(TOOL_ROOT / "agent-firm" / "lib"))
         import evidence_seal
         try:
-            evidence_seal.check_pending_suffix(
+            check.warning = evidence_seal.check_pending_suffix(
                 str(run.path), raw, record, TOOL_ROOT / "agent-firm" / "policy" / "evidence-privacy.yaml",
                 context["candidate_sha"], context["generation"],
             )
@@ -2874,14 +2892,15 @@ def sealed_suffix_append_check(run, record):
             raise SealedSuffixRefused(f"the sealed-suffix check could not run: {type(exc).__name__}") from exc
         verified["sha256"] = digest
 
+    check.warning = None
     return check
 
 
-# The reviewer wrapper's own events: it verifies the seal before and after writing them.
-SEALED_SUFFIX_EXEMPT_EVENTS = frozenset((
-    "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
-    "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
-))
+def warn_already_broken(check):
+    if getattr(check, "warning", None):
+        print(f"firm-ledger-log: warning: appended, but the live generation's sealed suffix was already "
+              f"broken before this row ({check.warning}); seal verification refuses this run until "
+              f"that is repaired", file=sys.stderr)
 
 
 def ordinary_main(argv):
@@ -3016,6 +3035,7 @@ def ordinary_main(argv):
         for value in evidence_identity_values:
             close_stable_relative(value)
         run.close()
+    warn_already_broken(suffix_check)
     if result is not None:
         print(result)
         ledger_barrier(run, "after_success_output")
@@ -3211,7 +3231,7 @@ def role_main(argv):
             except (OSError, ValidationError) as exc:
                 raise ContractDrift() from exc
 
-        role_suffix_check = sealed_suffix_append_check(run, record)
+        role_suffix_check = sealed_suffix_append_check(run, record, role_start=True)
 
         def role_precommit():
             prove_authority_descriptors(authority_descriptors)
@@ -3256,6 +3276,7 @@ def role_main(argv):
         if justification is not None:
             result["activation_justification"] = justification
         ledger_barrier(run, "after_result_construction")
+        warn_already_broken(role_suffix_check)
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
         ledger_barrier(run, "after_success_output")
     finally:
