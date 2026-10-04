@@ -1027,6 +1027,9 @@ os.makedirs(outside+"/a"); open(outside+"/a/attempt.json","w").write(json.dumps(
 os.symlink(outside+"/a",os.path.join(run,A,"gpt-c1-a0004"))
 a4=open(outside+"/a/attempt.json","rb").read()
 a5=attempt("gpt-c1-a0005",provider="claude")
+a6=attempt("gpt-c1-a0006"); a7=attempt("gpt-c1-a0007"); a8=attempt("gpt-c1-a0008")
+a10=put(f"{A}/gpt-c1-a0010/attempt.json",json.dumps({"schema_version":1,"attempt_id":"gpt-c1-a0010","provider":"gpt",
+        "note":"see /"+"Users/operator/x"}).encode())
 def row(eid,aid,data,event="reviewer_block",path=None,**extra):
     item={"ts":"2026-10-04T00:00:00Z","event":event,"event_id":eid,"run_id":"r","provider":"gpt","generation":"1",
           "sha":sha,"attempt":path or f"{A}/{aid}/attempt.json","attempt_id":aid,"exit_code":"1",
@@ -1045,11 +1048,17 @@ rows=[{"ts":"2026-10-04T00:00:00Z","event":"run_started","event_id":"evt-start",
       row("evt-a5","gpt-c1-a0005",a5),
       row("evt-noncanonical","gpt-c1-a0001",key,path="09-test-evidence/scratch/other-attempt.json"),
       row("evt-old-gen","gpt-c1-a0001",a1,generation="2"),
-      row("evt-unbound","gpt-c1-a0001",a1,seal_event_id="evt-other")]
+      row("evt-unbound","gpt-c1-a0001",a1,seal_event_id="evt-other"),
+      # Attempts no other row carries, so each exclusion is the row's own: bound to another seal,
+      # another generation inside the suffix, and an attempt record that is itself a privacy match.
+      row("evt-a6","gpt-c1-a0006",a6,seal_event_id="evt-other"),
+      row("evt-a7","gpt-c1-a0007",a7,generation="2"),
+      row("evt-a10","gpt-c1-a0010",a10)]
 def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
-raw=ledger(rows)
+verified=ledger(rows)
+raw=verified+ledger([row("evt-a8","gpt-c1-a0008",a8)])    # appended after the verification
 receipt={"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
-         "ledger_prefix":{"record_count":2},"verified_ledger":{"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"record_count":len(rows)}}
+         "ledger_prefix":{"record_count":2},"verified_ledger":{"bytes":len(verified),"sha256":hashlib.sha256(verified).hexdigest(),"record_count":len(rows)}}
 inputs,excluded,unresolved=e.prior_attempt_inputs(run,raw,receipt,privacy,f"{A}/gpt-c1-a0099/attempt.json")
 copied=[o for o,_,_ in inputs]
 assert copied==[f"{A}/gpt-c1-a0001/attempt.json",f"{A}/gpt-c1-a0001/verdict.json",f"{A}/gpt-c1-a0001/diagnostic.json",
@@ -1060,10 +1069,14 @@ assert reasons[("09-test-evidence/scratch/notes.txt",f"{A}/gpt-c1-a0002/attempt.
 assert ("08-qa-verdict.gpt.json",f"{A}/gpt-c1-a0001/attempt.json:canonical") in reasons
 assert reasons[(f"{A}/gpt-c1-a0001/attempt.json","reviewer_block")] in ("attempt_belongs_to_another_candidate_or_generation","row_is_not_bound_to_this_generations_seal")
 assert reasons[("09-test-evidence/scratch/other-attempt.json","reviewer_block")]=="attempt_path_is_not_its_canonical_attempt_record",reasons
+assert reasons[(f"{A}/gpt-c1-a0006/attempt.json","reviewer_block")]=="row_is_not_bound_to_this_generations_seal",reasons
+assert reasons[(f"{A}/gpt-c1-a0007/attempt.json","reviewer_block")]=="attempt_belongs_to_another_candidate_or_generation",reasons
+assert reasons[(f"{A}/gpt-c1-a0008/attempt.json","reviewer_block")]=="row_was_appended_after_the_seal_verification_this_input_is_bound_to",reasons
 unread={x["origin_path"]:x["reason"] for x in unresolved}
 assert unread[f"{A}/gpt-c1-a0004/attempt.json"]=="unreadable:ARTIFACT_SYMLINK",unread         # no symlinked component
 assert unread[f"{A}/gpt-c1-a0005/attempt.json"]=="attempt_record_does_not_describe_its_event"  # checked before copied
 assert unread[f"{A}/gpt-c1-a0003/diagnostic.json"].startswith("privacy:"),unread               # the seal's own scan
+assert unread[f"{A}/gpt-c1-a0010/attempt.json"].startswith("privacy:"),unread                 # ...of the record itself
 assert not any(key in data or b"outside" in data for _,data,_ in inputs)
 # A verdict whose bytes no longer match the terminal event is tampering.
 put(f"{A}/gpt-c1-a0001/verdict.json",b'{"verdict":"APPROVE"}\n')
@@ -1284,7 +1297,7 @@ else
       _pj_out="$("$_pj_fn" "$@" event_id=evt-pj-refused 2>&1)"; _pj_rc=$?
       case "$_pj_rc:$_pj_out" in
         0:*) _t_no "$_pj_label: the writer refuses it" "appended" ;;
-        *"post-judge event refused, nothing appended"*"$_pj_needle"*)
+        *"row refused by the sealed suffix, nothing appended"*"$_pj_needle"*)
           if grep -q '"event_id":"evt-pj-refused"' "$pj_run/run.jsonl"; then
             _t_no "$_pj_label: the writer refuses it" "the refused row is in the ledger"
           else _t_ok "$_pj_label: the writer refuses it"; fi ;;
@@ -1519,6 +1532,32 @@ PY
     pj_expect refuse "…and the verifier still refuses a malformed one" publication "reviewer seal identity mismatch"
     pj_restore "$pj_judged"
     pj_expect accept "the judged snapshot itself still verifies"
+
+    # The writer judges the ROW, not the run. A suffix something else already broke (here a raw row the
+    # writer would have refused) is not the next row's doing: the writer appends it, and verification
+    # still refuses the run.
+    pj_restore "$pj_judged"; pj lead_note note=raw-break @raw
+    assert_ok "after a raw row broke the suffix, the writer does not blame the next row" \
+      "$BIN/firm-ledger-log" --run "$pj_run" --strict lead_note note=after-the-break
+    pj_expect refuse "…and the verifier still refuses the run" publication "unexpected event lead_note"
+    # A check that cannot finish is a refusal, not a pass: here the live seal names no publication.
+    pj_restore "$pj_judged"; pj_seal_keep="$pj_run/.pj-seal.json"
+    cp -p "$pj_run/09-test-evidence/final-evidence/g1/seal.json" "$pj_seal_keep"
+    t_python - "$FIRM_ROOT" "$pj_run/09-test-evidence/final-evidence/g1/seal.json" "$pj_sha" <<'PY'
+import os,sys
+sys.path.insert(0,os.path.join(sys.argv[1],"agent-firm","lib"))
+import evidence_seal as e
+open(sys.argv[2],"wb").write(e.canonical_json_bytes({"identity":{"candidate_sha":sys.argv[3],"generation":1}}))
+PY
+    pj_out="$(pj final_gate_pending 2>&1)"; pj_rc=$?
+    case "$pj_rc:$pj_out" in
+      0:*) _t_no "a sealed-suffix check that cannot run refuses the row" "appended" ;;
+      *"nothing appended"*"the sealed-suffix check could not run"*)
+        if cmp -s "$pj_judged" "$pj_run/run.jsonl"; then _t_ok "a sealed-suffix check that cannot run refuses the row"
+        else _t_no "a sealed-suffix check that cannot run refuses the row" "the ledger changed"; fi ;;
+      *) _t_no "a sealed-suffix check that cannot run refuses the row" "$(_t_ctx "$pj_out")" ;;
+    esac
+    cp -p "$pj_seal_keep" "$pj_run/09-test-evidence/final-evidence/g1/seal.json"
 
     # A window answers only attempts that were terminal when it opened. Open one, let a second judge
     # attempt finish (a0002, trusted unavailable), then publish inside the window: answering a0001 is
@@ -2012,7 +2051,7 @@ PY
     fr_leak_append="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003 2>&1)"; fr_leak_append_rc=$?
     case "$fr_leak_append_rc:$fr_leak_append" in
       0:*) _t_no "the writer refuses disposition evidence carrying a secret" "appended" ;;
-      *"post-judge event refused"*secret_assignment*) _t_ok "the writer refuses disposition evidence carrying a secret" ;;
+      *"row refused by the sealed suffix"*secret_assignment*) _t_ok "the writer refuses disposition evidence carrying a secret" ;;
       *) _t_no "the writer refuses disposition evidence carrying a secret" "$(_t_ctx "$fr_leak_append")" ;;
     esac
     fr_round_leak="$(fr_publish round-leak.md disposition_evidence gpt-c1-a0003 @raw)"

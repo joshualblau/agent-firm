@@ -3008,7 +3008,7 @@ def ordinary_main(argv):
     except SealedSuffixRefused as exc:
         # Refused because THIS row is wrong for the sealed generation; the ledger is untouched and
         # stays appendable.
-        ordinary_fail(strict, f"post-judge event refused, nothing appended: {exc}", announce=True)
+        ordinary_fail(strict, f"row refused by the sealed suffix, nothing appended: {exc}", announce=True)
     finally:
         for _, fd, _ in reversed(held):
             os.close(fd)
