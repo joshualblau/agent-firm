@@ -182,6 +182,7 @@ class ContractDrift(Exception):
     pass
 
 
+
 class CommitError(Exception):
     def __init__(self, phase):
         super().__init__(phase)
@@ -487,7 +488,77 @@ def legacy_evidence_shape(record):
     return True
 
 
-def validate_evidence_record(record, ledger_run_id, context):
+class AmbiguousCheckout:
+    """A generation that more than one `qa_checkout` event claims: history for it binds to nothing."""
+    def __init__(self, count):
+        self.count = count
+
+
+def checkout_history(records, ledger_run_id):
+    """Map each generation to the sha of this run's UNIQUE `qa_checkout` event for it.
+
+    `firm-qa-checkout` appends exactly one `qa_checkout` event per captured generation, carrying the
+    candidate `sha` and the `generation` it persisted. That event is the run's own record of which
+    candidate an earlier generation was, and it is what lets history stay classifiable after the
+    candidate metadata moves on. A generation claimed by more than one event maps to
+    `AmbiguousCheckout`, so the refusal can say so; one named by no event, or by an event whose sha or
+    generation is not canonical, has no entry. Neither binds history.
+    """
+    seen = {}
+    for record in records:
+        if (not isinstance(record, dict) or record.get("event") != "qa_checkout"
+                or record.get("run_id") != ledger_run_id):
+            continue
+        generation = record.get("generation")
+        if not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation):
+            continue
+        seen.setdefault(generation, []).append(record.get("sha"))
+    history = {}
+    for generation, shas in seen.items():
+        if len(shas) != 1:
+            history[generation] = AmbiguousCheckout(len(shas))
+        elif isinstance(shas[0], str) and re.fullmatch(r"[0-9a-f]{40}", shas[0]):
+            history[generation] = shas[0]
+    return history
+
+
+def historical_evidence_target(record, context, history):
+    """True when an EXISTING row belongs to an earlier generation of this same run.
+
+    Generation-scoped history: once `firm-qa-checkout` captures generation N+1 the candidate
+    metadata no longer describes generation N, so a rule that compared every existing row with the
+    live candidate made every generation-N row "stale" and the whole ledger unappendable -- including
+    the `qa_checkout` event that records N+1 itself. An earlier row is still valid when its
+    generation is LOWER than the current one and its sha is the sha of that generation's unique
+    `qa_checkout` event. This is only ever consulted while classifying rows that already exist; a new
+    publication is validated without `history` and must match the current candidate exactly.
+
+    An earlier-generation row that history does NOT bind is refused with the reason (two checkout
+    events for its generation, none, or one naming another sha), because a ledger that cannot be
+    appended to again must at least say why. The refusal itself is unchanged: fail closed.
+    """
+    if history is None or not isinstance(context, dict):
+        return False
+    generation = record.get("generation")
+    current = context.get("generation")
+    if (not isinstance(generation, str) or not re.fullmatch(r"[1-9][0-9]*", generation)
+            or not isinstance(current, str) or not re.fullmatch(r"[1-9][0-9]*", current)):
+        return False
+    if int(generation) >= int(current):
+        return False
+    bound = history.get(generation)
+    if isinstance(bound, AmbiguousCheckout):
+        raise LedgerError(
+            f"ambiguous evidence history: generation {generation} has {bound.count} qa_checkout events"
+        )
+    if bound is None:
+        raise LedgerError(f"stale evidence target: no qa_checkout event binds generation {generation}")
+    if bound != record.get("sha"):
+        raise LedgerError(f"stale evidence target: generation {generation}'s qa_checkout names another sha")
+    return True
+
+
+def validate_evidence_record(record, ledger_run_id, context, history=None):
     mode = context.get("mode") if isinstance(context, dict) else "invalid"
     if mode == "legacy":
         shaped = legacy_evidence_shape(record)
@@ -512,8 +583,9 @@ def validate_evidence_record(record, ledger_run_id, context):
         return
     if mode != "current" or context.get("candidate_sha") is None:
         raise LedgerError("current evidence identity unavailable")
-    if (record["sha"] != context["candidate_sha"]
-            or record["generation"] != context["generation"]):
+    if ((record["sha"] != context["candidate_sha"]
+            or record["generation"] != context["generation"])
+            and not historical_evidence_target(record, context, history)):
         raise LedgerError("stale evidence target")
     stage = record["stage"]
     role = record["role"]
@@ -527,7 +599,8 @@ def validate_evidence_record(record, ledger_run_id, context):
         raise LedgerError("invalid evidence role start")
 
 
-def classify_record(record, ledger_run_id, evidence_context=None):
+def classify_record(record, ledger_run_id, evidence_context=None, history=None):
+    """Classify one EXISTING ledger row. `history` is `checkout_history` of the ledger it came from."""
     if not isinstance(record, dict):
         raise LedgerError("ledger line is not an object")
     families = []
@@ -535,7 +608,7 @@ def classify_record(record, ledger_run_id, evidence_context=None):
         validate_seal_publish_record(record, ledger_run_id)
         families.append("evidence_seal_published")
     elif record.get("event") == "evidence_produced":
-        validate_evidence_record(record, ledger_run_id, evidence_context)
+        validate_evidence_record(record, ledger_run_id, evidence_context, history)
         families.append("evidence_produced")
     elif NATIVE_ONLY_FIELDS & set(record):
         validate_native_record(record, ledger_run_id)
@@ -600,9 +673,10 @@ def classify_ledger_file(argv):
     try:
         bound = bind_run(path.parents[3], path.parent)
         context = evidence_context_for_run(bound)
-        for line in raw.splitlines():
-            record = parse_json_unique(line.decode("utf-8", "strict"))
-            family = classify_record(record, argv[1], context)
+        records = [parse_json_unique(line.decode("utf-8", "strict")) for line in raw.splitlines()]
+        history = checkout_history(records, argv[1])
+        for record in records:
+            family = classify_record(record, argv[1], context, history)
             if family not in ("shell_observation", "merge_observation", "merge_permit_observation"):
                 event_id = record["event_id"]
                 if event_id in seen:
@@ -2317,8 +2391,12 @@ def scan_ledger(fd, ledger_run_id, copy_fd=None, wanted_event_ids=(), evidence_c
     wanted = set(wanted_event_ids)
     matches = {}
     count = 0
-    for record in ledger_records(fd, copy_fd):
-        family = classify_record(record, ledger_run_id, evidence_context)
+    # Two passes over the SAME bytes: the generation history a row is judged against is derived from
+    # the ledger being classified, never from a second read of it.
+    records = list(ledger_records(fd, copy_fd))
+    history = checkout_history(records, ledger_run_id)
+    for record in records:
+        family = classify_record(record, ledger_run_id, evidence_context, history)
         count += 1
         if family not in (
             "ordinary", "native_role_start", "evidence_produced", "evidence_seal_published"
@@ -2739,6 +2817,123 @@ def atomic_commit(
                     pass
 
 
+# THE POST-JUDGE PHASE'S OWN ROWS ARE CHECKED BEFORE THEY LAND. Once the live candidate's generation
+# has a published seal, verification admits only the closed suffix grammar after it. A post-judge
+# row it would refuse -- a digest typo, a window mistake, a privacy match, a primary-QA window opened
+# while a judge attempt is open -- used to land unchecked, and then every later verification of that
+# generation failed for good: the Final check and every further judge attempt refused it. Under the
+# lock, against the exact ledger bytes the row would follow, the seal library checks such a row as
+# pending, and a row the grammar would refuse is not appended.
+#
+# Only the rows that phase governs are gated: its own events, and role starts for the primary-QA
+# window. Every other row -- Lead milestones, the Packager's finalize window, `handoff_finalized`,
+# `run_closed`, a `lead_note` -- lands as it always did. Those come AFTER the run's decision was
+# taken at Final and are not part of the sealed grammar; refusing them refused the lifecycle's
+# Package and Close stages in every sealed run. Reviewer events stay with the reviewer wrapper,
+# which verifies the seal itself. The live candidate's generation decides: a recapture follows the
+# rewrite to generation N+1, which has no seal yet.
+SEALED_SUFFIX_GATED_EVENTS = frozenset((
+    "post_judge_artifact_published", "final_gate_pending", "final_decision_required",
+    "qa_started", "qa_completed",
+))
+
+
+def sealed_suffix_gated(record, role_start):
+    if record.get("event") in SEALED_SUFFIX_GATED_EVENTS:
+        return True
+    return role_start and record.get("role") == "qa-tester"
+
+
+class SealedSuffixRefused(Exception):
+    """A row the live generation's sealed suffix grammar would refuse."""
+
+
+
+# The reviewer wrapper's own events: it verifies the seal before and after writing them.
+REVIEWER_WRAPPER_EVENTS = frozenset((
+    "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
+    "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
+))
+
+
+def sealed_suffix_append_check(run, record, role_start=False):
+    """A pre-commit check for one row. A gated row the grammar refuses raises SealedSuffixRefused.
+    Afterwards `check.warning` names a breakage the suffix already had without this row (the row is
+    judged, not the run, so it is appended anyway), and `check.breaks` says why an UNGATED row makes
+    a suffix that verified unverifiable. Neither refuses: the caller appends and warns."""
+    verified = {}
+
+    def pending(evidence_seal):
+        fd, _ = open_ledger(run)
+        if fd is None:
+            return
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(fd, CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        raw = b"".join(chunks)
+        digest = hashlib.sha256(raw).hexdigest()
+        if verified.get("sha256") == digest:
+            return
+        context = evidence_context_for_run(run)
+        if context.get("mode") != "current" or context.get("candidate_sha") is None:
+            verified["sha256"] = digest
+            return
+        check.warning = evidence_seal.check_pending_suffix(
+            str(run.path), raw, record, TOOL_ROOT / "agent-firm" / "policy" / "evidence-privacy.yaml",
+            context["candidate_sha"], context["generation"],
+        )
+        verified["sha256"] = digest
+
+    def check():
+        gated = sealed_suffix_gated(record, role_start)
+        if not gated and record.get("event") in REVIEWER_WRAPPER_EVENTS:
+            return
+        sys.path.insert(0, str(TOOL_ROOT / "agent-firm" / "lib"))
+        import evidence_seal
+        if gated:
+            try:
+                pending(evidence_seal)
+            except evidence_seal.SealError as exc:
+                raise SealedSuffixRefused(f"{exc.category}: {exc.detail}") from exc
+            except Exception as exc:  # a check that cannot finish is a refusal, not a pass
+                raise SealedSuffixRefused(f"the sealed-suffix check could not run: {type(exc).__name__}") from exc
+            return
+        # An ungated row is never refused (Package and Close must land), but in a sealed generation
+        # whose suffix still verifies, one outside the post-judge grammar ends that: say so.
+        check.breaks = None
+        try:
+            pending(evidence_seal)
+        except evidence_seal.SealError as exc:
+            check.breaks = f"{exc.category}: {exc.detail}"
+        except Exception:
+            pass                    # informational only; the row lands either way
+        check.warning = None        # an already-broken suffix is not this row's consequence
+
+    check.warning = None
+    check.breaks = None
+    return check
+
+
+def warn_already_broken(check):
+    if getattr(check, "warning", None):
+        print(f"firm-ledger-log: warning: appended, but the live generation's sealed suffix was already "
+              f"broken before this row ({check.warning}); seal verification refuses this run until "
+              f"that is repaired", file=sys.stderr)
+    if getattr(check, "breaks", None):
+        print(f"firm-ledger-log: warning: appended, but this row is outside the sealed post-judge grammar "
+              f"({check.breaks}), so the live generation's seal no longer verifies: the Final check and "
+              f"every further judge attempt for this generation will refuse it. That is expected once "
+              f"Final has passed; between the seal and a passing Final, record nothing outside the "
+              f"post-judge grammar", file=sys.stderr)
+
+
 def ordinary_main(argv):
     target = None
     strict = False
@@ -2838,27 +3033,32 @@ def ordinary_main(argv):
         except (ValidationError, LedgerError, CommitError):
             run.close()
             ordinary_fail(strict, "invalid evidence publication")
+    suffix_check = sealed_suffix_append_check(run, record)
     held = []
     try:
         held = acquire_locks(run, [])
         ledger_barrier(run, "after_lock")
         atomic_commit(
             run, record, event_id, lock_check=lambda: prove_locks(held),
-            precommit_check=evidence_check,
+            precommit_check=(lambda: (evidence_check(), suffix_check())) if evidence_check else suffix_check,
         )
         result = event_id if print_event_id else None
         ledger_barrier(run, "after_result_construction")
     except DuplicateEvent:
         ordinary_fail(strict, f"duplicate event id: {event_id}")
-    except LedgerError:
+    except LedgerError as exc:
         # The existing ledger content was refused, not this call's arguments: this run cannot be
-        # appended to again by anyone. Announce it even in best-effort mode.
+        # appended to again by anyone. Announce it even in best-effort mode, with the reason.
         ordinary_fail(
-            strict, "could not append target ledger: existing ledger content is unclassifiable",
+            strict, f"could not append target ledger: existing ledger content is unclassifiable: {exc}",
             announce=True,
         )
     except CommitError:
         ordinary_fail(strict, "could not append target ledger")
+    except SealedSuffixRefused as exc:
+        # Refused because THIS row is wrong for the sealed generation; the ledger is untouched and
+        # stays appendable.
+        ordinary_fail(strict, f"row refused by the sealed suffix, nothing appended: {exc}", announce=True)
     finally:
         for _, fd, _ in reversed(held):
             os.close(fd)
@@ -2866,6 +3066,7 @@ def ordinary_main(argv):
         for value in evidence_identity_values:
             close_stable_relative(value)
         run.close()
+    warn_already_broken(suffix_check)
     if result is not None:
         print(result)
         ledger_barrier(run, "after_success_output")
@@ -3061,12 +3262,24 @@ def role_main(argv):
             except (OSError, ValidationError) as exc:
                 raise ContractDrift() from exc
 
+        role_suffix_check = sealed_suffix_append_check(run, record, role_start=True)
+
+        def role_precommit():
+            prove_authority_descriptors(authority_descriptors)
+            role_suffix_check()
+
         try:
             atomic_commit(
                 run, record, event_id, role_key=(stage, role), failpoint=failpoint,
                 contract_check=contract_check, lock_check=lambda: prove_locks(held),
-                precommit_check=lambda: prove_authority_descriptors(authority_descriptors),
+                precommit_check=role_precommit,
             )
+        except SealedSuffixRefused as exc:
+            # The start would break the live generation's sealed suffix (for example a primary-QA
+            # window opened while a judge attempt is open). It is the REQUEST that is invalid for this
+            # run's state; nothing is appended.
+            print(f"firm-ledger-log: role start refused, nothing appended: {exc}", file=sys.stderr)
+            role_fail(2, "INPUT_INVALID", "sealed-suffix")
         except DuplicateActivation:
             role_fail(13, "DUPLICATE_ACTIVATION", f"{stage}:{role}")
         except DuplicateEvent:
@@ -3094,6 +3307,7 @@ def role_main(argv):
         if justification is not None:
             result["activation_justification"] = justification
         ledger_barrier(run, "after_result_construction")
+        warn_already_broken(role_suffix_check)
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
         ledger_barrier(run, "after_success_output")
     finally:

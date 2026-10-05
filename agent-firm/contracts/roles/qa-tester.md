@@ -63,6 +63,11 @@ provider/SHA/generation/attempt and current selection. Return both verdicts, blo
 and the recorded disposition state.
 
 For protocol-v1 runs, primary QA stops after final primary verdict and strict traceability production.
+If the cross-provider judge then BLOCKs, primary QA answers each producer objection after the judge
+in a fresh primary-QA role window opened after that terminal attempt, by publishing a
+`two_voice_dispositions` set (and any `disposition_evidence`) under `09-test-evidence/post-judge/g<N>/`
+as `agent-firm/contracts/lifecycle.md` describes. Silence is not dissent: an objection left
+unanswered still blocks.
 The Packager freezes the candidate-facing draft handoff, and the Lead—not QA—runs the canonical
 finalizer before the opposite-provider wrapper. QA must not fabricate publication or pre-claim its
 future secondary verdict.

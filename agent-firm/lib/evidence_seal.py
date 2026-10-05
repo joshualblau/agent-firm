@@ -739,7 +739,11 @@ def _producer(records, path, raw, sha, generation, required):
                 or not isinstance(item.get("stage"), str) or not item["stage"]
                 or not isinstance(item.get("role"), str) or not item["role"]):
             raise SealError("PRODUCER_SHAPE", str(item.get("path", "evidence"))[:160])
-    matches = [item for item in publications if item["path"] == path]
+    # Generation-scoped: a later generation republishes the same fixed roots, so the run-wide set of
+    # rows for one path is one row PER GENERATION. Only the generation being sealed or verified is
+    # its producer; within that generation a sha that is not this candidate's is still stale below.
+    matches = [item for item in publications
+               if item["path"] == path and str(item.get("generation")) == str(generation)]
     if not matches:
         if required:
             raise SealError("PRODUCER_MISSING", path)
@@ -751,34 +755,53 @@ def _producer(records, path, raw, sha, generation, required):
             event.get("sha") != sha or str(event.get("generation")) != str(generation)):
         raise SealError("PRODUCER_STALE", path)
     start_id = event.get("role_start_event_id")
-    if not isinstance(start_id, str) or EVENT_ID.fullmatch(start_id) is None:
-        raise SealError("PRODUCER_WINDOW", f"{path}:missing role_start_event_id")
-    if start_id:
-        start_indexes = [i for i, item in enumerate(records)
-                         if item.get("event_id") == start_id and str(item.get("event", "")).endswith("_started")]
-        complete_indexes = [i for i, item in enumerate(records)
-                            if item.get("role_start_event_id") == start_id
-                            and str(item.get("event", "")).endswith("_completed")]
-        event_index = records.index(event)
-        if len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
-            raise SealError("PRODUCER_WINDOW", path)
-        start = records[start_indexes[0]]
-        complete = records[complete_indexes[0]]
-        if not {"contract", "authority", "activation"}.issubset(start):
-            raise SealError("PRODUCER_WINDOW", f"{path}:role start is not native")
-        stage = event.get("stage")
-        role = event.get("role")
-        if (not isinstance(stage, str) or not isinstance(role, str) or
-                start.get("stage") != stage or start.get("role") != role or
-                complete.get("stage") != stage or complete.get("role") != role):
-            raise SealError("PRODUCER_WINDOW", f"{path}:stage/role mismatch")
-        start_ts = _parse_rfc3339_utc(start.get("ts"), f"{path}:role start")
-        produced_ts = _parse_rfc3339_utc(event.get("ts"), f"{path}:producer")
-        complete_ts = _parse_rfc3339_utc(complete.get("ts"), f"{path}:role completion")
-        if not start_ts <= produced_ts <= complete_ts:
-            raise SealError("PRODUCER_WINDOW", f"{path}:back-stamped timestamp")
+    _role_window(records, event, path)
     return {"event_id": event["event_id"], "event": "evidence_produced",
             "role_start_event_id": start_id, "stage": event.get("stage"), "role": event.get("role")}
+
+
+def _role_window(records, event, path, allow_open=False):
+    """Prove `event` was written inside its one native role window; return that window's indexes.
+
+    The window is the unique native `*_started` record `event["role_start_event_id"]` names and the
+    unique `*_completed` record that names it back; the event must lie strictly between them in the
+    ledger, with matching stage and role and non-decreasing timestamps. Shared by sealed-file
+    producers and post-judge publications, so both are held to the same producer identity.
+    """
+    start_id = event.get("role_start_event_id")
+    if not isinstance(start_id, str) or EVENT_ID.fullmatch(start_id) is None:
+        raise SealError("PRODUCER_WINDOW", f"{path}:missing role_start_event_id")
+    start_indexes = [i for i, item in enumerate(records)
+                     if item.get("event_id") == start_id and str(item.get("event", "")).endswith("_started")]
+    complete_indexes = [i for i, item in enumerate(records)
+                        if item.get("role_start_event_id") == start_id
+                        and str(item.get("event", "")).endswith("_completed")]
+    event_index = records.index(event)
+    if allow_open and len(start_indexes) == 1 and not complete_indexes:
+        # An append-time check of a window that has not closed YET: the start must still be unique,
+        # native, earlier, and agree on stage, role and time; its closure is checked when it lands.
+        complete_indexes = [None]
+        if not start_indexes[0] < event_index:
+            raise SealError("PRODUCER_WINDOW", path)
+    elif len(start_indexes) != 1 or len(complete_indexes) != 1 or not (start_indexes[0] < event_index < complete_indexes[0]):
+        raise SealError("PRODUCER_WINDOW", path)
+    start = records[start_indexes[0]]
+    complete = records[complete_indexes[0]] if complete_indexes[0] is not None else {
+        "stage": event.get("stage"), "role": event.get("role"), "ts": event.get("ts")}
+    if not {"contract", "authority", "activation"}.issubset(start):
+        raise SealError("PRODUCER_WINDOW", f"{path}:role start is not native")
+    stage = event.get("stage")
+    role = event.get("role")
+    if (not isinstance(stage, str) or not isinstance(role, str) or
+            start.get("stage") != stage or start.get("role") != role or
+            complete.get("stage") != stage or complete.get("role") != role):
+        raise SealError("PRODUCER_WINDOW", f"{path}:stage/role mismatch")
+    start_ts = _parse_rfc3339_utc(start.get("ts"), f"{path}:role start")
+    produced_ts = _parse_rfc3339_utc(event.get("ts"), f"{path}:producer")
+    complete_ts = _parse_rfc3339_utc(complete.get("ts"), f"{path}:role completion")
+    if not start_ts <= produced_ts <= complete_ts:
+        raise SealError("PRODUCER_WINDOW", f"{path}:back-stamped timestamp")
+    return start_indexes[0], complete_indexes[0]
 
 
 def validate_mutation_matrix(run, sha, generation, records):
@@ -993,9 +1016,11 @@ def _privacy_command_argv(cli_argv, run, cwd):
     return projected
 
 
-def seal_state(run):
+def seal_state(run, ledger_raw=None):
+    """`ledger_raw`, when given, is the exact ledger bytes the caller read and will act on."""
     run = Path(run)
-    ledger_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
+    if ledger_raw is None:
+        ledger_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
     if not ledger_raw or not ledger_raw.endswith(b"\n"):
         raise SealError("LEDGER_PREFIX", "ledger is not newline-complete")
     records = []
@@ -1350,7 +1375,176 @@ def _validate_terminal_attempt(run, item, start):
             raise SealError("LEDGER_SUFFIX", "terminal verdict identity mismatch")
 
 
-def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None):
+# ---------------------------------------------------------------------------------------------
+# The closed post-judge phase of the suffix grammar.  After the seal, the suffix used to admit only
+# reviewer events, but the lifecycle has four more things to record once a judge has answered: the
+# Final check's own `final_decision_required`, the Lead's `final_gate_pending`, and primary QA's
+# post-judge dispositions and the evidence/human records they cite.  Each of those made
+# `--verify --phase publication` fail, so every judge verdict was terminal for the run.  They are
+# admitted here as a CLOSED set, only once at least one reviewer attempt is terminal and none is
+# open, each bound to the seal's own candidate identity.  Post-judge artifacts live under a
+# directory the seal cannot contain, and each is bound to its exact bytes.
+#
+# A recapture is NOT part of this grammar. `firm-qa-checkout` rewrites qa-candidate.json before it
+# appends its `qa_checkout` event, and verification always checks the seal of the LIVE candidate's
+# generation, so a legitimate generation-N+1 capture never appears in a generation-N suffix that is
+# still being verified: from the moment it exists, generation N+1's seal is the one checked, and
+# that `qa_checkout` lies in its prefix. A `qa_checkout` inside a verified suffix is therefore
+# always a refusal. (An earlier revision let one end the suffix; a single forged event then switched
+# off checking of everything after it.)
+# ---------------------------------------------------------------------------------------------
+LEDGER_COMMON_FIELDS = frozenset(("ts", "event", "event_id", "run_id"))
+REVIEWER_SUFFIX_EVENTS = frozenset((
+    "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
+    "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
+))
+POST_JUDGE_EVENTS = frozenset((
+    "final_decision_required", "final_gate_pending", "post_judge_artifact_published",
+    "qa_started", "qa_completed",
+))
+POST_JUDGE_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence", "human_decision"))
+# Primary QA's own post-judge kinds. Each is produced inside a native primary-QA role window opened
+# after the terminal attempt it answers, exactly as a sealed file is produced inside its window, so
+# a disposition carries a producer identity rather than the word of whoever appended it.
+POST_JUDGE_QA_KINDS = frozenset(("two_voice_dispositions", "disposition_evidence"))
+POST_JUDGE_QA_ROLE = "qa-tester"
+POST_JUDGE_PUBLICATION_FIELDS = LEDGER_COMMON_FIELDS | frozenset((
+    "path", "sha256", "bytes", "sha", "generation", "kind", "secondary_attempt_id",
+    "seal_event_id", "seal_projection_sha256",
+))
+POST_JUDGE_WINDOW_FIELDS = frozenset(("stage", "role", "role_start_event_id"))
+# A Lead-published human decision answers one `final_decision_required` event, and through it one
+# terminal attempt; it names that event so a record made for another attempt cannot be reused.
+POST_JUDGE_DECISION_FIELDS = frozenset(("decision_required_event_id",))
+DECISION_REQUIRED_KINDS = frozenset(("secondary_objections", "required_secondary_unavailable"))
+
+
+def post_judge_root(generation):
+    """The one directory a generation's post-judge artifacts may occupy."""
+    return f"09-test-evidence/post-judge/g{generation}/"
+
+
+def _post_judge_bytes(run, item, privacy):
+    """Read the artifact a post-judge event names: exact digest and size, and the seal's privacy scan.
+
+    Post-judge artifacts are never sealed, so nothing else would hold them to the privacy policy the
+    sealed evidence meets; they are scanned with the same deny categories on their own surface.
+    """
+    if privacy is None:
+        raise SealError("PRIVACY_POLICY", "post-judge artifacts are verified only with the privacy policy")
+    if (HEX64.fullmatch(str(item.get("sha256", ""))) is None
+            or re.fullmatch(r"0|[1-9][0-9]*", str(item.get("bytes", ""))) is None):
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} digest/size is malformed")
+    try:
+        raw, _, _ = _safe_read(run, item.get("path"))
+    except SealError as exc:
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact is unreadable:{exc.category}") from exc
+    if sha256(raw) != item["sha256"] or str(len(raw)) != item["bytes"]:
+        raise SealError("LEDGER_SUFFIX", f"{item.get('event')} artifact digest/size mismatch")
+    _scan(raw, item["path"], privacy)
+    return raw
+
+
+def _validate_qa_window_event(item, index, qa_windows):
+    """A native primary-QA role start, or its completion, inside the post-judge phase."""
+    event = item.get("event")
+    if event == "qa_started":
+        if not {"contract", "authority", "activation"}.issubset(item):
+            raise SealError("LEDGER_SUFFIX", "post-judge qa_started is not a native role start")
+        if item.get("role") != POST_JUDGE_QA_ROLE or not isinstance(item.get("stage"), str):
+            raise SealError("LEDGER_SUFFIX", f"post-judge role windows are {POST_JUDGE_QA_ROLE} only")
+        qa_windows[item.get("event_id")] = {"start": index, "stage": item["stage"], "complete": None}
+        return
+    if set(item) != LEDGER_COMMON_FIELDS | POST_JUDGE_WINDOW_FIELDS:
+        raise SealError("LEDGER_SUFFIX", "post-judge qa_completed field set is not closed")
+    window = qa_windows.get(item.get("role_start_event_id"))
+    if (window is None or window["complete"] is not None or item.get("role") != POST_JUDGE_QA_ROLE
+            or item.get("stage") != window["stage"]):
+        raise SealError("LEDGER_SUFFIX", "post-judge qa_completed does not close an open primary-QA window")
+    window["complete"] = index
+
+
+def _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
+                         records=None, qa_windows=None, decisions=None, privacy=None, allow_open=False):
+    event = item.get("event")
+    identity = seal["identity"]
+    if item.get("sha") != identity["candidate_sha"] or item.get("generation") != str(identity["generation"]):
+        raise SealError("LEDGER_SUFFIX", f"{event} candidate/generation mismatch")
+    if event == "final_gate_pending":
+        if set(item) != LEDGER_COMMON_FIELDS | {"sha", "generation"}:
+            raise SealError("LEDGER_SUFFIX", "final_gate_pending field set is not closed")
+        return
+    if event == "final_decision_required":
+        # The shape bin/firm-final-qa-check writes, naming the decision state it wrote for itself.
+        if (set(item) != LEDGER_COMMON_FIELDS | {"path", "sha", "generation", "sha256", "bytes", "kind"}
+                or item.get("kind") not in DECISION_REQUIRED_KINDS):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required field set is not closed")
+        if item.get("path") != f"09-test-evidence/final-decision-required.{item.get('event_id')}.json":
+            raise SealError("LEDGER_SUFFIX", "final_decision_required does not name its own decision state")
+        raw = _post_judge_bytes(run, item, privacy)
+        try:
+            state = parse_json_unique(raw, item["path"])
+        except SealError as exc:
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state is malformed") from exc
+        if (not isinstance(state, dict) or state.get("status") != "decision_required"
+                or state.get("run_id") != run.name or state.get("candidate_sha") != identity["candidate_sha"]
+                or state.get("generation") != identity["generation"]
+                or state.get("event_id") != item.get("event_id") or state.get("kind") != item.get("kind")):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state does not describe its event")
+        if (not isinstance(state.get("secondary_attempt_id"), str)
+                or state["secondary_attempt_id"] not in terminal_attempts):
+            raise SealError("LEDGER_SUFFIX", "final_decision_required state does not name a terminal attempt in this suffix")
+        decisions[item["event_id"]] = {"attempt": state["secondary_attempt_id"], "kind": state["kind"]}
+        return
+    kind = item.get("kind")
+    expected = POST_JUDGE_PUBLICATION_FIELDS | (
+        POST_JUDGE_WINDOW_FIELDS if kind in POST_JUDGE_QA_KINDS
+        else POST_JUDGE_DECISION_FIELDS if kind == "human_decision" else set())
+    if set(item) != expected or kind not in POST_JUDGE_KINDS:
+        raise SealError("LEDGER_SUFFIX", "post_judge_artifact_published field set is not closed")
+    if (item.get("seal_event_id") != publication["event_id"]
+            or item.get("seal_projection_sha256") != seal["self"]["projection_sha256"]):
+        raise SealError("LEDGER_SUFFIX", "post-judge seal identity mismatch")
+    path = item.get("path")
+    try:
+        _safe_relative(path)
+    except (SealError, UnicodeError) as exc:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact path is not canonical") from exc
+    root = post_judge_root(identity["generation"])
+    if not path.startswith(root) or path == root:
+        raise SealError("LEDGER_SUFFIX", f"post-judge artifact is outside {root}")
+    # The directory alone does not exclude a sealed path: a sealed file may itself have declared a
+    # path under post-judge/g<N>/ before the seal. A post-judge publication never names a sealed file.
+    if path in {entry.get("path") for entry in seal["entries"]}:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact names a sealed path")
+    if path in published_paths:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact path is published twice")
+    if item.get("secondary_attempt_id") not in terminal_attempts:
+        raise SealError("LEDGER_SUFFIX", "post-judge artifact does not name a terminal attempt in this suffix")
+    if kind in POST_JUDGE_QA_KINDS:
+        # Inside one native primary-QA window that was opened AFTER the terminal attempt it answers.
+        window = qa_windows.get(item.get("role_start_event_id"))
+        if (item.get("role") != POST_JUDGE_QA_ROLE or window is None or window["complete"] is not None
+                or window["start"] <= terminal_attempts[item["secondary_attempt_id"]]):
+            raise SealError("LEDGER_SUFFIX",
+                            f"{kind} is not published inside a {POST_JUDGE_QA_ROLE} window opened after "
+                            "the attempt it answers")
+        try:
+            _role_window(records, item, path, allow_open)
+        except SealError as exc:
+            raise SealError("LEDGER_SUFFIX", f"{kind} role window:{exc.detail}") from exc
+    if kind == "human_decision":
+        decision = decisions.get(item.get("decision_required_event_id"))
+        if (decision is None or decision["kind"] != "secondary_objections"
+                or decision["attempt"] != item.get("secondary_attempt_id")):
+            raise SealError("LEDGER_SUFFIX",
+                            "human_decision does not answer an earlier final_decision_required for its attempt")
+    _post_judge_bytes(run, item, privacy)
+    published_paths.add(path)
+
+
+def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=None, attempt_id=None,
+                     privacy=None, allow_open_windows=False):
     prefix_count = seal["ledger"]["prefix"]["record_count"]
     suffix = records[prefix_count:]
     if not suffix:
@@ -1359,8 +1553,24 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
         raise SealError("LEDGER_SUFFIX", "publication is missing")
     _validate_publish_record(suffix[0], seal, seal_raw, publication)
     open_attempt = None
-    for item in suffix[1:]:
+    terminal_attempts = {}      # attempt id -> ledger index of its terminal event
+    published_paths = set()
+    qa_windows = {}             # post-judge primary-QA role start id -> its indexes
+    decisions = {}              # final_decision_required event id -> the attempt and kind it states
+    for offset, item in enumerate(suffix[1:], prefix_count + 1):
         event = item.get("event")
+        if event in POST_JUDGE_EVENTS:
+            if open_attempt is not None or not terminal_attempts:
+                raise SealError("LEDGER_SUFFIX",
+                                f"{event} needs a terminal reviewer attempt and no open attempt")
+            if event in ("qa_started", "qa_completed"):
+                _validate_qa_window_event(item, offset, qa_windows)
+            else:
+                _validate_post_judge(run, item, seal, publication, terminal_attempts, published_paths,
+                                     records, qa_windows, decisions, privacy, allow_open_windows)
+            continue
+        if event not in REVIEWER_SUFFIX_EVENTS:
+            raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
         common = {"ts", "event", "event_id", "run_id", "provider", "generation", "sha", "attempt",
                   "attempt_id", "seal_event_id", "seal_projection_sha256"}
         if item.get("seal_event_id") != publication["event_id"] or item.get("seal_projection_sha256") != seal["self"]["projection_sha256"]:
@@ -1405,6 +1615,7 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
             if event in ("reviewer_approve", "reviewer_block") and item.get("phase") != "judge":
                 raise SealError("LEDGER_SUFFIX", "reviewer verdict phase mismatch")
             _validate_terminal_attempt(run, item, open_attempt)
+            terminal_attempts[item["attempt_id"]] = offset
             open_attempt = None
             continue
         raise SealError("LEDGER_SUFFIX", f"unexpected event {event}")
@@ -1422,10 +1633,74 @@ def _validate_suffix(run, records, seal, seal_raw, publication, phase, provider=
     return open_attempt
 
 
-def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None):
+def _publication_identity(run, seal, seal_rel, bundle_rel):
+    """The publication record a seal's suffix must open with: its event id and bundle artifacts."""
+    expected_artifacts = []
+    for relative, kind in ((seal["pr_body"]["path"], "pr_body"),
+                           (bundle_rel + "/candidate.diff", "candidate_diff"),
+                           (bundle_rel + "/normalized-run-metadata.json", "normalized_metadata"),
+                           (seal["privacy"]["report_path"], "privacy"), (seal_rel, "seal")):
+        raw, _, _ = _safe_read(run, relative, 1024 * 1024 if relative.endswith((".json", ".md")) else MAX_FILE)
+        expected_artifacts.append({"path": relative, "kind": kind, "bytes": len(raw), "sha256": sha256(raw)})
+    expected_artifacts.sort(key=lambda item: item["path"])
+    return {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
+
+
+def check_pending_suffix(run_path, ledger_raw, pending, policy_path, candidate_sha, generation):
+    """Refuse ONE row not yet appended if it would break the live generation's suffix grammar.
+
+    The writer calls this, under its lock, for each row the post-judge phase governs (its own events
+    and primary-QA role starts) with the exact ledger bytes the row would follow and the LIVE
+    candidate's sha and generation, so nothing is checked before that generation's seal is published.
+
+    It judges the suffix GRAMMAR, not the sealed files: a row is refused only when the suffix accepts
+    the ledger without it and refuses it with it. A suffix already broken by something else, or a
+    sealed file changed since, is not this row's doing, and verification refuses that run anyway. A
+    QA window that has not closed yet is allowed here; its closure is checked when it lands.
+    Returns None when the row is fine, or a description of the breakage the suffix already had
+    without it (the writer appends the row and warns); raises SealError naming why it is refused.
+    """
+    run = Path(os.path.realpath(os.path.abspath(run_path)))
+    records = []
+    for number, line in enumerate(ledger_raw.splitlines(), 1):
+        records.append(parse_json_unique(line, f"ledger line {number}"))
+    published = [item for item in records if isinstance(item, dict)
+                 and item.get("event") == "evidence_seal_published" and item.get("sha") == candidate_sha
+                 and str(item.get("generation")) == str(generation)]
+    if not published:
+        return None
+    if not isinstance(pending, dict) or pending.get("run_id") != run.name:
+        raise SealError("LEDGER_SUFFIX", "pending record is not a record of this run")
+    bundle_rel = f"09-test-evidence/final-evidence/g{generation}"
+    seal_rel = f"{bundle_rel}/seal.json"
+    seal_raw, _, _ = _safe_read(run, seal_rel, 1024 * 1024)
+    seal = parse_canonical_json(seal_raw, "final evidence seal")
+    if (seal.get("identity", {}).get("candidate_sha") != candidate_sha
+            or str(seal.get("identity", {}).get("generation")) != str(generation)):
+        raise SealError("SEAL_IDENTITY", "the live generation's seal names another candidate")
+    publication = _publication_identity(run, seal, seal_rel, bundle_rel)
+    privacy = _privacy_patterns(parse_json_unique(Path(policy_path).read_bytes(), "privacy policy"))
+    try:
+        _validate_suffix(run, records, seal, seal_raw, publication, "wrapper-preflight",
+                         privacy=privacy, allow_open_windows=True)
+    except SealError as exc:
+        return f"{exc.category}: {exc.detail}"   # broken by something else; this row cannot make it worse
+    _validate_suffix(run, records + [pending], seal, seal_raw, publication, "wrapper-preflight",
+                     privacy=privacy, allow_open_windows=True)
+    return None
+
+
+def verify_seal(run_path, policy_path, phase="publication", provider=None, attempt_id=None,
+                ledger_raw=None):
+    """Verify the live generation's seal and its suffix.
+
+    `ledger_raw` makes the verification cover EXACTLY the ledger bytes a caller read and will act
+    on, so a row appended after the caller's read can never be trusted unverified: the classifier
+    must agree that the file still holds those bytes, and the suffix is checked over them alone.
+    """
     run, repo, metadata, candidate = _identity(run_path)
     identity_bindings = _operator_home_identity_bindings(metadata, candidate)
-    state = seal_state(run)
+    state = seal_state(run, ledger_raw)
     if not state["required"]:
         return {"schema_version": 1, "state": "legacy_unsealed", "manifest_version": 3,
                 "run_id": run.name}
@@ -1495,22 +1770,20 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
             raw, _, _ = _safe_read(run, entry["path"])
             _scan(raw, entry["path"], patterns, identity_bindings)
     prefix_bytes = seal["ledger"]["prefix"]["bytes"]
-    current_raw, _, _ = _safe_read(run, "run.jsonl", MAX_LEDGER)
-    if current_raw[:prefix_bytes] != state["ledger_raw"][:prefix_bytes] or sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:
+    # ONE read: the bytes seal_state classified are the bytes the prefix and suffix are checked over.
+    current_raw = state["ledger_raw"]
+    if sha256(current_raw[:prefix_bytes]) != seal["ledger"]["prefix"]["sha256"]:
         raise SealError("LEDGER_PREFIX", "sealed prefix changed")
-    records = _ledger(current_raw, run.name, run / "run.jsonl")
+    records = list(state["records"])
     bundle_rel = f"09-test-evidence/final-evidence/g{generation}"
-    expected_artifacts = []
-    for relative, kind in ((seal["pr_body"]["path"], "pr_body"),
-                           (bundle_rel + "/candidate.diff", "candidate_diff"),
-                           (bundle_rel + "/normalized-run-metadata.json", "normalized_metadata"),
-                           (seal["privacy"]["report_path"], "privacy"), (seal_rel, "seal")):
-        raw, _, _ = _safe_read(run, relative, 1024 * 1024 if relative.endswith((".json", ".md")) else MAX_FILE)
-        expected_artifacts.append({"path": relative, "kind": kind, "bytes": len(raw), "sha256": sha256(raw)})
-    expected_artifacts.sort(key=lambda item: item["path"])
-    publication = {"event_id": seal["ledger"]["publication"]["event_id"], "artifacts": expected_artifacts}
-    open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id)
+    publication = _publication_identity(run, seal, seal_rel, bundle_rel)
+    open_attempt = _validate_suffix(run, records, seal, seal_raw, publication, phase, provider, attempt_id,
+                                    patterns)
     receipt = {
+        # Exactly the ledger bytes this verification covered, so a caller can bind what it later
+        # acts on to them (post_judge_inputs does).
+        "verified_ledger": {"bytes": len(current_raw), "sha256": sha256(current_raw),
+                            "record_count": len(state["records"])},
         "schema_version": 1, "state": "sealed", "manifest_version": 4,
         "run_id": run.name, "candidate_sha": candidate["candidate_sha"], "generation": generation,
         "seal_path": seal_rel, "seal_sha256": sha256(seal_raw), "seal_bytes": len(seal_raw),
@@ -1524,6 +1797,324 @@ def verify_seal(run_path, policy_path, phase="publication", provider=None, attem
             key: open_attempt[key] for key in ("event_id", "provider", "generation", "sha", "attempt", "attempt_id")
         }
     return receipt
+
+
+def _verified_ledger_records(ledger_raw, receipt, category):
+    """Parse `ledger_raw`; for a sealed receipt, require it to begin with exactly the verified bytes."""
+    sealed = isinstance(receipt, dict) and receipt.get("state") == "sealed"
+    if sealed:
+        verified = receipt.get("verified_ledger") or {}
+        span = verified.get("bytes")
+        if (not isinstance(span, int) or isinstance(span, bool) or span > len(ledger_raw)
+                or sha256(ledger_raw[:span]) != verified.get("sha256")):
+            raise SealError(category, "ledger is not the one the seal verification covered")
+    records = []
+    for number, line in enumerate(ledger_raw.splitlines(), 1):
+        records.append(parse_json_unique(line, f"ledger line {number}"))
+    return sealed, records
+
+
+REVIEWER_TERMINAL_EVENTS = ("reviewer_approve", "reviewer_block", "reviewer_invalid",
+                            "reviewer_timeout", "reviewer_unavailable")
+ATTEMPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def proven_identity_roots(run_path):
+    """The run's proven repository and checkout roots: the identity `_identity` proves and the seal's
+    `declared_operator_home_identity` rule binds, as the absolute paths metadata declares."""
+    _, _, metadata, candidate = _identity(run_path)
+    bindings = _operator_home_identity_bindings(metadata, candidate)
+    return tuple(sorted({bindings[("run-metadata.json", "repository_root")],
+                         bindings[("09-test-evidence/qa-candidate.json", "repository_root")],
+                         bindings[("09-test-evidence/qa-candidate.json", "checkout_path")]}))
+
+
+IDENTITY_PATH_TOKEN = "<proven-identity>"
+
+
+def _identity_bound_attempt_record(raw, origin, privacy, identity_roots):
+    """True when the ONLY privacy matches in a prior attempt record are paths under the run's own
+    proven identity, in the judge command line the wrapper recorded.
+
+    Attempt records written before the wrapper projected its paths carry the judge's absolute
+    argv: the controlled root and the run's own files under the repository. Under an operator home
+    every such record failed the scan. It is not silently trusted: like the seal's
+    `declared_operator_home_identity` rule, an operator-home value counts only where it is bound to
+    proven identity -- here an exact `launch.argv` string that is a proven repository or checkout
+    root, or a normalized path under one -- in a record that is exactly the wrapper's serialization.
+    Those values are masked and the WHOLE record is scanned again with the full policy; any other
+    match anywhere, or any other shape, leaves it unresolved.
+    """
+    roots = sorted((root for root in identity_roots
+                    if isinstance(root, str) and _canonical_operator_home(root)), key=len, reverse=True)
+    if not roots:
+        return False
+    try:
+        document = parse_json_unique(raw, origin)
+    except SealError:
+        return False
+    if (not isinstance(document, dict)
+            or raw != (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")):
+        return False
+    launch = document.get("launch")
+    argv = launch.get("argv") if isinstance(launch, dict) else None
+    if not isinstance(argv, list):
+        return False
+    projected = []
+    for item in argv:
+        if isinstance(item, str) and os.path.normpath(item) == item:
+            for root in roots:
+                if item == root or item.startswith(root + "/"):
+                    item = IDENTITY_PATH_TOKEN + item[len(root):]
+                    break
+        projected.append(item)
+    masked = dict(document, launch=dict(launch, argv=projected))
+    try:
+        _scan((json.dumps(masked, indent=2, sort_keys=True) + "\n").encode("utf-8"), origin, privacy)
+    except SealError:
+        return False
+    return True
+
+
+def prior_attempt_inputs(run, ledger_raw, receipt, privacy, current_attempt=None, identity_roots=()):
+    """Decide which prior judge attempt records, and the files they name, may cross into a judge.
+
+    A terminal reviewer row names an attempt record by digest, and that record names its verdict,
+    diagnostic, behavior sentinel and prior verdict. In a SEALED run only rows the seal verification
+    grammar-checked may cross: this generation's suffix, within the verified ledger bytes, for this
+    candidate and generation, bound to this seal. Earlier generations' attempts, pre-seal rows, and
+    rows appended since are declared, never read. In every run the attempt must be its canonical
+    record `09-test-evidence/reviewer-attempts/<attempt_id>/attempt.json`, is read no-follow and must
+    describe its own event before it is copied, and a nested file must lie in that attempt's own
+    directory and is read no-follow; the verdict is bound to the event's verdict digest where the
+    event states one. In a sealed run every copied file also passes the seal's privacy `_scan`.
+    A nested `prior_verdict` belonging to another attempt is carried by that attempt's own record or
+    declared. An attempt record recorded before the wrapper projected its paths may still pass the
+    scan with `identity_roots` (see _identity_bound_attempt_record). Returns (inputs, excluded,
+    unresolved) like post_judge_inputs; a bound attempt or verdict whose digest does not match its
+    event raises SealError: tampering after the fact.
+    """
+    run = Path(run)
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "PRIOR_ATTEMPT_INPUT")
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1
+        last = receipt["verified_ledger"]["record_count"]
+        generation = str(receipt["generation"])
+    inputs, excluded, unresolved, taken, declared = [], [], [], set(), set()
+
+    def exclude(origin, referenced_by, reason, superseded_by=None):
+        if (origin, referenced_by) not in declared:
+            declared.add((origin, referenced_by))
+            excluded.append({"origin_path": origin[:512], "referenced_by": referenced_by,
+                             "reason": reason, "superseded_by": superseded_by})
+
+    def unreadable(origin, referenced_by, item, reason, digest=None, size=None):
+        if (origin, referenced_by) not in declared:
+            declared.add((origin, referenced_by))
+            unresolved.append({"origin_path": origin[:512], "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": digest,
+                               "declared_bytes": size, "reason": reason})
+
+    for index, item in enumerate(records):
+        event = item.get("event") if isinstance(item, dict) else None
+        if event not in REVIEWER_TERMINAL_EVENTS:
+            continue
+        origin = item.get("attempt")
+        attempt_id = item.get("attempt_id")
+        if not isinstance(origin, str) or not origin or origin == current_attempt:
+            continue
+        if sealed and index < first:
+            reason = ("attempt_belongs_to_an_earlier_generation"
+                      if item.get("generation") not in (None, generation)
+                      else "row_precedes_this_generations_seal_and_is_never_grammar_checked")
+        elif sealed and (item.get("sha") != receipt["candidate_sha"] or str(item.get("generation")) != generation):
+            reason = "attempt_belongs_to_another_candidate_or_generation"
+        elif sealed and index >= last:
+            reason = "row_was_appended_after_the_seal_verification_this_input_is_bound_to"
+        elif sealed and (item.get("seal_event_id") != receipt["publication_event_id"]
+                         or item.get("seal_projection_sha256") != receipt["projection_sha256"]):
+            reason = "row_is_not_bound_to_this_generations_seal"
+        elif not (isinstance(attempt_id, str) and ATTEMPT_ID.fullmatch(attempt_id)
+                  and origin == f"09-test-evidence/reviewer-attempts/{attempt_id}/attempt.json"):
+            reason = "attempt_path_is_not_its_canonical_attempt_record"
+        else:
+            reason = None
+        if reason is not None:
+            exclude(origin, event, reason)
+            continue
+        if origin in taken:
+            continue
+        taken.add(origin)
+        try:
+            raw, mode, _ = _safe_read(run, origin)
+        except SealError as exc:
+            unreadable(origin, event, item, f"unreadable:{exc.category}", item.get("sha256"), item.get("bytes"))
+            continue
+        if sha256(raw) != item.get("sha256") or str(len(raw)) != str(item.get("bytes")):
+            raise SealError("PRIOR_ATTEMPT_INPUT",
+                            f"prior reviewer attempt digest/size does not match the ledger event that references it: {origin}")
+        if sealed:
+            try:
+                _scan(raw, origin, privacy)
+            except SealError as exc:
+                if not _identity_bound_attempt_record(raw, origin, privacy, identity_roots):
+                    unreadable(origin, event, item, f"privacy:{exc.detail}", item.get("sha256"), item.get("bytes"))
+                    continue
+        try:
+            document = parse_json_unique(raw, origin)
+        except SealError:
+            document = None
+        if (not isinstance(document, dict) or document.get("attempt_id") != attempt_id
+                or document.get("provider") != item.get("provider")):
+            unreadable(origin, event, item, "attempt_record_does_not_describe_its_event",
+                       item.get("sha256"), item.get("bytes"))
+            continue
+        inputs.append((origin, raw, mode))
+        canonical = document.get("canonical")
+        if isinstance(canonical, str) and canonical:
+            exclude(canonical, f"{origin}:canonical",
+                    "mutable_pointer_superseded_by_immutable_attempt_local_verdict", document.get("verdict"))
+        own = f"09-test-evidence/reviewer-attempts/{attempt_id}/"
+        for field, digest, size in (("verdict", item.get("verdict_sha256"), item.get("verdict_bytes")),
+                                    ("prior_verdict", None, None), ("diagnostic", None, None),
+                                    ("behavior_sentinel", None, None)):
+            nested = document.get(field)
+            if not isinstance(nested, str) or not nested or nested in taken:
+                continue
+            referenced_by = f"{origin}:{field}"
+            if not nested.startswith(own) or nested == own:
+                exclude(nested, referenced_by, "nested_path_outside_its_own_attempt_directory")
+                continue
+            try:
+                nested_raw, nested_mode, _ = _safe_read(run, nested)
+            except SealError as exc:
+                unreadable(nested, referenced_by, item, f"unreadable:{exc.category}", digest, size)
+                continue
+            if digest is not None and (sha256(nested_raw) != digest or str(len(nested_raw)) != str(size)):
+                raise SealError("PRIOR_ATTEMPT_INPUT",
+                                f"prior reviewer verdict digest/size does not match the ledger event that references it: {nested}")
+            if sealed:
+                try:
+                    _scan(nested_raw, nested, privacy)
+                except SealError as exc:
+                    unreadable(nested, referenced_by, item, f"privacy:{exc.detail}", digest, size)
+                    continue
+            taken.add(nested)
+            inputs.append((nested, nested_raw, nested_mode))
+    return inputs, excluded, unresolved
+
+
+def current_judge_attempt(ledger_raw, receipt, provider, candidate_sha, generation):
+    """Which judge attempt for `provider` is CURRENT, read from the ledger rather than pointer files.
+
+    The pointer files -- 08-qa-verdict.<provider>.json and reviewer-state.<provider>.json -- are
+    mutable: copying an earlier APPROVE's pair back over a later BLOCK used to make the APPROVE
+    current again while the seal still verified. The ledger records the order of attempts and is what
+    the verification covers, so it decides. Returns (terminal, later_start):
+
+      terminal     the LAST terminal reviewer row (approve/block/invalid/timeout/unavailable) for
+                   `provider` -- in a sealed run inside this generation's verified suffix and bound to
+                   this seal, otherwise anywhere in the ledger for this candidate and generation;
+      later_start  the start row of an attempt begun after that terminal row (open, or abandoned by
+                   a dead wrapper), or None. Every attempt start removes the canonical verdict, so
+                   while one is set no verdict is current.
+
+    Both are None when the provider has no attempt in scope. Rows past the verified bytes are ignored.
+    """
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "CURRENT_ATTEMPT")
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1
+        last = receipt["verified_ledger"]["record_count"]
+        candidate_sha, generation = receipt["candidate_sha"], receipt["generation"]
+    else:
+        first, last = 0, len(records)
+    terminal = later_start = None
+    for item in records[first:last]:
+        if not (isinstance(item, dict) and item.get("provider") == provider
+                and item.get("sha") == candidate_sha and str(item.get("generation")) == str(generation)
+                and (not sealed or (item.get("seal_event_id") == receipt["publication_event_id"]
+                                    and item.get("seal_projection_sha256") == receipt["projection_sha256"]))):
+            continue
+        if item.get("event") in REVIEWER_TERMINAL_EVENTS:
+            terminal, later_start = item, None
+        elif item.get("event") == "reviewer_attempt_started":
+            later_start = item
+    return terminal, later_start
+
+
+def post_judge_inputs(run, ledger_raw, receipt, privacy):
+    """Decide, for every post-judge row in the ledger, whether its artifact may cross into a judge.
+
+    A `post_judge_artifact_published` or `final_decision_required` row names a digest-bound run file
+    that no sealed file references. Only rows the seal verification itself grammar-checked may cross:
+    inside THIS generation's suffix (after its publication, within the exact ledger bytes the
+    verification covered, as `receipt["verified_ledger"]` states), for this candidate and generation,
+    bound to this seal (a publication) or naming its own decision state, under this generation's
+    post-judge root. Each is read no-follow with `_safe_read` and must pass the seal's own privacy
+    `_scan`. Pre-seal rows, earlier generations, rows appended after the verification, and anything
+    else are DECLARED with a reason and their content is never read.
+
+    Returns (inputs, excluded, unresolved): inputs are (origin, raw, mode) to copy; excluded and
+    unresolved are manifest-shaped declarations. Raises SealError when a bound artifact no longer has
+    the digest and size its event states: that is tampering after verification.
+    """
+    run = Path(run)
+    sealed, records = _verified_ledger_records(ledger_raw, receipt, "POST_JUDGE_INPUT")
+    if sealed:
+        first = receipt["ledger_prefix"]["record_count"] + 1      # the first row after the publication
+        last = receipt["verified_ledger"]["record_count"]         # one past the last verified row
+        generation = receipt["generation"]
+        root = post_judge_root(generation)
+    inputs, excluded, unresolved = [], [], []
+    for index, item in enumerate(records):
+        event = item.get("event") if isinstance(item, dict) else None
+        if event not in ("post_judge_artifact_published", "final_decision_required"):
+            continue
+        origin = item.get("path")
+        shown = origin[:512] if isinstance(origin, str) and origin else "<missing path>"
+        referenced_by = f"{event}:{item.get('event_id')}"
+        if not sealed:
+            reason = "run_is_not_sealed_so_no_post_judge_row_is_grammar_checked"
+        elif index < first:
+            reason = "row_precedes_this_generations_seal_and_is_never_grammar_checked"
+        elif index >= last:
+            reason = "row_was_appended_after_the_seal_verification_this_input_is_bound_to"
+        elif item.get("sha") != receipt["candidate_sha"] or item.get("generation") != str(generation):
+            reason = "row_belongs_to_another_candidate_or_generation"
+        elif event == "post_judge_artifact_published" and (
+                item.get("seal_event_id") != receipt["publication_event_id"]
+                or item.get("seal_projection_sha256") != receipt["projection_sha256"]):
+            reason = "row_is_not_bound_to_this_generations_seal"
+        elif event == "post_judge_artifact_published" and not (
+                isinstance(origin, str) and origin.startswith(root) and origin != root):
+            reason = "artifact_is_outside_this_generations_post_judge_root"
+        elif event == "final_decision_required" and origin != (
+                f"09-test-evidence/final-decision-required.{item.get('event_id')}.json"):
+            reason = "decision_state_is_not_its_own_event_path"
+        else:
+            reason = None
+        if reason is not None:
+            excluded.append({"origin_path": shown, "referenced_by": referenced_by,
+                             "reason": reason, "superseded_by": None})
+            continue
+        try:
+            raw, mode, _ = _safe_read(run, origin)
+        except SealError as exc:
+            unresolved.append({"origin_path": shown, "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
+                               "declared_bytes": item.get("bytes"), "reason": f"unreadable:{exc.category}"})
+            continue
+        if sha256(raw) != item.get("sha256") or str(len(raw)) != str(item.get("bytes")):
+            raise SealError("POST_JUDGE_INPUT", f"artifact digest/size does not match its event: {origin}")
+        try:
+            _scan(raw, origin, privacy)
+        except SealError as exc:
+            unresolved.append({"origin_path": shown, "referenced_by": referenced_by,
+                               "event_id": item.get("event_id"), "declared_sha256": item.get("sha256"),
+                               "declared_bytes": item.get("bytes"), "reason": f"privacy:{exc.detail}"})
+            continue
+        inputs.append((origin, raw, mode))
+    return inputs, excluded, unresolved
 
 
 def manifest_v4_fields(receipt, seen_origins, provider):

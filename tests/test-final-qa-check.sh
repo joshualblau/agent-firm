@@ -266,6 +266,11 @@ objections: [required secondary unavailable]
 EOF
 add_record_ref 09-test-evidence/waiver.yaml waiver_recorded waiver
 assert_rc "exact digest-bound waiver passes" 0 "$FINAL" "$run"
+# The unavailable attempt must be the ledger's current one: a later terminal attempt supersedes it.
+wrapper_attempt claude BLOCK 'secondary defect' claude-c1-a0402 no
+assert_output "an unavailable state a later attempt superseded does not pass" \
+  "the verified ledger's current claude attempt is claude-c1-a0402 (reviewer_block); the pointer files do not match the ledger" \
+  "$FINAL" "$run"
 
 reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0501 yes auth/token.txt
 set_disposition human_decision high '' ''
@@ -283,6 +288,77 @@ objections: [secondary defect]
 EOF
 add_record_ref 09-test-evidence/human.yaml human_decision_recorded record
 assert_rc "exact digest-bound human record permits fresh mechanical pass" 0 "$FINAL" "$run"
+
+# Post-judge dispositions count only when bound to THIS generation's seal publication. This corpus is
+# a markerless, unsealed run, so a post_judge_artifact_published event here must be ignored and the
+# dispositions must still come from traceability.yaml (tests/test-evidence-seal.sh drives the sealed
+# path end to end). The control moves the very same entries back into traceability.yaml.
+t_case "an unsealed run ignores post-judge dispositions and keeps traceability.yaml authoritative"
+if [ "${FIRM_LEDGER_TEST_GUARD:-}" = 1 ] && [ -n "${FIRM_LEDGER_P2_TEST_REJECT:-}" ]; then
+  t_skip "unsealed post-judge dispositions are ignored" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  reset_case claude; wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0701 yes
+  set_disposition proceed_with_primary low '' ''
+  assert_rc "control: the disposition in traceability.yaml passes" 0 "$FINAL" "$run"
+  t_python - "$run" <<'PY'
+import hashlib,json,os,sys,yaml
+run=sys.argv[1]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p))
+c=json.load(open(run+"/09-test-evidence/qa-candidate.json")); sha=c["candidate_sha"]; gen=c["generation"]
+local=open(run+"/09-test-evidence/reviewer-attempts/gpt-c1-a0701/verdict.json","rb").read()
+doc={"schema_version":1,"run_id":os.path.basename(run),"candidate_sha":sha,"generation":gen,
+     "secondary_attempt_id":"gpt-c1-a0701","secondary_verdict_sha256":hashlib.sha256(local).hexdigest(),
+     "secondary_verdict_bytes":len(local),"two_voice_diff":d["two_voice_diff"]}
+rel=f"09-test-evidence/post-judge/g{gen}/two-voice-dispositions.1.json"
+os.makedirs(os.path.dirname(run+"/"+rel),exist_ok=True)
+raw=(json.dumps(doc,indent=2,sort_keys=True)+"\n").encode(); open(run+"/"+rel,"wb").write(raw)
+# Everything about the publication is well formed EXCEPT its seal binding: a native-shaped qa-tester
+# window opened after the attempt, the publication inside it, and its completion. So only the seal
+# binding separates "ignored" from "used".
+rid=os.path.basename(run)
+start={"ts":"2026-10-01T00:00:00Z","event":"qa_started","event_id":"evt-unsealed-window","run_id":rid,
+       "stage":"test/pj-unsealed","role":"qa-tester","agent":"/root/post_judge_qa","contract":{},"authority":[],"activation":{}}
+event={"ts":"2026-10-01T00:00:01Z","event":"post_judge_artifact_published","event_id":"evt-unsealed-dispositions",
+       "run_id":rid,"path":rel,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),
+       "sha":sha,"generation":str(gen),"kind":"two_voice_dispositions","secondary_attempt_id":"gpt-c1-a0701",
+       "stage":"test/pj-unsealed","role":"qa-tester","role_start_event_id":"evt-unsealed-window",
+       "seal_event_id":"evt-no-such-seal","seal_projection_sha256":"0"*64}
+done={"ts":"2026-10-01T00:00:02Z","event":"qa_completed","event_id":"evt-unsealed-window-done","run_id":rid,
+      "stage":"test/pj-unsealed","role":"qa-tester","role_start_event_id":"evt-unsealed-window"}
+with open(run+"/run.jsonl","a") as fh:
+    for row in (start,event,done): fh.write(json.dumps(row,separators=(",",":"))+"\n")
+d["two_voice_diff"]=[]; yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+  assert_rc "the same dispositions published post-judge in an unsealed run are not authority" 1 "$FINAL" "$run"
+fi
+
+# A decision state is not sealed and is written from the judge's own objection text, so the Final
+# check scans it with the seal's privacy policy BEFORE writing it: a match writes nothing, records no
+# event, and cannot evaluate. (In a sealed run the seal would otherwise refuse every later
+# verification.) The leak is assembled at run time so this file's own source carries none.
+t_case "a decision state that would carry a privacy-policy match is never written"
+reset_case claude
+leak_text="$(printf 'secondary defect leaks %s%s=%s' pass word Leaked-value-1234)"
+wrapper_attempt gpt BLOCK "$leak_text" gpt-c1-a0801 yes
+t_python - "$run" "$producer_start" "$leak_text" <<'PY'
+import hashlib,json,os,secrets,sys,yaml
+run,producer_start,text=sys.argv[1:]; p=run+"/traceability.yaml"; d=yaml.safe_load(open(p))
+sha=d["candidate"]["commit_sha"]; gen=d["candidate"]["generation"]
+raw=open(run+"/09-test-evidence/proof.log","rb").read(); eid="evt-leak-"+secrets.token_hex(8)
+event={"ts":"2026-08-10T00:00:00Z","event":"evidence_produced","event_id":eid,"run_id":os.path.basename(run),"sha":sha,"generation":str(gen),"path":"09-test-evidence/proof.log","sha256":hashlib.sha256(raw).hexdigest(),"bytes":str(len(raw)),"stage":"test/Q-01","role":"qa-tester","role_start_event_id":producer_start}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(event,separators=(",",":"))+"\n")
+ref={"path":"09-test-evidence/proof.log","candidate_sha":sha,"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),"producer":{"event_id":eid,"event":"evidence_produced"}}
+d["two_voice_diff"]=[{"secondary_blocker_id":"obj-secondary-defect","secondary_blocker":text,"primary_position":"positive evidence-based contrary reading","positive_dissent":True,
+ "affected_criteria":["AC-001"],"affected_paths":["result.txt"],"risk":"low","risk_reasons":["criterion:AC-001:functional","path:result.txt:benign"],
+ "bounded_resolution":{"attempted":True,"rounds":1,"rerun":"block","evidence":ref},"evidence":ref,"disposition":"human_decision"}]
+yaml.safe_dump(d,open(p,"w"),sort_keys=False)
+PY
+leak_before="$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+leak_events_before="$(grep -c '"event":"final_decision_required"' "$run/run.jsonl")"
+assert_rc "a decision state with a privacy-policy match cannot be evaluated" 2 "$FINAL" "$run"
+assert_output "…and says why" "would carry a privacy-policy match" "$FINAL" "$run"
+assert_eq "…and wrote no decision state" "$leak_before" \
+  "$(find "$run/09-test-evidence" -name 'final-decision-required.*.json' -type f | wc -l | tr -d ' ')"
+assert_eq "…and recorded no decision event" "$leak_events_before" "$(grep -c '"event":"final_decision_required"' "$run/run.jsonl")"
 
 t_case "one decision_required artifact aggregates mixed benign and protected objections"
 reset_case claude
@@ -314,5 +390,33 @@ objections: [secondary defect, protected defect]
 EOF
 add_record_ref 09-test-evidence/human-mixed.yaml human_decision_recorded record
 assert_rc "one shared exact record permits one fresh mechanical rerun" 0 "$FINAL" "$run"
+
+# THE CURRENT SECONDARY ATTEMPT IS THE LEDGER'S. Final used to read "current" from the mutable pointer
+# files, so restoring an earlier APPROVE's 08-qa-verdict.<p>.json and reviewer-state.<p>.json over a
+# later BLOCK passed. It is the last terminal row for this candidate and generation (in a sealed run,
+# its generation's verified suffix: tests/test-evidence-seal.sh), and no attempt may follow it.
+t_case "the current secondary attempt is the ledger's last terminal one, not the pointer files'"
+reset_case claude; wrapper_attempt gpt APPROVE '' gpt-c1-a0801 yes
+assert_rc "control: the current APPROVE passes" 0 "$FINAL" "$run"
+pointers="$(mktemp -d "${TMPDIR:-/tmp}/firm-final-pointers.XXXXXX")"; t_track "$pointers"
+cp -p "$run/08-qa-verdict.gpt.json" "$run/09-test-evidence/reviewer-state.gpt.json" "$run/run.jsonl" "$pointers/"
+t_python - "$run" <<'PY'
+import json,os,sys
+run=sys.argv[1]; c=json.load(open(run+"/09-test-evidence/qa-candidate.json"))
+row={"ts":"2026-08-10T00:00:02Z","event":"reviewer_attempt_started","event_id":"evt-start-gpt-c1-a0802","run_id":os.path.basename(run),
+     "provider":"gpt","generation":str(c["generation"]),"sha":c["candidate_sha"],
+     "attempt":"09-test-evidence/reviewer-attempts/gpt-c1-a0802/attempt.json","attempt_id":"gpt-c1-a0802"}
+with open(run+"/run.jsonl","a") as fh: fh.write(json.dumps(row,separators=(",",":"))+"\n")
+PY
+assert_output "an attempt started after the last terminal one leaves no verdict current" \
+  "gpt attempt gpt-c1-a0802 started after the last terminal one and has no verdict" "$FINAL" "$run"
+cp -p "$pointers/run.jsonl" "$run/run.jsonl"
+wrapper_attempt gpt BLOCK 'secondary defect' gpt-c1-a0802 yes
+cp -p "$pointers/08-qa-verdict.gpt.json" "$run/08-qa-verdict.gpt.json"
+cp -p "$pointers/reviewer-state.gpt.json" "$run/09-test-evidence/reviewer-state.gpt.json"
+assert_rc "an earlier APPROVE's restored pointer files do not pass" 1 "$FINAL" "$run"
+assert_output "…and the check names the ledger's current attempt" \
+  "the verified ledger's current gpt attempt is gpt-c1-a0802 (reviewer_block); the pointer files do not match the ledger" \
+  "$FINAL" "$run"
 
 t_summary

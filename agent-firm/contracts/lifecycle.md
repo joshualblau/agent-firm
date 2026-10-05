@@ -147,7 +147,9 @@ work-orders to wide heavyweight fan-out.
 
 Ask only at gates in `firm-policy gate-matrix`, and ask once using:
 `decision_needed · context · options · recommendation · default_if_no_answer · risk_if_wrong · blocking_status`.
-Immediately before the one Final interaction, run `firm-ledger-log final_gate_pending`. Present the
+Immediately before the one Final interaction, run
+`firm-ledger-log --run <run_dir> --strict final_gate_pending sha=<candidate_sha> generation=<N>` for the
+current candidate generation; a sealed run admits that event with exactly those fields. Present the
 draft handoff together with every exact objection from the current `decision_required` artifact and
 only its `permitted_record_types`; do not summarize objections into a broader authorization.
 
@@ -167,6 +169,36 @@ one complete local PR body between the canonical markers. The Lead runs
 the exact final primary bytes, privacy result, producer identities, ledger prefix, acyclic self
 projection, and closed reviewer suffix grammar. Present, declared, or required partial seal state
 blocks; only genuinely markerless historical runs retain manifest v3 compatibility.
+
+After the publication the suffix admits reviewer events and, only once at least one reviewer attempt
+is terminal and none is open, a closed post-judge phase interleavable with further attempts: the Final
+check's own `final_decision_required`, the Lead's `final_gate_pending`, native primary-QA
+(`qa-tester`) role windows (`qa_started` and its `qa_completed`), and
+`post_judge_artifact_published` (`path`, `sha256`, `bytes`, `sha`, `generation`, `kind` of
+`two_voice_dispositions`, `disposition_evidence`, or `human_decision`, `secondary_attempt_id`,
+`seal_event_id`, `seal_projection_sha256`). Every one is bound to the seal's candidate and
+generation; a post-judge artifact lies under `09-test-evidence/post-judge/g<N>/`, is published once
+with its exact digest and size, names the seal's publication event and projection, and names an
+attempt already terminal in that suffix. Post-judge artifacts and decision states are not sealed, so
+verification scans them with the seal's own privacy policy, and the Final check scans every one it
+consumes and refuses to write a decision state that would carry a privacy-policy match. Primary QA's own kinds, `two_voice_dispositions` and
+`disposition_evidence`, also carry `stage`, `role=qa-tester` and `role_start_event_id`, and must be
+published inside one native `qa-tester` window that was opened after the attempt they answer and is
+closed by its `qa_completed`; a `human_decision` is published by the Lead, carries no window, and
+names in `decision_required_event_id` the earlier `final_decision_required` it answers, whose decision
+state names the same attempt. Any
+other event after the seal still fails verification, and so does a post-judge event before the first
+terminal attempt or while an attempt is open.
+
+A recapture starts the next generation. `firm-qa-checkout` rewrites `qa-candidate.json` before it
+appends its `qa_checkout` event, and verification always checks the seal of the live candidate's
+generation, so from that moment generation N+1's seal is the one verified and the event lies in its
+prefix. A `qa_checkout` inside a suffix that is being verified is therefore always refused; it never
+ends or shortens the suffix. Earlier rows stay valid history only while each is bound to its own
+generation's unique `qa_checkout` event, and a new evidence publication must match the current
+candidate exactly. The new generation republishes its
+fixed-root producers in fresh role windows and seals `final-evidence/g<N+1>/` before either wrapper
+runs again; each generation's seal counts only its own producer rows.
 
 - Claude-primary run: call `firm-gpt-qa`; it writes `08-qa-verdict.gpt.json`.
 - Codex-primary run: call `firm-claude-qa`; it writes `08-qa-verdict.claude.json`.
@@ -194,6 +226,18 @@ before provider execution. Transient raw bytes exist only below the package-excl
 normal exit or wrapper death; any cleanup failure is visibly marked mode 0600 and makes the wrapper
 BLOCK. They do not install, authenticate, upgrade, deploy, push, or otherwise change external state.
 
+Which judge attempt is current comes from the ledger, never from the pointer files.
+`08-qa-verdict.<provider>.json` and `reviewer-state.<provider>.json` are mutable projections that the
+seal does not cover. The current secondary attempt is the last terminal attempt for the secondary
+provider in the verified ledger: in a sealed run, the live generation's suffix, bound to its seal;
+otherwise, the last terminal row for this candidate and generation. No attempt may have started after
+it. The Final check blocks unless the canonical verdict is byte-for-byte that attempt's verdict (the
+`verdict_sha256`/`verdict_bytes` on its terminal event) and both pointer files name that attempt.
+An unavailable state must be that attempt. In a sealed run the wrapper refuses to start a new attempt
+while the canonical verdict is not the verdict of the generation's latest attempt, so a superseded
+verdict copied back is never archived as a prior verdict. To repair, restore the pointer files from the
+ledger's current attempt's own records.
+
 The secondary provider's BLOCK binds unless primary QA positively dissents on that exact point.
 High-risk state is derived from accepted security/privacy criteria and the committed candidate diff
 matched against `high-risk-paths.yaml`; ambiguity is high-risk. High-risk disagreement remains
@@ -204,7 +248,51 @@ producer-authored object with a stable id, exact text, affected criteria, and af
 `two_voice_diff` entry must bind that id and repeat those fields exactly. Risk is derived from the
 producer object, never from disposition-authored affected fields. An unavailable required judge needs a
 matching trusted availability-attempt record and an exact logged human waiver. Primary QA BLOCK always
-blocks. Run `firm-final-qa-check <run_dir>` before the Final interaction:
+blocks.
+
+A sealed run's `traceability.yaml` is frozen before the judge, so primary QA answers a CURRENT
+secondary BLOCK after it. It opens a fresh primary-QA window for the post-judge answer
+(`firm-ledger-log --run <run_dir> --strict --role-start --stage <new stage> --role qa-tester
+--event qa_started ...`), writes `09-test-evidence/post-judge/g<N>/two-voice-dispositions.<k>.json`
+and publishes it inside that window with `firm-ledger-log --run <run_dir> --strict
+post_judge_artifact_published path=<that path> sha256=<digest> bytes=<size> sha=<candidate_sha>
+generation=<N> kind=two_voice_dispositions secondary_attempt_id=<current attempt> stage=<the window's
+stage> role=qa-tester role_start_event_id=<the window's start> seal_event_id=<publication event>
+seal_projection_sha256=<projection>`, the last two being `publication_event_id` and `projection_sha256`
+from `firm-seal-qa-evidence --verify --run <run_dir>`, and then closes the window with `qa_completed`.
+Disposition evidence is published the same way. The document is JSON with
+exactly `schema_version` (1), `run_id`, `candidate_sha`, `generation`, `secondary_attempt_id`,
+`secondary_verdict_sha256` and `secondary_verdict_bytes` (the current attempt's immutable verdict,
+`verdict_sha256`/`verdict_bytes` on its terminal event), and `two_voice_diff`, whose entries have
+exactly the traceability disposition shape. Evidence it cites may be a `disposition_evidence`
+post-judge artifact and a human record a `human_decision` one; neither may stand in for the other,
+each counts only when bound to this generation's seal, and a human record counts only when the
+decision it answers was required after the current judge verdict, so nothing staged before the seal
+can answer it.
+Every post-judge file is published once, so a revision is a new `<k>`. Once the live candidate's
+generation has a published seal, `firm-ledger-log` checks the post-judge phase's own rows against that
+seal's suffix grammar before appending them: `post_judge_artifact_published`, `final_gate_pending`,
+`final_decision_required`, `qa_started`/`qa_completed`, and every `qa-tester` role start. It refuses a
+row the grammar would refuse (an event it does not admit, wrong field set, binding, path, digest,
+window, attempt, a window opened while a judge attempt is open, or a privacy-policy match), naming why;
+nothing is appended, so correct the file or command and publish again. A refused role start fails with
+`INPUT_INVALID: sealed-suffix`. The check judges the row, not the run: if the suffix was already
+broken by something else, a well-formed row is appended with a warning that names the existing
+breakage, and verification still refuses the run until that is repaired. Every other row -- Lead
+milestones, the Packager's finalize window, `handoff_finalized`, `run_closed`, a `lead_note` -- is not
+gated and lands as it always did; when one ends verification of a sealed generation that still
+verified, the writer appends it and warns that the Final check and every further judge attempt for
+that generation will now refuse it. Between the seal and a passing Final, record nothing outside the
+post-judge grammar. A recapture is not affected: `firm-qa-checkout` moves the live
+candidate to the next generation before it appends, and that generation has no seal yet. A disposition must repeat the judge's objection text exactly, so if that text
+itself carries a privacy-policy match no disposition of it can be published: run a new judge attempt
+rather than editing around it. For a current BLOCK the Final
+check uses the LATEST such publication for the generation when it names the current canonical attempt
+and verdict digest and comes from a primary-QA window opened after that attempt ended; a latest publication naming anything else is ignored, never replaced by an older
+one, and the check falls back to `traceability.yaml`. An unsealed run keeps its dispositions in
+`traceability.yaml`. An objection with no disposition still blocks: silence is not dissent.
+
+Run `firm-final-qa-check <run_dir>` before the Final interaction:
 
 - exit 0 permits the Packager to present the draft handoff with the ordinary approve/reject Final
   choice once; after approval, the Packager finalizes it against that current passing result;
@@ -216,9 +304,23 @@ The decision-required artifact aggregates the complete relevant objection set an
 text, derived risk, and permitted record type. If the human chooses a permitted option, the Lead
 appends exactly one shared typed, digest-bound, current-run/current-full-SHA record naming every
 relevant producer id and text, references it from every relevant disposition, and then runs one fresh
-`firm-final-qa-check <run_dir>`. Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
+`firm-final-qa-check <run_dir>`. In a sealed run that record is a `human_decision` post-judge
+artifact published with `secondary_attempt_id=<current attempt>` and
+`decision_required_event_id=<the decision_required event it answers>`, and the dispositions citing it
+are re-published as the next `two-voice-dispositions.<k>.json`. Each decision state names the attempt
+it is about, and every post-judge record and evidence file answers exactly one attempt: after a
+further judge attempt, nothing published for an earlier attempt answers the new verdict, and a new
+BLOCK needs its own decision.
+Finalize `10-handoff.md` only when that fresh run exits 0. A rejection,
 wrong record type, mismatched objection, stale SHA/generation, or nonzero rerun stays blocked; never
 manufacture a record, reinterpret the answer, or prompt a second time in the same Final cycle.
+
+Rows written after a passing Final check -- the Packager's finalize window, `handoff_finalized`, the
+Close stage's milestones -- are not part of the sealed grammar. Seal verification of a finalized or
+closed run is therefore expected to refuse ("unexpected event ..."); the run's decision was taken at
+Final, by the check that passed. A designed post-Final phase is a known follow-up: it must admit those
+rows, and it must account for finalizing `10-handoff.md`, which changes a file the seal covers (a
+second `evidence_produced` for it in the same generation is a duplicate the writer refuses).
 
 ## Completion
 

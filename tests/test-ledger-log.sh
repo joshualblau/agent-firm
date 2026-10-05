@@ -619,6 +619,149 @@ else
   t_skip "real-shaped genuine-legacy classifier positive control" "requires a supported P2 ledger write host"
 fi
 
+# ledger_writes_supported — t_p2_row_supported, but also false under firm-ledger-log's own guarded
+# rejection seam (the tests/test-concurrent-runs-eval.sh pattern), so a case that needs successful
+# writes is SKIPPED by name on a refused host rather than reported as a fixture failure:
+#   FIRM_LEDGER_TEST_GUARD=1 FIRM_LEDGER_P2_TEST_REJECT=linux bash tests/test-ledger-log.sh
+ledger_writes_supported() {
+  [ "${FIRM_LEDGER_TEST_GUARD:-}" = 1 ] && [ -n "${FIRM_LEDGER_P2_TEST_REJECT:-}" ] && return 1
+  t_p2_row_supported
+}
+
+# GENERATION-SCOPED HISTORY. `firm-qa-checkout` rewrites qa-candidate.json for generation N+1 and
+# then appends its own `qa_checkout` event. Every append re-classifies the whole ledger, and the old
+# rule compared each existing evidence row with the LIVE candidate, so the first append after a
+# recapture -- that `qa_checkout` event itself -- was refused and the run became unwritable. An
+# earlier row is now valid only when its generation is lower than the current one AND its sha is the
+# sha of that generation's UNIQUE qa_checkout event; a NEW publication must still match the current
+# candidate exactly.
+t_case "generation-scoped history: earlier-generation rows stay classifiable only when bound to their qa_checkout"
+if ! ledger_writes_supported; then
+  t_skip "generation-scoped evidence history" "requires a supported P2 ledger write host and no refused-row seam"
+else
+  gen_fixture="$(make_current_evidence_run)"; gen_fixture_rc=$?
+  gen_repo="$(printf '%s\n' "$gen_fixture" | sed -n '1p')"
+  gen_run="$(printf '%s\n' "$gen_fixture" | sed -n '2p')"
+  gen_sha1="$(printf '%s\n' "$gen_fixture" | sed -n '3p')"
+  gen_start1="$(printf '%s\n' "$gen_fixture" | sed -n '4p')"
+  gen_id="$(basename "$gen_run")"
+  if [ "$gen_fixture_rc" -ne 0 ] || [ -z "$gen_start1" ]; then
+    _t_no "generation-history fixture created" "rc=$gen_fixture_rc"
+  else
+    _t_ok "generation-history fixture created"
+    gen_checkout() { # <generation> <sha> [event-id]
+      "$LOG" --run "$gen_run" --strict ${3:+--event-id "$3"} qa_checkout \
+        "dir=.agent-firm/qa-checkout/$gen_id" "branch=integration/$gen_id" \
+        "source_ref=refs/heads/integration/$gen_id" "base_sha=$gen_sha1" "sha=$2" \
+        "generation=$1" candidate=09-test-evidence/qa-candidate.json
+    }
+    gen_publish() { # <generation> <sha> <path> <stage> <start>
+      printf '%s\n' "evidence for $3 at generation $1" > "$gen_run/$3"; chmod 600 "$gen_run/$3"
+      "$LOG" --run "$gen_run" --strict evidence_produced "sha=$2" "generation=$1" "path=$3" \
+        "sha256=$(shasum -a 256 "$gen_run/$3" | awk '{print $1}')" \
+        "bytes=$(wc -c < "$gen_run/$3" | tr -d ' ')" "stage=$4" role=qa-tester "role_start_event_id=$5"
+    }
+    gen_classify() { "$LOG" --classify-ledger-file "$gen_id" "$gen_run/run.jsonl"; }
+    assert_ok "generation 1 records its checkout" gen_checkout 1 "$gen_sha1" evt-gen-checkout-1
+    assert_ok "generation 1 publishes evidence in its role window" \
+      gen_publish 1 "$gen_sha1" 09-test-evidence/g1.log test/Q-01 "$gen_start1"
+    assert_ok "generation 1 closes its role window" "$LOG" --run "$gen_run" --strict qa_completed \
+      stage=test/Q-01 role=qa-tester "role_start_event_id=$gen_start1"
+    # Recapture exactly as firm-qa-checkout does: a new candidate commit, then the candidate metadata
+    # for generation 2 is written BEFORE its qa_checkout event is appended.
+    git -C "$gen_repo" commit -q --allow-empty -m "generation two" && gen_sha2="$(sha_of "$gen_repo" HEAD)"
+    t_python - "$gen_run/09-test-evidence/qa-candidate.json" "$gen_sha2" <<'PY'
+import json,os,sys
+path,sha=sys.argv[1:]
+candidate=json.load(open(path))
+candidate.update({"candidate_sha":sha,"source_ref_sha":sha,"generation":2})
+open(path,"w").write(json.dumps(candidate)+"\n"); os.chmod(path,0o600)
+PY
+    gen_snapshot="$gen_run/.generation-snapshot.jsonl"; cp "$gen_run/run.jsonl" "$gen_snapshot"
+    assert_rc "the classifier accepts generation-1 rows bound to their unique checkout" 0 gen_classify
+    assert_rc "the generation-2 qa_checkout event appends after the recapture" 0 \
+      gen_checkout 2 "$gen_sha2" evt-gen-checkout-2
+    gen_start2="$("$LOG" --run "$gen_run" --strict --role-start --stage test/Q-02 --role qa-tester \
+      --contract role-contracts/Q-01-qa-tester.md --event qa_started \
+      --authority-json "$(t_python -c 'import json,sys; rid=sys.argv[1]; print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":sys.argv[2],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":sys.argv[3]}}}],separators=(",",":")))' "$gen_id" "$(t_python -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["event_id"])' "$gen_run/run.jsonl")" "$gen_sha1")" \
+      --agent /root/generation_two_fixture \
+      --activation-json "$("$BIN/firm-model-resolve" --provider codex --role qa-tester --format activation)" \
+      2>/dev/null | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])' 2>/dev/null)"
+    assert_ok "a generation-2 role window opens" test -n "$gen_start2"
+    assert_ok "generation 2 publishes its own evidence against the current candidate" \
+      gen_publish 2 "$gen_sha2" 09-test-evidence/g2.log test/Q-02 "$gen_start2"
+    gen_before="$(sha_or_absent "$gen_run/run.jsonl")"
+    assert_rc "a NEW generation-1 era publication is refused once generation 2 exists" 1 \
+      gen_publish 1 "$gen_sha1" 09-test-evidence/late.log test/Q-02 "$gen_start2"
+    assert_eq "the refused late publication leaves the ledger exact" "$gen_before" \
+      "$(sha_or_absent "$gen_run/run.jsonl")"
+    assert_rc "the whole two-generation ledger still classifies" 0 gen_classify
+
+    # The binding is what makes history acceptable, so every way of loosening it is refused. Each
+    # mutation starts from the snapshot taken right after the recapture.
+    gen_mutate() { # <mode>
+      cp "$gen_snapshot" "$gen_run/run.jsonl"; chmod 600 "$gen_run/run.jsonl"
+      t_python - "$gen_run/run.jsonl" "$1" "$gen_id" "$gen_start1" <<'PY'
+import json,sys
+path,mode,run_id,start=sys.argv[1:]
+rows=[json.loads(line) for line in open(path)]
+other="1"*40
+def checkout(generation,sha,eid):
+    return {"ts":"2026-10-01T00:00:00Z","event":"qa_checkout","event_id":eid,"run_id":run_id,
+            "dir":".agent-firm/qa-checkout/"+run_id,"branch":"integration/"+run_id,
+            "source_ref":"refs/heads/integration/"+run_id,"base_sha":other,"sha":sha,
+            "generation":generation,"candidate":"09-test-evidence/qa-candidate.json"}
+def evidence(generation,sha,eid):
+    return {"ts":"2026-10-01T00:00:01Z","event":"evidence_produced","event_id":eid,"run_id":run_id,
+            "sha":sha,"generation":generation,"path":"09-test-evidence/g1.log","sha256":"0"*64,
+            "bytes":"1","stage":"test/Q-01","role":"qa-tester","role_start_event_id":start}
+if mode=="unbound":
+    rows=[row for row in rows if row.get("event")!="qa_checkout"]
+elif mode=="wrong_sha":
+    for row in rows:
+        if row.get("event")=="qa_checkout": row["sha"]=other
+elif mode=="duplicate":
+    original=[row for row in rows if row.get("event")=="qa_checkout"][0]
+    rows.append(dict(original,event_id="evt-gen-checkout-1-again"))
+elif mode=="not_lower":
+    rows+=[checkout("2",other,"evt-forged-checkout-2"),evidence("2",other,"evt-forged-row-2")]
+elif mode=="future":
+    rows+=[checkout("3",other,"evt-forged-checkout-3"),evidence("3",other,"evt-forged-row-3")]
+elif mode=="noncanonical":
+    for row in rows:
+        if row.get("event")=="qa_checkout": row["generation"]="01"
+open(path,"w").writelines(json.dumps(row,separators=(",",":"))+"\n" for row in rows)
+PY
+    }
+    for gen_mode in unbound wrong_sha duplicate not_lower future noncanonical; do
+      gen_mutate "$gen_mode"
+      # The refusal names its cause (L3): an unappendable ledger must at least say why.
+      case $gen_mode in
+        unbound) gen_label="an earlier row with no qa_checkout for its generation"
+                 gen_cause="no qa_checkout event binds generation 1" ;;
+        wrong_sha) gen_label="an earlier row whose generation's checkout names another sha"
+                   gen_cause="generation 1's qa_checkout names another sha" ;;
+        duplicate) gen_label="an earlier row whose generation has two checkout events"
+                   gen_cause="ambiguous evidence history: generation 1 has 2 qa_checkout events" ;;
+        not_lower) gen_label="a current-generation row bound only to a forged checkout of that generation"
+                   gen_cause="stale evidence target" ;;
+        future) gen_label="a later-generation row bound to a forged later checkout"
+                gen_cause="stale evidence target" ;;
+        noncanonical) gen_label="an earlier row whose checkout generation is not canonical"
+                      gen_cause="no qa_checkout event binds generation 1" ;;
+      esac
+      assert_rc "$gen_label is refused" 1 gen_classify
+      assert_output "$gen_label: the classifier names the cause" "$gen_cause" gen_classify
+      gen_mutated="$(sha_or_absent "$gen_run/run.jsonl")"
+      assert_rc "$gen_label leaves the run unappendable" 1 \
+        "$LOG" --run "$gen_run" --strict ordinary_event note=after-mutation
+      assert_output "$gen_label: the refused append names the cause" "$gen_cause" \
+        "$LOG" --run "$gen_run" --strict ordinary_event note=after-mutation
+      assert_eq "$gen_label refusal leaves the ledger exact" "$gen_mutated" "$(sha_or_absent "$gen_run/run.jsonl")"
+    done
+  fi
+fi
+
 t_case "malformed source-run evidence is rejected without normalization or mutation"
 source_common="$(git -C "$FIRM_ROOT" rev-parse --git-common-dir)"
 case $source_common in /*) ;; *) source_common="$FIRM_ROOT/$source_common";; esac

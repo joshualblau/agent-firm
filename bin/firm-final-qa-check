@@ -33,9 +33,9 @@ if [[ -z "$run_dir" || ! -d "$run_dir" || -L "$run_dir" ]]; then
 fi
 primary="$run_dir/08-qa-verdict.json"
 [[ -f "$primary" && ! -L "$primary" ]] || { echo "FINAL QA: CANNOT EVALUATE -- missing primary verdict" >&2; exit 2; }
-seal_detail="$("$SELF/firm-seal-qa-evidence" --verify --run "$run_dir" --phase publication 2>&1)"
-seal_rc=$?
-[[ $seal_rc -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- final evidence seal validation rc=$seal_rc: ${seal_detail//$'\n'/ }" >&2; exit 2; }
+# The final evidence seal is verified INSIDE the check below, over exactly the ledger bytes the check
+# then uses. It used to be a separate subprocess here, after which the check re-read run.jsonl, so a
+# row appended in between was trusted without ever being grammar-checked.
 "$SELF/firm-validate-verdict" "$primary" >/dev/null 2>&1
 pvalid=$?
 [[ $pvalid -eq 0 ]] || { echo "FINAL QA: CANNOT EVALUATE -- primary verdict validation rc=$pvalid" >&2; exit 2; }
@@ -96,6 +96,29 @@ try:
 except BaseException as exc:
     cannot(f"validation prerequisites unavailable or broken: {type(exc).__name__}: {exc}")
 
+# The seal's own privacy scan, for the post-judge artifacts this check consumes and for the decision
+# state it writes. Neither is sealed, so without this nothing would hold them to the privacy policy
+# the sealed evidence meets -- and a decision state that failed the seal's scan would make every
+# later verification of this run fail.
+firm_root = policy_path.resolve().parents[2]
+sys.path.insert(0, str(firm_root / "agent-firm" / "lib"))
+try:
+    import evidence_seal
+    privacy_patterns = evidence_seal._privacy_patterns(evidence_seal.parse_json_unique(
+        (firm_root / "agent-firm" / "policy" / "evidence-privacy.yaml").read_bytes(), "privacy policy"))
+except BaseException as exc:
+    cannot(f"privacy policy unavailable: {type(exc).__name__}: {exc}")
+
+def privacy_match(raw, relative):
+    """Return the seal's PRIVACY_MATCH detail for these bytes on this path's surface, or None."""
+    try:
+        evidence_seal._scan(raw, relative, privacy_patterns)
+    except evidence_seal.SealError as exc:
+        if exc.category == "PRIVACY_MATCH":
+            return exc.detail
+        cannot(f"privacy scan failed: {exc.category}: {exc.detail}")
+    return None
+
 def load_json(path, label):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -141,6 +164,26 @@ def utc(value):
         return True
     except ValueError:
         return False
+
+# ONE READ OF THE LEDGER. Verify the seal over exactly these bytes, in process, and use only them
+# afterwards: a row appended after this read is neither verified nor trusted.
+ledger_path = safe_file("run.jsonl", "target ledger")
+try:
+    ledger_raw = ledger_path.read_bytes()
+except OSError as exc:
+    cannot(f"target ledger is unreadable: {exc}")
+try:
+    seal_receipt = evidence_seal.verify_seal(
+        run, firm_root / "agent-firm" / "policy" / "evidence-privacy.yaml", "publication", ledger_raw=ledger_raw)
+except evidence_seal.SealError as exc:
+    cannot(f"final evidence seal validation rc=1: firm-seal-qa-evidence: BLOCK {exc.category}: {exc.detail}")
+except Exception as exc:
+    cannot(f"final evidence seal validation could not run: {type(exc).__name__}: {exc}")
+sealed_run = seal_receipt.get("state") == "sealed"
+# Guarded test seam: runs between the verification and every later use of the ledger, so a test can
+# prove that a row appended in that window is not trusted. Inert unless the guard is set.
+if os.environ.get("FIRM_FINAL_TEST_GUARD") == "1" and os.environ.get("FIRM_FINAL_AFTER_VERIFY_HOOK"):
+    subprocess.run([os.environ["FIRM_FINAL_AFTER_VERIFY_HOOK"]], check=False)
 
 evidence_parent = run / "09-test-evidence"
 try:
@@ -226,22 +269,135 @@ if not isinstance(voice.get("required"), bool) or voice["required"] != derived_r
     block(f"supplied two_voice.required does not match derived value {str(derived_required).lower()}")
 
 def ledger_events():
+    """The ledger rows of the ONE read above, the bytes the seal verification covered."""
     events=[]
-    path=safe_file("run.jsonl", "target ledger")
     try:
-        with open(path, encoding="utf-8") as fh:
-            for number,line in enumerate(fh,1):
-                item=json.loads(line)
-                if not isinstance(item,dict):
-                    raise ValueError(f"line {number} is not an object")
-                events.append(item)
+        for number,line in enumerate(ledger_raw.decode("utf-8","strict").splitlines(),1):
+            item=json.loads(line)
+            if not isinstance(item,dict):
+                raise ValueError(f"line {number} is not an object")
+            events.append(item)
     except Exception as exc:
         cannot(f"target ledger is malformed: {exc}")
     return events
 
 events = ledger_events()
 
-def evidence_ref(ref, label):
+# POST-JUDGE PUBLICATIONS. A sealed run's traceability.yaml is frozen before the judge runs, so a
+# CURRENT judge BLOCK could never be answered there. Primary QA instead publishes its dispositions,
+# and the evidence and human records they cite, as `post_judge_artifact_published` events under
+# 09-test-evidence/post-judge/g<N>/. The seal verification above has already proved every such event
+# in this generation's suffix is closed, digest-bound, and names a terminal attempt; here only the
+# ones bound to THIS generation's seal publication count, so an unsealed run has none.
+post_judge_root=f"09-test-evidence/post-judge/g{generation}/"
+seal_publications=[event for event in events if event.get("event")=="evidence_seal_published"
+                   and event.get("sha")==sha and str(event.get("generation"))==str(generation)]
+current_seal=seal_publications[0] if len(seal_publications)==1 else None
+
+# The seal binding is the ONE mechanism that makes a post-judge publication count: without a seal
+# publication for this generation there is nothing to bind to, so nothing matches.
+current_seal_id=current_seal.get("event_id") if current_seal is not None else None
+current_seal_projection=current_seal.get("projection_sha256") if current_seal is not None else None
+if sealed_run and (current_seal_id!=seal_receipt.get("publication_event_id")
+                   or current_seal_projection!=seal_receipt.get("projection_sha256")):
+    cannot("the verified seal publication is not the ledger's seal publication for this generation")
+if not sealed_run:
+    current_seal_id=current_seal_projection=None
+
+def require_reviewer_seal_binding(event, label):
+    """In a sealed generation every reviewer event Final relies on carries this seal's binding."""
+    if sealed_run and (event.get("seal_event_id")!=seal_receipt.get("publication_event_id")
+                       or event.get("seal_projection_sha256")!=seal_receipt.get("projection_sha256")):
+        block(f"{label} reviewer event is not bound to this generation's seal")
+
+# THE CURRENT SECONDARY ATTEMPT IS THE LEDGER'S, NOT THE POINTER FILES'. 08-qa-verdict.<p>.json and
+# reviewer-state.<p>.json are mutable copies: restoring an earlier APPROVE's pair over a later BLOCK
+# used to make the APPROVE current again while the seal still verified. The current attempt is the
+# last terminal attempt for the secondary provider in the verified ledger (in a sealed run, this
+# generation's suffix, bound to this seal); no attempt may have started after it, and the pointers
+# must name exactly it.
+try:
+    ledger_terminal,ledger_later_start=evidence_seal.current_judge_attempt(ledger_raw,seal_receipt,expected,sha,generation)
+except evidence_seal.SealError as exc:
+    cannot(f"current judge attempt cannot be read from the verified ledger: {exc.category}: {exc.detail}")
+
+def require_ledger_current(event, label):
+    """`event` -- the terminal row the pointer files lead to -- is the ledger's current attempt."""
+    if ledger_terminal is None:
+        block(f"{label}: the verified ledger has no terminal {expected} attempt for this candidate")
+    if ledger_later_start is not None:
+        block(f"{label}: {expected} attempt {ledger_later_start.get('attempt_id')} started after the last "
+              f"terminal one and has no verdict, so no {expected} verdict is current")
+    if (event.get("event_id")!=ledger_terminal.get("event_id")
+            or event.get("attempt_id")!=ledger_terminal.get("attempt_id")):
+        block(f"{label} names attempt {event.get('attempt_id')}, but the verified ledger's current {expected} "
+              f"attempt is {ledger_terminal.get('attempt_id')} ({ledger_terminal.get('event')}); "
+              "the pointer files do not match the ledger")
+
+def post_judge_published(kind):
+    return [event for event in events if event.get("event")=="post_judge_artifact_published"
+            and event.get("kind")==kind and event.get("sha")==sha
+            and str(event.get("generation"))==str(generation)
+            and isinstance(current_seal_id,str) and isinstance(current_seal_projection,str)
+            and event.get("seal_event_id")==current_seal_id
+            and event.get("seal_projection_sha256")==current_seal_projection]
+
+def require_qa_window(event, label, answering):
+    """`event` was published inside one native primary-QA window opened after `answering` ended.
+
+    The seal's suffix grammar already proves every post-judge window is closed and well-formed; this
+    is the Final check's own requirement that the window answers the CURRENT attempt, so a set made
+    before the current judge verdict, or by a caller outside any QA window, cannot dispose of it.
+    """
+    start_id=event.get("role_start_event_id")
+    if event.get("role")!="qa-tester" or not isinstance(event.get("stage"),str) or not isinstance(start_id,str):
+        block(f"{label} was not published inside a primary-QA (qa-tester) role window")
+    position=[index for index,item in enumerate(events) if item is event]
+    starts=[index for index,item in enumerate(events) if item.get("event_id")==start_id]
+    completions=[index for index,item in enumerate(events)
+                 if item.get("event")=="qa_completed" and item.get("role_start_event_id")==start_id]
+    outcomes=[index for index,item in enumerate(events)
+              if item.get("event_id")==(answering or {}).get("outcome_event_id")]
+    if len(position)!=1 or len(starts)!=1 or len(completions)!=1 or len(outcomes)!=1:
+        block(f"{label} has no single closed primary-QA window answering the current judge attempt")
+    start=events[starts[0]]; completion=events[completions[0]]
+    if (start.get("event")!="qa_started" or start.get("role")!="qa-tester" or start.get("stage")!=event.get("stage")
+            or not {"contract","authority","activation"}.issubset(start)
+            or completion.get("role")!="qa-tester" or completion.get("stage")!=event.get("stage")
+            or not outcomes[0] < starts[0] < position[0] < completions[0]):
+        block(f"{label} was not published inside a primary-QA window opened after the current judge attempt")
+
+def require_decision_answered(event, label, answering):
+    """A human record answers one earlier final_decision_required made for the CURRENT attempt."""
+    decision_id=event.get("decision_required_event_id")
+    decisions=[index for index,item in enumerate(events)
+               if item.get("event")=="final_decision_required" and item.get("event_id")==decision_id]
+    position=[index for index,item in enumerate(events) if item is event]
+    seal_positions=[index for index,item in enumerate(events) if item is current_seal]
+    outcomes=[index for index,item in enumerate(events) if item.get("event_id")==answering.get("outcome_event_id")]
+    if len(decisions)!=1 or len(position)!=1 or not decisions[0] < position[0]:
+        block(f"{label} does not answer one earlier final_decision_required event")
+    # The decision answered was required AFTER this generation's seal and after the current verdict.
+    if (len(seal_positions)!=1 or len(outcomes)!=1
+            or not seal_positions[0] < outcomes[0] < decisions[0]):
+        block(f"{label} answers a decision that was not required after the current judge verdict")
+    decision=events[decisions[0]]
+    state_raw=safe_file(decision.get("path"),f"{label} decision state").read_bytes()
+    if hashlib.sha256(state_raw).hexdigest()!=decision.get("sha256") or str(len(state_raw))!=str(decision.get("bytes")):
+        block(f"{label} decision state changed after it was recorded")
+    leak=privacy_match(state_raw,decision.get("path"))
+    if leak is not None:
+        block(f"{label} decision state carries a privacy-policy match: {leak}")
+    try:
+        state=json.loads(state_raw)
+    except Exception as exc:
+        block(f"{label} decision state is malformed: {exc}")
+    if (not isinstance(state,dict) or state.get("status")!="decision_required" or state.get("kind")!="secondary_objections"
+            or state.get("event_id")!=decision_id or state.get("candidate_sha")!=sha or state.get("generation")!=generation
+            or state.get("secondary_attempt_id")!=answering.get("attempt_id")):
+        block(f"{label} answers a decision that was not required for the current secondary attempt")
+
+def evidence_ref(ref, label, post_judge_kinds=(), answering=None):
     if not isinstance(ref, dict) or ref.get("candidate_sha") != sha:
         block(f"{label} is missing, stale, or bound to another SHA")
     path=safe_file(ref.get("path"), label)
@@ -255,6 +411,27 @@ def evidence_ref(ref, label):
     if len(matches)!=1 or matches[0].get("event")!=producer.get("event"):
         block(f"{label} producer event is missing or duplicated")
     event=matches[0]; origin=ref.get("path")
+    # A post-judge artifact may stand only where its declared kind belongs: disposition evidence as
+    # evidence, a human decision as the human record, and never the disposition set itself.
+    if event.get("event")=="post_judge_artifact_published":
+        if event.get("kind") not in post_judge_kinds or answering is None:
+            block(f"{label} cites a post-judge {event.get('kind')} artifact where it may not")
+        leak=privacy_match(raw,ref.get("path"))
+        if leak is not None:
+            block(f"{label} carries a privacy-policy match: {leak}")
+        # Bound to THIS generation's seal, so it lies in the grammar-checked suffix: the pre-seal
+        # ledger is only classified, and a record staged there could otherwise answer a later verdict.
+        if (not isinstance(current_seal_id,str) or event.get("seal_event_id")!=current_seal_id
+                or event.get("seal_projection_sha256")!=current_seal_projection):
+            block(f"{label} is a post-judge artifact not bound to this generation's seal")
+        # Every post-judge artifact answers one attempt; it may answer only the CURRENT one.
+        if event.get("secondary_attempt_id")!=answering.get("attempt_id"):
+            block(f"{label} was published for attempt {event.get('secondary_attempt_id')}, "
+                  f"not the current secondary attempt {answering.get('attempt_id')}")
+        if event.get("kind")=="disposition_evidence":
+            require_qa_window(event,label,answering)
+        if event.get("kind")=="human_decision":
+            require_decision_answered(event,label,answering)
     if event.get("sha")!=sha or str(event.get("generation"))!=str(generation) or origin not in (event.get("path"),event.get("verdict"),event.get("attempt")):
         block(f"{label} producer candidate/artifact identity mismatches")
     digest_field="verdict_sha256" if origin==event.get("verdict") else "sha256"
@@ -304,15 +481,21 @@ def bind_disposition(entry, objects, label):
             block(f"{label} contradicts producer field {object_key}")
     return objection
 
-def decision_required(kind, objections, permitted_record_types):
+def decision_required(kind, objections, permitted_record_types, secondary_attempt_id):
     event_id=f"evt-final-decision-required-g{generation}-{os.getpid()}-{os.urandom(6).hex()}"
     relative=f"09-test-evidence/final-decision-required.{event_id}.json"
     path=run/relative
+    # `secondary_attempt_id` names the attempt this decision is about, so a human record made in
+    # answer to it is bound to that attempt and cannot be replayed against a later one.
     state={"schema_version":1,"status":"decision_required","run_id":run_id,"candidate_sha":sha,
            "generation":generation,"kind":kind,"objections":objections,
            "permitted_record_types":permitted_record_types,"event_id":event_id,
+           "secondary_attempt_id":secondary_attempt_id,
            "created_at":datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
     payload=(json.dumps(state,indent=2,sort_keys=True)+"\n").encode("utf-8")
+    leak=privacy_match(payload,relative)
+    if leak is not None:
+        cannot(f"the decision state would carry a privacy-policy match ({leak}); nothing was written")
     atomic_write(path,payload)
     done=subprocess.run([str(ledger_writer),"--run",str(run),"--strict","--event-id",event_id,
                          "final_decision_required",f"path={relative}",f"sha={sha}",f"generation={generation}",
@@ -357,6 +540,7 @@ def validate_attempt_verdict(verdict_path, verdict, label, current):
     if len(matches)!=1:
         block(f"{label} needs exactly one wrapper outcome event")
     event=matches[0]
+    require_reviewer_seal_binding(event,label)
     if any((event.get("event")!=event_name,event.get("provider")!=expected,
             str(event.get("generation"))!=str(generation),event.get("sha")!=sha,
             event.get("attempt")!=attempt_rel,event.get("attempt_id")!=attempt_id,
@@ -367,6 +551,11 @@ def validate_attempt_verdict(verdict_path, verdict, label, current):
             str(event.get("verdict_bytes"))!=str(len(local_raw)))):
         block(f"{label} attempt/event/verdict chain is inconsistent")
     if current:
+        require_ledger_current(event,label)
+        canonical_raw=safe_file(str(secondary_path.relative_to(run)),label).read_bytes()
+        if (ledger_terminal.get("verdict_sha256")!=hashlib.sha256(canonical_raw).hexdigest()
+                or str(ledger_terminal.get("verdict_bytes"))!=str(len(canonical_raw))):
+            block(f"{label} is not byte-for-byte the verdict of the verified ledger's current {expected} attempt")
         state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json",f"{label} reviewer state"),f"{label} reviewer state")
         if state.get("candidate_sha")!=sha or state.get("generation")!=generation or state.get("attempt_id")!=attempt_id:
             block(f"{label} is not the latest serialized attempt")
@@ -428,6 +617,8 @@ if not present:
     state=load_json(safe_file(f"09-test-evidence/reviewer-state.{expected}.json","unavailable reviewer state"),"unavailable reviewer state")
     if len(matches)!=1 or matches[0].get("event")!="reviewer_unavailable" or matches[0].get("attempt")!=rel_attempt or str(matches[0].get("exit_code"))!="3" or state.get("attempt_id")!=attempt.get("attempt_id"):
         block("unavailable state needs the latest exact target-ledger exit-3 attempt")
+    require_reviewer_seal_binding(matches[0],"unavailable attempt")
+    require_ledger_current(matches[0],"unavailable attempt")
     if derived_required:
         if not isinstance(voice.get("unavailable_waiver"),dict):
             decision_required("required_secondary_unavailable",[{
@@ -436,7 +627,7 @@ if not present:
                 "affected_criteria":sorted(criterion_types),"affected_paths":sorted(changed_set),
                 "risk":"high","risk_reasons":["required-secondary-unavailable"],
                 "permitted_record_types":["required_unavailable"]
-            }],["required_unavailable"])
+            }],["required_unavailable"],attempt["attempt_id"])
         waiver_path = evidence_ref(voice.get("unavailable_waiver"), "required-unavailable waiver")
         waiver = load_yaml(waiver_path, "required-unavailable waiver")
         needed = {
@@ -496,6 +687,57 @@ blockers = secondary.get("blockers")
 if not isinstance(blockers,list) or not blockers or not all(isinstance(item,str) and item.strip() for item in blockers):
     block("secondary BLOCK lacks an actionable blockers list")
 current_objects=blocker_objects(secondary,"secondary verdict")
+
+# The disposition set for a CURRENT BLOCK is the LATEST post-judge `two_voice_dispositions`
+# publication for this generation when it names the current canonical secondary attempt and its
+# immutable verdict digest. A latest publication naming another attempt or digest is ignored -- it
+# never resurrects an older one -- and the set falls back to traceability.yaml, which is where runs
+# that disposed before sealing, and unsealed runs, keep it. Silence is not dissent: with no matching
+# set, an objection with no disposition blocks below exactly as before.
+published_dispositions=post_judge_published("two_voice_dispositions")
+if published_dispositions:
+    latest=published_dispositions[-1]
+    latest_rel=latest.get("path")
+    if not isinstance(latest_rel,str) or not latest_rel.startswith(post_judge_root):
+        block("published two-voice dispositions lie outside this generation's post-judge directory")
+    latest_raw=safe_file(latest_rel,"published two-voice dispositions").read_bytes()
+    if hashlib.sha256(latest_raw).hexdigest()!=latest.get("sha256") or str(len(latest_raw))!=str(latest.get("bytes")):
+        block("published two-voice dispositions changed after publication")
+    leak=privacy_match(latest_raw,latest_rel)
+    if leak is not None:
+        block(f"published two-voice dispositions carry a privacy-policy match: {leak}")
+    try:
+        published=json.loads(latest_raw)
+    except Exception as exc:
+        block(f"published two-voice dispositions are malformed: {exc}")
+    published_keys={"schema_version","run_id","candidate_sha","generation","secondary_attempt_id",
+                    "secondary_verdict_sha256","secondary_verdict_bytes","two_voice_diff"}
+    if (not isinstance(published,dict) or set(published)!=published_keys
+            or published.get("schema_version")!=1 or published.get("run_id")!=run_id
+            or published.get("candidate_sha")!=sha or isinstance(published.get("generation"),bool)
+            or published.get("generation")!=generation
+            or published.get("secondary_attempt_id")!=latest.get("secondary_attempt_id")
+            or not isinstance(published.get("secondary_verdict_sha256"),str)
+            or isinstance(published.get("secondary_verdict_bytes"),bool)
+            or not isinstance(published.get("secondary_verdict_bytes"),int)
+            or not isinstance(published.get("two_voice_diff"),list)):
+        block("published two-voice dispositions are malformed or bound to another run, candidate, or attempt")
+    if (published["secondary_attempt_id"]==current_attempt.get("attempt_id")
+            and published["secondary_verdict_sha256"]==hashlib.sha256(current_local_raw).hexdigest()
+            and published["secondary_verdict_bytes"]==len(current_local_raw)):
+        require_qa_window(latest,"published two-voice dispositions",current_attempt)
+        for index,entry in enumerate(published["two_voice_diff"],1):
+            try:
+                jsonschema.validate(entry,{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/disposition","$defs":trace_schema["$defs"]})
+            except Exception as exc:
+                block(f"published disposition #{index} is not a traceability disposition: {type(exc).__name__}")
+        diffs=published["two_voice_diff"]
+        print(f"FINAL QA: NOTE -- dispositions from {latest_rel} (attempt {published['secondary_attempt_id']})",file=sys.stderr)
+    else:
+        print(f"FINAL QA: NOTE -- latest published dispositions {latest_rel} name attempt "
+              f"{published['secondary_attempt_id']} or a verdict digest that is not the current canonical "
+              f"secondary verdict; they are ignored and traceability.yaml applies",file=sys.stderr)
+
 disposition_ids=[item.get("secondary_blocker_id") for item in diffs if isinstance(item,dict)]
 if len(disposition_ids)!=len(diffs) or len(disposition_ids)!=len(set(disposition_ids)) or set(disposition_ids)!=set(current_objects):
     block("two_voice_diff must contain exactly one entry per producer objection id")
@@ -504,7 +746,7 @@ human_entries=[]
 for entry in diffs:
     label=entry["secondary_blocker"]
     objection=bind_disposition(entry,current_objects,f"disposition for {label}")
-    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}")
+    evidence_ref(entry.get("evidence"), f"disposition evidence for {label}", ("disposition_evidence",), current_attempt)
     disposition=entry.get("disposition")
     risk=entry.get("risk")
     derived_risk,derived_reasons=derived_objection_risk(objection)
@@ -518,7 +760,7 @@ for entry in diffs:
             block(f"proceed_with_primary needs positive, unambiguous low-risk dissent: {label}")
         if not isinstance(bounded,dict) or bounded.get("attempted") is not True or bounded.get("rounds") != 1:
             block(f"proceed_with_primary needs exactly one bounded resolution round: {label}")
-        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}")
+        evidence_ref(bounded.get("evidence"), f"bounded resolution evidence for {label}", ("disposition_evidence",), current_attempt)
         continue
     if disposition in ("fixed", "secondary_withdrew"):
         block(f"{disposition} requires a later wrapper APPROVE promoted as current canonical: {label}")
@@ -533,11 +775,11 @@ if human_entries:
         for entry,objection in human_entries:
             risk,reasons=derived_objection_risk(objection)
             structured.append({**objection,"risk":risk,"risk_reasons":reasons,"permitted_record_types":["human_decision"]})
-        decision_required("secondary_objections",structured,["human_decision"])
+        decision_required("secondary_objections",structured,["human_decision"],current_attempt.get("attempt_id"))
     record_refs=[entry["record"] for entry,_ in human_entries]
     if any(ref!=record_refs[0] for ref in record_refs[1:]):
         block("all human-decision objections must reference one exact shared record")
-    record_path=evidence_ref(record_refs[0],"aggregate human decision")
+    record_path=evidence_ref(record_refs[0],"aggregate human decision",("human_decision",),current_attempt)
     record=load_yaml(record_path,"aggregate human decision")
     needed={"schema_version":1,"type":"human_decision","run_id":run_id,"candidate_sha":sha,"decision":"proceed"}
     if not isinstance(record,dict) or any(record.get(k)!=v for k,v in needed.items()):
