@@ -1137,6 +1137,9 @@ legacy("gpt-c1-a0005",argv("gpt-c1-a0005")+[f"{repo}/../../etc/x"])             
 legacy("gpt-c1-a0006",argv("gpt-c1-a0006"),serializer=lambda d:json.dumps(d).encode()+b"\n")  # not the wrapper's bytes
 legacy("gpt-c1-a0007",argv("gpt-c1-a0007")+["pass"+"word="+"abcdefgh"])             # another category entirely
 legacy("gpt-c1-a0008",argv("gpt-c1-a0008")+[repo+"-sibling/x"])                     # a sibling, not under the root
+# Only the proven root itself is masked: whatever follows it in the same value is scanned.
+legacy("gpt-c1-a0009",argv("gpt-c1-a0009")+[repo+"/pass"+"word="+"SuperSecret123"])  # a secret after the root
+legacy("gpt-c1-a0010",argv("gpt-c1-a0010")+[repo+"/a:"+home+"/elsewhere/x"])         # a second home path after it
 def ledger(items): return b"".join(json.dumps(i,separators=(",",":")).encode()+b"\n" for i in items)
 raw=ledger(rows)
 receipt={"state":"sealed","generation":1,"candidate_sha":sha,"publication_event_id":seal_id,"projection_sha256":projection,
@@ -1148,7 +1151,8 @@ for aid in ("gpt-c1-a0001","gpt-c1-a0002"):
         assert f"{A}/{aid}/{name}" in copied,(aid,name,sorted(copied),unresolved)
 unread={u["origin_path"]:u["reason"] for u in unresolved}
 for aid,category in (("gpt-c1-a0003","operator_home"),("gpt-c1-a0004","operator_home"),("gpt-c1-a0005","operator_home"),
-                     ("gpt-c1-a0006","operator_home"),("gpt-c1-a0007","secret_assignment"),("gpt-c1-a0008","operator_home")):
+                     ("gpt-c1-a0006","operator_home"),("gpt-c1-a0007","secret_assignment"),("gpt-c1-a0008","operator_home"),
+                     ("gpt-c1-a0009","secret_assignment"),("gpt-c1-a0010","operator_home")):
     origin=f"{A}/{aid}/attempt.json"
     assert origin not in copied and unread.get(origin,"").startswith("privacy:") and category in unread[origin],(aid,unread)
     assert f"{A}/{aid}/verdict.json" not in copied
