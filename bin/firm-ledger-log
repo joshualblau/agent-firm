@@ -2849,15 +2849,21 @@ class SealedSuffixRefused(Exception):
 
 
 
+# The reviewer wrapper's own events: it verifies the seal before and after writing them.
+REVIEWER_WRAPPER_EVENTS = frozenset((
+    "reviewer_attempt_started", "reviewer_attempt_abandoned", "reviewer_approve", "reviewer_block",
+    "reviewer_invalid", "reviewer_timeout", "reviewer_unavailable",
+))
+
+
 def sealed_suffix_append_check(run, record, role_start=False):
-    """A pre-commit check for one row. After it ran, `check.warning` names a breakage the suffix
-    already had without this row: the row is judged, not the run, so it is appended anyway and the
-    caller says so."""
+    """A pre-commit check for one row. A gated row the grammar refuses raises SealedSuffixRefused.
+    Afterwards `check.warning` names a breakage the suffix already had without this row (the row is
+    judged, not the run, so it is appended anyway), and `check.breaks` says why an UNGATED row makes
+    a suffix that verified unverifiable. Neither refuses: the caller appends and warns."""
     verified = {}
 
-    def check():
-        if not sealed_suffix_gated(record, role_start):
-            return
+    def pending(evidence_seal):
         fd, _ = open_ledger(run)
         if fd is None:
             return
@@ -2879,20 +2885,39 @@ def sealed_suffix_append_check(run, record, role_start=False):
         if context.get("mode") != "current" or context.get("candidate_sha") is None:
             verified["sha256"] = digest
             return
-        sys.path.insert(0, str(TOOL_ROOT / "agent-firm" / "lib"))
-        import evidence_seal
-        try:
-            check.warning = evidence_seal.check_pending_suffix(
-                str(run.path), raw, record, TOOL_ROOT / "agent-firm" / "policy" / "evidence-privacy.yaml",
-                context["candidate_sha"], context["generation"],
-            )
-        except evidence_seal.SealError as exc:
-            raise SealedSuffixRefused(f"{exc.category}: {exc.detail}") from exc
-        except Exception as exc:  # a check that cannot finish is a refusal, not a pass
-            raise SealedSuffixRefused(f"the sealed-suffix check could not run: {type(exc).__name__}") from exc
+        check.warning = evidence_seal.check_pending_suffix(
+            str(run.path), raw, record, TOOL_ROOT / "agent-firm" / "policy" / "evidence-privacy.yaml",
+            context["candidate_sha"], context["generation"],
+        )
         verified["sha256"] = digest
 
+    def check():
+        gated = sealed_suffix_gated(record, role_start)
+        if not gated and record.get("event") in REVIEWER_WRAPPER_EVENTS:
+            return
+        sys.path.insert(0, str(TOOL_ROOT / "agent-firm" / "lib"))
+        import evidence_seal
+        if gated:
+            try:
+                pending(evidence_seal)
+            except evidence_seal.SealError as exc:
+                raise SealedSuffixRefused(f"{exc.category}: {exc.detail}") from exc
+            except Exception as exc:  # a check that cannot finish is a refusal, not a pass
+                raise SealedSuffixRefused(f"the sealed-suffix check could not run: {type(exc).__name__}") from exc
+            return
+        # An ungated row is never refused (Package and Close must land), but in a sealed generation
+        # whose suffix still verifies, one outside the post-judge grammar ends that: say so.
+        check.breaks = None
+        try:
+            pending(evidence_seal)
+        except evidence_seal.SealError as exc:
+            check.breaks = f"{exc.category}: {exc.detail}"
+        except Exception:
+            pass                    # informational only; the row lands either way
+        check.warning = None        # an already-broken suffix is not this row's consequence
+
     check.warning = None
+    check.breaks = None
     return check
 
 
@@ -2901,6 +2926,12 @@ def warn_already_broken(check):
         print(f"firm-ledger-log: warning: appended, but the live generation's sealed suffix was already "
               f"broken before this row ({check.warning}); seal verification refuses this run until "
               f"that is repaired", file=sys.stderr)
+    if getattr(check, "breaks", None):
+        print(f"firm-ledger-log: warning: appended, but this row is outside the sealed post-judge grammar "
+              f"({check.breaks}), so the live generation's seal no longer verifies: the Final check and "
+              f"every further judge attempt for this generation will refuse it. That is expected once "
+              f"Final has passed; between the seal and a passing Final, record nothing outside the "
+              f"post-judge grammar", file=sys.stderr)
 
 
 def ordinary_main(argv):

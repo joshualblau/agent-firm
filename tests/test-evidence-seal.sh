@@ -1406,13 +1406,19 @@ PY
     }
 
     # pj_lands <label> <needle> <fn> [args...] — a row outside the post-judge phase's own set is not
-    # gated by the writer: it lands, as it always did, and the verifier refuses the run it is in.
+    # gated by the writer: it lands, as it always did, with a warning that it ends verification of the
+    # sealed generation, and the verifier refuses the run it is in.
     pj_lands() {
       local _pj_label="$1" _pj_needle="$2" _pj_fn="$3" _pj_out _pj_rc; shift 3
       _pj_out="$("$_pj_fn" "$@" event_id=evt-pj-lands 2>&1)"; _pj_rc=$?
       if [ "$_pj_rc" -eq 0 ] && grep -q '"event_id":"evt-pj-lands"' "$pj_run/run.jsonl"; then
         _t_ok "$_pj_label: the writer appends it"
       else _t_no "$_pj_label: the writer appends it" "rc=$_pj_rc $(_t_ctx "$_pj_out")"; fi
+      case "$_pj_out" in
+        *"warning: appended, but this row is outside the sealed post-judge grammar"*"$_pj_needle"*"seal no longer verifies"*"record nothing outside the post-judge grammar"*)
+          _t_ok "$_pj_label: the writer warns that the generation no longer verifies" ;;
+        *) _t_no "$_pj_label: the writer warns that the generation no longer verifies" "$(_t_ctx "$_pj_out")" ;;
+      esac
       pj_expect refuse "$_pj_label: the verifier refuses the run" "${PJ_PHASE:-publication}" "$_pj_needle"
     }
 
@@ -1612,6 +1618,13 @@ PY
     # gates only the post-judge phase's own rows, so these land, as they did before the gate existed.
     pj_restore "$pj_judged"; pj_lands "an ordinary lead_note after the judge" \
       "unexpected event lead_note" pj lead_note note=after-the-judge
+    pj_restore "$pj_judged"; pj_lands "a Lead milestone such as dispositions_requested after the judge" \
+      "unexpected event dispositions_requested" pj dispositions_requested note=asking-primary-QA
+    # Only the row that ENDS verification warns: once the suffix is broken, a further ungated row is
+    # not this row's consequence.
+    pj_out="$(pj lead_note note=after-the-break 2>&1)"
+    case "$pj_out" in *warning*) _t_no "a further ungated row after the break does not warn again" "$(_t_ctx "$pj_out")";;
+      *) _t_ok "a further ungated row after the break does not warn again";; esac
     pj_restore "$pj_judged"; pj_lands "an unsealed-style human_decision_recorded event after the seal" \
       "unexpected event human_decision_recorded" \
       pj human_decision_recorded "path=$pj_root/human.yaml" "sha=$pj_sha" generation=1
@@ -2553,9 +2566,12 @@ PY
   pf_authority="$(t_python -c 'import json,sys; run=sys.argv[1]; rid=run.rstrip("/").split("/")[-1]; first=json.loads(open(run+"/run.jsonl").readline()); print(json.dumps([{"source_run":".agent-firm/runs/"+rid,"event_id":first["event_id"],"expect":{"event":"run_started","run_id":rid,"fields":{"base_sha":first["base_sha"]}}}],separators=(",",":")))' "$pf_run")"
   pf_out="$("$BIN/firm-ledger-log" --run "$pf_run" --strict --role-start --stage package/P-02 --role packager \
     --contract role-contracts/P-01-packager.md --event packaging_started --authority-json "$pf_authority" \
-    --agent /root/finalize --activation-json "$("$BIN/firm-model-resolve" --provider codex --role packager --format activation)" 2>&1)"
+    --agent /root/finalize --activation-json "$("$BIN/firm-model-resolve" --provider codex --role packager --format activation)" \
+    2>"$pf_keep/finalize.err")"
   pf_rc=$?
   assert_eq "the Packager's finalize window opens" 0 "$pf_rc"
+  assert_output "…warning that the sealed generation no longer verifies, as expected after Final" \
+    "That is expected once Final has passed" cat "$pf_keep/finalize.err"
   pf_start="$(printf '%s' "$pf_out" | t_python -c 'import json,sys; print(json.load(sys.stdin)["event_id"])' 2>/dev/null)"
   printf '%s\n' '# 10 · Handoff' '<!-- BEGIN COMPLETE LOCAL PR BODY -->' 'Title: sealed fixture' '' \
     'Body bytes remain exact.' '<!-- END COMPLETE LOCAL PR BODY -->' '' 'Finalized after Final.' > "$pf_run/10-handoff.md"

@@ -280,7 +280,10 @@ nothing is appended, so correct the file or command and publish again. A refused
 broken by something else, a well-formed row is appended with a warning that names the existing
 breakage, and verification still refuses the run until that is repaired. Every other row -- Lead
 milestones, the Packager's finalize window, `handoff_finalized`, `run_closed`, a `lead_note` -- is not
-gated and lands as it always did. A recapture is not affected: `firm-qa-checkout` moves the live
+gated and lands as it always did; when one ends verification of a sealed generation that still
+verified, the writer appends it and warns that the Final check and every further judge attempt for
+that generation will now refuse it. Between the seal and a passing Final, record nothing outside the
+post-judge grammar. A recapture is not affected: `firm-qa-checkout` moves the live
 candidate to the next generation before it appends, and that generation has no seal yet. A disposition must repeat the judge's objection text exactly, so if that text
 itself carries a privacy-policy match no disposition of it can be published: run a new judge attempt
 rather than editing around it. For a current BLOCK the Final
